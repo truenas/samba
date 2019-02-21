@@ -9,6 +9,7 @@ Type=notify
 PIDFile=@PIDDIR@/smbd.pid
 LimitNOFILE=16384
 EnvironmentFile=-@SYSCONFDIR@/sysconfig/samba
+ExecStartPre=/usr/share/samba/update-apparmor-samba-profile
 ExecStart=@SBINDIR@/smbd --foreground --no-process-group $SMBDOPTIONS
 ExecReload=/bin/kill -HUP $MAINPID
 LimitCORE=infinity
