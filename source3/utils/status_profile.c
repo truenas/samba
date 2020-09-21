@@ -21,43 +21,130 @@
 #include "includes.h"
 #include "smbprofile.h"
 #include "status_profile.h"
+#include <jansson.h>
+#include "audit_logging.h" /* various JSON helpers */
+#include "auth/common_auth.h"
 
-static void profile_separator(const char * title)
+static bool first_done;
+static bool header_complete;
+
+static void profile_separator(const char * title, struct json_object jsobj,
+			      struct json_object *jo, enum PROFILE_OUTPUT proft)
 {
-    char line[79 + 1];
-    char * end;
+	int ret;
+	size_t tlen;
+	char l[80] = {0};
+	char * end;
+	switch (proft) {
+	case PROF_TEXT:
+		snprintf(l, sizeof(l), "**** %s ", title);
 
-    snprintf(line, sizeof(line), "**** %s ", title);
+		for (end = l + strlen(l); end < &l[sizeof(l) -1]; ++end) {
+			*end = '*';
+		}
 
-    for (end = line + strlen(line); end < &line[sizeof(line) -1]; ++end) {
-	    *end = '*';
-    }
+		l[sizeof(l) - 1] = '\0';
+		d_printf("%s\n", l);
+		break;
+	case PROF_JSON:
+		tlen = strlen(title);
+		SMB_ASSERT(tlen < 80);
+		memcpy(l, title + 1, (tlen -2));
 
-    line[sizeof(line) - 1] = '\0';
-    d_printf("%s\n", line);
+		*jo = json_new_object();
+		if (json_is_invalid(jo)) {
+			fprintf(stderr, "jo is invalid JSON\n");
+			return;
+		}
+		ret = json_add_object(&jsobj, l, jo);
+		if (ret != 0) {
+			fprintf(stderr, "failed to add new json object: %s\n",
+				title);
+		}
+		break;
+	case PROF_CSV:
+		break;
+	}
+	return;
 }
 
 /*******************************************************************
  dump the elements of the profile structure
   ******************************************************************/
-bool status_profile_dump(bool verbose)
+bool status_profile_dump(bool verbose,  enum PROFILE_OUTPUT proft)
 {
+	TALLOC_CTX *mem_ctx = NULL;
+	int ret;
 	struct profile_stats stats = {};
+	struct json_object jo, jsobj;
+	bool json, csv;
+	char fname[80] = {0};
+	char elem[3] = {0};
+	char csvout[1024] = {0};
+	struct timeval tv;
 
 	if (!profile_setup(NULL, True)) {
 		fprintf(stderr,"Failed to initialise profile memory\n");
 		return False;
 	}
+	if (proft == PROF_JSON) {
+		mem_ctx = talloc_new(NULL);
+		if (mem_ctx == NULL) {
+			fprintf(stderr, "talloc_new() failed\n");
+			return False;
+		}
+		jsobj = json_new_object();
+		if (json_is_invalid(&jsobj)) {
+			fprintf(stderr, "jsobj is invalid\n");
+			return False;
+		}
+		ret = json_add_timestamp(&jsobj);
+		if (ret < 0) {
+			fprintf(stderr, "Failed to add timestamp to JSON.\n");
+			json_free(&jsobj);
+			return False;
+		}
+	}
 
 	smbprofile_collect(&stats);
 
 #define __PRINT_FIELD_LINE(name, _stats, field) do { \
-	d_printf("%-59s%20ju\n", \
-		 name "_" #field ":", \
-		 (uintmax_t)stats.values._stats.field); \
+	uintmax_t val = (uintmax_t)stats.values._stats.field; \
+	if (proft == PROF_JSON) { \
+		snprintf(fname, sizeof(fname), "%s_%s", name, #field); \
+		if (json_add_int(&jo, fname, val) < 0) { \
+			json_free(&jsobj); \
+			return False; \
+		} \
+	} \
+	else if (proft == PROF_CSV) { \
+		if (!header_complete) { \
+			if (!first_done) { \
+				printf("timestamp"); \
+				gettimeofday(&tv, NULL); \
+				snprintf(csvout, sizeof(csvout), "%ld", tv.tv_sec); \
+			} \
+			printf(",%s_%s", name, #field); \
+			snprintf(elem, sizeof(elem), ",%lu", val); \
+		} \
+		else { \
+			if (!first_done) { \
+				gettimeofday(&tv, NULL); \
+				snprintf(csvout, sizeof(csvout), "%ld", tv.tv_sec); \
+			} \
+			snprintf(elem, sizeof(elem), ",%lu", val); \
+		} \
+		first_done = True; \
+		strncat(csvout, elem, sizeof(csvout) - strlen(csvout) - 1); \
+	} \
+	else {\
+		d_printf("%-59s%20ju\n", \
+			 name "_" #field ":", \
+			 val); \
+	}\
 } while(0);
 #define SMBPROFILE_STATS_START
-#define SMBPROFILE_STATS_SECTION_START(name, display) profile_separator(#display);
+#define SMBPROFILE_STATS_SECTION_START(name, display) profile_separator(#display, jsobj, &jo, proft);
 #define SMBPROFILE_STATS_COUNT(name) do { \
 	__PRINT_FIELD_LINE(#name, name##_stats,  count); \
 } while(0);
@@ -95,6 +182,19 @@ bool status_profile_dump(bool verbose)
 #undef SMBPROFILE_STATS_SECTION_END
 #undef SMBPROFILE_STATS_END
 
+	first_done = False;
+	if (proft == PROF_JSON) {
+		printf("%s\n", json_to_string(mem_ctx, &jsobj));
+		TALLOC_FREE(mem_ctx);
+		json_free(&jsobj);
+	}
+	else if (proft == PROF_CSV) {
+		if (!header_complete) {
+			printf("\n");
+		}
+		printf("%s\n", csvout);
+	}
+	header_complete = True;
 	return True;
 }
 
@@ -359,5 +459,43 @@ bool status_profile_rates(bool verbose)
 
 	}
 
+	return True;
+}
+
+bool status_profile_timed_dump(bool verbose, enum PROFILE_OUTPUT proft, uint64_t sample_interval)
+{
+	uint64_t remain_usec;
+	uint64_t next_usec;
+	uint64_t delta_usec;
+	uint64_t interval;
+	bool ret;
+	int last = 0;
+	int current = 1;
+	int tmp;
+	interval = sample_interval * one_second_usec;
+
+	for (;/*ever*/;) {
+		sample_time[current] = profile_timestamp();
+		next_usec = sample_time[current] + interval;
+		ret = status_profile_dump(verbose, proft);
+		if (!ret) {
+			fprintf(stderr, "Timed dump failed\n");
+			return False;
+		}
+		last = current;
+		current = tmp;
+		ret = fflush(stdout);
+		if (ret != 0) {
+			fprintf(stderr, "Failed to flush output stream: %s\n",
+				strerror(errno));
+			return False;
+		}
+		remain_usec = next_usec - profile_timestamp();
+		if (remain_usec > interval) {
+			fprintf(stderr, "eek! falling behind sampling rate!\n");
+		} else {
+			usleep(remain_usec);
+		}
+	}
 	return True;
 }

@@ -33,6 +33,11 @@
 #include "passdb/machine_sid.h"
 #include "../librpc/gen_ndr/ndr_lsa_c.h"
 #include "util_sd.h"
+#ifdef HAVE_JANSSON
+#include <jansson.h>
+#include "audit_logging.h" /* various JSON helpers */
+#include "auth/common_auth.h"
+#endif /* [HAVE_JANSSON] */
 
 static char DIRSEP_CHAR = '\\';
 
@@ -499,6 +504,48 @@ static int cacl_dump(struct cli_state *cli, const char *filename, bool numeric)
 		}
 	}
 
+	return EXIT_OK;
+}
+
+static int cacl_dump_json(struct cli_state *cli, const char *filename, bool numeric)
+{
+	TALLOC_CTX *frame = talloc_stackframe();
+	struct security_descriptor *sd;
+	struct json_object jsobj;
+	int ret;
+
+	if (test_args) {
+		return EXIT_OK;
+	}
+
+	sd = get_secdesc(cli, filename);
+	if (sd == NULL) {
+		return EXIT_FAILED;
+	}
+
+	if (sddl) {
+		char *str = sddl_encode(talloc_tos(), sd, get_domain_sid(cli));
+		if (str == NULL) {
+			return EXIT_FAILED;
+		}
+		printf("%s\n", str);
+		TALLOC_FREE(str);
+	} else {
+		ret = sec_desc_to_json(cli, &jsobj, sd, numeric, false);
+		if (!ret) {
+			fprintf(stderr, "Failed to get secdesc_json\n");
+			TALLOC_FREE(frame);
+			return ret;
+		}
+		printf("%s", json_to_string(frame, &jsobj));
+	}
+	if (want_mxac) {
+		ret = cacl_mxac(cli, filename);
+		if (ret != EXIT_OK) {
+			return ret;
+		}
+	}
+	TALLOC_FREE(frame);
 	return EXIT_OK;
 }
 
@@ -1564,6 +1611,7 @@ int main(int argc, char *argv[])
 	int result;
 	char *path;
 	char *filename = NULL;
+	bool json_output = false;
 	poptContext pc;
 	/* numeric is set when the user wants numeric SIDs and ACEs rather
 	   than going via LSA calls to resolve them */
@@ -1669,6 +1717,14 @@ int main(int argc, char *argv[])
 			.arg        = &query_sec_info,
 			.val        = 1,
 			.descrip    = "The security-info flags for queries"
+		},
+		{
+			.longName   = "json-output",
+			.shortName  = 'j',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'j',
+			.descrip    = "JSON output"
 		},
 		{
 			.longName   = "set-security-info",
@@ -1779,6 +1835,9 @@ int main(int argc, char *argv[])
 		case 'I':
 			owner_username = poptGetOptArg(pc);
 			change_mode = REQUEST_INHERIT;
+			break;
+		case 'j':
+			json_output = true;
 			break;
 		case 'm':
 			lp_set_cmdline("client max protocol", poptGetOptArg(pc));
@@ -1893,6 +1952,8 @@ int main(int argc, char *argv[])
 					   mode,
 					   numeric);
 		}
+	} else if (json_output) {
+		result = cacl_dump_json(targetcli, targetfile, numeric);
 	} else {
 		result = cacl_dump(targetcli, targetfile, numeric);
 	}
