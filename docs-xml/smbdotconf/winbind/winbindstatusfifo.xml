@@ -1,0 +1,25 @@
+<samba:parameter name="winbind status fifo"
+                 context="G"
+                 type="boolean"
+                 xmlns:samba="http://www.samba.org/samba/DTD/samba-doc">
+<description>
+	<para>
+	JSON object with the following keys will be written to the winbind status FIFO:
+
+	winbind_message - integer. defined in librpc/idl/messaging.idl
+	following keys are from struct winbindd_domain in source3/winbindd/winbindd.h.
+	domain_name_netbios - string.
+	forest_name - string.
+	domain_flags - integer.
+	domain_type - integer.
+	domain_trust_attribs - integer.
+	primary - boolean.
+	internal - boolean.
+	rodc - boolean.
+	startup_time - int.
+	startup - boolean. (within first 30 seconds after startup_time).
+	</para>
+</description>
+
+<value type="default">No</value>
+</samba:parameter>
