@@ -29,30 +29,53 @@
 #include "rpc_client/cli_pipe.h"
 #include "rpc_client/cli_lsarpc.h"
 #include "lib/util/string_wrappers.h"
+#ifdef HAVE_JANSSON
+#include <jansson.h>
+#include "audit_logging.h" /* various JSON helpers */
+#endif /* [HAVE_JANSSON] */
 
 /* These values discovered by inspection */
 
 struct perm_value {
 	const char *perm;
+	const char *text;
 	uint32_t mask;
 };
 
 static const struct perm_value special_values[] = {
-	{ "R", SEC_RIGHTS_FILE_READ },
-	{ "W", SEC_RIGHTS_FILE_WRITE },
-	{ "X", SEC_RIGHTS_FILE_EXECUTE },
-	{ "D", SEC_STD_DELETE },
-	{ "P", SEC_STD_WRITE_DAC },
-	{ "O", SEC_STD_WRITE_OWNER },
-	{ NULL, 0 },
+	{ "R", "READ", SEC_RIGHTS_FILE_READ },
+	{ "W", "WRITE", SEC_RIGHTS_FILE_WRITE },
+	{ "X", "EXECUTE", SEC_RIGHTS_FILE_EXECUTE },
+	{ "D", "DELETE", SEC_STD_DELETE },
+	{ "P", "WRITE_DAC", SEC_STD_WRITE_DAC },
+	{ "O", "WRITE_OWNER", SEC_STD_WRITE_OWNER },
+	{ NULL, NULL, 0 },
+};
+
+static const struct perm_value extended_values[] = {
+	{ "R", "READ", SEC_FILE_READ_DATA },
+	{ "W", "WRITE", SEC_FILE_WRITE_DATA },
+	{ "X", "EXECUTE", SEC_FILE_EXECUTE },
+	{ "p", "APPEND_DATA", SEC_FILE_APPEND_DATA},
+	{ "a", "READ_ATTRIBUTES", SEC_FILE_READ_ATTRIBUTE},
+	{ "A", "WRITE_ATTRIBUTES", SEC_FILE_WRITE_ATTRIBUTE},
+	{ "r", "READ_EA", SEC_FILE_READ_EA},
+	{ "w", "WRITE_EA", SEC_FILE_WRITE_EA},
+	{ "D", "DELETE", SEC_STD_DELETE },
+	{ "d", "DELETE_CHILD", FILE_DELETE_CHILD},
+	{ "c", "READ_CONTROL", SEC_STD_READ_CONTROL},
+	{ "P", "WRITE_DAC", SEC_STD_WRITE_DAC },
+	{ "O", "WRITE_OWNER", SEC_STD_WRITE_OWNER },
+	{ "S", "SYNCHRONIZE", SEC_STD_SYNCHRONIZE},
+	{ NULL, NULL, 0 },
 };
 
 static const struct perm_value standard_values[] = {
-	{ "READ",   SEC_RIGHTS_DIR_READ|SEC_DIR_TRAVERSE },
-	{ "CHANGE", SEC_RIGHTS_DIR_READ|SEC_STD_DELETE|\
+	{ "READ", "READ", SEC_RIGHTS_DIR_READ|SEC_DIR_TRAVERSE },
+	{ "CHANGE", "CHANGE", SEC_RIGHTS_DIR_READ|SEC_STD_DELETE|\
 	  SEC_RIGHTS_DIR_WRITE|SEC_DIR_TRAVERSE },
-	{ "FULL",   SEC_RIGHTS_DIR_ALL },
-	{ NULL, 0 },
+	{ "FULL", "FULL",  SEC_RIGHTS_DIR_ALL },
+	{ NULL, NULL, 0 },
 };
 
 static const struct {
@@ -367,6 +390,364 @@ void print_ace(struct cli_state *cli, FILE *f, struct security_ace *ace,
 	}
 }
 
+static bool add_acl_ctrl_json(struct json_object *jsobj, uint16_t ctrl, bool numeric)
+{
+	struct json_object control, tmp;
+	int i, ret;
+	control = json_new_object();
+	if (json_is_invalid(&control)) {
+		fprintf(stderr, "Failed to get JSON array for ACL control\n");
+		return false;
+	}
+
+	for (i = ARRAY_SIZE(sec_desc_ctrl_bits) - 1; i >= 0; i--) {
+		if (ctrl & sec_desc_ctrl_bits[i].mask) {
+			ret =json_add_bool(&control, sec_desc_ctrl_bits[i].desc, true);
+			if (ret != 0) {
+				fprintf(stderr, "Failed to add control bits\n");
+				json_free(&control);
+				return false;
+			}
+
+		}
+		else {
+			ret = json_add_bool(&control, sec_desc_ctrl_bits[i].desc, false);
+			if (ret != 0) {
+				fprintf(stderr, "Failed to add control bits\n");
+				json_free(&control);
+				return false;
+			}
+		}
+	}
+	ret = json_add_object(jsobj, "control", &control);
+	return true;
+}
+
+static bool add_trustee_json(struct json_object *jsobj, struct cli_state *cli,
+			     const struct dom_sid *sid, char *title,
+			     bool numeric)
+{
+	struct json_object trustee;
+	int ret;
+	NTSTATUS status;
+	char *domain = NULL;
+	char *name = NULL;
+	fstring str;
+
+	enum lsa_SidType type;
+
+	trustee = json_new_object();
+	if (json_is_invalid(&trustee)) {
+		fprintf(stderr, "New JSON object for trustee is invalid\n");
+		return false;
+	}
+	ret = json_add_sid(&trustee, "sid", sid);
+	if (ret != 0) {
+		fprintf(stderr, "Failed to add SID to trustee JSON object: %s\n",
+			strerror(errno));
+		json_free(&trustee);
+		return false;
+	}
+        if (numeric || cli == NULL) {
+		ret = json_add_string(&trustee, "name", "");
+		if (ret != 0) {
+			json_free(&trustee);
+			return false;
+		}
+        }
+	else {
+		status = cli_lsa_lookup_sid(cli, sid, talloc_tos(), &type,
+					    &domain, &name);
+
+		if (!NT_STATUS_IS_OK(status)) {
+			fprintf(stderr, "cli_lsa_lookup_sid failed\n");
+			json_free(&trustee);
+			return false;
+		}
+		if (*domain) {
+			slprintf(str, sizeof(fstring) - 1, "%s%s%s",
+				domain, lp_winbind_separator(), name);
+			ret = json_add_string(&trustee, "name", str);
+			if (ret != 0) {
+				fprintf(stderr, "Failed to add name to trustee: %s",
+					strerror(errno));
+				json_free(&trustee);
+				return false;
+			}
+		} else {
+			ret = json_add_string(&trustee, "name", "");
+			if (ret != 0) {
+				json_free(&trustee);
+				return false;
+			}
+		}
+	}
+	ret = json_add_object(jsobj, title, &trustee);
+	if (ret != 0) {
+		fprintf(stderr, "Failed to %s to JSON object: %s\n",
+			title, strerror(errno));
+		json_free(&trustee);
+		return false;
+	}
+	return true;
+}
+
+static bool add_ace_flags_json(struct json_object *jsobj, uint8_t flags)
+{
+	struct json_object js_flags;
+	int ret;
+	if (json_is_invalid(jsobj)) {
+		return false;
+	}
+	js_flags = json_new_object();
+	if (json_is_invalid(&js_flags)) {
+		return false;
+	}
+
+	ret = json_add_bool(&js_flags, "OBJECT_INHERIT",
+			    (flags & SEC_ACE_FLAG_OBJECT_INHERIT)
+			    ? true : false);
+	if (ret < 0) {
+		goto failure;
+	}
+	ret = json_add_bool(&js_flags, "CONTAINER_INHERIT",
+			    (flags & SEC_ACE_FLAG_CONTAINER_INHERIT)
+			    ? true : false);
+	if (ret < 0) {
+		goto failure;
+	}
+	ret = json_add_bool(&js_flags, "NO_PROPAGATE_INHERIT",
+			    (flags & SEC_ACE_FLAG_NO_PROPAGATE_INHERIT)
+			    ? true : false);
+	if (ret < 0) {
+		goto failure;
+	}
+	ret = json_add_bool(&js_flags, "INHERIT_ONLY",
+			    (flags & SEC_ACE_FLAG_INHERIT_ONLY)
+			    ? true : false);
+	if (ret < 0) {
+		goto failure;
+	}
+	ret = json_add_bool(&js_flags, "INHERITED",
+			    (flags & SEC_ACE_FLAG_INHERITED_ACE)
+			    ? true : false);
+	if (ret < 0) {
+		goto failure;
+	}
+
+	ret = json_add_object(jsobj, "flags", &js_flags);
+	if (ret < 0) {
+		fprintf(stderr, "Failed to add flags to JSON object: %s\n",
+			strerror(errno));
+		return false;
+	}
+	return true;
+
+failure:
+	json_free(&js_flags);
+	return false;
+}
+
+static bool add_perms_json(struct json_object *jsobj,
+			   const struct perm_value *perm,
+			   struct security_ace *ace,
+			   uint32_t *got_mask)
+{
+	int ret;
+	const struct perm_value *v;
+
+	for (v = perm; v->perm; v++) {
+		if ((ace->access_mask & v->mask) == v->mask) {
+			ret = json_add_bool(jsobj, v->text, true);
+			if (ret < 0) {
+				return false;
+			}
+			*got_mask &= ~v->mask;
+		}
+		else {
+			ret = json_add_bool(jsobj, v->text, false);
+			if (ret < 0) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+static bool add_access_mask_json(struct json_object *jsobj,
+				 struct security_ace *ace,
+				 bool share_acl)
+{
+	struct json_object js_amask, special;
+	int ret;
+	const struct perm_value *v;
+	char buf[80];
+	bool has_standard = false;
+	uint32_t got_mask;
+	if (json_is_invalid(jsobj)) {
+		return false;
+	}
+	js_amask = json_new_object();
+	if (json_is_invalid(&js_amask)) {
+		return false;
+	}
+	special = json_new_object();
+	if (json_is_invalid(&special)) {
+		json_free(&js_amask);
+		return false;
+	}
+	snprintf(buf, sizeof(buf), "0x%08x", ace->access_mask);
+	ret = json_add_string(&js_amask, "hex", buf);
+	if (ret < 0) {
+		goto failure;
+	}
+	for (v = standard_values; v->perm; v++) {
+		if (ace->access_mask == v->mask) {
+			ret = json_add_string(&js_amask, "standard", v->perm);
+			if (ret < 0) {
+				json_free(&js_amask);
+				return false;
+			}
+			has_standard = true;
+		}
+	}
+	if (share_acl) {
+		goto done;
+	}
+
+	if (!has_standard) {
+		ret = json_add_string(&js_amask, "standard", "");
+		if (ret < 0) {
+			goto failure;
+		}
+	}
+
+	got_mask = ace->access_mask;
+
+	ret = add_perms_json(&special, extended_values, ace, &got_mask);
+	if (!ret) {
+		goto failure;
+	}
+
+	ret = json_add_object(&js_amask, "special", &special);
+	if (ret < 0) {
+		fprintf(stderr,
+			"failed to add special entries to access mask "
+			"JSON object: %s\n", strerror(errno));
+		goto failure;
+	}
+	snprintf(buf, sizeof(buf), "0x%08x", got_mask);
+	ret = json_add_string(&js_amask, "unknown", buf);
+	if (ret < 0) {
+		goto failure;
+	}
+done:
+	ret = json_add_object(jsobj, "access_mask", &js_amask);
+	if (ret < 0) {
+		fprintf(stderr, "Failed to add access mask to JSON object: %s\n",
+			strerror(errno));
+		return false;
+	}
+	return true;
+failure:
+	json_free(&js_amask);
+	json_free(&special);
+	return false;
+}
+
+static bool add_ace_json(struct cli_state *cli, struct json_object *jsobj,
+			 struct security_ace *ace, bool numeric, bool share_acl)
+{
+	const struct perm_value *v;
+	struct json_object jsace, trustee;
+	fstring sidstr;
+	int do_print = 0;
+	int ret;
+	bool rv;
+	char buf[80] = {0};
+	bool has_js_amask = false;
+	if (json_is_invalid(jsobj)) {
+		return false;
+	}
+	jsace = json_new_object();
+	if (json_is_invalid(&jsace)) {
+		fprintf(stderr, "Failed to create new JSON object: %s\n",
+			strerror(errno));
+		return false;
+	}
+	trustee = json_new_object();
+	if (json_is_invalid(&trustee)) {
+		fprintf(stderr, "Failed to create new JSON object: %s\n",
+			strerror(errno));
+		goto failure;
+	}
+
+	rv = add_trustee_json(&jsace, cli, &ace->trustee, "trustee", numeric);
+	if (!rv) {
+		goto failure;
+	}
+
+	if (numeric) {
+		ret = json_add_int(&jsace, "type", ace->type);
+		if (ret < 0 ) {
+			goto failure;
+		}
+		ret = json_add_int(&jsace, "flags", ace->flags);
+		if (ret < 0 ) {
+			goto failure;
+		}
+		snprintf(buf, sizeof(buf), "0x%08x", ace->access_mask);
+		ret = json_add_string(&jsace, "access_mask", buf);
+		if (ret < 0 ) {
+			goto failure;
+		}
+		ret = json_add_object(jsobj, NULL, &jsace);
+		if (ret < 0 ) {
+			goto failure;
+		}
+		return true;
+	}
+	switch(ace->type) {
+	case SEC_ACE_TYPE_ACCESS_ALLOWED:
+		snprintf(buf, sizeof(buf), "%s", "ALLOWED");
+		break;
+	case SEC_ACE_TYPE_ACCESS_DENIED:
+		snprintf(buf, sizeof(buf), "%s", "DENIED");
+		break;
+	default:
+		snprintf(buf, sizeof(buf), "UNKNOWN - %d", ace->type);
+		break;
+	}
+	ret = json_add_string(&jsace, "type", buf);
+	if (ret != 0) {
+		fprintf(stderr,
+			"Failed to add ace_type [%s] to JSON object "
+			"for ACE: %s\n", buf, strerror(errno));
+		goto failure;
+	}
+	ret = add_access_mask_json(&jsace, ace, share_acl);
+	if (!ret) {
+		goto failure;
+	}
+	if (!share_acl) {
+		ret = add_ace_flags_json(&jsace, ace->flags);
+		if (!ret) {
+			goto failure;
+		}
+	}
+	ret = json_add_object(jsobj, NULL, &jsace);
+	if (ret < 0) {
+		fprintf(stderr, "Failed to add new ACE to JSON object: %s\n",
+			strerror(errno));
+		return false;
+	}
+	return true;
+
+failure:
+	json_free(&jsace);
+	return false;
+}
+
 static bool parse_ace_flags(const char *str, unsigned int *pflags)
 {
 	const char *p = str;
@@ -647,4 +1028,72 @@ void sec_desc_print(struct cli_state *cli, FILE *f,
 		fprintf(f, "\n");
 	}
 
+}
+
+bool sec_desc_to_json(struct cli_state *cli, struct json_object *out,
+		      struct security_descriptor *sd, bool numeric,
+		      bool share_acl)
+{
+	struct json_object jsret, dacl, owner, group, control;
+	fstring sidstr;
+	uint32_t i;
+	int ret;
+	bool rv;
+	jsret = json_new_object();
+	if (json_is_invalid(&jsret)) {
+		fprintf(stderr, "Failed to create new JSON object: %s\n",
+			strerror(errno));
+		return false;
+	}
+	ret = json_add_int(&jsret, "revision", sd->revision);
+	if (ret < 0) {
+		fprintf(stderr, "Failed to add REVISION to JSON object\n");
+		goto failure;
+	}
+
+	if (!share_acl) {
+		rv = add_trustee_json(&jsret, cli, sd->owner_sid, "owner", numeric);
+		if (!rv) {
+			fprintf(stderr, "Failed to add owner to JSON object: %s\n",
+				strerror(errno));
+			goto failure;
+		}
+		rv = add_trustee_json(&jsret, cli, sd->group_sid, "group", numeric);
+		if (!rv) {
+			fprintf(stderr, "Failed to add owner to JSON object: %s\n",
+				strerror(errno));
+			goto failure;
+		}
+	}
+
+	dacl = json_get_array(&jsret, "dacl");
+	if (json_is_invalid(&dacl)) {
+		goto failure;
+	}
+	for (i = 0; sd->dacl && i < sd->dacl->num_aces; i++) {
+		struct security_ace *ace = &sd->dacl->aces[i];
+		ret = add_ace_json(cli, &dacl, ace, numeric, share_acl);
+		if (!ret) {
+			json_free(&dacl);
+			goto failure;
+		}
+	}
+	ret = json_add_object(&jsret, "dacl", &dacl);
+	if (ret == -1) {
+		fprintf(stderr, "Failed to add DACL to jsret: %s\n",
+			strerror(errno));
+	}
+
+	rv = add_acl_ctrl_json(&jsret, sd->type, numeric);
+	if (!rv) {
+		fprintf(stderr, "Failed to do control: %s\n", strerror(errno));
+		goto failure;
+	}
+
+	*out = jsret;
+	return true;
+
+failure:
+	json_free(&jsret);
+	return false;
 }
