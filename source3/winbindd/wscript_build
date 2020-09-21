@@ -248,6 +248,7 @@ bld.SAMBA3_SUBSYSTEM('winbindd-lib',
                     winbindd_check_machine_acct.c
                     winbindd_change_machine_acct.c
                     winbindd_irpc.c
+                    winbindd_json.c
                     winbindd_ping_dc.c
                     winbindd_domain_info.c
                     winbindd_pam_auth.c
