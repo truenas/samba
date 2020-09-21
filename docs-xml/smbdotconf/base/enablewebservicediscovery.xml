@@ -1,0 +1,11 @@
+<samba:parameter name="enable web service discovery"
+                 type="boolean"
+                 context="G"
+                 xmlns:samba="http://www.samba.org/samba/DTD/samba-doc">
+<description>
+        <para>Enable Web Services Dynamic Discovery (WS-Discovery) to
+        make samba_server appear in Network Neighborhood on Windows
+        clients.</para>
+</description>
+<value type="default">no</value>
+</samba:parameter>
