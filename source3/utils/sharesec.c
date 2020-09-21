@@ -29,6 +29,11 @@ struct cli_state;
 #include "passdb/machine_sid.h"
 #include "util_sd.h"
 #include "cmdline_contexts.h"
+#ifdef HAVE_JANSSON
+#include <jansson.h>
+#include "audit_logging.h" /* various JSON helpers */
+#include "auth/common_auth.h"
+#endif /* [HAVE_JANSSON] */
 
 static TALLOC_CTX *ctx;
 
@@ -155,12 +160,15 @@ static void sort_acl(struct security_acl *the_acl)
 }
 
 
-static int change_share_sec(TALLOC_CTX *mem_ctx, const char *sharename, char *the_acl, enum acl_mode mode)
+static int change_share_sec(TALLOC_CTX *mem_ctx, const char *sharename,
+			    char *the_acl, enum acl_mode mode, struct json_object *jsobj)
 {
 	struct security_descriptor *sd = NULL;
 	struct security_descriptor *old = NULL;
 	size_t sd_size = 0;
 	uint32_t i, j;
+	bool rv;
+	char *to_free = NULL;
 	NTSTATUS status;
 
 	if (mode != SMB_ACL_SET && mode != SMB_SD_DELETE) {
@@ -182,7 +190,15 @@ static int change_share_sec(TALLOC_CTX *mem_ctx, const char *sharename, char *th
 		/* should not happen */
 		return 0;
 	case SMB_ACL_VIEW:
-		sec_desc_print(NULL, stdout, old, false);
+		if (jsobj != NULL) {
+			rv = sec_desc_to_json(NULL, jsobj, old, false, true);
+			if (!rv) {
+				return -1;
+			}
+		}
+		else {
+			sec_desc_print(NULL, stdout, old, false);
+		}
 		return 0;
 	case SMB_ACL_DELETE:
 	    for (i=0;sd->dacl && i<sd->dacl->num_aces;i++) {
@@ -328,10 +344,13 @@ int main(int argc, const char *argv[])
 	int retval = 0;
 	enum acl_mode mode = SMB_ACL_SET;
 	static char *the_acl = NULL;
+	char *to_free = NULL;
 	fstring sharename;
 	bool force_acl = False;
+	bool do_json = False;
 	int snum;
 	poptContext pc;
+	struct json_object jsobj, jsint;
 	bool initialize_sid = False;
 	struct poptOption long_options[] = {
 		POPT_AUTOHELP
@@ -428,6 +447,14 @@ int main(int argc, const char *argv[])
 			.descrip    = "Force storing the ACL",
 			.argDescrip = "ACLS",
 		},
+		{
+			.longName   = "json",
+			.shortName  = 'j',
+			.argInfo    = POPT_ARG_NONE,
+			.arg        = NULL,
+			.val        = 'J',
+			.descrip    = "View ACL in JSON",
+		},
 		POPT_COMMON_SAMBA
 		POPT_TABLEEND
 	};
@@ -491,6 +518,10 @@ int main(int argc, const char *argv[])
 			force_acl = True;
 			break;
 
+		case 'J':
+			do_json = True;
+			break;
+
 		case 'M':
 			initialize_sid = True;
 			break;
@@ -529,6 +560,13 @@ int main(int argc, const char *argv[])
 
 	if (mode == SMB_ACL_VIEW_ALL) {
 		int i;
+		if (do_json) {
+			jsobj = json_new_object();
+			if (json_is_invalid(&jsobj)) {
+				fprintf(stderr, "Failed to generate valid JSON object\n");
+				goto done;
+			}
+		}
 
 		for (i=0; i<lp_numservices(); i++) {
 			TALLOC_CTX *frame = talloc_stackframe();
@@ -540,10 +578,28 @@ int main(int argc, const char *argv[])
 				continue;
 			}
 
-			printf("[%s]\n", service);
-			change_share_sec(frame, service, NULL, SMB_ACL_VIEW);
-			printf("\n");
+			if (do_json) {
+				change_share_sec(frame, service, NULL, SMB_ACL_VIEW, &jsint);
+				retval = json_add_object(&jsobj, service, &jsint);
+				if (retval != 0) {
+					fprintf(stderr,
+						"Failed to add JSON object for [%s]: %s\n",
+						service, strerror(errno));
+					goto done;
+				}
+			}
+			else {
+				printf("[%s]\n", service);
+				change_share_sec(frame, service, NULL, SMB_ACL_VIEW, NULL);
+				printf("\n");
+			}
 			TALLOC_FREE(frame);
+		}
+		if (do_json) {
+			to_free =  json_to_string(talloc_tos(), &jsobj);
+                        printf("%s", to_free);
+			TALLOC_FREE(to_free);
+			json_free(&jsobj);
 		}
 		goto done;
 	}
@@ -574,7 +630,7 @@ int main(int argc, const char *argv[])
 		retval = view_sharesec_sddl(sharename);
 		break;
 	default:
-		retval = change_share_sec(ctx, sharename, the_acl, mode);
+		retval = change_share_sec(ctx, sharename, the_acl, mode, NULL);
 		break;
 	}
 

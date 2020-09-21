@@ -21,8 +21,10 @@
 #define __STATUS_PROFILE_H__
 
 #include "replace.h"
+enum PROFILE_OUTPUT {PROF_TEXT, PROF_CSV, PROF_JSON};
 
-bool status_profile_dump(bool be_verbose);
+bool status_profile_dump(bool be_verbose, enum PROFILE_OUTPUT proft);
 bool status_profile_rates(bool be_verbose);
+bool status_profile_timed_dump(bool be_verbose, enum PROFILE_OUTPUT proft, uint64_t sample_interval);
 
 #endif
