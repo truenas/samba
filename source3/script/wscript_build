@@ -6,6 +6,18 @@ bld.INSTALL_FILES('${BINDIR}',
 	          'smbtar',
                   chmod=MODE_755, flat=True)
 
+bld.INSTALL_FILES('${BINDIR}',
+	          'wsdd.py',
+                  chmod=MODE_755, flat=True)
+
+bld.INSTALL_FILES('${BINDIR}',
+	          'smb.addshare.py',
+                  chmod=MODE_755, flat=True)
+
+bld.INSTALL_FILES('${BINDIR}',
+	          'smb.delshare.py',
+                  chmod=MODE_755, flat=True)
+
 # Callout scripts for use in selftest environment
 bld.SAMBA_SCRIPT('smbaddshare', pattern='smbaddshare', installdir='.')
 bld.SAMBA_SCRIPT('smbchangeshare', pattern='smbchangeshare', installdir='.')
