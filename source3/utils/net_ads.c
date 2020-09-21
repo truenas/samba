@@ -1763,6 +1763,10 @@ static void _net_ads_join_dns_updates(struct net_context *c, TALLOC_CTX *ctx, st
 		return;
 	}
 
+	if (!lp_ads_dns_update()) {
+		return;
+	}
+
 	if (!r->out.domain_is_ad) {
 		return;
 	}

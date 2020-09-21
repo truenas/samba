@@ -569,6 +569,13 @@ static ADS_STATUS libnet_join_set_machine_spn(TALLOC_CTX *mem_ctx,
 		goto done;
 	}
 
+	/*
+	 * Workaround for legacy HA systems. Below parameter defaults to 'true'
+	 * If it is not set to 'false' on legacy HA system, then domain join
+	 * will fail on one of the nodes due to constraint violation on
+	 * registering netbios SPN entries.
+	 */
+	if (lp_winbind_netbios_alias_spn()) {
 	for (netbios_aliases = lp_netbios_aliases();
 	     netbios_aliases != NULL && *netbios_aliases != NULL;
 	     netbios_aliases++) {
@@ -608,6 +615,7 @@ static ADS_STATUS libnet_join_set_machine_spn(TALLOC_CTX *mem_ctx,
 			goto done;
 		}
 	}
+	} /* End workaround for legacy HA kerberos issues */
 
 	for (addl_hostnames = lp_additional_dns_hostnames();
 	     addl_hostnames != NULL && *addl_hostnames != NULL;
