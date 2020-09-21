@@ -2022,6 +2022,8 @@ WERROR _srvsvc_NetShareAdd(struct pipes_struct *p,
 	int snum;
 	int ret;
 	char *path;
+	char *parent = NULL;
+	const char *base;
 	struct security_descriptor *psd = NULL;
 	bool is_disk_op;
 	int max_connections = 0;
@@ -2128,6 +2130,14 @@ WERROR _srvsvc_NetShareAdd(struct pipes_struct *p,
 	}
 
 	ret = sys_lstat(path, &st, false);
+	if (ret == -1 && (errno != EACCES) && lp_allow_dataset_creation()) {
+		ret = parent_dirname(ctx, path, &parent, &base);
+		if (!ret) {
+			return WERR_NOT_ENOUGH_MEMORY;
+		}
+		ret = sys_lstat(parent, &st, false);
+
+	}
 	if (ret == -1 && (errno != EACCES)) {
 		/*
 		 * If path has any other than permission
