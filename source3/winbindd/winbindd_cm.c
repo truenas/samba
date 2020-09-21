@@ -60,6 +60,7 @@
 
 #include "includes.h"
 #include "winbindd.h"
+#include "winbindd_json.h"
 #include "libsmb/namequery.h"
 #include "../libcli/auth/libcli_auth.h"
 #include "../librpc/gen_ndr/ndr_netlogon_c.h"
@@ -474,6 +475,9 @@ void set_domain_offline(struct winbindd_domain *domain)
 					   (const uint8_t *)domain->name,
 					   strlen(domain->name)+1);
 		}			
+		if (lp_winbind_status_fifo()) {
+			fifo_update_status(MSG_WINBIND_OFFLINE, domain);
+		}
 	}
 
 	return;	
@@ -560,6 +564,9 @@ static void set_domain_online(struct winbindd_domain *domain)
 					   (const uint8_t *)domain->name,
 					   strlen(domain->name)+1);
 		}			
+		if (lp_winbind_status_fifo()) {
+			fifo_update_status(MSG_WINBIND_ONLINE, domain);
+		}
 	}
 
 	return;	
