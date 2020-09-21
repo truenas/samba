@@ -1,0 +1,11 @@
+<samba:parameter name="allow dataset creation"
+                 type="boolean"
+                 context="G"
+                 xmlns:samba="http://www.samba.org/samba/DTD/samba-doc">
+<description>
+        <para>Allow automatic creation of ZFS datasets when creating
+	shares through the NT Server Manager.</para>
+
+</description>
+<value type="default">yes</value>
+</samba:parameter>
