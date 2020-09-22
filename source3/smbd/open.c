@@ -5055,7 +5055,7 @@ static NTSTATUS open_streams_for_delete(connection_struct *conn,
  as the NT ACL when read.
 *********************************************************************/
 
-static NTSTATUS inherit_new_acl(files_struct *fsp)
+NTSTATUS inherit_new_acl(files_struct *fsp)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
 	struct security_descriptor *parent_desc = NULL;
