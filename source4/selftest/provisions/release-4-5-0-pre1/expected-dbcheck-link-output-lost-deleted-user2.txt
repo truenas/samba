@@ -1,8 +1,0 @@
-Checking 232 objects
-ERROR: object CN=fred\0ADEL:2301a64c-8765-4321-851e-12d4a711cfb4,CN=LostAndFound,DC=release-4-5-0-pre1,DC=samba,DC=corp, has changes after deletion
-isDeleted: attid=0x00020030 version=1 invocation=4e4496a3-7fb8-4f97-8a33-d238db8b5e2d usn=3746 (local=3746) at Wed Jun 29 04:36:39 2016
-name: attid=0x00090001 version=4 invocation=4e4496a3-7fb8-4f97-8a33-d238db8b5e2d usn=3772 (local=3772) at Mon Mar 11 13:28:24 2019
-lastKnownParent: attid=0x0009030d version=3 invocation=4e4496a3-7fb8-4f97-8a33-d238db8b5e2d usn=3773 (local=3773) at Mon Mar 11 13:28:24 2019
-Delete broken tombstone object CN=fred\0ADEL:2301a64c-8765-4321-851e-12d4a711cfb4,CN=LostAndFound,DC=release-4-5-0-pre1,DC=samba,DC=corp deleted 180 days ago? [YES]
-Removed DN CN=fred\0ADEL:2301a64c-8765-4321-851e-12d4a711cfb4,CN=LostAndFound,DC=release-4-5-0-pre1,DC=samba,DC=corp
-Checked 232 objects (1 errors)
