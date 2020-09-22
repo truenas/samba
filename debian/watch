@@ -1,0 +1,3 @@
+version=3
+opts="uversionmangle=s/tp/~alpha1~tp/;s/alpha/~alpha/;s/beta/~beta/;s/rc/~rc/,dversionmangle=s/\+ix\d*$//,pgpsigurlmangle=s/tar\.gz/tar.asc/,decompress" \
+	  https://download.samba.org/pub/samba/samba-(4\.13\..*).tar.gz

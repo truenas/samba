@@ -1,0 +1,25 @@
+From 0ecd28ff3fd7f3d5c20705a2b8233fc8648cbf9c Mon Sep 17 00:00:00 2001
+From: Mathieu Parent <math.parent@gmail.com>
+Date: Thu, 21 Feb 2019 21:04:30 +0100
+Subject: [PATCH] smbd.service: Run update-apparmor-samba-profile before start
+
+Bug-Debian: https://bugs.debian.org/896080
+---
+ packaging/systemd/smb.service.in | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/packaging/systemd/smb.service.in b/packaging/systemd/smb.service.in
+index 18912ef0e98..6bb24861682 100644
+--- a/packaging/systemd/smb.service.in
++++ b/packaging/systemd/smb.service.in
+@@ -10,6 +10,7 @@ NotifyAccess=all
+ PIDFile=@PIDDIR@/smbd.pid
+ LimitNOFILE=16384
+ EnvironmentFile=-@SYSCONFDIR@/sysconfig/samba
++ExecStartPre=/usr/share/samba/update-apparmor-samba-profile
+ ExecStart=@SBINDIR@/smbd --foreground --no-process-group $SMBDOPTIONS
+ ExecReload=/bin/kill -HUP $MAINPID
+ LimitCORE=infinity
+-- 
+2.20.1
+

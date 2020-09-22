@@ -1,0 +1,415 @@
+#!/bin/sh
+
+set -e
+
+nmbd_error_handler() {
+    if [ -d /sys/class/net/lo ] && ls /sys/class/net | grep -qv ^lo$; then
+        # https://bugs.debian.org/893762
+        echo 'WARNING: nmbd failed to start as there is no non-loopback interfaces available.'
+        echo 'Either add an interface or set "disable netbios = yes" in smb.conf and run "systemctl mask nmbd"'
+        return 0
+    elif command -v ip > /dev/null && ip a show | grep '^[[:space:]]*inet ' | grep -vq ' lo$'; then
+        # https://bugs.debian.org/859526
+        echo 'WARNING: nmbd failed to start as there is no local IPv4 non-loopback interfaces available.'
+        echo 'Either add an IPv4 address or set "disable netbios = yes" in smb.conf and run "systemctl mask nmbd"'
+        return 0
+    else
+        echo 'ERROR: nmbd failed to start.'
+        return 1 # caught by set -e
+    fi
+}
+
+mask_services() {
+    local reason="$1"
+    shift
+    local masked_count=0
+    mkdir -p /etc/systemd/system
+    echo "${reason}: Masking $*"
+    echo "Please ignore the following error about deb-systemd-helper not finding those services."
+    while true; do
+        local service_name="$1"
+        if [ -z "$service_name" ]; then
+            break
+        fi
+        shift
+        if [ ! -e "/etc/systemd/system/${service_name}" ]; then
+            ln -s /dev/null "/etc/systemd/system/${service_name}"
+            echo "(${service_name} masked)"
+            masked_count=$((masked_count+1))
+        elif [ -h "/etc/systemd/system/${service_name}" ] \
+            && [ "$(realpath /etc/systemd/system/${service_name})" = /dev/null ] \
+        ; then
+            echo "(${service_name} already masked)"
+        else
+            echo "WARNING ${service_name} should be masked. The install may fail."
+        fi
+    done
+    # In case this system is running systemd, we make systemd reload the unit files
+    # to pick up changes.
+    if [ "${masked_count}" -ge 1 -a -d /run/systemd/system ] ; then
+        systemctl --system daemon-reload >/dev/null || true
+    fi
+}
+
+# We generate several files during the postinst, and we don't want
+#	them to be readable only by root.
+umask 022
+
+# add the sambashare group
+if ! getent group sambashare > /dev/null 2>&1
+then
+	addgroup --system sambashare
+	# Only on Ubuntu, use the "admin" group as a template for the
+	# initial users for this group; Debian has no equivalent group,
+	# so leaving the sambashare group empty is the more secure default
+	if [ -x "`which lsb_release 2>/dev/null`" ] \
+	   && [ "`lsb_release -s -i`" = "Ubuntu" ]
+	then
+		OLDIFS="$IFS"
+		IFS=","
+		for USER in `getent group admin | cut -f4 -d:`; do
+			adduser "$USER" sambashare \
+			|| ! getent passwd "$USER" >/dev/null
+		done
+		IFS="$OLDIFS"
+	fi
+fi
+
+if [ ! -e /var/lib/samba/usershares ]
+then
+	install -d -m 1770 -g sambashare /var/lib/samba/usershares
+fi
+
+# mimic source4/smbd/server.c and mask service before it fails
+# NB: server role = active directory domain controller is what we need to properly support
+# NB: server services = smb is not compiled in
+# NB: dcerpc endpoint servers = remote is for developpement
+# NB: dcerpc endpoint servers = mapiproxy is for OpenChange which is dead
+SERVER_ROLE=`samba-tool testparm --parameter-name="server role"  2>/dev/null | tail -1`
+SERVER_SERVICES=`samba-tool testparm --parameter-name="server services"  2>/dev/null | tail -1`
+DCERPC_ENDPOINT_SERVERS=`samba-tool testparm --parameter-name="dcerpc endpoint servers"  2>/dev/null | tail -1`
+DISABLE_NETBIOS=`samba-tool testparm --parameter-name="disable netbios"  2>/dev/null | tail -1`
+
+if [ "$SERVER_ROLE" != "active directory domain controller" ] \
+        && ( echo "$SERVER_SERVICES" | grep -qv '\(^\|, \)smb\(,\|$\)' ) \
+        && ( echo "$DCERPC_ENDPOINT_SERVERS" | grep -qv '\(^\|, \)remote\(,\|$\)' ) \
+        && ( echo "$DCERPC_ENDPOINT_SERVERS" | grep -qv '\(^\|, \)mapiproxy\(,\|$\)' ) \
+; then
+    mask_services "Samba is not being run as an AD Domain Controller" samba-ad-dc.service
+fi
+if [ "$SERVER_ROLE" = "active directory domain controller" ]; then
+    mask_services "Samba is being run as an AD Domain Controller" smbd.service nmbd.service
+elif [ "$DISABLE_NETBIOS" = Yes ]; then
+    mask_services "NetBIOS is disabled" nmbd.service
+fi
+
+#DEBHELPER#
+
+exit 0
+#XXX:CTDB
+#!/bin/sh
+
+set -e
+
+pam-auth-update --package
+
+#DEBHELPER#
+#XXX: samba-common-bin.postinst
+#!/bin/sh
+
+set -e
+
+SERVER_ROLE=`samba-tool testparm --parameter-name="server role"  2>/dev/null | tail -1`
+if [ "$SERVER_ROLE" = "active directory domain controller" ]; then
+    echo "Checking smb.conf with samba-tool"
+    samba-tool testparm -d1 --suppress-prompt > /dev/null
+    echo "Done"
+else
+    echo "Checking smb.conf with testparm"
+    testparm -d1 --suppress-prompt > /dev/null
+    echo "Done"
+fi
+
+#DEBHELPER#
+#XXX: samba-common.postinst
+#!/bin/sh
+#
+#
+
+set -e
+
+# Do debconf stuff here
+. /usr/share/debconf/confmodule
+
+TEMPDIR=/run/samba/upgrades
+NEWFILE=$TEMPDIR/smb.conf
+CONFIG=/etc/samba/smb.conf
+
+# ------------------------- Debconf questions start ---------------------
+
+configure_smb_conf() {
+	local CONFIG
+	CONFIG="$1"
+
+	# Is the user configuring with debconf, or he/she prefers manual config?
+	db_get samba-common/do_debconf || true
+	if [ "${RET}" != "true" ]; then
+		return 0
+	fi
+
+	# Get workgroup name
+	db_get samba-common/workgroup || true
+	WORKGROUP="${RET}"
+
+	# Oh my GOD, this is ugly.  Why would anyone put these
+	# characters in a workgroup name?  Why, Lord, why???
+	WORKGROUP=`echo $WORKGROUP | \
+	           sed -e's/\\\\/\\\\\\\\/g
+	                  s#/#\\\\/#g
+	                  s/&/\\\&/g
+	                  s/\\\$/\\\\\\\$/g'`
+
+	sed -i -e "s/^\([[:space:]]*\)\[global\]/\1\[global\]/i
+		/^[[:space:]]*\[global\]/,/^[[:space:]]*\[/ \
+			s/^\([[:space:]]*\)workgroup[[:space:]]*=.*/\1workgroup = ${WORKGROUP}/i" \
+		"$CONFIG"
+
+	# Install DHCP support
+	db_get samba-common/dhcp
+	if [ "$RET" = true ] && \
+	   ! grep -q dhcp.conf "$CONFIG"
+	then
+		sed -i -e "s/^\([[:space:]]*\)\[global\]/\1\[global\]/i
+			/^[[:space:]]*\[global\]/,/^[[:space:]]*\[/ {
+				/wins server[[:space:]]*=/a \\
+\\
+# If we receive WINS server info from DHCP, override the options above. \\
+   include = /var/lib/samba/dhcp.conf
+}" "$CONFIG"
+		# Ensure the file exists
+		touch /var/lib/samba/dhcp.conf
+	elif [ "$RET" != true ]; then
+		sed -i -e '
+		/^#[[:space:]]*If we receive WINS server info from DHCP, override the options above/d
+		/^#*[[:space:]]*include[[:space:]]*=[[:space:]]*\/var\/lib\/samba\/dhcp.conf/,/[^[:space:]]/ {
+			/^#*[[:space:]]*include[[:space:]]*=[[:space:]]*\/var\/lib\/samba\/dhcp.conf/d
+			/^[[:space:]]*$/d
+		}' "$CONFIG"
+	fi
+
+}
+
+if [ "$1" = configure ]; then
+    if dpkg --compare-versions "$2" lt-nl 2:4.8.0+dfsg-3~; then
+        # Move dhcp.conf out of /etc (https://bugs.debian.org/695362)
+        if [ -f /etc/samba/dhcp.conf ]; then
+            mv /etc/samba/dhcp.conf /var/lib/samba/dhcp.conf
+        fi
+        sed -i -e 's/^\([#[:space:]]*include[[:space:]]*=[[:space:]]*\)\/etc\/samba\/dhcp.conf\([[:space:]]*\)$/\1\/var\/lib\/samba\/dhcp.conf\2/
+        ' "$CONFIG"
+    fi
+
+    if ! dpkg-statoverride --list /var/log/samba >/dev/null; then
+        # Set some reasonable default perms for the samba logdir
+        # to hide sensitive information
+        chmod 0750 /var/log/samba
+        chown root:adm /var/log/samba
+    fi
+fi
+
+
+if [ -e "$CONFIG" ]; then
+	configure_smb_conf "$CONFIG"
+fi
+
+mkdir -p "$TEMPDIR"
+
+cp /usr/share/samba/smb.conf "$NEWFILE"
+configure_smb_conf "$NEWFILE"
+
+if [ -e "$CONFIG" ]; then
+	sed -e '1,/^[;#[:space:]]*\[print\$\]/ { d }
+		1,/^[[:space:]]*\[/ { /^[^[]/d; /^$/d }
+	' "$CONFIG" >> "$NEWFILE"
+fi
+
+ucf --three-way --debconf-ok "$NEWFILE" "$CONFIG"
+
+if [ ! -e "$CONFIG" ]; then
+	echo "Install/upgrade will fail. To recover, please try:"
+	echo " sudo cp /usr/share/samba/smb.conf $CONFIG"
+	echo " sudo dpkg --configure -a"
+else
+	ucfr samba-common "$CONFIG"
+	chmod a+r "$CONFIG"
+fi
+
+# ------------------------- Debconf questions end ---------------------
+
+db_stop
+
+#DEBHELPER#
+#XXX: samba-common.postinst
+#!/bin/sh
+#
+#
+
+set -e
+
+# Do debconf stuff here
+. /usr/share/debconf/confmodule
+
+TEMPDIR=/run/samba/upgrades
+NEWFILE=$TEMPDIR/smb.conf
+CONFIG=/etc/samba/smb.conf
+
+# ------------------------- Debconf questions start ---------------------
+
+configure_smb_conf() {
+	local CONFIG
+	CONFIG="$1"
+
+	# Is the user configuring with debconf, or he/she prefers manual config?
+	db_get samba-common/do_debconf || true
+	if [ "${RET}" != "true" ]; then
+		return 0
+	fi
+
+	# Get workgroup name
+	db_get samba-common/workgroup || true
+	WORKGROUP="${RET}"
+
+	# Oh my GOD, this is ugly.  Why would anyone put these
+	# characters in a workgroup name?  Why, Lord, why???
+	WORKGROUP=`echo $WORKGROUP | \
+	           sed -e's/\\\\/\\\\\\\\/g
+	                  s#/#\\\\/#g
+	                  s/&/\\\&/g
+	                  s/\\\$/\\\\\\\$/g'`
+
+	sed -i -e "s/^\([[:space:]]*\)\[global\]/\1\[global\]/i
+		/^[[:space:]]*\[global\]/,/^[[:space:]]*\[/ \
+			s/^\([[:space:]]*\)workgroup[[:space:]]*=.*/\1workgroup = ${WORKGROUP}/i" \
+		"$CONFIG"
+
+	# Install DHCP support
+	db_get samba-common/dhcp
+	if [ "$RET" = true ] && \
+	   ! grep -q dhcp.conf "$CONFIG"
+	then
+		sed -i -e "s/^\([[:space:]]*\)\[global\]/\1\[global\]/i
+			/^[[:space:]]*\[global\]/,/^[[:space:]]*\[/ {
+				/wins server[[:space:]]*=/a \\
+\\
+# If we receive WINS server info from DHCP, override the options above. \\
+   include = /var/lib/samba/dhcp.conf
+}" "$CONFIG"
+		# Ensure the file exists
+		touch /var/lib/samba/dhcp.conf
+	elif [ "$RET" != true ]; then
+		sed -i -e '
+		/^#[[:space:]]*If we receive WINS server info from DHCP, override the options above/d
+		/^#*[[:space:]]*include[[:space:]]*=[[:space:]]*\/var\/lib\/samba\/dhcp.conf/,/[^[:space:]]/ {
+			/^#*[[:space:]]*include[[:space:]]*=[[:space:]]*\/var\/lib\/samba\/dhcp.conf/d
+			/^[[:space:]]*$/d
+		}' "$CONFIG"
+	fi
+
+}
+
+if [ "$1" = configure ]; then
+    if dpkg --compare-versions "$2" lt-nl 2:4.8.0+dfsg-3~; then
+        # Move dhcp.conf out of /etc (https://bugs.debian.org/695362)
+        if [ -f /etc/samba/dhcp.conf ]; then
+            mv /etc/samba/dhcp.conf /var/lib/samba/dhcp.conf
+        fi
+        sed -i -e 's/^\([#[:space:]]*include[[:space:]]*=[[:space:]]*\)\/etc\/samba\/dhcp.conf\([[:space:]]*\)$/\1\/var\/lib\/samba\/dhcp.conf\2/
+        ' "$CONFIG"
+    fi
+
+    if ! dpkg-statoverride --list /var/log/samba >/dev/null; then
+        # Set some reasonable default perms for the samba logdir
+        # to hide sensitive information
+        chmod 0750 /var/log/samba
+        chown root:adm /var/log/samba
+    fi
+fi
+
+
+if [ -e "$CONFIG" ]; then
+	configure_smb_conf "$CONFIG"
+fi
+
+mkdir -p "$TEMPDIR"
+
+cp /usr/share/samba/smb.conf "$NEWFILE"
+configure_smb_conf "$NEWFILE"
+
+if [ -e "$CONFIG" ]; then
+	sed -e '1,/^[;#[:space:]]*\[print\$\]/ { d }
+		1,/^[[:space:]]*\[/ { /^[^[]/d; /^$/d }
+	' "$CONFIG" >> "$NEWFILE"
+fi
+
+ucf --three-way --debconf-ok "$NEWFILE" "$CONFIG"
+
+if [ ! -e "$CONFIG" ]; then
+	echo "Install/upgrade will fail. To recover, please try:"
+	echo " sudo cp /usr/share/samba/smb.conf $CONFIG"
+	echo " sudo dpkg --configure -a"
+else
+	ucfr samba-common "$CONFIG"
+	chmod a+r "$CONFIG"
+fi
+
+# ------------------------- Debconf questions end ---------------------
+
+db_stop
+
+#DEBHELPER#
+#XXX: winbind.postinst
+#!/bin/sh
+
+set -e
+
+mask_services() {
+    local reason="$1"
+    shift
+    local masked_count=0
+    mkdir -p /etc/systemd/system
+    echo "${reason}: Masking $*"
+    echo "Please ignore the following error about deb-systemd-helper not finding those services."
+    while true; do
+        local service_name="$1"
+        if [ -z "$service_name" ]; then
+            break
+        fi
+        shift
+        if [ ! -e "/etc/systemd/system/${service_name}" ]; then
+            ln -s /dev/null "/etc/systemd/system/${service_name}"
+            echo "(${service_name} masked)"
+            masked_count=$((masked_count+1))
+        elif [ -h "/etc/systemd/system/${service_name}" ] \
+            && [ "$(realpath /etc/systemd/system/${service_name})" = /dev/null ] \
+        ; then
+            echo "(${service_name} already masked)"
+        else
+            echo "WARNING ${service_name} should be masked. The install may fail."
+        fi
+    done
+    # In case this system is running systemd, we make systemd reload the unit files
+    # to pick up changes.
+    if [ "${masked_count}" -ge 1 -a -d /run/systemd/system ] ; then
+        systemctl --system daemon-reload >/dev/null || true
+    fi
+}
+
+getent group winbindd_priv >/dev/null 2>&1 ||
+	addgroup --system --force-badname --quiet winbindd_priv
+
+winbindd_privileged_socket_directory='/var/lib/samba/winbindd_privileged'
+mkdir -pv "$winbindd_privileged_socket_directory"
+chgrp -c winbindd_priv "$winbindd_privileged_socket_directory"
+chmod -c 0750 "$winbindd_privileged_socket_directory"
+
+#DEBHELPER#

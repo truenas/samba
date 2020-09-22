@@ -1,0 +1,20 @@
+libpam-winbind: missing-pre-dependency-on-multiarch-support
+# changing a library package name needlessly is always worse than having a
+# name that doesn't match the soname.
+libsmbclient: package-name-doesnt-match-sonames libsmbclient0
+# False positives, see #896012
+python3-samba: library-not-linked-against-libc *
+#XXX: samba-vfs-modules.lintian-overrides
+# False positives, see #896012
+samba-vfs-modules: library-not-linked-against-libc *
+# the samba-libs package contains a number of libraries
+# it doesn't make sense to have them in separate packages, as this would
+# result in circular dependencies
+samba-libs: package-name-doesnt-match-sonames libdcerpc-binding0 libdcerpc-samr0 libdcerpc-server-core0 libdcerpc-server0 libdcerpc0 libndr-krb5pac0 libndr-nbt0 libndr-standard0 libndr1 libnetapi0 libsamba-credentials0 libsamba-errors1 libsamba-hostconfig0 libsamba-passdb0 libsamba-policy.cpython-38-x86-64-linux-gnu0 libsamdb0 libsmbconf0 libsmbldap2 libtevent-util0
+# Embedded Heimdal is patched
+samba-libs: embedded-library usr/lib/*/samba/libgssapi-samba4.so.*: heimdal
+# False positives, see #896012
+samba-libs: library-not-linked-against-libc *
+winbind4 binary: no-shlibs-control-file lib/libnss_winbind.so.2
+winbind4 binary: package-name-doesnt-match-sonames libnss-winbind2
+winbind4 binary: binary-or-shlib-defines-rpath

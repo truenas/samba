@@ -1,0 +1,15 @@
+07_private_lib
+README_nosmbldap-tools.patch
+smbclient-pager.patch
+VERSION.patch
+add-so-version-to-private-libraries
+heimdal-rfc3454.txt
+smbd.service-Run-update-apparmor-samba-profile-befor.patch
+fix-nfs-service-name-to-nfs-kernel-server.patch
+add-zfs-based-modules.patch
+s3-utils-add-JSON-support.patch 
+s3-winbind-add-winbind-status-fifo.patch 
+s3-script-add-truenas-scripts.patch
+s3-param-loadparm.c-add-TrueNAS-parameters.patch
+packaging-systemd-add-wsdd-service.patch
+s3-smbd-add-support-for-streams-64-KiB.patch
