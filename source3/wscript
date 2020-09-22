@@ -91,6 +91,11 @@ def options(opt):
                    help=("Directory under which libcephfs is installed"),
                    action="store", dest='libcephfs_dir', default=None)
 
+    opt.add_option('--with-libzfs',
+                   help='enable libZFS support',
+                   action='store_true', dest='with_libzfs', default=False)
+
+
     opt.samba_add_onoff_option('glusterfs', with_name="enable", without_name="disable", default=True)
     opt.samba_add_onoff_option('cephfs', with_name="enable", without_name="disable", default=True)
 
@@ -1706,6 +1711,36 @@ main() {
                       or lack of ceph_statx support''')
             conf.undefine('HAVE_CEPH')
 
+    if Options.options.with_libzfs:
+        conf.DEFINE('HAVE_LIBZFS', '1')
+        if os.path.exists('/usr/include/libzfs/libzfs.h'):
+            conf.env['CPPPATH_ZFS'] = [
+                '/usr/include/libspl',
+                '/usr/include/libzfs',
+                '/usr/include/libzfs/sys',
+                '/usr/include/libzfs/sys/fs',
+            ]
+        else:
+            src_base = conf.CONFIG_GET("SRC_BASE")
+            if src_base is None:
+                src_base = "/usr/src"
+            conf.env['CPPPATH_ZFS'] = [
+                f'{src_base}/cddl/contrib/opensolaris/lib/libzpool/common',
+                f'{src_base}/cddl/compat/opensolaris/include',
+                f'{src_base}/cddl/compat/opensolaris/lib/libumem',
+                f'{src_base}/sys/cddl/compat/opensolaris',
+                f'{src_base}/cddl/contrib/opensolaris/head',
+                f'{src_base}/cddl/contrib/opensolaris/lib/libuutil/common',
+                f'{src_base}/cddl/contrib/opensolaris/lib/libzfs/common',
+                f'{src_base}/cddl/contrib/opensolaris/lib/libzfs_core/common',
+                f'{src_base}/cddl/contrib/opensolaris/lib/libumem/common',
+                f'{src_base}/cddl/contrib/opensolaris/lib/libnvpair',
+                f'{src_base}/sys/cddl/contrib/opensolaris/uts/common',
+                f'{src_base}/sys/cddl/contrib/opensolaris/uts/common/fs/zfs',
+                f'{src_base}/sys/cddl/contrib/opensolaris/uts/common/sys',
+                f'{src_base}/sys/cddl/contrib/opensolaris/common/zfs',
+            ]
+
     if Options.options.with_glusterfs:
         conf.CHECK_CFG(package='glusterfs-api', args='"glusterfs-api >= 4" --cflags --libs',
                        msg='Checking for glusterfs-api >= 4', uselib_store="GFAPI")
@@ -1931,6 +1966,12 @@ main() {
 
     if conf.CONFIG_SET('HAVE_LDAP'):
         default_static_modules.extend(['pdb_ldapsam', 'idmap_ldap'])
+
+    if conf.CONFIG_SET('HAVE_LIBZFS'):
+        default_shared_modules.extend(TO_LIST('vfs_zfs_core'))
+        default_shared_modules.extend(TO_LIST('vfs_zfs_fsrvp'))
+        default_shared_modules.extend(TO_LIST('vfs_shadow_copy_zfs'))
+        default_shared_modules.extend(TO_LIST('vfs_tmprotect'))
 
     if conf.CONFIG_SET('DARWINOS'):
         default_static_modules.extend(['charset_macosxfs'])

@@ -54,7 +54,7 @@ bld.SAMBA3_SUBSYSTEM('HASH_INODE',
 bld.SAMBA3_MODULE('vfs_default',
                  subsystem='vfs',
                  source='vfs_default.c',
-                 deps='samba-util NDR_DFSBLOBS OFFLOAD_TOKEN UTIL_REPARSE',
+                 deps='samba-util NDR_DFSBLOBS OFFLOAD_TOKEN UTIL_REPARSE smb_libzfs',
                  init_function='',
                  internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_default'),
                  enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_default'))
@@ -248,6 +248,39 @@ bld.SAMBA3_MODULE('vfs_solarisacl',
                  internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_solarisacl'),
                  enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_solarisacl'))
 
+bld.SAMBA3_MODULE('vfs_tmprotect',
+                 subsystem='vfs',
+                 source='vfs_tmprotect.c',
+                 deps='smb_libzfs',
+                 init_function='',
+                 internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_tmprotect'),
+                 enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_tmprotect'))
+
+bld.SAMBA3_MODULE('vfs_zfs_core',
+                 subsystem='vfs',
+                 source='vfs_zfs_core.c',
+                 deps='smb_libzfs',
+                 init_function='',
+                 internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_zfs_core'),
+                 enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_zfs_core'))
+
+bld.SAMBA3_MODULE('vfs_zfs_fsrvp',
+                 subsystem='vfs',
+                 source='vfs_zfs_fsrvp.c',
+                 deps='smb_libzfs',
+                 init_function='',
+                 internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_zfs_fsrvp'),
+                 enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_zfs_fsrvp'))
+
+bld.SAMBA3_MODULE('vfs_shadow_copy_zfs',
+                 subsystem='vfs',
+                 source='vfs_shadow_copy_zfs.c',
+                 allow_warnings=True,
+                 deps='samba-util tdb smb_libzfs',
+                 init_function='',
+                 internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_shadow_copy_zfs'),
+                 enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_shadow_copy_zfs'))
+
 bld.SAMBA3_MODULE('vfs_zfsacl',
                  subsystem='vfs',
                  source='vfs_zfsacl.c',
@@ -285,6 +318,15 @@ if bld.CONFIG_SET("HAVE_RPC_XDR_H"):
                         deps='NFS4_ACLS NDR_NFS4ACL tirpc')
 else:
     bld.SET_TARGET_TYPE('VFS_NFS4_XDR', 'EMPTY')
+
+bld.SAMBA3_LIBRARY('smb_libzfs',
+                   source='smb_libzfs.c',
+                   cflags='-DNEED_SOLARIS_BOOLEAN',
+                   deps='samba-util',
+                   includes=bld.CONFIG_GET('CPPPATH_ZFS'),
+                   ldflags='-luutil -lzfs_core -lzfs -lnvpair',
+                   enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_zfs_core'),
+                   private_library=True)
 
 bld.SAMBA3_MODULE('vfs_nfs4acl_xattr',
                   subsystem='vfs',
