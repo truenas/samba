@@ -4,6 +4,7 @@ systemd_services = [
     'systemd/smb.service',
     'systemd/nmb.service',
     'systemd/winbind.service',
+    'systemd/wsdd.service',
     'systemd/samba.service'
 ]
 
