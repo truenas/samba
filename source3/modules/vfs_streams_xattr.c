@@ -34,6 +34,7 @@
 struct streams_xattr_config {
 	const char *prefix;
 	size_t prefix_len;
+	size_t max_xattr_size;
 	bool store_stream_type;
 };
 
@@ -904,6 +905,9 @@ static int streams_xattr_connect(vfs_handle_struct *handle,
 						 "store_stream_type",
 						 true);
 
+	config->max_xattr_size = (size_t)lp_parm_ulonglong(
+		SNUM(handle->conn), "smbd", "max_xattr_size", 65536);
+
 	SMB_VFS_HANDLE_SET_DATA(handle, config,
 				NULL, struct stream_xattr_config,
 				return -1);
@@ -918,6 +922,7 @@ static ssize_t streams_xattr_pwrite(vfs_handle_struct *handle,
         struct stream_io *sio =
 		(struct stream_io *)VFS_FETCH_FSP_EXTENSION(handle, fsp);
 	struct ea_struct ea;
+	struct streams_xattr_config *config = NULL;
 	NTSTATUS status;
 	struct smb_filename *smb_fname_base = NULL;
 	int ret;
@@ -928,7 +933,31 @@ static ssize_t streams_xattr_pwrite(vfs_handle_struct *handle,
 		return SMB_VFS_NEXT_PWRITE(handle, fsp, data, n, offset);
 	}
 
+	SMB_VFS_HANDLE_GET_DATA(handle, config, struct streams_xattr_config,
+				return -1);
+
 	if (!streams_xattr_recheck(sio)) {
+		return -1;
+	}
+
+	if ((offset + n) >= config->max_xattr_size) {
+		/*
+		 * Requested write is beyond what can be read based on
+		 * samba configuration. Correct action is debatable.
+		 * ReFS returns STATUS_FILESYSTEM_LIMITATION, which causes
+		 * entire file to be skipped by File Explorer. VFAT returns
+		 * NT_STATUS_OBJECT_NAME_COLLISION causes user to be prompted
+		 * to skip writing metadata, but copy data.
+		 */
+		DBG_ERR("Write to xattr [%s] on file [%s] exceeds maximum "
+			"supported extended attribute size. "
+			"Depending on filesystem type and operating system "
+			"(OS) specifics, this value may be increased using "
+			"the value of the parameter: "
+			"smbd:max_xattr_size = <bytes>. Consult OS and "
+			"filesystem manpages prior to increasing this limit.\n",
+			sio->xattr_name, sio->base);
+		errno = EOVERFLOW;
 		return -1;
 	}
 

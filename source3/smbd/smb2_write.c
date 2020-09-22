@@ -194,6 +194,13 @@ static NTSTATUS smb2_write_complete_internal(struct tevent_req *req,
 
 	if (nwritten == -1) {
 		status = map_nt_error_from_unix(err);
+		if (err == EOVERFLOW &&
+		    is_ntfs_stream_smb_fname(fsp->fsp_name)) {
+			status = NT_STATUS_FILE_SYSTEM_LIMITATION;
+		}
+		else {
+			status = map_nt_error_from_unix(err);
+		}
 
 		DEBUG(2, ("smb2_write failed: %s, file %s, "
 			  "length=%lu offset=%lu nwritten=-1: %s\n",
