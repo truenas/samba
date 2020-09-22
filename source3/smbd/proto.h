@@ -723,6 +723,7 @@ NTSTATUS check_parent_access(struct connection_struct *conn,
 				struct files_struct *dirfsp,
 				struct smb_filename *smb_fname,
 				uint32_t access_mask);
+NTSTATUS inherit_new_acl(files_struct *fsp);
 NTSTATUS fd_open(files_struct *fsp,
 		 int flags, mode_t mode);
 NTSTATUS fd_openat(files_struct *fsp,
