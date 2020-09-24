@@ -825,7 +825,7 @@ def serve_wsd_requests(addresses):
 
 
 def main():
-    LP_CTX.load("/usr/local/etc/smb4.conf")
+    LP_CTX.load_default()
     parse_args()
     if not getparm('enable web service discovery'):
         logger.debug('Web service discovery is disabled. Exiting')
