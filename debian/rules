@@ -32,7 +32,8 @@ conf_args = \
 		--libexecdir=/usr/lib/$(DEB_HOST_MULTIARCH) \
 		--with-privatedir=/var/db/system/samba4/private \
 		--with-statedir=/var/db/system/samba4 \
-		--with-smbpasswd-file=/var/db/system/samba4/private/smbpasswd\
+		--with-smbpasswd-file=/var/db/system/samba4/private/smbpasswd \
+		--with-logfilebase=/var/log/samba4 \
 		--with-piddir=/run/samba \
 		--with-pammodulesdir=/lib/$(DEB_HOST_MULTIARCH)/security \
 		--with-pam \

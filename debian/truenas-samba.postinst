@@ -68,6 +68,8 @@ SERVER_SERVICES=`samba-tool testparm --parameter-name="server services"  2>/dev/
 DCERPC_ENDPOINT_SERVERS=`samba-tool testparm --parameter-name="dcerpc endpoint servers"  2>/dev/null | tail -1`
 DISABLE_NETBIOS=`samba-tool testparm --parameter-name="disable netbios"  2>/dev/null | tail -1`
 
+mkdir /var/empty
+
 if [ "$SERVER_ROLE" != "active directory domain controller" ] \
         && ( echo "$SERVER_SERVICES" | grep -qv '\(^\|, \)smb\(,\|$\)' ) \
         && ( echo "$DCERPC_ENDPOINT_SERVERS" | grep -qv '\(^\|, \)remote\(,\|$\)' ) \
