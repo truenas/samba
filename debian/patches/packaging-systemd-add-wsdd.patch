@@ -25,7 +25,7 @@ index 00000000000..c9cfce04611
 +
 +[Service]
 +Type=simple
-+ExecStart=/usr/bin/wsdd --shortlog
++ExecStart=/usr/bin/wsdd.py --shortlog
 +; Replace those with an unprivledged user/group that matches your environment,
 +; like nobody/nogroup or daemon:daemon or a dedicated user for wsdd
 +User=nobody
