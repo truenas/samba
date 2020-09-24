@@ -113,7 +113,7 @@ override_dh_auto_install:
 	mkdir -p $(DESTDIR)/etc/dhcp/dhclient-enter-hooks.d
 	install -m755 debian/samba-common.dhcp $(DESTDIR)/etc/dhcp/dhclient-enter-hooks.d/samba
 	mkdir -p $(DESTDIR)/etc/ufw/applications.d
-	install -m644 debian/samba.ufw.profile $(DESTDIR)/etc/ufw/applications.d/samba
+	install -m644 debian/truenas-samba.ufw.profile $(DESTDIR)/etc/ufw/applications.d/samba
 	mkdir -p $(DESTDIR)/usr/share/apport/package-hooks
 	install -D -m 644 debian/source_samba.py $(DESTDIR)/usr/share/apport/package-hooks/source_samba.py
 	# Install other stuff not installed by "make install"
@@ -161,9 +161,9 @@ override_dh_installchangelogs:
 
 override_dh_installinit:
 ifneq (,$(filter samba, $(shell dh_listpackages)))
-	dh_installinit -psamba --name smbd
-	dh_installinit -psamba --name nmbd --error-handler nmbd_error_handler
-	dh_installinit -psamba --name winbindd
+	dh_installinit -ptruenas-samba --name smbd
+	dh_installinit -ptruenas-samba --name nmbd --error-handler nmbd_error_handler
+	dh_installinit -ptruenas-samba --name winbindd
 	mkdir -p $(CURDIR)/debian/ctdb/etc/init.d
 	install -m755 ctdb/config/ctdb.init $(CURDIR)/debian/ctdb/etc/init.d/ctdb
 	# Install dh scripts

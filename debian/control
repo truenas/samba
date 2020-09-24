@@ -54,7 +54,7 @@ Rules-Requires-Root: binary-targets
 Vcs-Browser: https://github.com/truenas/samba
 Vcs-Git: https://github.com/truenas/samba
 
-Package: samba
+Package: truenas-samba
 Architecture: any
 Pre-Depends: dpkg (>= 1.15.6~), ${misc:Pre-Depends}
 Depends: adduser,
@@ -70,6 +70,20 @@ Depends: adduser,
 Recommends: attr,
             logrotate,
             python3-markdown,
+Conflicts: samba
+Provides: samba,
+          samba-client,
+          samba-common-bin,
+          samba-libs,
+          samba-vfs-modules,
+          smbclient,
+          libsmbclient,
+          ctdb,
+          python3-samba,
+          libpam-winbind,
+          libnss-winbind,
+          libwbclient0,
+          winbind
 Suggests: ufw,
 Enhances: bind9, ntp
 Description: SMB/CIFS file, print, and login server for Unix
