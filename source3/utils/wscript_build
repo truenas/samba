@@ -325,3 +325,14 @@ bld.SAMBA3_BINARY('mdfind',
                  RPCCLI_MDSSVC
                  mdssvc
                  ''')
+
+bld.SAMBA3_BINARY('acltool',
+                 source='''
+                 acltool.c
+                 acltool_posix1e.c
+                 acltool_nfs4.c
+                 ''',
+                 deps='''
+                 acl
+                 cmdline_contexts
+                 ''')
