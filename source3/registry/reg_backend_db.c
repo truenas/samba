@@ -733,7 +733,7 @@ WERROR regdb_init(void)
 		return WERR_OK;
 	}
 
-	db_path = state_path(talloc_tos(), "registry.tdb");
+	db_path = cache_path(talloc_tos(), "registry.tdb");
 	if (db_path == NULL) {
 		return WERR_NOT_ENOUGH_MEMORY;
 	}
@@ -862,7 +862,7 @@ WERROR regdb_open( void )
 		goto done;
 	}
 
-	db_path = state_path(talloc_tos(), "registry.tdb");
+	db_path = cache_path(talloc_tos(), "registry.tdb");
 	if (db_path == NULL) {
 		result = WERR_NOT_ENOUGH_MEMORY;
 		goto done;
