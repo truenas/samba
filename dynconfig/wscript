@@ -252,8 +252,8 @@ dynconfig = {
          'DELAY':     True,
     },
     'CONFIGFILE' : {
-         'STD-PATH':  '${CONFIGDIR}/smb.conf',
-         'FHS-PATH':  '${CONFIGDIR}/smb.conf',
+         'FHS-PATH':  '${SYSCONFDIR}/smb4.conf',
+         'FHS-PATH':  '${SYSCONFDIR}/smb4.conf',
          'DELAY':     True,
     },
     'LMHOSTSFILE' : {
