@@ -14,3 +14,4 @@ s3-param-loadparm.c-add-TrueNAS-parameters.patch
 packaging-systemd-add-wsdd-service.patch
 s3-smbd-add-support-for-streams-64-KiB.patch
 s3-utils-add-acltool.patch
+dynconfig-registry-alter-default-paths.patch
