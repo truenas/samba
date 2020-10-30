@@ -30,10 +30,11 @@ o  CVE-2020-14318:
 o  CVE-2020-14323:
    winbind in version 3.6 and later implements a request to translate multiple
    Windows SIDs into names in one request. This was done for performance
-   reasons: The Microsoft RPC call domain controllers offer to do this
-   translation, so it was an obvious extension to also offer this batch
-   operation on the winbind unix domain stream socket that is available to local
-   processes on the Samba server.
+   reasons: Active Directory domain controllers can do multiple SID to name
+   translations in one RPC call. It was an obvious extension to also offer this
+   batch operation on the winbind unix domain stream socket that is available to
+   local processes on the Samba server to reduce network round-trips to the
+   domain controller.
 
    Due to improper input validation a hand-crafted packet can make winbind
    perform a NULL pointer dereference and thus crash.
