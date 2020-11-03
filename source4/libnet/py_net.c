@@ -168,7 +168,6 @@ static PyObject *py_net_change_password(py_net_Object *self, PyObject *args, PyO
 	union libnet_ChangePassword r;
 	NTSTATUS status;
 	TALLOC_CTX *mem_ctx = NULL;
-	struct tevent_context *ev = NULL;
 	const char *kwnames[] = { "newpassword", "oldpassword", "domain", "username", NULL };
 	const char *newpass = NULL;
 	const char *oldpass = NULL;
@@ -202,11 +201,7 @@ static PyObject *py_net_change_password(py_net_Object *self, PyObject *args, PyO
 			= cli_credentials_get_password(self->libnet_ctx->cred);
 	}
 
-	/* FIXME: we really need to get a context from the caller or we may end
-	 * up with 2 event contexts */
-	ev = s4_event_context_init(NULL);
-
-	mem_ctx = talloc_new(ev);
+	mem_ctx = talloc_new(self->ev);
 	if (mem_ctx == NULL) {
 		PyMem_Free(discard_const_p(char, newpass));
 		PyMem_Free(discard_const_p(char, oldpass));
@@ -243,7 +238,6 @@ static PyObject *py_net_set_password(py_net_Object *self, PyObject *args, PyObje
 	union libnet_SetPassword r;
 	NTSTATUS status;
 	TALLOC_CTX *mem_ctx;
-	struct tevent_context *ev;
 	const char *kwnames[] = { "account_name", "domain_name", "newpassword", NULL };
 
 	ZERO_STRUCT(r);
@@ -258,11 +252,7 @@ static PyObject *py_net_set_password(py_net_Object *self, PyObject *args, PyObje
 		return NULL;
 	}
 
-	/* FIXME: we really need to get a context from the caller or we may end
-	 * up with 2 event contexts */
-	ev = s4_event_context_init(NULL);
-
-	mem_ctx = talloc_new(ev);
+	mem_ctx = talloc_new(self->ev);
 	if (mem_ctx == NULL) {
 		PyErr_NoMemory();
 		return NULL;
@@ -843,6 +833,7 @@ static PyMethodDef net_obj_methods[] = {
 
 static void py_net_dealloc(py_net_Object *self)
 {
+	talloc_free(self->mem_ctx);
 	talloc_free(self->ev);
 	PyObject_Del(self);
 }
