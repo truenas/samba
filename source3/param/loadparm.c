@@ -3049,7 +3049,7 @@ void lp_killservice(int iServiceIn)
  changed (ie. non-default) parameters.
 ***************************************************************************/
 
-static void lp_save_defaults(void)
+void lp_save_defaults(void)
 {
 	int i;
 	struct parmlist_entry * parm;
