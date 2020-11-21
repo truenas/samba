@@ -48,6 +48,7 @@ static PyObject *py_get_context(PyObject *self, PyObject *Py_UNUSED(ignored))
 		PyErr_NoMemory();
 		return NULL;
 	}
+	lp_save_defaults();
 
 	py_loadparm = pytalloc_steal(loadparm_Type, discard_const_p(struct loadparm_context, s4_context));
 	if (py_loadparm == NULL) {
