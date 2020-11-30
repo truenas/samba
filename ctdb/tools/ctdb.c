@@ -45,10 +45,15 @@
 #include "client/client.h"
 #include "client/client_sync.h"
 
+#include <jansson.h>
+#include "json_minimal.h" /* various JSON helpers */
+
 #define TIMEOUT()	timeval_current_ofs(options.timelimit, 0)
 
 #define SRVID_CTDB_TOOL    (CTDB_SRVID_TOOL_RANGE | 0x0001000000000000LL)
 #define SRVID_CTDB_PUSHDB  (CTDB_SRVID_TOOL_RANGE | 0x0002000000000000LL)
+
+enum output_format {F_TEXT, F_JSON, F_CSV};
 
 static struct {
 	const char *debuglevelstr;
@@ -57,6 +62,7 @@ static struct {
 	int machinereadable;
 	const char *sep;
 	int machineparsable;
+	int json;
 	int verbose;
 	int maxruntime;
 	int printemptyrecords;
@@ -64,6 +70,7 @@ static struct {
 	int printlmaster;
 	int printhash;
 	int printrecordflags;
+	enum output_format format;
 } options;
 
 static poptContext pc;
@@ -871,6 +878,186 @@ static void print_status(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 	printf("Recovery master:%d\n", recmaster);
 }
 
+static void print_nodemap_json(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+			  struct ctdb_node_map *nodemap, uint32_t mypnn,
+			  bool print_header, struct json_object *_jsobj)
+{
+	struct ctdb_node_and_flags *node;
+	int num_deleted_nodes = 0;
+	unsigned int i, rv;
+	struct json_object nodesarray;
+
+	for (i=0; i<nodemap->num; i++) {
+		if (nodemap->node[i].flags & NODE_FLAGS_DELETED) {
+			num_deleted_nodes++;
+		}
+	}
+
+	if (print_header) {
+		rv = json_add_int(_jsobj, "node_count", nodemap->num);
+		if (rv != 0) {
+			return;
+		}
+		rv = json_add_int(_jsobj, "deleted_node_count", num_deleted_nodes);
+		if (rv != 0) {
+			return;
+		}
+	}
+	nodesarray = json_get_array(_jsobj, "nodes");
+	if (json_is_invalid(&nodesarray)) {
+		return;
+	}
+
+	for (i=0; i<nodemap->num; i++) {
+		struct json_object tmpobj;
+		char *sockaddrstr = NULL;
+		char *flags = NULL;
+		bool ok;
+		tmpobj = json_new_object();
+		if (json_is_invalid(&tmpobj)) {
+			goto failure;
+		}
+
+		node = &nodemap->node[i];
+		if (node->flags & NODE_FLAGS_DELETED) {
+			continue;
+		}
+		rv = json_add_int(&tmpobj, "pnn", node->pnn);
+		if (rv != 0) {
+			goto failure;
+		}
+
+		sockaddrstr = ctdb_sock_addr_to_string(mem_ctx, &node->addr, false);
+		rv = json_add_string(&tmpobj, "address", sockaddrstr);
+		if (rv != 0) {
+			goto failure;
+		}
+
+		flags = pretty_print_flags(mem_ctx, node->flags);
+		rv = json_add_string(&tmpobj, "flags_str", flags);
+		if (rv != 0) {
+			goto failure;
+		}
+
+		rv = json_add_int(&tmpobj, "flags_raw", node->flags);
+		if (rv != 0) {
+			goto failure;
+		}
+
+		rv = json_add_bool(&tmpobj, "partially_online", partially_online(mem_ctx, ctdb, node));
+		if (rv != 0) {
+			goto failure;
+		}
+
+		rv = json_add_bool(&tmpobj, "this_node", node->pnn == mypnn);
+		if (rv != 0) {
+			goto failure;
+		}
+
+		rv = json_add_object(&nodesarray, NULL, &tmpobj);
+		if (rv != 0) {
+			goto failure;
+		}
+	}
+	rv = json_add_object(_jsobj, "nodes", &nodesarray);
+	if (rv != 0) {
+		goto failure;
+	}
+	return;
+failure:
+	fprintf(stderr, "Failed to convert nodemap to JSON\n");
+	json_free(&nodesarray);
+	return;
+}
+
+static void print_status_json(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+			 struct ctdb_node_map *nodemap, uint32_t mypnn,
+			 struct ctdb_vnn_map *vnnmap, int recmode,
+			 uint32_t recmaster)
+{
+	unsigned int i;
+	int rv;
+	struct json_object jsobj, jsvnnmap, jsnodemap;
+	char *json_output = NULL;
+
+	jsobj = json_new_object();
+	if (json_is_invalid(&jsobj)) {
+		fprintf(stderr, "Failed to create json object for output\n");
+		return;
+	}
+	jsnodemap = json_new_object();
+	if (json_is_invalid(&jsnodemap)){
+		fprintf(stderr, "Failed to create json object for nodemap\n");
+		goto failure;
+	}
+	rv = json_add_object(&jsobj, "nodemap", &jsnodemap);
+	if (rv != 0) {
+		goto failure;
+	}
+
+	print_nodemap_json(mem_ctx, ctdb, nodemap, mypnn, true, &jsnodemap);
+
+	rv = json_add_int(&jsobj, "generation", vnnmap->generation);
+	if (rv != 0) {
+		goto failure;
+	}
+	rv = json_add_int(&jsobj, "size", vnnmap->size);
+	if (rv != 0) {
+		goto failure;
+	}
+	jsvnnmap = json_get_array(&jsobj, "vnnmap");
+	if (json_is_invalid(&jsvnnmap)) {
+		goto failure;
+	}
+	for (i=0; i<vnnmap->size; i++) {
+		struct json_object tmp_obj;
+		tmp_obj = json_new_object();
+		if (json_is_invalid(&tmp_obj)) {
+			json_free(&jsvnnmap);
+			goto failure;
+		}
+		rv = json_add_int(&tmp_obj, "hash", i);
+		if (rv != 0) {
+			json_free(&tmp_obj);
+			json_free(&jsvnnmap);
+			goto failure;
+		}
+		rv = json_add_int(&tmp_obj, "lmaster", vnnmap->map[i]);
+		if (rv != 0) {
+			json_free(&tmp_obj);
+			json_free(&jsvnnmap);
+			goto failure;
+		}
+		rv = json_add_object(&jsvnnmap, NULL, &tmp_obj);
+		if (rv != 0) {
+			json_free(&tmp_obj);
+			json_free(&jsvnnmap);
+			goto failure;
+		}
+	}
+	rv = json_add_object(&jsobj, "vnnmap", &jsvnnmap);
+	if (rv != 0) {
+		json_free(&jsvnnmap);
+		goto failure;
+	}
+
+	rv = json_add_int(&jsobj, "recovery_mode_raw", recmode);
+	if (rv != 0) {
+		goto failure;
+	}
+
+	rv = json_add_string(&jsobj, "recovery_mode_str", recmode == CTDB_RECOVERY_NORMAL ? "NORMAL" : "RECOVERY");
+	if (rv != 0) {
+		goto failure;
+	}
+	json_output = json_to_string(mem_ctx, &jsobj);
+	printf("%s\n", json_output);
+	TALLOC_FREE(json_output);
+failure:
+	json_free(&jsobj);
+	return;
+}
+
 static int control_status(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 			  int argc, const char **argv)
 {
@@ -912,8 +1099,16 @@ static int control_status(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 		return ret;
 	}
 
-	print_status(mem_ctx, ctdb, nodemap, ctdb->cmd_pnn, vnnmap,
-		     recmode, recmaster);
+	switch(options.format) {
+	case F_JSON:
+		print_status_json(mem_ctx, ctdb, nodemap, ctdb->cmd_pnn, vnnmap,
+			     recmode, recmaster);
+		break;
+	default:
+		print_status(mem_ctx, ctdb, nodemap, ctdb->cmd_pnn, vnnmap,
+			     recmode, recmaster);
+		break;
+	}
 	return 0;
 }
 
@@ -1930,22 +2125,11 @@ static int control_process_exists(TALLOC_CTX *mem_ctx,
 	return status;
 }
 
-static int control_getdbmap(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
-			    int argc, const char **argv)
+static int print_dbmap(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+		       struct ctdb_dbid_map *dbmap)
 {
-	struct ctdb_dbid_map *dbmap;
 	unsigned int i;
 	int ret;
-
-	if (argc != 0) {
-		usage("getdbmap");
-	}
-
-	ret = ctdb_ctrl_get_dbmap(mem_ctx, ctdb->ev, ctdb->client,
-				  ctdb->cmd_pnn, TIMEOUT(), &dbmap);
-	if (ret != 0) {
-		return ret;
-	}
 
 	if (options.machinereadable == 1) {
 		printf("%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
@@ -2029,6 +2213,229 @@ static int control_getdbmap(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 	return 0;
 }
 
+static int print_db_status_json(TALLOC_CTX *mem_ctx, uint32_t db_id, const char *db_name,
+				const char *db_path, const char *db_health,
+				uint8_t db_flags, struct json_object *_jsobj);
+
+static int print_dbmap_json(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+			    struct ctdb_dbid_map *dbmap)
+{
+	struct json_object jsobj, jsdbmap;
+	unsigned int i;
+	int ret;
+	char *json_output = NULL;
+
+	jsobj = json_new_object();
+	if (json_is_invalid(&jsobj)) {
+		return 1;
+	}
+
+	ret = json_add_int(&jsobj, "database_cnt", dbmap->num);
+	if (ret != 0) {
+		goto failure;
+	}
+
+	jsdbmap = json_get_array(&jsobj, "dbmap");
+	if (json_is_invalid(&jsdbmap)) {
+		goto failure;
+	}
+
+	for (i=0; i<dbmap->num; i++) {
+		struct json_object tmp_obj;
+		const char *name;
+		const char *path;
+		const char *health;
+		bool persistent;
+		bool readonly;
+		bool sticky;
+		bool replicated;
+		uint32_t db_id;
+
+
+		tmp_obj = json_new_object();
+		if (json_is_invalid(&tmp_obj)) {
+			json_free(&jsdbmap);
+			goto failure;
+		}
+
+		db_id = dbmap->dbs[i].db_id;
+
+		ret = ctdb_ctrl_get_dbname(mem_ctx, ctdb->ev, ctdb->client,
+					   ctdb->cmd_pnn, TIMEOUT(), db_id,
+					   &name);
+		if (ret != 0) {
+			return ret;
+		}
+
+		ret = ctdb_ctrl_getdbpath(mem_ctx, ctdb->ev, ctdb->client,
+					  ctdb->cmd_pnn, TIMEOUT(), db_id,
+					  &path);
+		if (ret != 0) {
+			return ret;
+		}
+
+		ret = ctdb_ctrl_db_get_health(mem_ctx, ctdb->ev, ctdb->client,
+					      ctdb->cmd_pnn, TIMEOUT(), db_id,
+					      &health);
+		if (ret != 0) {
+			return ret;
+		}
+
+		ret = print_db_status_json(mem_ctx, db_id, name, path, health,
+					   dbmap->dbs[i].flags, &tmp_obj);
+
+		if (ret != 0) {
+			json_free(&jsdbmap);
+			goto failure;
+		}
+		talloc_free(discard_const(name));
+		talloc_free(discard_const(path));
+		talloc_free(discard_const(health));
+		ret = json_add_object(&jsdbmap, NULL, &tmp_obj);
+		if (ret != 0) {
+			json_free(&jsdbmap);
+			goto failure;
+		}
+	}
+	ret = json_add_object(&jsobj, "dbmap", &jsdbmap);
+	if (ret != 0) {
+		json_free(&jsdbmap);
+		goto failure;
+	}
+
+	json_output = json_to_string(mem_ctx, &jsobj);
+	printf("%s\n", json_output);
+	TALLOC_FREE(json_output);
+
+	return 0;
+failure:
+	json_free(&jsobj);
+	return 1;
+}
+
+static int control_getdbmap(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+			    int argc, const char **argv)
+{
+	struct ctdb_dbid_map *dbmap;
+	unsigned int i;
+	int ret;
+
+	ret = ctdb_ctrl_get_dbmap(mem_ctx, ctdb->ev, ctdb->client,
+				  ctdb->cmd_pnn, TIMEOUT(), &dbmap);
+	if (ret != 0) {
+		return ret;
+	}
+	switch (options.format) {
+	case F_JSON:
+		ret = print_dbmap_json(mem_ctx, ctdb, dbmap);
+		break;
+	default:
+		ret = print_dbmap(mem_ctx, ctdb, dbmap);
+	}
+	return ret;
+}
+
+static int print_db_status(uint32_t db_id, const char *db_name,
+			   const char *db_path, const char *db_health,
+			   uint8_t db_flags)
+{
+	printf("dbid: 0x%08x\nname: %s\npath: %s\n", db_id, db_name, db_path);
+	printf("PERSISTENT: %s\nREPLICATED: %s\nSTICKY: %s\nREADONLY: %s\n",
+	       (db_flags & CTDB_DB_FLAGS_PERSISTENT ? "yes" : "no"),
+	       (db_flags & CTDB_DB_FLAGS_REPLICATED ? "yes" : "no"),
+	       (db_flags & CTDB_DB_FLAGS_STICKY ? "yes" : "no"),
+	       (db_flags & CTDB_DB_FLAGS_READONLY ? "yes" : "no"));
+	printf("HEALTH: %s\n", (db_health ? db_health : "OK"));
+	return 0;
+
+}
+
+static int print_db_status_json(TALLOC_CTX *mem_ctx, uint32_t db_id, const char *db_name,
+				const char *db_path, const char *db_health,
+				uint8_t db_flags, struct json_object *_jsobj)
+{
+	int rv;
+	bool print_output = false;
+	struct json_object jsobj;
+	char dbid_hex[12] = {0};
+
+	if (_jsobj != NULL) {
+		jsobj = *_jsobj;
+	}
+	else {
+		jsobj = json_new_object();
+		print_output = true;
+	}
+	if (json_is_invalid(&jsobj)) {
+		fprintf(stderr, "Failed to generate JSON object for output: %s\n",
+			strerror(errno));
+		return 1;
+	}
+	snprintf(dbid_hex, sizeof(dbid_hex), "0x%08x", db_id);
+	rv = json_add_string(&jsobj, "dbid", dbid_hex);
+	if (rv != 0) {
+		goto failure;
+	}
+
+	rv = json_add_string(&jsobj, "name", db_name);
+	if (rv != 0) {
+		goto failure;
+	}
+
+	rv = json_add_string(&jsobj, "path", db_path);
+	if (rv != 0) {
+		goto failure;
+	}
+
+	rv = json_add_bool(&jsobj, "persistent", db_flags & CTDB_DB_FLAGS_PERSISTENT);
+	if (rv != 0) {
+		goto failure;
+	}
+
+
+	rv = json_add_bool(&jsobj, "replicated", db_flags & CTDB_DB_FLAGS_REPLICATED);
+	if (rv != 0) {
+		goto failure;
+	}
+
+	rv = json_add_bool(&jsobj, "sticky", db_flags & CTDB_DB_FLAGS_STICKY);
+	if (rv != 0) {
+		goto failure;
+	}
+
+	rv = json_add_bool(&jsobj, "readonly", db_flags & CTDB_DB_FLAGS_READONLY);
+	if (rv != 0) {
+		goto failure;
+	}
+
+	rv = json_add_int(&jsobj, "flags_raw", db_flags);
+	if (rv != 0) {
+		goto failure;
+	}
+
+	rv = json_add_string(&jsobj, "health", db_health ? db_health : "OK");
+	if (rv != 0) {
+		goto failure;
+	}
+
+	if (print_output) {
+		char *json_output = NULL;
+		json_output = json_to_string(mem_ctx, &jsobj);
+		printf("%s\n", json_output);
+		TALLOC_FREE(json_output);
+		json_free(&jsobj);
+	}
+	return 0;
+
+failure:
+	fprintf(stderr, "Failed to generate json output for DB status\n");
+	if (print_output) {
+		// If caller passed in json oject to this function, then memory should
+		// be freed there.
+		json_free(&jsobj);
+	}
+	return 1;
+}
 static int control_getdbstatus(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 			       int argc, const char **argv)
 {
@@ -2058,15 +2465,17 @@ static int control_getdbstatus(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 	if (ret != 0) {
 		return ret;
 	}
-
-	printf("dbid: 0x%08x\nname: %s\npath: %s\n", db_id, db_name, db_path);
-	printf("PERSISTENT: %s\nREPLICATED: %s\nSTICKY: %s\nREADONLY: %s\n",
-	       (db_flags & CTDB_DB_FLAGS_PERSISTENT ? "yes" : "no"),
-	       (db_flags & CTDB_DB_FLAGS_REPLICATED ? "yes" : "no"),
-	       (db_flags & CTDB_DB_FLAGS_STICKY ? "yes" : "no"),
-	       (db_flags & CTDB_DB_FLAGS_READONLY ? "yes" : "no"));
-	printf("HEALTH: %s\n", (db_health ? db_health : "OK"));
-	return 0;
+	switch (options.format) {
+	case F_JSON:
+		ret = print_db_status_json(mem_ctx, db_id, db_name, db_path, db_health,
+					   db_flags, NULL);
+		break;
+	default:
+		ret = print_db_status(db_id, db_name, db_path, db_health,
+				      db_flags);
+		break;
+	}
+	return ret;
 }
 
 struct dump_record_state {
@@ -3404,11 +3813,103 @@ static int control_deltickle(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 	return 0;
 }
 
+static bool print_nodelist(TALLOC_CTX *mem_ctx, struct ctdb_node_map *nodemap)
+{
+	int i;
+	for (i=0; i<nodemap->num; i++) {
+		char *addr = NULL;
+		if (nodemap->node[i].flags & NODE_FLAGS_DELETED) {
+			continue;
+		}
+
+		addr = ctdb_sock_addr_to_string(mem_ctx,
+						&nodemap->node[i].addr,
+						false);
+
+		if (options.machinereadable) {
+			printf("%s%u%s%s%s\n", options.sep,
+			       nodemap->node[i].pnn, options.sep,
+			       addr, options.sep);
+		} else {
+			printf("%s\n", addr);
+		}
+		TALLOC_FREE(addr);
+	}
+	return true;
+}
+
+static bool print_nodelist_json(TALLOC_CTX *mem_ctx, struct ctdb_node_map *nodemap)
+{
+	struct json_object jsobj, jsnodelist;
+	int rv, i;
+	char *json_output = NULL;
+	jsobj = json_new_object();
+	if (json_is_invalid(&jsobj)) {
+		return false;
+	}
+
+	jsnodelist = json_get_array(&jsobj, "nodeslist");
+	if (json_is_invalid(&jsnodelist)) {
+		goto failure;
+	}
+
+	for (i=0; i<nodemap->num; i++) {
+		struct json_object jsnode;
+		char *addr = NULL;
+		if (nodemap->node[i].flags & NODE_FLAGS_DELETED) {
+			continue;
+		}
+		jsnode = json_new_object();
+		if (json_is_invalid(&jsnode)) {
+			return false;
+		}
+		addr = ctdb_sock_addr_to_string(mem_ctx,
+						&nodemap->node[i].addr,
+						false);
+
+		rv = json_add_int(&jsnode, "pnn", nodemap->node[i].pnn);
+		if (rv != 0) {
+			json_free(&jsnode);
+			goto failure;
+		}
+
+		rv = json_add_string(&jsnode, "address", addr);
+		if (rv != 0) {
+			json_free(&jsnode);
+			goto failure;
+		}
+		TALLOC_FREE(addr);
+
+		rv = json_add_object(&jsnodelist, NULL, &jsnode);
+		if (rv != 0) {
+			json_free(&jsnode);
+			goto failure;
+		}
+
+	}
+	rv = json_add_object(&jsobj, "nodelist", &jsnodelist);
+	if (rv != 0) {
+		json_free(&jsnodelist);
+		goto failure;
+	}
+
+	json_output = json_to_string(mem_ctx, &jsobj);
+	printf("%s\n", json_output);
+	TALLOC_FREE(json_output);
+
+	return true;
+
+failure:
+	json_free(&jsobj);
+	return false;
+}
+
 static int control_listnodes(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 			     int argc, const char **argv)
 {
 	struct ctdb_node_map *nodemap;
 	unsigned int i;
+	bool ok;
 
 	if (argc != 0) {
 		usage("listnodes");
@@ -3419,25 +3920,15 @@ static int control_listnodes(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 		return 1;
 	}
 
-	for (i=0; i<nodemap->num; i++) {
-		if (nodemap->node[i].flags & NODE_FLAGS_DELETED) {
-			continue;
-		}
-
-		if (options.machinereadable) {
-			printf("%s%u%s%s%s\n", options.sep,
-			       nodemap->node[i].pnn, options.sep,
-			       ctdb_sock_addr_to_string(
-				       mem_ctx, &nodemap->node[i].addr, false),
-			       options.sep);
-		} else {
-			printf("%s\n",
-			       ctdb_sock_addr_to_string(
-				       mem_ctx, &nodemap->node[i].addr, false));
-		}
+	switch (options.format) {
+	case F_JSON:
+		ok = print_nodelist_json(mem_ctx, nodemap);
+		break;
+	default:
+		ok = print_nodelist(mem_ctx, nodemap);
 	}
 
-	return 0;
+	return ok;
 }
 
 static bool nodemap_identical(struct ctdb_node_map *nodemap1,
@@ -5587,6 +6078,8 @@ static int control_nodestatus(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 	unsigned int i;
 	int ret;
 	bool print_hdr = false;
+	struct json_object jsobj;
+	char *json_output = NULL;
 
 	if (argc > 1) {
 		usage("nodestatus");
@@ -5603,10 +6096,25 @@ static int control_nodestatus(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 		return 1;
 	}
 
-	if (options.machinereadable) {
-		print_nodemap_machine(mem_ctx, ctdb, nodemap, ctdb->cmd_pnn);
-	} else {
-		print_nodemap(mem_ctx, ctdb, nodemap, ctdb->cmd_pnn, print_hdr);
+	switch (options.format) {
+	case F_JSON:
+		jsobj = json_new_object();
+		if (json_is_invalid(&jsobj)) {
+			fprintf(stderr, "Failed to create json object for tmp_obj\n");
+			return ENOMEM;
+		}
+		print_nodemap_json(mem_ctx, ctdb, nodemap, ctdb->cmd_pnn, print_hdr, &jsobj);
+		json_output = json_to_string(mem_ctx, &jsobj);
+		printf("%s\n", json_output);
+		TALLOC_FREE(json_output);
+		break;
+	default:
+		if (options.machinereadable) {
+			print_nodemap_machine(mem_ctx, ctdb, nodemap, ctdb->cmd_pnn);
+		} else {
+			print_nodemap(mem_ctx, ctdb, nodemap, ctdb->cmd_pnn, print_hdr);
+		}
+		break;
 	}
 
 	ret = 0;
@@ -6175,6 +6683,13 @@ struct poptOption cmdline_options[] = {
 		.descrip    = "enable machine parsable output with separator |",
 	},
 	{
+		.shortName  = 'j',
+		.argInfo    = POPT_ARG_NONE,
+		.arg        = &options.json,
+		.val        = 0,
+		.descrip    = "Do JSON output",
+	},
+	{
 		.longName   = "verbose",
 		.shortName  = 'v',
 		.argInfo    = POPT_ARG_NONE,
@@ -6341,7 +6856,9 @@ int main(int argc, const char *argv[])
 			options.maxruntime = 120;
 		}
 	}
-
+	if (options.json) {
+		options.format = F_JSON;
+	}
 	if (options.machineparsable) {
 		options.machinereadable = 1;
 	}

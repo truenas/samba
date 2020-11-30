@@ -17,3 +17,4 @@ s3-utils-add-acltool.patch
 dynconfig-registry-alter-default-paths.patch
 s4-libnet-py-net.patch
 s3-param-pyparam-fix-dump-of-global-parameters.patch
+ctdb-tools-ctdb-add-JSON-output.patch
