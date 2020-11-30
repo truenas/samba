@@ -1,0 +1,8 @@
+#!/usr/bin/env python
+
+bld.SAMBA_SUBSYSTEM(
+    'json_minimal',
+    deps='''jansson
+            samba-debug ''',
+    source='json_minimal.c'
+)
