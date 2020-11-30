@@ -35,6 +35,7 @@ samba_dist.DIST_DIRS('''ctdb:. lib/replace:lib/replace lib/talloc:lib/talloc
                         lib/async_req:lib/async_req
                         lib/pthreadpool:lib/pthreadpool
                         lib/messaging:lib/messaging
+                        lib/json_minimal:lib/json_minimal
                         buildtools:buildtools third_party/waf:third_party/waf''')
 
 manpages_binary = [
@@ -378,6 +379,7 @@ def build(bld):
     bld.RECURSE('lib/async_req')
     bld.RECURSE('lib/pthreadpool')
     bld.RECURSE('lib/messaging')
+    bld.RECURSE('lib/json_minimal')
 
     bld.RECURSE('lib/talloc')
     bld.RECURSE('lib/tevent')
@@ -603,7 +605,7 @@ def build(bld):
     bld.SAMBA_BINARY('ctdb',
                      source='tools/ctdb.c',
                      deps='''ctdb-client ctdb-protocol ctdb-protocol-util
-                             ctdb-util ctdb-system samba-util sys_rw popt''',
+                             ctdb-util ctdb-system samba-util sys_rw popt jansson json_minimal''',
                      install_path='${BINDIR}',
                      manpages='ctdb.1')
 
