@@ -1,4 +1,184 @@
                    ==============================
+                   Release Notes for Samba 4.13.3
+                          December 15, 2020
+                   ==============================
+
+
+This is the latest stable release of the Samba 4.13 release series.
+
+
+Changes since 4.13.2
+--------------------
+
+o  Jeremy Allison <jra@samba.org>
+   * BUG 14210: libcli: smb2: Never print length if smb2_signing_key_valid()
+     fails for crypto blob.
+   * BUG 14486: s3: modules: gluster. Fix the error I made in preventing talloc
+     leaks from a function. 
+   * BUG 14515: s3: smbd: Don't overwrite contents of fsp->aio_requests[0] with
+     NULL via TALLOC_FREE().
+   * BUG 14568: s3: spoolss: Make parameters in call to user_ok_token() match
+     all other uses.
+   * BUG 14590: s3: smbd: Quiet log messages from usershares for an unknown
+     share.
+
+o  Ralph Boehme <slow@samba.org>
+   * BUG 14248: samba process does not honor max log size.
+   * BUG 14587: vfs_zfsacl: Add missing inherited flag on hidden "magic"
+     everyone@ ACE.
+
+o  Isaac Boukris <iboukris@gmail.com>
+   * BUG 13124: s3-libads: Pass timeout to open_socket_out in ms.
+
+o  Günther Deschner <gd@samba.org>
+   * BUG 14486: s3-vfs_glusterfs: Always disable write-behind translator.
+
+o  Volker Lendecke <vl@samba.org>
+   * BUG 14517: smbclient: Fix recursive mget.
+   * BUG 14581: clitar: Use do_list()'s recursion in clitar.c.
+
+o  Anoop C S <anoopcs@samba.org>
+   * BUG 14486: manpages/vfs_glusterfs: Mention silent skipping of write-behind
+     translator.
+   * BUG 14573: vfs_shadow_copy2: Preserve all open flags assuming ROFS.
+
+o  Jones Syue <jonessyue@qnap.com>
+   * BUG 14514: interface: Fix if_index is not parsed correctly.
+
+
+#######################################
+Reporting bugs & Development Discussion
+#######################################
+
+Please discuss this release on the samba-technical mailing list or by
+joining the #samba-technical IRC channel on irc.freenode.net.
+
+If you do report problems then please try to send high quality
+feedback. If you don't provide vital information to help us track down
+the problem then you will probably be ignored.  All bug reports should
+be filed under the Samba 4.1 and newer product in the project's Bugzilla
+database (https://bugzilla.samba.org/).
+
+
+======================================================================
+== Our Code, Our Bugs, Our Responsibility.
+== The Samba Team
+======================================================================
+
+
+Release notes for older releases follow:
+----------------------------------------
+
+                   ==============================
+                   Release Notes for Samba 4.13.2
+                          November 03, 2020
+                   ==============================
+
+
+This is the latest stable release of the Samba 4.13 release series.
+
+Major enhancements include:
+  o BUG 14537: ctdb-common: Avoid aliasing errors during code optimization.
+  o BUG 14486: vfs_glusterfs: Avoid data corruption with the write-behind
+               translator.
+
+
+=======
+Details
+=======
+
+The GlusterFS write-behind performance translator, when used with Samba, could
+be a source of data corruption. The translator, while processing a write call,
+immediately returns success but continues writing the data to the server in the
+background. This can cause data corruption when two clients relying on Samba to
+provide data consistency are operating on the same file.
+
+The write-behind translator is enabled by default on GlusterFS.
+The vfs_glusterfs plugin will check for the presence of the translator and
+refuse to connect if detected. Please disable the write-behind translator for
+the GlusterFS volume to allow the plugin to connect to the volume.
+
+
+Changes since 4.13.1
+--------------------
+
+o  Jeremy Allison <jra@samba.org>
+   * BUG 14486: s3: modules: vfs_glusterfs: Fix leak of char 
+     **lines onto mem_ctx on return.
+
+o  Ralph Boehme <slow@samba.org>
+   * BUG 14471: RN: vfs_zfsacl: Only grant DELETE_CHILD if ACL tag is special.
+
+o  Alexander Bokovoy <ab@samba.org>
+   * BUG 14538: smb.conf.5: Add clarification how configuration changes
+     reflected by Samba.
+   * BUG 14552: daemons: Report status to systemd even when running in
+     foreground.
+   * BUG 14553: DNS Resolver: Support both dnspython before and after 2.0.0.
+ 
+o  Günther Deschner <gd@samba.org>
+   * BUG 14486: s3-vfs_glusterfs: Refuse connection when write-behind xlator is
+     present.
+
+o  Amitay Isaacs <amitay@gmail.com>
+   * BUG 14487: provision: Add support for BIND 9.16.x.
+   * BUG 14537: ctdb-common: Avoid aliasing errors during code optimization.
+   * BUG 14541: libndr: Avoid assigning duplicate versions to symbols.
+
+o  Björn Jacke <bjacke@samba.org>
+   * BUG 14522: docs: Fix default value of spoolss:architecture.
+
+o  Laurent Menase <laurent.menase@hpe.com>
+   * BUG 14388: winbind: Fix a memleak.
+
+o  Stefan Metzmacher <metze@samba.org>
+   * BUG 14531: s4:dsdb:acl_read: Implement "List Object" mode feature.
+
+o  Sachin Prabhu <sprabhu@redhat.com>
+   * BUG 14486: docs-xml/manpages: Add warning about write-behind translator for
+     vfs_glusterfs.
+
+o  Khem Raj <raj.khem@gmail.com>
+   * nsswitch/nsstest.c: Avoid nss function conflicts with glibc nss.h.
+
+o  Anoop C S <anoopcs@samba.org>
+   * BUG 14530: vfs_shadow_copy2: Avoid closing snapsdir twice.
+
+o  Andreas Schneider <asn@samba.org>
+   * BUG 14547: third_party: Update resolv_wrapper to version 1.1.7.
+   * BUG 14550: examples:auth: Do not install example plugin.
+
+o  Martin Schwenke <martin@meltin.net>
+   * BUG 14513: ctdb-recoverd: Drop unnecessary and broken code.
+
+o  Andrew Walker <awalker@ixsystems.com>
+   * BUG 14471: RN: vfs_zfsacl: Only grant DELETE_CHILD if ACL tag is special.
+
+
+#######################################
+Reporting bugs & Development Discussion
+#######################################
+
+Please discuss this release on the samba-technical mailing list or by
+joining the #samba-technical IRC channel on irc.freenode.net.
+
+If you do report problems then please try to send high quality
+feedback. If you don't provide vital information to help us track down
+the problem then you will probably be ignored.  All bug reports should
+be filed under the Samba 4.1 and newer product in the project's Bugzilla
+database (https://bugzilla.samba.org/).
+
+
+======================================================================
+== Our Code, Our Bugs, Our Responsibility.
+== The Samba Team
+======================================================================
+
+
+----------------------------------------------------------------------
+
+
+                   ==============================
                    Release Notes for Samba 4.13.1
                           October 29, 2020
                    ==============================
@@ -89,8 +269,8 @@ database (https://bugzilla.samba.org/).
 ======================================================================
 
 
-Release notes for older releases follow:
-----------------------------------------
+----------------------------------------------------------------------
+
 
                    ==============================
                    Release Notes for Samba 4.13.0
@@ -178,9 +358,6 @@ REMOVED FEATURES
 
 The deprecated "ldap ssl ads" smb.conf option has been removed.
 
-The deprecated "server schannel" smb.conf option will very likely
-removed in the final 4.13.0 release.
-
 
 smb.conf changes
 ================
@@ -196,7 +373,6 @@ smb.conf changes
   client NTLMv2 auth                  Deprecated                 yes
   client lanman auth                  Deprecated                 no
   client use spnego                   Deprecated                 yes
-  server schannel                     To be removed in 4.13.0
   server require schannel:COMPUTER    Added
 
 
