@@ -476,23 +476,23 @@ for env in ["fileserver"]:
     plantestsuite("samba3.blackbox.smbclient_tarmode.NT1", env + "_smb1_done",
                   [os.path.join(samba3srcdir, "script/tests/test_smbclient_tarmode.sh"),
                    '$SERVER', '$SERVER_IP', '$USERNAME', '$PASSWORD',
-                   '$LOCAL_PATH/tarmode', '$PREFIX', smbclient3, configuration, "-mNT1"])
+                   '$LOCAL_PATH/tarmode/smbclient_tar', '$PREFIX', smbclient3, configuration, "-mNT1"])
     plantestsuite("samba3.blackbox.smbclient_tarmode.SMB3", env,
                   [os.path.join(samba3srcdir, "script/tests/test_smbclient_tarmode.sh"),
                    '$SERVER', '$SERVER_IP', '$USERNAME', '$PASSWORD',
-                   '$LOCAL_PATH/tarmode', '$PREFIX', smbclient3, configuration, "-mSMB3"])
+                   '$LOCAL_PATH/tarmode/smbclient_tar', '$PREFIX', smbclient3, configuration, "-mSMB3"])
 
     # Test suite for new smbclient/tar with libarchive (GSoC 13)
     plantestsuite("samba3.blackbox.smbclient_tar.NT1", env + "_smb1_done",
                   [os.path.join(samba3srcdir, "script/tests/test_smbclient_tarmode.pl"),
-                   '-n', '$SERVER', '-i', '$SERVER_IP', '-s', 'tmp',
-                   '-u', '$USERNAME', '-p', '$PASSWORD', '-l', '$LOCAL_PATH/tarmode',
+                   '-n', '$SERVER', '-i', '$SERVER_IP', '-s', 'tarmode2',
+                   '-u', '$USERNAME', '-p', '$PASSWORD', '-l', '$LOCAL_PATH/tarmode2',
                    '-d', '$PREFIX', '-b', smbclient3,
                    '--subunit', '--', configuration, '-mNT1'])
     plantestsuite("samba3.blackbox.smbclient_tar.SMB3", env,
                   [os.path.join(samba3srcdir, "script/tests/test_smbclient_tarmode.pl"),
-                   '-n', '$SERVER', '-i', '$SERVER_IP', '-s', 'tmp',
-                   '-u', '$USERNAME', '-p', '$PASSWORD', '-l', '$LOCAL_PATH/tarmode',
+                   '-n', '$SERVER', '-i', '$SERVER_IP', '-s', 'tarmode2',
+                   '-u', '$USERNAME', '-p', '$PASSWORD', '-l', '$LOCAL_PATH/tarmode2',
                    '-d', '$PREFIX', '-b', smbclient3,
                    '--subunit', '--', configuration, '-mSMB3'])
 
@@ -1097,6 +1097,16 @@ for env in ["ad_member_idmap_rid:local", "maptoguest:local"]:
                    '$SERVER', smbclient3, smbcontrol, net, configuration])
 
 plantestsuite("samba3.blackbox.itime", "ad_dc", [os.path.join(samba3srcdir, "script/tests/test_itime.sh"), '$SERVER', '$USERNAME', '$PASSWORD', '$LOCAL_PATH', smbclient3, 'xattr'])
+
+plantestsuite("samba3.blackbox.smbclient-mget",
+              "fileserver",
+              [os.path.join(samba3srcdir, "script/tests/test_smbclient_mget.sh"),
+               smbclient3,
+               "$SERVER",
+               "tmp",
+               "$USERNAME",
+               "$PASSWORD",
+               "valid_users"])
 
 t = "readdir-timestamp"
 plantestsuite(
