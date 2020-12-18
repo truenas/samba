@@ -28,7 +28,7 @@ Merging minor upstream releases
 Importing a new upstream version can be done like this:
 
     # set target version
-    upstream_version=4.13.1
+    upstream_version=4.13.3
     # go to git repo
     cd $GIT_DIR
     # Import upstream
