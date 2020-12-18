@@ -408,6 +408,8 @@ static void standard_accept_connection(
 	talloc_free(c);
 	talloc_free(s);
 
+	force_check_log_size();
+
 	/* setup this new connection.  Cluster ID is PID based for this process model */
 	new_conn(ev, lp_ctx, sock2, cluster_id(pid, 0), private_data,
 		 process_context);
@@ -513,6 +515,8 @@ static void standard_new_task(struct tevent_context *ev,
 	 * we put the constant part last
 	 */
 	prctl_set_comment("%s[task]", service_name);
+
+	force_check_log_size();
 
 	/*
 	 * Set up the process context to be passed through to the terminate
