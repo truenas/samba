@@ -125,7 +125,8 @@ struct smblibzfshandle *get_global_smblibzfs_handle(TALLOC_CTX *mem_ctx);
 
 int get_smbzhandle(struct smblibzfshandle *smblibzfsp,
 		   TALLOC_CTX *mem_ctx, const char *path,
-		   struct smbzhandle **smbzhandle);
+		   struct smbzhandle **smbzhandle,
+		   bool resolve);
 
 /*
  * Get userspace quotas for a given path, ID, and quota type.

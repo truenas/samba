@@ -147,10 +147,6 @@ static uint64_t zfs_core_disk_free(vfs_handle_struct *handle,
 	if (res == -1) {
 		res = SMB_VFS_NEXT_DISK_FREE(handle, smb_fname, bsize, dfree, dsize);
 	}
-
-	DBG_DEBUG("bsize = %lu, dfree: %lu, dsize: %lu \n",
-		  bsize, dfree, dsize);
-
 	return res;
 }
 
