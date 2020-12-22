@@ -18,3 +18,4 @@ dynconfig-registry-alter-default-paths.patch
 s4-libnet-py-net.patch
 s3-param-pyparam-fix-dump-of-global-parameters.patch
 ctdb-tools-ctdb-add-JSON-output.patch
+s3-modules-smblibzfs-synchronize-with-FreeBSD.patch

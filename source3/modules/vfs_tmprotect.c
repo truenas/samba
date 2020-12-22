@@ -230,9 +230,9 @@ static int tmprotect_connect(struct vfs_handle_struct *handle,
 	 * having too many snapshots.
 	 */
 	if (remaining_snaps > min_snaps || (config->oldest_snap > (curtime-(retention/2)))) {
-		DBG_DEBUG("num_snaps: %d, num_delete: %d, remaining_snaps: %d, "
-			  "min snaps: %d\n", snapshots->num_entries,
-			  to_delete->num_entries, remaining_snaps, min_snaps);
+		DBG_INFO("num_snaps: %zu, num_delete: %zu, remaining_snaps: %zu, "
+			 "min snaps: %d\n", snapshots->num_entries,
+			 to_delete->num_entries, remaining_snaps, min_snaps);
 		to_delete->dataset_name = talloc_strdup(talloc_tos(), snapshots->dataset_name);
 		ret = smb_zfs_delete_snapshots(config->libzp,
 					       talloc_tos(),
