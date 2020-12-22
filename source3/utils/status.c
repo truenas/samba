@@ -615,6 +615,10 @@ static int traverse_sessionid_json(const char *key, struct sessionid *session,
 		return -1;
 	}
 
+	if (json_add_string(&jsobjint, "session_id",
+			 server_id_str_buf(session->pid, &tmp)) < 0) {
+		goto failure;
+	}
 	if (json_add_int(&jsobjint, "uid",
 			 (unsigned int)session->uid) < 0) {
 		goto failure;
@@ -769,7 +773,7 @@ static int traverse_sessionid_json(const char *key, struct sessionid *session,
 	if (json_add_string(&jsobjint, "signing", signing) < 0) {
 		goto failure;
 	}
-	if (json_add_object(&jsobj, server_id_str_buf(session->pid, &tmp), &jsobjint) < 0) {
+	if (json_add_object(&jsobj, NULL, &jsobjint) < 0) {
 		goto failure;
 	}
 
@@ -1543,7 +1547,7 @@ int main(int argc, const char *argv[])
 		}
 		#ifdef HAVE_JANSSON
 		else {
-			struct json_object sessions = json_new_object();
+			struct json_object sessions = json_new_array();
 			if (json_is_invalid(&sessions)) {
 				fprintf(stderr, "Failed to create JSON object [sessions]\n");
 				ret = -1;
