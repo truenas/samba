@@ -1742,6 +1742,7 @@ int main(int argc, const char *argv[])
 	}
 
 done:
+	cmdline_messaging_context_free();
 	poptFreeContext(pc);
 	#ifdef HAVE_JANSSON
 	if (json_output && !profile_only) {
