@@ -1,9 +1,14 @@
+samba (2:4.13.3+ix-3) unstable; urgency=high
+
+  * Fix leak of lockdirs in various s3 utils. 
+
+ -- Andrew Walker <awalker@ixsystems.com>  Thu, 24 Dec 2020 17:00:00 +0000
+
 samba (2:4.13.3+ix-2) unstable; urgency=high
 
   * Synchronize smblibzfs work with FreeBSD port
 
  -- Andrew Walker <awalker@ixsystems.com>  Tue, 22 Dec 2020 17:00:00 +0000
-
 
 samba (2:4.13.3+ix-1) unstable; urgency=high
 

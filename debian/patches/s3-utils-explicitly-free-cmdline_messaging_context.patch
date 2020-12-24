@@ -1,0 +1,67 @@
+From 3e7d7279c417571c9026c04dfcf4dbe2ef4d60c2 Mon Sep 17 00:00:00 2001
+From: Andrew Walker <awalker@ixsystems.com>
+Date: Thu, 24 Dec 2020 06:54:02 -0500
+Subject: [PATCH] s3:utils - explicitly free cmdline_messaging_context
+
+Some CLI utilies do not talloc_free() their messaging contexts
+which results in extra lock entries being left behind in the
+msg.lock directory. Ensure that the cmdline_messaging_context_free()
+is explicitly called before exiting these utilities.
+---
+ source3/utils/mdfind.c     | 1 +
+ source3/utils/net.c        | 1 +
+ source3/utils/smbcontrol.c | 1 +
+ source3/utils/status.c     | 1 +
+ 4 files changed, 4 insertions(+)
+
+diff --git a/source3/utils/mdfind.c b/source3/utils/mdfind.c
+index 2f952c29b4f..e05eb4657bb 100644
+--- a/source3/utils/mdfind.c
++++ b/source3/utils/mdfind.c
+@@ -259,6 +259,7 @@ int main(int argc, char **argv)
+ 		goto fail;
+ 	}
+ 
++	cmdline_messaging_context_free();
+ 	TALLOC_FREE(frame);
+ 	poptFreeContext(pc);
+ 	return 0;
+diff --git a/source3/utils/net.c b/source3/utils/net.c
+index 683b46794e4..a553603f33e 100644
+--- a/source3/utils/net.c
++++ b/source3/utils/net.c
+@@ -1424,6 +1424,7 @@ static void get_credentials_file(struct net_context *c,
+ 
+ 	poptFreeContext(pc);
+ 
++	cmdline_messaging_context_free();
+ 	TALLOC_FREE(frame);
+ 	return rc;
+ }
+diff --git a/source3/utils/smbcontrol.c b/source3/utils/smbcontrol.c
+index 6836b3ad7db..13c5035fa1a 100644
+--- a/source3/utils/smbcontrol.c
++++ b/source3/utils/smbcontrol.c
+@@ -1774,6 +1774,7 @@ int main(int argc, const char **argv)
+ 
+ 	ret = !do_command(evt_ctx, msg_ctx, argc, argv);
+ 
++	cmdline_messaging_context_free();
+ 	poptFreeContext(pc);
+ 	TALLOC_FREE(frame);
+ 	return ret;
+diff --git a/source3/utils/status.c b/source3/utils/status.c
+index a7b5c733d1b..15a05244581 100644
+--- a/source3/utils/status.c
++++ b/source3/utils/status.c
+@@ -1742,6 +1742,7 @@ int main(int argc, const char *argv[])
+ 	}
+ 
+ done:
++	cmdline_messaging_context_free();
+ 	poptFreeContext(pc);
+ 	#ifdef HAVE_JANSSON
+ 	if (json_output && !profile_only) {
+-- 
+2.28.0
+
