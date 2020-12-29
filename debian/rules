@@ -51,8 +51,8 @@ conf_args = \
 		--libdir=/usr/lib/$(DEB_HOST_MULTIARCH) \
 		--with-modulesdir=/usr/lib/$(DEB_HOST_MULTIARCH)/samba \
 		--datadir=/usr/share \
-		--with-lockdir=/var/lock/samba4 \
-		--with-cachedir=/var/run/samba \
+		--with-lockdir=/var/run/samba-lock \
+		--with-cachedir=/var/run/samba-cache \
 		--with-libzfs \
                 --with-profiling-data \
 		--disable-avahi \
