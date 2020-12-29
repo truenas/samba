@@ -1,3 +1,9 @@
+samba (2:4.13.3+ix-4) unstable; urgency=high
+
+  * Add session-id optimization to smbstatus. 
+
+ -- Andrew Walker <awalker@ixsystems.com>  Tue, 29 Dec 2020 17:00:00 +0000
+
 samba (2:4.13.3+ix-3) unstable; urgency=high
 
   * Fix leak of lockdirs in various s3 utils. 
