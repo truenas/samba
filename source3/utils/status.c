@@ -75,6 +75,7 @@ static bool csv_output = false;
 static bool resolve_uids = false;
 
 const char *username = NULL;
+const char *session_id = NULL;
 
 static const char *session_dialect_str(uint16_t dialect);
 
@@ -197,6 +198,11 @@ static bool Ucrit_addPid( struct server_id pid )
 }
 
 #ifdef HAVE_JANSSON
+struct print_share_mode_state {
+	char *session_id;
+	struct json_object jsobj;
+};
+
 static int print_share_mode_json(struct file_id fid,
 				 const struct share_mode_data *d,
 				 const struct share_mode_entry *e,
@@ -206,9 +212,11 @@ static int print_share_mode_json(struct file_id fid,
 	if (tmp_ctx == NULL) {
 		return -1;
 	}
+	struct print_share_mode_state *state = NULL;
 	struct json_object jsobj;
 	struct json_object jsobjint;
-	jsobj = *(struct json_object *)private_data;
+	state = talloc_get_type_abort(private_data, struct print_share_mode_state);
+	jsobj = state->jsobj;
 	jsobjint = json_new_object();
 	static int count;
 	const char *denymode = NULL;
@@ -229,6 +237,16 @@ static int print_share_mode_json(struct file_id fid,
 		json_free(&jsobjint);
 		return 0;
 	}
+
+	if (state->session_id) {
+		struct server_id_buf tmp;
+		char *s_id = server_id_str_buf(e->pid, &tmp);
+		if (strcmp(s_id, state->session_id) != 0) {
+			TALLOC_FREE(tmp_ctx);
+			json_free(&jsobjint);
+			return 0;
+		}
+	}
 	if (Ucrit_checkPid(e->pid)) {
 		struct server_id_buf tmp;
 		uint denymode_int = 0;
@@ -238,7 +256,7 @@ static int print_share_mode_json(struct file_id fid,
 		if (json_is_invalid(&jsobjint)) {
 			return -1;
 		}
-		if (json_add_string(&jsobjint, "pid",
+		if (json_add_string(&jsobjint, "session_id",
 				    server_id_str_buf(e->pid, &tmp)) < 0) {
 			goto failure;
 		}
@@ -270,7 +288,7 @@ static int print_share_mode_json(struct file_id fid,
 		}
 		access_mask = talloc_asprintf(tmp_ctx, "0x%08x",
 					      (unsigned int)e->access_mask);
-		if (json_add_string(&amask, "hex", access_mask) < 0) {
+		if (json_add_string(&amask, "raw", access_mask) < 0) {
 			goto failure;
 		}
 		TALLOC_FREE(access_mask);
@@ -1291,6 +1309,14 @@ int main(int argc, const char *argv[])
 			.descrip    = "Switch to user",
 		},
 		{
+			.longName   = "session-id",
+			.shortName  = 's',
+			.argInfo    = POPT_ARG_STRING,
+			.arg        = &session_id,
+			.val        = 's',
+			.descrip    = "Restrict to session id",
+		},
+		{
 			.longName   = "brief",
 			.shortName  = 'b',
 			.argInfo    = POPT_ARG_NONE,
@@ -1454,6 +1480,8 @@ int main(int argc, const char *argv[])
 			break;
 		case 'u':
 			Ucrit_addUid(nametouid(poptGetOptArg(pc)));
+			break;
+		case 's':
 			break;
 		case 'D':
 		case 'P':
@@ -1655,19 +1683,24 @@ int main(int argc, const char *argv[])
 		#if HAVE_JANSSON
 		else {
 			struct json_object locks_array = json_new_array();
+			struct print_share_mode_state *state = NULL;
 			if (json_is_invalid(&locks_array)) {
 				locking_end();
 				fprintf(stderr, "Failed to create JSON array [locks_array]\n");
 				ret = 1;
 				goto done;
 			}
-			result = share_entry_forall(print_share_mode_json, &locks_array);
+			state = talloc_zero(NULL, struct print_share_mode_state);
+			state->jsobj = locks_array;
+			state->session_id = session_id;
+			result = share_entry_forall(print_share_mode_json, state);
 			if (json_add_object(&jsobj, "locked_files", &locks_array) < 0) {
 				locking_end();
 				fprintf(stderr, "Failed to add JSON array [locks_array]\n");
 				ret = 1;
 				goto done;
 			}
+			TALLOC_FREE(state);
 		}
 		#endif /* [HAVE_JANSSON] */
 
