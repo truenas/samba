@@ -20,3 +20,4 @@ s3-param-pyparam-fix-dump-of-global-parameters.patch
 ctdb-tools-ctdb-add-JSON-output.patch
 s3-modules-smblibzfs-synchronize-with-FreeBSD.patch
 s3-utils-explicitly-free-cmdline_messaging_context.patch
+s3-utils-add-session-id-filter.patch
