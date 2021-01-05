@@ -790,6 +790,71 @@ send:
 	return True;
 }
 
+struct file_close_state {
+	struct messaging_context *msg_ctx;
+	uint32_t fid;
+	struct server_id pid;
+	bool ret;
+};
+
+static int file_close_fn(struct file_id id,
+			 const struct share_mode_data *d,
+			 const struct share_mode_entry *e,
+			 void *private_data)
+{
+	char msg[MSG_SMB_SHARE_MODE_ENTRY_SIZE];
+	struct file_close_state *state = NULL;
+	uint32_t fid;
+	state = talloc_get_type_abort(private_data, struct file_close_state);
+	fid = (((uint32_t)(procid_to_pid(&e->pid))<<16) | e->share_file_id);
+
+	if (fid != state->fid) {
+		return 0; /* This is not the file you are looking for */
+	}
+
+	if (!process->exists(e->pid)) {
+		return 0;
+	}
+
+	if (!server_id_equal(&state->pid, &e->pid)) {
+		return 0;
+	}
+
+	share_mode_entry_to_message(msg, &id, e);
+	state->ret = messaging_send_buf(state->msg_ctx,
+					state->pid,
+					MSG_SMB_CLOSE_FILE,
+					(uint8_t *)msg,
+					sizeof(msg));
+	return 0;
+}
+
+/* Close a file */
+
+static bool do_closefile(struct tevent_context *ev_ctx,
+			 struct messaging_context *msg_ctx,
+			 const struct server_id pid,
+			 const int argc, const char **argv)
+{
+	struct file_close_state *state = NULL;
+	uint32_t fid;
+	if (argc != 2) {
+		fprintf(stderr, "Usage: smbcontrol <dest> close-file "
+			"<file-id>\n");
+		return False;
+	}
+	fid = atoi(argv[1]);
+	state = (struct file_close_state) {
+		.msg_ctx = msg_ctx,
+		.pid = pid,
+		.fid = fid,
+		.ret = false
+	};
+
+	share_entry_forall(file_close_fn, state);
+	return state->ret;
+}
+
 /* Close a share */
 
 static bool do_closeshare(struct tevent_context *ev_ctx,
@@ -1456,6 +1521,11 @@ static const struct {
 		.name = "close-share",
 		.fn   = do_closeshare,
 		.help = "Forcibly disconnect a share",
+	},
+	{
+		.name = "close-file",
+		.fn   = do_closefile,
+		.help = "Forcibly close file identified by file-id",
 	},
 	{
 		.name = "close-denied-share",

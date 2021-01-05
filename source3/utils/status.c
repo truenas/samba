@@ -249,15 +249,19 @@ static int print_share_mode_json(struct file_id fid,
 	}
 	if (Ucrit_checkPid(e->pid)) {
 		struct server_id_buf tmp;
+		uint32_t fid;
 		uint denymode_int = 0;
 		denymode_int = map_share_mode_to_deny_mode(e->share_access,
 							   e->private_options);
-
+		fid = (((uint32_t)(procid_to_pid(&e->pid))<<16) | e->share_file_id);
 		if (json_is_invalid(&jsobjint)) {
 			return -1;
 		}
 		if (json_add_string(&jsobjint, "session_id",
 				    server_id_str_buf(e->pid, &tmp)) < 0) {
+			goto failure;
+		}
+		if (json_add_int(&jsobjint, "file_id", fid) < 0) {
 			goto failure;
 		}
 		if (resolve_uids && (json_add_string(&jsobjint, "username",
