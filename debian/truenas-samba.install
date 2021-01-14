@@ -399,7 +399,7 @@ usr/lib/*/libndr.so
 usr/lib/*/libsamba-passdb.so
 usr/lib/*/libsamba-errors.so
 usr/lib/*/libndr-standard.so
-usr/lib/*/libsamba-policy.cpython-38-x86-64-linux-gnu.so
+usr/lib/*/libsamba-policy.cpython-39-x86-64-linux-gnu.so
 usr/lib/*/libsmbldap.so
 usr/lib/*/pkgconfig/*
 
