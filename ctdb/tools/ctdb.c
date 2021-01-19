@@ -1639,7 +1639,7 @@ static bool print_ip_json(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 	if (json_is_invalid(&jsobj)) {
 		return false;
 	}
-	jsnodes = json_get_array(&jsobj, "nodes");
+	jsnodes = json_get_array(&jsobj, "public_ips");
 	if (json_is_invalid(&jsnodes)) {
 		json_free(&jsobj);
 		return false;
@@ -1653,7 +1653,7 @@ static bool print_ip_json(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 			goto failure;
 		}
 		a = ctdb_sock_addr_to_string(mem_ctx, &ips->ip[i].addr, false);
-		ret = json_add_string(&jsint, "public_ip", a);
+		ret = json_add_string(&jsint, "address", a);
 		if (ret != 0) {
 			json_free(&jsint);
 			goto failure;
@@ -1725,7 +1725,7 @@ static bool print_ip_json(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 		}
 		TALLOC_FREE(a);
 	}
-	ret = json_add_object(&jsobj, "nodes", &jsnodes);
+	ret = json_add_object(&jsobj, "public_ips", &jsnodes);
 	if (ret != 0) {
 		goto failure;
 	}
