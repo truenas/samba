@@ -1625,7 +1625,122 @@ static int ctdb_public_ip_cmp(const void *a, const void *b)
 	return ctdb_sock_addr_cmp(&ip_a->addr, &ip_b->addr);
 }
 
-static void print_ip(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+static bool print_ip_json(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+		     struct ctdb_public_ip_list *ips,
+		     struct ctdb_public_ip_info **ipinfo,
+		     bool all_nodes)
+{
+	unsigned int i, j;
+	struct json_object jsobj, jsnodes;
+	int ret;
+	char *json_output = NULL;
+
+	jsobj = json_new_object();
+	if (json_is_invalid(&jsobj)) {
+		return false;
+	}
+	jsnodes = json_get_array(&jsobj, "nodes");
+	if (json_is_invalid(&jsnodes)) {
+		json_free(&jsobj);
+		return false;
+	}
+
+	for (i = 0; i < ips->num; i++) {
+		char *a = NULL;
+		struct json_object jsint, ifaces;
+		jsint = json_new_object();
+		if (json_is_invalid(&jsint)) {
+			goto failure;
+		}
+		a = ctdb_sock_addr_to_string(mem_ctx, &ips->ip[i].addr, false);
+		ret = json_add_string(&jsint, "public_ip", a);
+		if (ret != 0) {
+			json_free(&jsint);
+			goto failure;
+		}
+		ret = json_add_int(&jsint, "pnn", ips->ip[i].pnn);
+		if (ret != 0) {
+			json_free(&jsint);
+			goto failure;
+		}
+
+		ifaces = json_get_array(&jsint, "interfaces");
+		if (json_is_invalid(&ifaces)) {
+			json_free(&jsint);
+			goto failure;
+		}
+
+		if (ipinfo[i] == NULL) {
+			goto skip_ipinfo;
+		}
+
+		for (j=0; j<ipinfo[i]->ifaces->num; j++) {
+			struct ctdb_iface *iface;
+			struct json_object to_add;
+			bool active, available;
+			to_add = json_new_object();
+			if (json_is_invalid(&to_add)) {
+				json_free(&jsint);
+				goto failure;
+			}
+
+			iface = &ipinfo[i]->ifaces->iface[j];
+			active = ipinfo[i]->active_idx == j ? true : false;
+			available = iface->link_state == 0 ? false : true;
+
+			ret = json_add_string(&to_add, "name", iface->name);
+			if (ret != 0) {
+				json_free(&jsint);
+				json_free(&to_add);
+				goto failure;
+			}
+			ret = json_add_bool(&to_add, "active", active);
+			if (ret != 0 ) {
+				json_free(&jsint);
+				json_free(&to_add);
+				goto failure;
+			}
+
+			ret = json_add_bool(&to_add, "available", available);
+			if (ret != 0) {
+				json_free(&jsint);
+				json_free(&to_add);
+				goto failure;
+			}
+			ret = json_add_object(&ifaces, NULL, &to_add);
+			if (ret != 0) {
+				json_free(&jsint);
+				goto failure;
+			}
+		}
+	skip_ipinfo:
+		ret = json_add_object(&jsint, "interfaces", &ifaces);
+		if (ret != 0) {
+			goto failure;
+		}
+
+		ret = json_add_object(&jsnodes, NULL, &jsint);
+		if (ret != 0) {
+			goto failure;
+		}
+		TALLOC_FREE(a);
+	}
+	ret = json_add_object(&jsobj, "nodes", &jsnodes);
+	if (ret != 0) {
+		goto failure;
+	}
+	json_output = json_to_string(mem_ctx, &jsobj);
+	printf("%s\n", json_output);
+	TALLOC_FREE(json_output);
+	return true;
+failure:
+	json_free(&jsnodes);
+	json_free(&jsobj);
+	return false;
+}
+
+
+static bool print_ip(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 		     struct ctdb_public_ip_list *ips,
 		     struct ctdb_public_ip_info **ipinfo,
 		     bool all_nodes)
@@ -1724,6 +1839,7 @@ static void print_ip(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 			       avail ? avail : "", conf ? conf : "");
 		}
 	}
+	return true;
 }
 
 static int collect_ips(uint8_t *keybuf, size_t keylen, uint8_t *databuf,
@@ -1858,6 +1974,7 @@ static int control_ip(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 	unsigned int i;
 	int ret;
 	bool do_all = false;
+	bool ok;
 
 	if (argc > 1) {
 		usage("ip");
@@ -1910,8 +2027,14 @@ static int control_ip(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 		}
 	}
 
-	print_ip(mem_ctx, ctdb, ips, ipinfo, do_all);
-	return 0;
+	switch (options.format) {
+	case F_JSON:
+		ok = print_ip_json(mem_ctx, ctdb, ips, ipinfo, do_all);
+		break;
+	default:
+		ok = print_ip(mem_ctx, ctdb, ips, ipinfo, do_all);
+	}
+	return ok ? 0 : 1;
 }
 
 static int control_ipinfo(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
@@ -3928,7 +4051,7 @@ static int control_listnodes(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 		ok = print_nodelist(mem_ctx, nodemap);
 	}
 
-	return ok;
+	return ok ? 0 : 1;
 }
 
 static bool nodemap_identical(struct ctdb_node_map *nodemap1,
