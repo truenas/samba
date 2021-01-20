@@ -3979,9 +3979,12 @@ static bool print_nodelist_json(TALLOC_CTX *mem_ctx, struct ctdb_node_map *nodem
 	for (i=0; i<nodemap->num; i++) {
 		struct json_object jsnode;
 		char *addr = NULL;
-		if (nodemap->node[i].flags & NODE_FLAGS_DELETED) {
+		bool enabled;
+		if ((nodemap->node[i].flags & NODE_FLAGS_DELETED) &&
+		    (options.verbose == 0)) {
 			continue;
 		}
+		enabled = (nodemap->node[i].flags & NODE_FLAGS_DELETED) ? false : true;
 		jsnode = json_new_object();
 		if (json_is_invalid(&jsnode)) {
 			return false;
@@ -4002,7 +4005,13 @@ static bool print_nodelist_json(TALLOC_CTX *mem_ctx, struct ctdb_node_map *nodem
 			goto failure;
 		}
 		TALLOC_FREE(addr);
-
+		if (options.verbose == 1) {
+			rv = json_add_bool(&jsnode, "enabled", enabled);
+			if (rv != 0) {
+				json_free(&jsnode);
+				goto failure;
+			}
+		}
 		rv = json_add_object(&jsnodelist, NULL, &jsnode);
 		if (rv != 0) {
 			json_free(&jsnode);
