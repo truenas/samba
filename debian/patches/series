@@ -22,3 +22,4 @@ s3-modules-smblibzfs-synchronize-with-FreeBSD.patch
 s3-utils-explicitly-free-cmdline_messaging_context.patch
 s3-utils-add-session-id-filter.patch
 ctdb-add-json-output-for-ip.patch
+ctdb-tools-ctdb-add-option-to-show-deleted-nodes.patch

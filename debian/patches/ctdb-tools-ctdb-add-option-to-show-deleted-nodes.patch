@@ -1,0 +1,48 @@
+From 94179ed20d4321df374fadc8d448af00e469012c Mon Sep 17 00:00:00 2001
+From: Andrew Walker <awalker@ixsystems.com>
+Date: Wed, 20 Jan 2021 16:13:58 -0500
+Subject: [PATCH] ctdb:tools:ctdb - add option to show deleted nodes
+
+When verbose output is selected, include deleted (disabled) nodes
+in ctdb nodelist json output. In this case add additional key
+"enabled" to differentiate between enabled and disabled nodes.
+---
+ ctdb/tools/ctdb.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/ctdb/tools/ctdb.c b/ctdb/tools/ctdb.c
+index 9e885af42f7..53c6223bbd6 100644
+--- a/ctdb/tools/ctdb.c
++++ b/ctdb/tools/ctdb.c
+@@ -3979,9 +3979,12 @@ static bool print_nodelist_json(TALLOC_CTX *mem_ctx, struct ctdb_node_map *nodem
+ 	for (i=0; i<nodemap->num; i++) {
+ 		struct json_object jsnode;
+ 		char *addr = NULL;
+-		if (nodemap->node[i].flags & NODE_FLAGS_DELETED) {
++		bool enabled;
++		if ((nodemap->node[i].flags & NODE_FLAGS_DELETED) &&
++		    (options.verbose == 0)) {
+ 			continue;
+ 		}
++		enabled = (nodemap->node[i].flags & NODE_FLAGS_DELETED) ? false : true;
+ 		jsnode = json_new_object();
+ 		if (json_is_invalid(&jsnode)) {
+ 			return false;
+@@ -4002,7 +4005,13 @@ static bool print_nodelist_json(TALLOC_CTX *mem_ctx, struct ctdb_node_map *nodem
+ 			goto failure;
+ 		}
+ 		TALLOC_FREE(addr);
+-
++		if (options.verbose == 1) {
++			rv = json_add_bool(&jsnode, "enabled", enabled);
++			if (rv != 0) {
++				json_free(&jsnode);
++				goto failure;
++			}
++		}
+ 		rv = json_add_object(&jsnodelist, NULL, &jsnode);
+ 		if (rv != 0) {
+ 			json_free(&jsnode);
+-- 
+2.28.0
+
