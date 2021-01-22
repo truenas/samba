@@ -1,0 +1,12 @@
+#XXX: samba-vfs-modules.lintian-overrides
+# False positives, see #896012
+samba: library-not-linked-against-libc *
+# the samba-libs package contains a number of libraries
+# it doesn't make sense to have them in separate packages, as this would
+# result in circular dependencies
+samba: package-name-doesnt-match-sonames libdcerpc-binding0 libdcerpc-samr0 libdcerpc-server-core0 libdcerpc-server0 libdcerpc0 libndr-krb5pac0 libndr-nbt0 libndr-standard0 libndr1 libnetapi0 libsamba-credentials0 libsamba-errors1 libsamba-hostconfig0 libsamba-passdb0 libsamba-policy.cpython-38-x86-64-linux-gnu0 libsamdb0 libsmbconf0 libsmbldap2 libtevent-util0 libnss-winbind2 libsmbclient0
+# Embedded Heimdal is patched
+samba: embedded-library usr/lib/*/samba/libgssapi-samba4.so.*: heimdal
+# False positives, see #896012
+samba: no-shlibs-control-file lib/libnss_winbind.so.2
+samba: binary-or-shlib-defines-rpath

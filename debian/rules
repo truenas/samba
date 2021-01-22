@@ -1,0 +1,187 @@
+#!/usr/bin/make -f
+# By Jelmer Vernooij <jelmer@samba.org>
+#
+DESTDIR = $(CURDIR)/debian/tmp
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export DEB_LDFLAGS_MAINT_APPEND = -Wl,--as-needed
+DPKG_EXPORT_BUILDFLAGS = 1
+include /usr/share/dpkg/buildflags.mk
+include /usr/share/dpkg/pkg-info.mk
+
+DEB_HOST_ARCH ?= $(shell dpkg-architecture -qDEB_HOST_ARCH)
+DEB_HOST_ARCH_OS ?= $(shell dpkg-architecture -qDEB_HOST_ARCH_OS)
+DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+DEB_HOST_ARCH_CPU ?= $(shell dpkg-architecture -qDEB_HOST_ARCH_CPU)
+
+export PYSHORT=python3
+export PYTHON=$(shell which $(PYSHORT))
+export PYTHON_CONFIG="$(PYTHON)-config"
+WAF := $(PYTHON) ./buildtools/bin/waf -v
+WAF_NO_PARALLEL := $(WAF) -j 1
+
+ifneq (,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+WAF += -j $(patsubst parallel=%,%,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+endif
+
+conf_args = \
+		--prefix=/usr \
+		--enable-fhs \
+		--sysconfdir=/etc \
+		--localstatedir=/var \
+		--libexecdir=/usr/lib/$(DEB_HOST_MULTIARCH) \
+		--with-privatedir=/var/db/system/samba4/private \
+		--with-statedir=/var/db/system/samba4 \
+		--with-smbpasswd-file=/var/db/system/samba4/private/smbpasswd \
+		--with-logfilebase=/var/log/samba4 \
+		--with-piddir=/run/samba \
+		--with-pammodulesdir=/lib/$(DEB_HOST_MULTIARCH)/security \
+		--with-pam \
+		--with-syslog \
+		--with-utmp \
+		--with-winbind \
+		--without-ad-dc \
+		--with-quotas \
+		--with-shared-modules=idmap_rid,idmap_ad,idmap_ldap,idmap_tdb2,auth_samba4,vfs_nfs4acl_xattr \
+		--with-automount \
+		--with-ldap \
+		--with-ads \
+		--with-dnsupdate \
+		--without-gpgme \
+		--libdir=/usr/lib/$(DEB_HOST_MULTIARCH) \
+		--with-modulesdir=/usr/lib/$(DEB_HOST_MULTIARCH)/samba \
+		--datadir=/usr/share \
+		--with-lockdir=/var/run/samba-lock \
+		--with-cachedir=/var/run/samba-cache \
+		--with-libzfs \
+                --with-profiling-data \
+		--disable-avahi \
+		--disable-rpath \
+		--disable-rpath-install \
+		--builtin-libraries=ccan,samba-cluster-support \
+		--minimum-library-version="$(shell ./debian/autodeps.py --minimum-library-version)" \
+		--with-cluster-support \
+		--with-socketpath=/run/ctdb/ctdbd.socket \
+		--with-logdir=/var/log/ctdb \
+		--enable-etcd-reclock \
+		--disable-cups \
+		--disable-iprint \
+                --disable-cephfs
+
+ifeq ($(DEB_HOST_ARCH_OS), linux)
+	conf_args += \
+		--with-systemd \
+		--systemd-install-services \
+		--with-systemddir=/lib/systemd/system
+else
+	conf_args += \
+		--without-systemd
+endif
+
+%:
+	dh $* --with python3
+
+override_dh_auto_configure:
+	$(WAF_NO_PARALLEL) configure $(conf_args)
+
+override_dh_auto_build:
+	DESTDIR="$(DESTDIR)" $(WAF)
+
+override_dh_auto_test:
+	# Running make test requires configuration with --enable-selftest, which
+	# we don't want to do for production systems.
+
+override_dh_auto_install:
+	DESTDIR="$(DESTDIR)" $(WAF) install
+	# get list of files in build log
+	find ${DESTDIR}
+	# Included in python-tevent
+	rm $(DESTDIR)/usr/lib/python*/*-packages/_tevent.*
+	rm $(DESTDIR)/usr/lib/python*/*-packages/tevent.py
+	# pam stuff
+	mkdir -p $(DESTDIR)/usr/share/pam-configs
+	mkdir -p $(DESTDIR)/var/db/system/samba4/private
+	install -m 0644 debian/winbind.pam-config $(DESTDIR)/usr/share/pam-configs/winbind
+	mv $(DESTDIR)/usr/lib/$(DEB_HOST_MULTIARCH)/libnss_* $(DESTDIR)/lib/$(DEB_HOST_MULTIARCH)/
+	# we don't ship the symlinks
+	rm $(DESTDIR)/lib/$(DEB_HOST_MULTIARCH)/libnss_*.so
+	#Remove unused vfstest manpage vfstest is no longer installed
+	rm $(DESTDIR)/usr/share/man/man1/vfstest.1
+	# Debian goodies
+	mkdir -p $(DESTDIR)/usr/share/samba/
+	cp debian/smb.conf* $(DESTDIR)/usr/share/samba/
+	install -m755 debian/update-apparmor-samba-profile $(DESTDIR)/usr/share/samba/update-apparmor-samba-profile
+	mkdir -p $(DESTDIR)/etc/dhcp/dhclient-enter-hooks.d
+	install -m755 debian/samba-common.dhcp $(DESTDIR)/etc/dhcp/dhclient-enter-hooks.d/samba
+	mkdir -p $(DESTDIR)/etc/ufw/applications.d
+	install -m644 debian/truenas-samba.ufw.profile $(DESTDIR)/etc/ufw/applications.d/samba
+	mkdir -p $(DESTDIR)/usr/share/apport/package-hooks
+	install -D -m 644 debian/source_samba.py $(DESTDIR)/usr/share/apport/package-hooks/source_samba.py
+	# Install other stuff not installed by "make install"
+	# This moves the dckeytab module to the samba package in order to avoid
+	# a circular dependency between python3-samba, samba and samba-common-bin
+	# use upstream version of smb.conf.5 if there is no built version
+	# this is a temporary workaround for #750593 in xsltproc
+	[ -e $(DESTDIR)/usr/share/man/man5/smb.conf.5 ] || \
+	   cp docs/manpages/smb.conf.5 $(DESTDIR)/usr/share/man/man5/smb.conf.5
+	# Tests that shouldn't be installed
+	rm -f $(DESTDIR)/usr/bin/async_connect_send_test
+ifeq ($(DEB_HOST_ARCH_OS), linux)
+	# Install systemd configs
+	mkdir -p $(DESTDIR)/lib/systemd/system/
+	install -m 0644 ctdb/config/ctdb.service $(DESTDIR)/lib/systemd/system/
+	# Services fixups
+	mv $(DESTDIR)/lib/systemd/system/nmb.service $(DESTDIR)/lib/systemd/system/nmbd.service
+	mv $(DESTDIR)/lib/systemd/system/smb.service $(DESTDIR)/lib/systemd/system/smbd.service
+	sed -i \
+	  -e 's|/etc/sysconfig/|/etc/default/|' \
+	  -e 's|nmb\.service|nmbd.service|' \
+	  -e 's|smb\.service|smbd.service|' \
+	  $(DESTDIR)/lib/systemd/system/nmbd.service \
+	  $(DESTDIR)/lib/systemd/system/smbd.service \
+	  $(DESTDIR)/lib/systemd/system/winbind.service
+endif
+	# Harmless on systems without systemd-tmpfiles, and other consumers exist
+	# such as OpenRC's opentmpfiles
+	mkdir -p $(DESTDIR)/usr/lib/tmpfiles.d
+	echo "d /run/samba 0755 root root -" > $(DESTDIR)/usr/lib/tmpfiles.d/samba.conf
+	echo "d /run/ctdb 0755 root root -" > $(DESTDIR)/usr/lib/tmpfiles.d/ctdb.conf
+
+override_dh_installdocs-arch:
+	cp ctdb/config/events/README ctdb/README.eventscripts
+	cp ctdb/config/notification.README ctdb/README.notification
+	dh_installdocs
+
+override_dh_installchangelogs:
+	dh_installchangelogs
+
+override_dh_installinit:
+ifneq (,$(filter samba, $(shell dh_listpackages)))
+	dh_installinit -ptruenas-samba --name smbd
+	dh_installinit -ptruenas-samba --name nmbd --error-handler nmbd_error_handler
+	dh_installinit -ptruenas-samba --name winbindd
+	mkdir -p $(CURDIR)/debian/ctdb/etc/init.d
+	install -m755 ctdb/config/ctdb.init $(CURDIR)/debian/ctdb/etc/init.d/ctdb
+	# Install dh scripts
+endif
+
+override_dh_installpam:
+	dh_installpam --name=samba
+
+override_dh_missing:
+	dh_missing --fail-missing
+
+override_dh_makeshlibs:
+	# create symbols and shlibs files in separate wrapper script to deal with
+	# private libraries
+	debian/make_shlibs
+
+override_dh_auto_clean:
+	-$(WAF) clean
+	find . -name "*.pyc" | xargs rm -f
+	rm -rf buildtools/bin/.waf-*
+	rm -rf bin
+	rm -f .lock-wscript
+	rm -f ctdb/README.eventscripts
+	rm -f ctdb/README.notification
+	rm -rf ctdb/doc/examples/nfs-kernel-server/
