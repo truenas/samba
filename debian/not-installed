@@ -1,0 +1,6 @@
+etc/sysconfig/samba
+usr/share/man/man7/traffic_replay.7
+usr/share/man/man7/traffic_learner.7
+usr/lib/${DEB_HOST_MULTIARCH}/*
+lib/systemd/system/samba.service
+source4/selftest/*

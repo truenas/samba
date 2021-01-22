@@ -1,0 +1,197 @@
+#
+#    Translators, if you are not familiar with the PO format, gettext
+#    documentation is worth reading, especially sections dedicated to
+#    this format, e.g. by running:
+#         info -n '(gettext)PO Files'
+#         info -n '(gettext)Header Entry'
+#
+#    Some information specific to po-debconf are available at
+#            /usr/share/doc/po-debconf/README-trans
+#         or http://www.debian.org/intl/l10n/po-debconf/README-trans
+#
+#    Developers do not need to manually edit POT or PO files.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: samba4\n"
+"Report-Msgid-Bugs-To: samba@packages.debian.org\n"
+"POT-Creation-Date: 2017-07-17 16:42+0200\n"
+"PO-Revision-Date: 2013-10-23 23:04+0900\n"
+"Last-Translator: Kenshi Muto <kmuto@debian.org>\n"
+"Language-Team: Japanese <debian-japanese@lists.debian.org>\n"
+"Language: ja\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+#. Type: title
+#. Description
+#: ../samba-common.templates:1001
+msgid "Samba server and utilities"
+msgstr "Samba サーバおよびユーティリティ"
+
+#. Type: boolean
+#. Description
+#: ../samba-common.templates:2001
+msgid "Modify smb.conf to use WINS settings from DHCP?"
+msgstr "DHCP から WINS 設定を使うよう smb.conf を変更しますか?"
+
+#. Type: boolean
+#. Description
+#: ../samba-common.templates:2001
+msgid ""
+"If your computer gets IP address information from a DHCP server on the "
+"network, the DHCP server may also provide information about WINS servers "
+"(\"NetBIOS name servers\") present on the network.  This requires a change "
+"to your smb.conf file so that DHCP-provided WINS settings will automatically "
+"be read from /var/lib/samba/dhcp.conf."
+msgstr ""
+"あなたのコンピュータがネットワーク上の DHCP サーバから IP アドレス情報を取得"
+"しているのであれば、DHCP サーバはネットワーク上にある WINS サーバ (NetBIOS "
+"ネームサーバ) についての情報を提供することもできます。DHCP で提供される WINS "
+"設定は /var/lib/samba/dhcp.conf から自動的に読み込まれるため、smb.conf ファイルを"
+"変更する必要があります。"
+
+#. Type: boolean
+#. Description
+#: ../samba-common.templates:2001
+msgid ""
+"The dhcp-client package must be installed to take advantage of this feature."
+msgstr ""
+"この機能を使うためには、dhcp-client パッケージがインストールされている必要が"
+"あります。"
+
+#. Type: boolean
+#. Description
+#: ../samba-common.templates:3001
+msgid "Configure smb.conf automatically?"
+msgstr "自動的に smb.conf を設定しますか?"
+
+#. Type: boolean
+#. Description
+#: ../samba-common.templates:3001
+msgid ""
+"The rest of the configuration of Samba deals with questions that affect "
+"parameters in /etc/samba/smb.conf, which is the file used to configure the "
+"Samba programs (nmbd and smbd). Your current smb.conf contains an \"include"
+"\" line or an option that spans multiple lines, which could confuse the "
+"automated configuration process and require you to edit your smb.conf by "
+"hand to get it working again."
+msgstr ""
+"Samba の設定の残りの部分は、Samba プログラム (nmbd および smbd) を設定するの"
+"に使うファイル /etc/samba/smb.conf にあるパラメータに影響する質問です。現在"
+"の smb.conf は、'include' 行または複数行にまたがるオプションを含んでいます。"
+"これは自動設定処理を混乱させる可能性があり、再びそれが作動するようにすべく "
+"smb.conf の手動での修正を必要とします。"
+
+#. Type: boolean
+#. Description
+#: ../samba-common.templates:3001
+msgid ""
+"If you do not choose this option, you will have to handle any configuration "
+"changes yourself, and will not be able to take advantage of periodic "
+"configuration enhancements."
+msgstr ""
+"この選択肢で「いいえ」と答えると、すべての設定の変更をあなた自身が面倒を見る"
+"必要があります。これは定期的な設定改善には向いていません。"
+
+#. Type: string
+#. Description
+#: ../samba-common.templates:4001
+msgid "Workgroup/Domain Name:"
+msgstr "ワークグループ/ドメイン名:"
+
+#. Type: string
+#. Description
+#: ../samba-common.templates:4001
+msgid ""
+"Please specify the workgroup for this system.  This setting controls which "
+"workgroup the system will appear in when used as a server, the default "
+"workgroup to be used when browsing with various frontends, and the domain "
+"name used with the \"security=domain\" setting."
+msgstr ""
+"このシステムのワークグループを指定してください。この設定は、システムがサーバ"
+"として使われるときにどのワークグループとして現れるか、いくつかのフロントエン"
+"ドでブラウジングされたときに使われるデフォルトのワークグループ、そして"
+"\"security=domain\" 設定が使われたときのドメイン名を制御します。"
+
+#~ msgid "Upgrade from Samba 3?"
+#~ msgstr "Samba 3 からアップグレードしますか?"
+
+#~ msgid ""
+#~ "It is possible to migrate the existing configuration files from Samba 3 "
+#~ "to Samba 4. This is likely to fail for complex setups, but should provide "
+#~ "a good starting point for most existing installations."
+#~ msgstr ""
+#~ "Samba 3 から Samba 4 に既存の設定ファイルを移行することが可能です。これ"
+#~ "は、複雑なセットアップでは失敗することはあるものの、大半の既存のインストー"
+#~ "ル状態にとって良い開始点を提供することになります。"
+
+#~ msgid "Server role"
+#~ msgstr "サーバロール"
+
+#~ msgid ""
+#~ "Domain controllers manage NT4-style or Active Directory domains and "
+#~ "provide services such as identity management and domain logons. Each "
+#~ "domain needs to have a at least one domain controller."
+#~ msgstr ""
+#~ "ドメインコントローラは NT4 スタイルまたは Active Directory ドメインを管理"
+#~ "し、認証管理やドメインログオンなどのサービスを提供します。各ドメインは少な"
+#~ "くとも 1 つのドメインコントローラを持つ必要があります。"
+
+#~ msgid ""
+#~ "Member servers can be part of a NT4-style or Active Directory domain but "
+#~ "do not provide any domain services. Workstations and file or print "
+#~ "servers are usually regular domain members."
+#~ msgstr ""
+#~ "メンバサーバは、NT4 スタイルまたは Active Directory ドメインの一部になるこ"
+#~ "とができますが、ドメインサービスは何も提供しません。ワークステーションおよ"
+#~ "びファイル/プリントサーバは通常、普通のドメインメンバです。"
+
+#~ msgid ""
+#~ "A standalone server can not be used in a domain and only supports file "
+#~ "sharing and Windows for Workgroups-style logins."
+#~ msgstr ""
+#~ "スタンドアロンサーバは、ドメインでは利用できず、ファイル共有および "
+#~ "Windows for Workgroups スタイルのログインのみをサポートします。"
+
+#~ msgid ""
+#~ "If no server role is specified, the Samba server will not be provisioned, "
+#~ "so this can be done manually by the user."
+#~ msgstr ""
+#~ "サーバロールが指定されない場合、Samba サーバは供給されず、ユーザが手動でこ"
+#~ "れを行うことになります。"
+
+#~ msgid "Realm name:"
+#~ msgstr "レルム名:"
+
+#~ msgid ""
+#~ "Please specify the Kerberos realm for the domain that this domain "
+#~ "controller controls."
+#~ msgstr ""
+#~ "このドメインコントローラが制御するドメインの Kerberos レルムを指定してくだ"
+#~ "さい。"
+
+#~ msgid "Usually this is the a capitalized version of your DNS hostname."
+#~ msgstr "通常これは、あなたの DNS ホスト名の大文字版です。"
+
+#~ msgid "New password for the Samba \"administrator\" user:"
+#~ msgstr "Samba の \"administrator\" ユーザの新しいパスワード:"
+
+#~ msgid "If this field is left blank, a random password will be generated."
+#~ msgstr "この欄を空のままにすると、ランダムなパスワードが生成されます。"
+
+#~ msgid "A password can be set later by running, as root:"
+#~ msgstr "root で次のように実行することで、パスワードを後から設定できます:"
+
+#~ msgid "Repeat password for the Samba \"administrator\" user:"
+#~ msgstr "Samba の \"administrator\" ユーザのパスワードの繰り返し:"
+
+#~ msgid "Password input error"
+#~ msgstr "パスワード入力エラー"
+
+#~ msgid "The two passwords you entered were not the same. Please try again."
+#~ msgstr "入力した 2 つのパスワードが一致しません。再度試してください。"
+
+#~ msgid " $ samba-tool user setpassword administrator"
+#~ msgstr " $ samba-tool user setpassword administrator"
