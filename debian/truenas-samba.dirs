@@ -1,0 +1,26 @@
+etc/apparmor.d/samba
+usr/bin
+usr/sbin
+var/lib/samba/printers/COLOR
+var/lib/samba/printers/IA64
+var/lib/samba/printers/W32ALPHA
+var/lib/samba/printers/W32MIPS
+var/lib/samba/printers/W32PPC
+var/lib/samba/printers/W32X86
+var/lib/samba/printers/WIN40
+var/lib/samba/printers/x64
+var/spool/samba
+var/log/ctdb
+var/lib/ctdb
+var/lib/ctdb/persistent
+var/lib/ctdb/state
+var/lib/ctdb/volatile
+#XXX: samba-common-bin.dirs
+etc/samba/tls
+var/cache/samba
+#XXX: samba-common.dirs
+etc/samba
+var/cache/samba
+var/lib/samba
+var/lib/samba/private
+var/log/samba

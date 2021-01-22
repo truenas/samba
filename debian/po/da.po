@@ -1,0 +1,198 @@
+# Danish translation samba4.
+# Copyright (C) 2013 samba4 & nedenstående oversættere.
+# This file is distributed under the same license as the samba4 package.
+# Claus Hindsgaul <claus_h@image.dk>, 2004.
+# Claus Hindsgaul <claus.hindsgaul@gmail.com>, 2006, 2007.
+# Joe Hansen <joedalton2@yahoo.dk>, 2010, 2012, 2013.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: samba4\n"
+"Report-Msgid-Bugs-To: samba@packages.debian.org\n"
+"POT-Creation-Date: 2017-07-17 16:42+0200\n"
+"PO-Revision-Date: 2013-10-26 19:21+0100\n"
+"Last-Translator: Joe Hansen <joedalton2@yahoo.dk>\n"
+"Language-Team: Danish <debian-l10n-danish@lists.debian.org>\n"
+"Language: da\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+#. Type: title
+#. Description
+#: ../samba-common.templates:1001
+msgid "Samba server and utilities"
+msgstr "Sambaserver og -redskaber"
+
+#. Type: boolean
+#. Description
+#: ../samba-common.templates:2001
+msgid "Modify smb.conf to use WINS settings from DHCP?"
+msgstr "Ret smb.conf, så den benytter WINS-indstillinger fra DHCP?"
+
+#. Type: boolean
+#. Description
+#: ../samba-common.templates:2001
+msgid ""
+"If your computer gets IP address information from a DHCP server on the "
+"network, the DHCP server may also provide information about WINS servers "
+"(\"NetBIOS name servers\") present on the network.  This requires a change "
+"to your smb.conf file so that DHCP-provided WINS settings will automatically "
+"be read from /var/lib/samba/dhcp.conf."
+msgstr ""
+"Hvis din computer får IP-adresseoplysninger fra en DHCP-server på netværket, "
+"kan DHCP-serveren også give oplysninger om WINS-servere (»NetBIOS "
+"navneservere«) på netværket. Dette kræver en ændring i din smb.conf-fil, så "
+"WINS-indstillingerne fra DHCP-serveren automatisk indlæses fra /var/lib/samba"
+"/dhcp.conf."
+
+#. Type: boolean
+#. Description
+#: ../samba-common.templates:2001
+msgid ""
+"The dhcp-client package must be installed to take advantage of this feature."
+msgstr ""
+"Pakken dhcp-client skal være installeret, for at kunne udnytte denne "
+"funktion."
+
+#. Type: boolean
+#. Description
+#: ../samba-common.templates:3001
+msgid "Configure smb.conf automatically?"
+msgstr "Sæt smb.conf op automatisk?"
+
+#. Type: boolean
+#. Description
+#: ../samba-common.templates:3001
+msgid ""
+"The rest of the configuration of Samba deals with questions that affect "
+"parameters in /etc/samba/smb.conf, which is the file used to configure the "
+"Samba programs (nmbd and smbd). Your current smb.conf contains an \"include"
+"\" line or an option that spans multiple lines, which could confuse the "
+"automated configuration process and require you to edit your smb.conf by "
+"hand to get it working again."
+msgstr ""
+"Resten af Samba-opsætningen drejer sig om spørgsmål, der vedrører "
+"indstillingerne i filen /etc/samba/smb.conf, som benyttes til at sætte Samba-"
+"programmerne (nmbd og smbd) op. Din nuværende smb.conf indeholder en "
+"'include'-linje eller en indstilling, der fylder flere linjer, hvilket kan "
+"forvirre den automatiske opsætning, og kræver at du redigerer din smb.conf "
+"selv for at få den til at fungere igen."
+
+#. Type: boolean
+#. Description
+#: ../samba-common.templates:3001
+msgid ""
+"If you do not choose this option, you will have to handle any configuration "
+"changes yourself, and will not be able to take advantage of periodic "
+"configuration enhancements."
+msgstr ""
+"Hvis du ikke vælger denne indstilling, må du selv håndtere ændringer i "
+"opsætningen, og vil ikke kunne drage nytte af de løbende forbedringer i "
+"opsætningen."
+
+#. Type: string
+#. Description
+#: ../samba-common.templates:4001
+msgid "Workgroup/Domain Name:"
+msgstr "Arbejdsgruppe/domænenavn:"
+
+#. Type: string
+#. Description
+#: ../samba-common.templates:4001
+msgid ""
+"Please specify the workgroup for this system.  This setting controls which "
+"workgroup the system will appear in when used as a server, the default "
+"workgroup to be used when browsing with various frontends, and the domain "
+"name used with the \"security=domain\" setting."
+msgstr ""
+"Angiv venligst arbejdsgruppen for dette system. Denne indstilling kontroller "
+"hvilken arbejdsgruppe systemet vil fremgå i, når den bruges som en server, "
+"standardarbejdsgruppen der bruges når der browses med forskellige "
+"grænseflader, og domænenavnet brugt med indstillingen »security=domain«."
+
+#~ msgid "Upgrade from Samba 3?"
+#~ msgstr "Opgradere fra Samba 3?"
+
+#~ msgid ""
+#~ "It is possible to migrate the existing configuration files from Samba 3 "
+#~ "to Samba 4. This is likely to fail for complex setups, but should provide "
+#~ "a good starting point for most existing installations."
+#~ msgstr ""
+#~ "Det er muligt at migrere de eksisterende konfigurationsfiler fra Samba 3 "
+#~ "til Samba 4. Det er sandsynligt, at det vil mislykkes for komplekse "
+#~ "opsætninger, men bør tilbyde et godt udgangspunkt for de fleste "
+#~ "eksisterende installationer."
+
+#~ msgid "Server role"
+#~ msgstr "Serverrolle"
+
+#~ msgid ""
+#~ "Domain controllers manage NT4-style or Active Directory domains and "
+#~ "provide services such as identity management and domain logons. Each "
+#~ "domain needs to have a at least one domain controller."
+#~ msgstr ""
+#~ "Domænecontrollere håndterer NT4-lignende domæner eller Active Directory-"
+#~ "domæner og tilbyder tjenester såsom identitetshåndtering og domænelogind. "
+#~ "Hvert domæne kræver mindst en domænecontroller."
+
+#~ msgid ""
+#~ "Member servers can be part of a NT4-style or Active Directory domain but "
+#~ "do not provide any domain services. Workstations and file or print "
+#~ "servers are usually regular domain members."
+#~ msgstr ""
+#~ "Medlemsservere kan være en del af et NT4-lignende domæne eller Active "
+#~ "Directory-domæne men tilbyder ikke nogen domænetjenester. "
+#~ "Arbejdsstationer og fil- eller udskrivningsservere er normalt "
+#~ "standarddomænemedlemmer."
+
+#~ msgid ""
+#~ "A standalone server can not be used in a domain and only supports file "
+#~ "sharing and Windows for Workgroups-style logins."
+#~ msgstr ""
+#~ "En uafhængig server kan ikke bruges i et domæne og understøtter kun "
+#~ "fildeling og Windows for Workgroups-lignende logind."
+
+#~ msgid ""
+#~ "If no server role is specified, the Samba server will not be provisioned, "
+#~ "so this can be done manually by the user."
+#~ msgstr ""
+#~ "Hvis ingen serverrolle er angivet, så vil Sambaserveren blive klargjort, "
+#~ "så dette kan gøres manuelt af brugeren."
+
+#~ msgid "Realm name:"
+#~ msgstr "Områdenavn (realm):"
+
+#~ msgid ""
+#~ "Please specify the Kerberos realm for the domain that this domain "
+#~ "controller controls."
+#~ msgstr ""
+#~ "Angiv venligst Kerberosområdet (realm) for domænet som denne "
+#~ "domænecontroller kontrollerer."
+
+#~ msgid "Usually this is the a capitalized version of your DNS hostname."
+#~ msgstr ""
+#~ "Normalt er dette en version skrevet med stort bogstav for dit DNS-"
+#~ "værtsnavn."
+
+#~ msgid "New password for the Samba \"administrator\" user:"
+#~ msgstr "Ny adgangskode for Sambas »administratorbruger«:"
+
+#~ msgid "If this field is left blank, a random password will be generated."
+#~ msgstr ""
+#~ "Hvis feltet efterlades tomt vil en vilkårlig adgangskode blive oprettet."
+
+#~ msgid "A password can be set later by running, as root:"
+#~ msgstr "En adgangskode kan angives senere ved at køre, som root:"
+
+#~ msgid "Repeat password for the Samba \"administrator\" user:"
+#~ msgstr "Gentag adgangskode for Sambas »administratorbruger«:"
+
+#~ msgid "Password input error"
+#~ msgstr "Indtastningsfejl for adgangskode"
+
+#~ msgid "The two passwords you entered were not the same. Please try again."
+#~ msgstr "De to adgangskoder du indtastede var ikke ens. Prøv igen."
+
+#~ msgid " $ samba-tool user setpassword administrator"
+#~ msgstr " $ samba-tool user setpassword administrator"
