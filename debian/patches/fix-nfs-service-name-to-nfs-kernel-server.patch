@@ -1,0 +1,59 @@
+From: Rafael David Tinoco <rafaeldtinoco@gmail.com>
+Subject: fix nfs related service names
+
+Upstream defines nfs related service names based on the Linux
+distribution. This patch fixes the names for Debian and derivatives.
+
+Bug-Debian: https://bugs.debian.org/929931
+Bug-Ubuntu: https://bugs.launchpad.net/bugs/722201
+Last-Update: 2018-08-05
+diff --git a/ctdb/config/events/legacy/06.nfs.script b/ctdb/config/events/legacy/06.nfs.script
+index 97086f78ed0..7b7614228a5 100755
+--- a/ctdb/config/events/legacy/06.nfs.script
++++ b/ctdb/config/events/legacy/06.nfs.script
+@@ -6,7 +6,7 @@
+ 
+ . "${CTDB_BASE}/functions"
+ 
+-service_name="nfs"
++service_name="nfs-kernel-server"
+ 
+ load_script_options "service" "60.nfs"
+ 
+diff --git a/ctdb/config/events/legacy/60.nfs.script b/ctdb/config/events/legacy/60.nfs.script
+index 2eb90b421c8..5c6a0903322 100755
+--- a/ctdb/config/events/legacy/60.nfs.script
++++ b/ctdb/config/events/legacy/60.nfs.script
+@@ -6,9 +6,9 @@
+ 
+ . "${CTDB_BASE}/functions"
+ 
+-service_name="nfs"
++service_name="nfs-kernel-server"
+ 
+-load_system_config "nfs"
++load_system_config "nfs-kernel-server"
+ 
+ load_script_options
+ 
+diff --git a/ctdb/config/nfs-linux-kernel-callout b/ctdb/config/nfs-linux-kernel-callout
+index 71d8ecf8074..9c698f5ad91 100755
+--- a/ctdb/config/nfs-linux-kernel-callout
++++ b/ctdb/config/nfs-linux-kernel-callout
+@@ -14,7 +14,7 @@ nfs_exports_file="${CTDB_NFS_EXPORTS_FILE:-/var/lib/nfs/etab}"
+ 
+ # As above, edit the default value below.  CTDB_NFS_DISTRO_STYLE is a
+ # test variable only.
+-nfs_distro_style="${CTDB_NFS_DISTRO_STYLE:-systemd-redhat}"
++nfs_distro_style="${CTDB_NFS_DISTRO_STYLE:-systemd-debian}"
+ 
+ case "$nfs_distro_style" in
+ systemd-*)
+@@ -33,6 +33,7 @@ systemd-*)
+ 		;;
+ 	*-debian)
+ 		nfs_rquotad_service="quotarpc"
++		nfs_config="/etc/default/nfs-kernel-server"
+ 		;;
+ 	*)
+ 		echo "Internal error"

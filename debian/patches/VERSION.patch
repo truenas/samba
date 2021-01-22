@@ -1,0 +1,19 @@
+From: Andrew Walker <awalker@ixsystems.com>
+Subject: Add "TrueNAS" as vendor suffix
+
+Forwarded: not-needed
+---
+ VERSION | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/VERSION b/VERSION
+index d91963a..2650887 100644
+--- a/VERSION
++++ b/VERSION
+@@ -123,5 +123,5 @@ SAMBA_VERSION_RELEASE_NICKNAME=
+ #  ->  "3.0.0rc2-VendorVersion"                        #
+ #                                                      #
+ ########################################################
+-SAMBA_VERSION_VENDOR_SUFFIX=
++SAMBA_VERSION_VENDOR_SUFFIX=TrueNAS
+ SAMBA_VERSION_VENDOR_PATCH=

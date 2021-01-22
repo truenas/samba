@@ -1,0 +1,39 @@
+From 1f97aeac6b866ff4ecdb704ecf15130eb2f87a9a Mon Sep 17 00:00:00 2001
+From: David Disseldorp <ddiss@samba.org>
+Date: Tue, 21 Apr 2020 14:43:14 +0200
+Subject: [PATCH] traffic_packets: fix SyntaxWarning: "is" with a literal
+
+Python 3.8 adds this warning via https://bugs.python.org/issue34850:
+  the "is" and "is not" operator sometimes is used with string and
+  numerical literals. This code "works" on CPython by accident, because
+  of caching on different levels (small integers and strings caches,
+  interned strings, deduplicating constants at compile time). But it
+  shouldn't work on other implementations, and can not work even on
+  early or future CPython versions.
+
+Reported-by: L. van Belle <belle@samba.org>
+Signed-off-by: David Disseldorp <ddiss@samba.org>
+Reviewed-by: Noel Power <noel.power@suse.com>
+
+Autobuild-User(master): David Disseldorp <ddiss@samba.org>
+Autobuild-Date(master): Mon Apr 27 12:19:59 UTC 2020 on sn-devel-184
+---
+ python/samba/emulate/traffic_packets.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/python/samba/emulate/traffic_packets.py b/python/samba/emulate/traffic_packets.py
+index a585482ccd4..95c7465d2fc 100644
+--- a/python/samba/emulate/traffic_packets.py
++++ b/python/samba/emulate/traffic_packets.py
+@@ -336,7 +336,7 @@ def packet_ldap_3(packet, conversation, context):
+ 
+     # try to guess the search expression (don't bother for base searches, as
+     # they're only looking up a single object)
+-    if (filter is None or filter is '') and scope != SCOPE_BASE:
++    if (filter is None or filter == '') and scope != SCOPE_BASE:
+         filter = context.guess_search_filter(attrs, dn_sig, dn)
+ 
+     samdb.search(dn,
+-- 
+2.26.2
+

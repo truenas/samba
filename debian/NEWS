@@ -1,0 +1,202 @@
+samba (2:4.6.5+dfsg-5) unstable; urgency=medium
+
+    The samba service has been removed. Use the individual services instead:
+
+    * nmbd
+    * smbd
+    * samba-ad-dc
+
+ -- Mathieu Parent <sathieu@debian.org>  Tue, 18 Jul 2017 22:52:05 +0200
+
+samba (2:4.4.1+dfsg-1) experimental; urgency=medium
+
+    This Samba security addresses both Denial of Service and Man in
+    the Middle vulnerabilities.
+
+    Both of these changes implement new smb.conf options and a number
+    of stricter behaviours to prevent Man in the Middle attacks on our
+    network services, as a client and as a server.
+
+    Between these changes, compatibility with a large number of older
+    software versions has been lost in the default configuration.
+
+    See the release notes in WHATNEW.txt for more information.
+
+
+    Here are some additional hints how to work around the new stricter default behaviors:
+
+    * As an AD DC server, only Windows 2000 and Samba 3.6 and above as
+      a domain member are supported out of the box. Other smb file
+      servers as domain members are also fine out of the box.
+
+    * As an AD DC server, with default setting of "ldap server require
+      strong auth", LDAP clients connecting over ldaps:// or START_TLS
+      will be allowed to perform simple LDAP bind only.
+
+      The preferred configuration for LDAP clients is to use SASL
+      GSSAPI directly over ldap:// without using ldaps:// or
+      START_TLS.
+
+      To use LDAP with START_TLS and SASL GSSAPI (either Kerberos or
+      NTLMSSP) sign/seal protection must be used by the client and
+      server should be configured with "ldap server require strong
+      auth = allow_sasl_over_tls".
+
+      Consult OpenLDAP documentation how to set sign/seal protection
+      in ldap.conf.
+
+      For SSSD client configured with "id_provider = ad" or
+      "id_provider = ldap" with "auth_provider = krb5", see
+      sssd-ldap(5) manual for details on TLS session handling.
+
+    * As a File Server, compatibility with the Linux Kernel cifs
+      client depends on which configuration options are selected, please
+      use "sec=krb5(i)" or "sec=ntlmssp(i)", not "sec=ntlmv2".
+
+    * As a file or printer client and as a domain member, out of the
+      box compatibility with Samba less than 4.0 and other SMB/CIFS
+      servers, depends on support for SMB signing or SMB2 on the
+      server, which is often disabled or absent. You may need to
+      adjust the "client ipc signing" to "no" in these cases.
+
+    * In case of an upgrade from versions before 4.2.0, you might run
+      into problems as a domain member. The out of the box compatibility
+      with Samba 3.x domain controllers requires NETLOGON features only
+      available in Samba 3.2 and above.
+
+    However, all of these can be worked around by setting smb.conf
+    options in Samba, see WHATSNEW.txt the 4.2.0 release notes at
+    https://www.samba.org/samba/history/samba-4.2.0.html and the Samba
+    wiki for details, workarounds and suggested security-improving
+    changes to these and other software packages.
+
+
+    Suggested further improvements after patching:
+
+    It is recommended that administrators set these additional options,
+    if compatible with their network environment:
+
+        server signing = mandatory
+        ntlm auth = no
+
+    Without "server signing = mandatory", Man in the Middle attacks
+    are still possible against our file server and
+    classic/NT4-like/Samba3 Domain controller. (It is now enforced on
+    Samba's AD DC.) Note that this has heavy impact on the file server
+    performance, so you need to decide between performance and
+    security. These Man in the Middle attacks for smb file servers are
+    well known for decades.
+
+    Without "ntlm auth = no", there may still be clients not using
+    NTLMv2, and these observed passwords may be brute-forced easily using
+    cloud-computing resources or rainbow tables.
+
+ -- Andrew Bartlett <abartlet+debian@catalyst.net.nz>  Tue, 12 Apr 2016 16:18:57 +1200
+
+samba (2:4.0.10+dfsg-3) unstable; urgency=low
+
+    The SWAT package is no longer available.
+
+    Upstream support for SWAT (Samba Web Administration Tool) was removed in
+    samba 4.1.0. As a result, swat is no longer shipped in the Debian Samba
+    packages. Unfortunately, there is currently no replacement.
+
+    Details why SWAT has been removed upstream can be found on the
+    samba-technical mailing list:
+
+    https://lists.samba.org/archive/samba-technical/2013-February/090572.html
+
+ -- Ivo De Decker <ivo.dedecker@ugent.be>  Tue, 22 Oct 2013 07:52:54 +0200
+
+samba (2:3.6.5-2) unstable; urgency=low
+
+    NSS modules have been split out from libpam-winbind to
+    libnss-winbind.
+    
+    If Recommends: installs are disabled on your system you may need
+    to manually install the libnss-winbind package after upgrading
+    from former versions of winbind (for instance from squeeze) or
+    from former versions of libpam-winbind.
+
+ -- Christian Perrier <bubulle@debian.org>  Mon, 07 May 2012 22:16:32 +0200
+
+samba (2:3.5.11~dfsg-3) unstable; urgency=low
+
+    PAM modules and NSS modules have been split out from the winbind
+    package into libpam-winbind.
+    
+    If Recommends: installs are disabled on your system you may need
+    to manually install the libpam-winbind package after upgrading
+    from former versions of winbind (for instance from squeeze)
+
+ -- Steve Langasek <vorlon@debian.org>  Fri, 21 Oct 2011 20:00:13 +0000
+
+samba (2:3.4.0-1) unstable; urgency=low
+
+    Default passdb backend changed in samba 3.4.0 and above
+  
+    Beginning with samba 3.4.0, the default setting for "passdb
+    backend" changed from "smbpasswd" to "tdbsam".
+    
+    If your smb.conf file does not have an explicit mention of
+    "passdb backend" when upgrading from pre-3.4.0 versions of
+    samba, it is likely that users will no longer be able to
+    authenticate.
+    
+    As a consequence of all this, if you're upgrading from lenny
+    and have no setting of "passdb backend" in smb.conf, you MUST
+    add "passdb backend = smbpasswd" in order to keep your samba
+    server's behaviour.
+    
+    As Debian packages of samba explicitly set "passdb backend = tdbsam"
+    by default since etch, very few users should need to modify their
+    settings.
+
+ -- Christian Perrier <bubulle@debian.org>  Tue, 07 Jul 2009 20:42:19 +0200
+
+samba (3.0.27a-2) unstable; urgency=low
+
+    Weak authentication methods are disabled by default
+
+    Beginning with this version, plaintext authentication is disabled for
+    clients and lanman authentication is disabled for both clients and
+    servers.  Lanman authentication is not needed for Windows
+    NT/2000/XP/Vista, Mac OS X or Samba, but if you still have Windows
+    95/98/ME clients (or servers) you may need to set lanman auth (or client
+    lanman auth) to yes in your smb.conf.
+
+    The "lanman auth = no" setting will also cause lanman password hashes to
+    be deleted from smbpasswd and prevent new ones from being written, so
+    that these can't be subjected to brute-force password attacks.  This
+    means that re-enabling lanman auth after it has been disabled is more
+    difficult; it is therefore advisable that you re-enable the option as
+    soon as possible if you think you will need to support Win9x clients.
+
+    Client support for plaintext passwords is not needed for recent Windows
+    servers, and in fact this behavior change makes the Samba client behave
+    in a manner consistent with all Windows clients later than Windows 98.
+    However, if you need to connect to a Samba server that does not have
+    encrypted password support enabled, or to another server that does not
+    support NTLM authentication, you will need to set
+    "client plaintext auth = yes" and "client lanman auth = yes" in smb.conf.
+
+ -- Steve Langasek <vorlon@debian.org>  Sat, 24 Nov 2007 00:23:37 -0800
+
+samba (3.0.26a-2) unstable; urgency=low
+
+    Default printing system has changed from BSD to CUPS
+
+    Previous versions of this package were configured to use BSD lpr as the
+    default printing system.  With this version of Samba, the default has
+    been changed to CUPS for consistency with the current default printer
+    handling in the rest of the system.
+
+    If you wish to continue using the BSD printing interface from Samba, you
+    will need to set "printing = bsd" manually in /etc/samba/smb.conf.  If
+    you wish to use CUPS printing but have previously set any of the
+    "print command", "lpq command", or "lprm command" options in smb.conf,
+    you will want to remove these settings from your config.  Otherwise, if
+    you have the cupsys package installed, Samba should begin to use it
+    automatically with no action on your part.
+
+ -- Steve Langasek <vorlon@debian.org>  Wed, 14 Nov 2007 17:19:36 -0800
