@@ -1,0 +1,88 @@
+#!/bin/sh
+
+set -e
+
+nmbd_error_handler() {
+    if [ -d /sys/class/net/lo ] && ls /sys/class/net | grep -qv ^lo$; then
+        # https://bugs.debian.org/893762
+        echo 'WARNING: nmbd failed to start as there is no non-loopback interfaces available.'
+        echo 'Either add an interface or set "disable netbios = yes" in smb.conf and run "systemctl mask nmbd"'
+        return 0
+    elif command -v ip > /dev/null && ip a show | grep '^[[:space:]]*inet ' | grep -vq ' lo$'; then
+        # https://bugs.debian.org/859526
+        echo 'WARNING: nmbd failed to start as there is no local IPv4 non-loopback interfaces available.'
+        echo 'Either add an IPv4 address or set "disable netbios = yes" in smb.conf and run "systemctl mask nmbd"'
+        return 0
+    else
+        echo 'ERROR: nmbd failed to start.'
+        return 1 # caught by set -e
+    fi
+}
+
+mask_services() {
+    local reason="$1"
+    shift
+    local masked_count=0
+    mkdir -p /etc/systemd/system
+    echo "${reason}: Masking $*"
+    echo "Please ignore the following error about deb-systemd-helper not finding those services."
+    while true; do
+        local service_name="$1"
+        if [ -z "$service_name" ]; then
+            break
+        fi
+        shift
+        if [ ! -e "/etc/systemd/system/${service_name}" ]; then
+            ln -s /dev/null "/etc/systemd/system/${service_name}"
+            echo "(${service_name} masked)"
+            masked_count=$((masked_count+1))
+        elif [ -h "/etc/systemd/system/${service_name}" ] \
+            && [ "$(realpath /etc/systemd/system/${service_name})" = /dev/null ] \
+        ; then
+            echo "(${service_name} already masked)"
+        else
+            echo "WARNING ${service_name} should be masked. The install may fail."
+        fi
+    done
+    # In case this system is running systemd, we make systemd reload the unit files
+    # to pick up changes.
+    if [ "${masked_count}" -ge 1 -a -d /run/systemd/system ] ; then
+        systemctl --system daemon-reload >/dev/null || true
+    fi
+}
+
+# from CTDB postinst
+pam-auth-update --package
+
+# We generate several files during the postinst, and we don't want
+#	them to be readable only by root.
+umask 022
+
+# mimic source4/smbd/server.c and mask service before it fails
+# NB: server role = active directory domain controller is what we need to properly support
+# NB: server services = smb is not compiled in
+# NB: dcerpc endpoint servers = remote is for developpement
+# NB: dcerpc endpoint servers = mapiproxy is for OpenChange which is dead
+SERVER_ROLE=`samba-tool testparm --parameter-name="server role"  2>/dev/null | tail -1`
+SERVER_SERVICES=`samba-tool testparm --parameter-name="server services"  2>/dev/null | tail -1`
+DCERPC_ENDPOINT_SERVERS=`samba-tool testparm --parameter-name="dcerpc endpoint servers"  2>/dev/null | tail -1`
+DISABLE_NETBIOS=`samba-tool testparm --parameter-name="disable netbios"  2>/dev/null | tail -1`
+
+mkdir /var/empty
+
+if [ "$SERVER_ROLE" != "active directory domain controller" ] \
+        && ( echo "$SERVER_SERVICES" | grep -qv '\(^\|, \)smb\(,\|$\)' ) \
+        && ( echo "$DCERPC_ENDPOINT_SERVERS" | grep -qv '\(^\|, \)remote\(,\|$\)' ) \
+        && ( echo "$DCERPC_ENDPOINT_SERVERS" | grep -qv '\(^\|, \)mapiproxy\(,\|$\)' ) \
+; then
+    mask_services "Samba is not being run as an AD Domain Controller" samba-ad-dc.service
+fi
+if [ "$SERVER_ROLE" = "active directory domain controller" ]; then
+    mask_services "Samba is being run as an AD Domain Controller" smbd.service nmbd.service
+elif [ "$DISABLE_NETBIOS" = Yes ]; then
+    mask_services "NetBIOS is disabled" nmbd.service
+fi
+
+#DEBHELPER#
+
+exit 0

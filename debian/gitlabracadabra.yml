@@ -1,0 +1,136 @@
+samba-team/:
+  create_object: true
+  name: Debian Samba Team
+  description: |-
+  visibility: public
+  lfs_enabled: false
+  request_access_enabled: true
+  members:
+    ivodd: owner
+    jelmer: owner
+    sathieu: owner
+    vorlon: owner
+    carnil: developer
+  unknown_members: delete
+  variables: []
+  unknown_variables: delete
+
+.samba-project:
+  create_object: true
+  name: ''
+  default_branch: master
+  description: ''
+  issues_access_level: disabled
+  repository_access_level: enabled
+  merge_requests_access_level: enabled
+  builds_access_level: enabled
+  wiki_access_level: disabled
+  snippets_access_level: disabled
+  resolve_outdated_diff_discussions: false
+  build_git_strategy: fetch
+  build_timeout: 3600
+  auto_cancel_pending_pipelines: enabled
+  build_coverage_regex: ''
+  ci_config_path: 'debian/salsa-ci.yml'
+  ci_default_git_depth:
+  auto_devops_enabled: false
+  auto_devops_deploy_strategy: continuous
+  container_registry_enabled: false
+  shared_runners_enabled: true
+  visibility: public
+  public_builds:
+  only_allow_merge_if_pipeline_succeeds: false
+  only_allow_merge_if_all_discussions_are_resolved: true
+  merge_method: merge
+  lfs_enabled: false
+  request_access_enabled: false
+  tag_list: [Debian, Samba]
+  # avatar
+  printing_merge_request_link_enabled: true
+  initialize_with_readme: true
+  branches:
+    - master
+  groups: {}
+  unknown_groups: delete
+  members: {}
+  unknown_members: delete
+  protected_branches:
+    master:
+      merge_access_level: maintainer
+      push_access_level: maintainer
+    '*jessie*':
+      merge_access_level: maintainer
+      push_access_level: maintainer
+    pristine-tar:
+      merge_access_level: noone
+      push_access_level: maintainer
+    squeeze*:
+      merge_access_level: maintainer
+      push_access_level: maintainer
+    wheezy*:
+      merge_access_level: maintainer
+      push_access_level: maintainer
+    stretch:
+      merge_access_level: maintainer
+      push_access_level: maintainer
+    stretch-security:
+      merge_access_level: maintainer
+      push_access_level: maintainer
+    upstream_*:
+      merge_access_level: noone
+      push_access_level: maintainer
+    upstream-*:
+      merge_access_level: noone
+      push_access_level: maintainer
+  unknown_protected_branches: delete
+  protected_tags:
+    '*': developer
+  unknown_protected_tags: delete
+  archived: false
+  variables: []
+  unknown_variables: delete
+
+samba-team/cifs-utils:
+  extends: .samba-project
+  name: cifs-utils
+  description: |-
+    cifs-utils packaging
+
+samba-team/ldb:
+  extends: .samba-project
+  name: ldb
+  description: |-
+    ldb packaging
+
+samba-team/libsmb2:
+  extends: .samba-project
+  name: libsmb2
+  description: |-
+    libsmb2 packaging
+
+samba-team/samba:
+  extends: .samba-project
+  name: samba
+  description: |-
+    samba packaging.
+
+    See [debian/README.source.md](https://salsa.debian.org/samba-team/samba/blob/master/debian/README.source.md) for build instructions.
+  build_timeout: 10800
+
+samba-team/talloc:
+  extends: .samba-project
+  name: talloc
+  description: |-
+    talloc packaging
+
+samba-team/tdb:
+  extends: .samba-project
+  name: tdb
+  description: |-
+    tdb packaging
+
+samba-team/tevent:
+  extends: .samba-project
+  name: tevent
+  description: |-
+    tevent packaging

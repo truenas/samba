@@ -1,0 +1,34 @@
+#!/bin/sh -x
+
+if ! testparm -s 2>&1 | grep -qE "^\[homes\]"; then
+    echo "Adding [homes] share"
+    cat >> /etc/samba/smb.conf <<EOFEOF
+[homes]
+  valid users = %S
+  read only = no
+  guest ok = no
+EOFEOF
+    systemctl reload smbd.service
+else
+    echo "No need to add [homes] share, continuing."
+fi
+
+username="smbtest$$"
+password="$$"
+echo "Creating a local test user called ${username}"
+useradd -m "$username"
+echo "Setting samba password for the ${username} user"
+echo "${password}\n${password}" | smbpasswd -s -a ${username}
+userhome=$(eval echo ~$username)
+echo "Creating file with random data and computing its md5"
+dd if=/dev/urandom bs=1 count=128 2>/dev/null | base64 > ${userhome}/data
+chown ${username}:${username} ${userhome}/data
+cd ${userhome}
+md5sum data > data.md5
+
+rm -f downloaded-data
+echo "Downloading file and comparing its md5"
+smbclient //localhost/${username} -U ${username}%${password} -c "get data downloaded-data"
+
+mv -f downloaded-data data
+md5sum -c data.md5

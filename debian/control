@@ -1,0 +1,104 @@
+Source: samba
+Section: net
+Priority: optional
+Maintainer: Andrew Walker <awalker@ixsystems.com>
+Homepage: http://www.samba.org
+Standards-Version: 4.4.1
+Build-Depends: bison,
+               debhelper-compat (= 12),
+               dh-exec,
+               dh-python,
+               docbook-xml,
+               docbook-xsl,
+               flex,
+               libacl1-dev,
+               libarchive-dev,
+               libblkid-dev,
+               libbsd-dev,
+               libcap-dev [linux-any],
+               libcmocka-dev (>= 1.1.3),
+               libdbus-1-dev,
+               libglusterfs-dev [linux-any],
+               libgnutls28-dev,
+               libgpgme11-dev,
+               libjansson-dev,
+               libldap2-dev,
+               libncurses5-dev,
+               libpam0g-dev,
+               libparse-yapp-perl,
+               libpcap-dev [hurd-i386 kfreebsd-any],
+               libpopt-dev,
+               libreadline-dev,
+               libsystemd-dev [linux-any],
+               libtasn1-6-dev (>= 3.8),
+               libtasn1-bin,
+               liburing-dev,
+               libnvpair3,
+               libuutil3,
+               libzfs4,
+               libzfs4-devel,
+               perl,
+               pkg-config,
+               po-debconf,
+               python3-dev,
+               python3-dnspython,
+               python3-etcd,
+               python3-testtools,
+               python3,
+               xfslibs-dev [linux-any],
+               xsltproc,
+               zlib1g-dev (>= 1:1.2.3)
+Build-Conflicts: libtracker-miner-2.0-dev,
+                 libtracker-sparql-2.0-dev
+Rules-Requires-Root: binary-targets
+Vcs-Browser: https://github.com/truenas/samba
+Vcs-Git: https://github.com/truenas/samba
+
+Package: truenas-samba
+Architecture: any
+Pre-Depends: dpkg (>= 1.15.6~), ${misc:Pre-Depends}
+Depends: adduser,
+         libpam-modules,
+         libpam-runtime (>= 1.0.1-11),
+         lsb-base (>= 4.1+Debian),
+         procps,
+         python3,
+         python3-dnspython,
+         ${misc:Depends},
+         ${python3:Depends},
+         ${shlibs:Depends}
+Recommends: attr,
+            logrotate,
+            python3-markdown,
+Conflicts: samba
+Provides: samba,
+          samba-client,
+          samba-common-bin,
+          samba-libs,
+          samba-vfs-modules,
+          smbclient,
+          libsmbclient,
+          libtalloc2 (= 2.3.1),
+          libtevent0,
+          ctdb,
+          python3-samba,
+          libpam-winbind,
+          libnss-winbind,
+          libwbclient0 (= 2:4.13.0+dfsg1),
+          winbind
+Suggests: ufw,
+Enhances: bind9, ntp
+Description: SMB/CIFS file, print, and login server for Unix
+ Samba is an implementation of the SMB/CIFS protocol for Unix systems,
+ providing support for cross-platform file and printer sharing with
+ Microsoft Windows, OS X, and other Unix systems.  Samba can also function
+ as an NT4-style domain controller, and can integrate with both NT4 domains
+ and Active Directory realms as a member server.
+ .
+ This package provides the components necessary to use Samba as a stand-alone
+ file and print server or as an NT4 or Active Directory domain controller.
+ For use in an NT4 domain or Active Directory realm, you will also need the
+ winbind package.
+ .
+ This package is not required for connecting to existing SMB/CIFS servers
+ (see smbclient) or for mounting remote filesystems (see cifs-utils).
