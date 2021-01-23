@@ -1,0 +1,55 @@
+From 74407e27d96b82896c7b7792973691face596dfa Mon Sep 17 00:00:00 2001
+From: Andrew Walker <awalker@ixsystems.com>
+Date: Tue, 22 Sep 2020 06:02:12 -0400
+Subject: [PATCH] packaging:systemd - add wsdd service
+
+---
+ packaging/systemd/wsdd.service.in | 23 +++++++++++++++++++++++
+ packaging/wscript_build           |  1 +
+ 2 files changed, 24 insertions(+)
+ create mode 100644 packaging/systemd/wsdd.service.in
+
+diff --git a/packaging/systemd/wsdd.service.in b/packaging/systemd/wsdd.service.in
+new file mode 100644
+index 00000000000..c9cfce04611
+--- /dev/null
++++ b/packaging/systemd/wsdd.service.in
+@@ -0,0 +1,23 @@
++[Unit]
++Description=Web Services Dynamic Discovery host daemon
++; Start after the network has been configured
++After=network-online.target
++Wants=network-online.target
++; It makes sense to have Samba running when wsdd starts, but is not required
++;Wants=smb.service
++
++[Service]
++Type=simple
++ExecStart=/usr/bin/wsdd --shortlog
++; Replace those with an unprivledged user/group that matches your environment,
++; like nobody/nogroup or daemon:daemon or a dedicated user for wsdd
++User=nobody
++Group=nobody
++; The following lines can be used for a chroot execution of wsdd.
++; Also append '--chroot /run/wsdd/chroot' to ExecStart to enable chrooting
++;AmbientCapabilities=CAP_SYS_CHROOT
++;ExecStartPre=/usr/bin/install -d -o nobody -g nobody -m 0700 /run/wsdd/chroot
++;ExecStopPost=rmdir /run/wsdd/chroot
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/packaging/wscript_build b/packaging/wscript_build
+index fbcd4e55f8c..98d58909776 100644
+--- a/packaging/wscript_build
++++ b/packaging/wscript_build
+@@ -4,6 +4,7 @@ systemd_services = [
+     'systemd/smb.service',
+     'systemd/nmb.service',
+     'systemd/winbind.service',
++    'systemd/wsdd.service',
+     'systemd/samba.service'
+ ]
+ 
+-- 
+2.28.0
+
