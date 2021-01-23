@@ -191,7 +191,7 @@ usr/lib/*/libsamba-passdb.so.0.28.0
 usr/lib/*/libsamba-policy.cpython-*.so.*
 usr/lib/*/libsamdb.so.*
 usr/lib/*/libsmbconf.so.0
-usr/lib/*/libsmbldap.so.2
+usr/lib/*/libsmbldap.so.2*
 usr/lib/*/libtevent-util.so.*
 usr/lib/*/samba/libCHARSET3.so.*
 usr/lib/*/samba/libLIBWBCLIENT-OLD.so.0
