@@ -6,7 +6,7 @@
 
 . "${CTDB_BASE}/functions"
 
-service_name="nfs"
+service_name="nfs-kernel-server"
 
 load_script_options "service" "60.nfs"
 
