@@ -1,0 +1,65 @@
+From 9bcc0199af77a4f749824034c39e4ea5994d5523 Mon Sep 17 00:00:00 2001
+From: Andrew Walker <awalker@ixsystems.com>
+Date: Thu, 15 Oct 2020 13:53:02 -0400
+Subject: [PATCH] dynconfig / registry - alter default paths
+
+Place files in TrueNAS-specific paths
+---
+ dynconfig/wscript                 | 4 ++--
+ source3/registry/reg_backend_db.c | 4 ++--
+ source3/utils/net_registry.c      | 2 +-
+ 3 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/dynconfig/wscript b/dynconfig/wscript
+index f455699f062..ed5753004d7 100644
+--- a/dynconfig/wscript
++++ b/dynconfig/wscript
+@@ -252,8 +252,8 @@ dynconfig = {
+          'DELAY':     True,
+     },
+     'CONFIGFILE' : {
+-         'STD-PATH':  '${CONFIGDIR}/smb.conf',
+-         'FHS-PATH':  '${CONFIGDIR}/smb.conf',
++         'FHS-PATH':  '${SYSCONFDIR}/smb4.conf',
++         'FHS-PATH':  '${SYSCONFDIR}/smb4.conf',
+          'DELAY':     True,
+     },
+     'LMHOSTSFILE' : {
+diff --git a/source3/registry/reg_backend_db.c b/source3/registry/reg_backend_db.c
+index c870dc57ed6..23059a9f6d4 100644
+--- a/source3/registry/reg_backend_db.c
++++ b/source3/registry/reg_backend_db.c
+@@ -733,7 +733,7 @@ WERROR regdb_init(void)
+ 		return WERR_OK;
+ 	}
+ 
+-	db_path = state_path(talloc_tos(), "registry.tdb");
++	db_path = cache_path(talloc_tos(), "registry.tdb");
+ 	if (db_path == NULL) {
+ 		return WERR_NOT_ENOUGH_MEMORY;
+ 	}
+@@ -862,7 +862,7 @@ WERROR regdb_open( void )
+ 		goto done;
+ 	}
+ 
+-	db_path = state_path(talloc_tos(), "registry.tdb");
++	db_path = cache_path(talloc_tos(), "registry.tdb");
+ 	if (db_path == NULL) {
+ 		result = WERR_NOT_ENOUGH_MEMORY;
+ 		goto done;
+diff --git a/source3/utils/net_registry.c b/source3/utils/net_registry.c
+index 389e3f6a552..4812504069f 100644
+--- a/source3/utils/net_registry.c
++++ b/source3/utils/net_registry.c
+@@ -1523,7 +1523,7 @@ static int net_registry_check(struct net_context *c, int argc,
+ 	} else if (argc > 0) {
+ 		dbfile = talloc_strdup(talloc_tos(), argv[0]);
+ 	} else {
+-		dbfile = state_path(talloc_tos(), "registry.tdb");
++		dbfile = cache_path(talloc_tos(), "registry.tdb");
+ 	}
+ 	if (dbfile == NULL) {
+ 		return -1;
+-- 
+2.28.0
+
