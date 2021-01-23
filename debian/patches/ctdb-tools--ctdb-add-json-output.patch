@@ -1,0 +1,1716 @@
+From 09f556a9214d6561e9322e94026a1125caa79c5e Mon Sep 17 00:00:00 2001
+From: Andrew Walker <awalker@ixsystems.com>
+Date: Mon, 30 Nov 2020 00:52:15 -0500
+Subject: [PATCH] ctdb:tools:ctdb - add JSON output to ctdb command
+
+Create simplified JSON library in lib/json_minimal and use said
+library to generate JSON output to various ctdb commands.
+
+Add json output for the "ctdb ip" command. This is slightly differently
+formatted than the text version. "configured" is implicit in IP
+appearing in the list. Output has array of interfaces with boolean
+fields "active" and "available", and a string for the interface name.
+
+When verbose output is selected, include deleted (disabled) nodes
+in ctdb nodelist json output. In this case add additional key
+"enabled" to differentiate between enabled and disabled nodes.
+---
+ ctdb/tools/ctdb.c               | 747 +++++++++++++++++++++++++++++---
+ ctdb/wscript                    |   4 +-
+ lib/json_minimal/json_minimal.c | 663 ++++++++++++++++++++++++++++
+ lib/json_minimal/json_minimal.h |  75 ++++
+ lib/json_minimal/wscript_build  |   8 +
+ 5 files changed, 1447 insertions(+), 50 deletions(-)
+ create mode 100644 lib/json_minimal/json_minimal.c
+ create mode 100644 lib/json_minimal/json_minimal.h
+ create mode 100644 lib/json_minimal/wscript_build
+
+diff --git a/ctdb/tools/ctdb.c b/ctdb/tools/ctdb.c
+index 598ab4ff4b7..46458e03450 100644
+--- a/ctdb/tools/ctdb.c
++++ b/ctdb/tools/ctdb.c
+@@ -46,11 +46,16 @@
+ #include "client/client.h"
+ #include "client/client_sync.h"
+ 
++#include <jansson.h>
++#include "json_minimal.h" /* various JSON helpers */
++
+ #define TIMEOUT()	timeval_current_ofs(options.timelimit, 0)
+ 
+ #define SRVID_CTDB_TOOL    (CTDB_SRVID_TOOL_RANGE | 0x0001000000000000LL)
+ #define SRVID_CTDB_PUSHDB  (CTDB_SRVID_TOOL_RANGE | 0x0002000000000000LL)
+ 
++enum output_format {F_TEXT, F_JSON, F_CSV};
++
+ static struct {
+ 	const char *debuglevelstr;
+ 	int timelimit;
+@@ -58,6 +63,7 @@ static struct {
+ 	int machinereadable;
+ 	const char *sep;
+ 	int machineparsable;
++	int json;
+ 	int verbose;
+ 	int maxruntime;
+ 	int printemptyrecords;
+@@ -65,6 +71,7 @@ static struct {
+ 	int printlmaster;
+ 	int printhash;
+ 	int printrecordflags;
++	enum output_format format;
+ } options;
+ 
+ static poptContext pc;
+@@ -865,6 +872,186 @@ static void print_status(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+ 	printf("Recovery master:%d\n", recmaster);
+ }
+ 
++static void print_nodemap_json(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
++			  struct ctdb_node_map *nodemap, uint32_t mypnn,
++			  bool print_header, struct json_object *_jsobj)
++{
++	struct ctdb_node_and_flags *node;
++	int num_deleted_nodes = 0;
++	unsigned int i, rv;
++	struct json_object nodesarray;
++
++	for (i=0; i<nodemap->num; i++) {
++		if (nodemap->node[i].flags & NODE_FLAGS_DELETED) {
++			num_deleted_nodes++;
++		}
++	}
++
++	if (print_header) {
++		rv = json_add_int(_jsobj, "node_count", nodemap->num);
++		if (rv != 0) {
++			return;
++		}
++		rv = json_add_int(_jsobj, "deleted_node_count", num_deleted_nodes);
++		if (rv != 0) {
++			return;
++		}
++	}
++	nodesarray = json_get_array(_jsobj, "nodes");
++	if (json_is_invalid(&nodesarray)) {
++		return;
++	}
++
++	for (i=0; i<nodemap->num; i++) {
++		struct json_object tmpobj;
++		char *sockaddrstr = NULL;
++		char *flags = NULL;
++		bool ok;
++		tmpobj = json_new_object();
++		if (json_is_invalid(&tmpobj)) {
++			goto failure;
++		}
++
++		node = &nodemap->node[i];
++		if (node->flags & NODE_FLAGS_DELETED) {
++			continue;
++		}
++		rv = json_add_int(&tmpobj, "pnn", node->pnn);
++		if (rv != 0) {
++			goto failure;
++		}
++
++		sockaddrstr = ctdb_sock_addr_to_string(mem_ctx, &node->addr, false);
++		rv = json_add_string(&tmpobj, "address", sockaddrstr);
++		if (rv != 0) {
++			goto failure;
++		}
++
++		flags = pretty_print_flags(mem_ctx, node->flags);
++		rv = json_add_string(&tmpobj, "flags_str", flags);
++		if (rv != 0) {
++			goto failure;
++		}
++
++		rv = json_add_int(&tmpobj, "flags_raw", node->flags);
++		if (rv != 0) {
++			goto failure;
++		}
++
++		rv = json_add_bool(&tmpobj, "partially_online", partially_online(mem_ctx, ctdb, node));
++		if (rv != 0) {
++			goto failure;
++		}
++
++		rv = json_add_bool(&tmpobj, "this_node", node->pnn == mypnn);
++		if (rv != 0) {
++			goto failure;
++		}
++
++		rv = json_add_object(&nodesarray, NULL, &tmpobj);
++		if (rv != 0) {
++			goto failure;
++		}
++	}
++	rv = json_add_object(_jsobj, "nodes", &nodesarray);
++	if (rv != 0) {
++		goto failure;
++	}
++	return;
++failure:
++	fprintf(stderr, "Failed to convert nodemap to JSON\n");
++	json_free(&nodesarray);
++	return;
++}
++
++static void print_status_json(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
++			 struct ctdb_node_map *nodemap, uint32_t mypnn,
++			 struct ctdb_vnn_map *vnnmap, int recmode,
++			 uint32_t recmaster)
++{
++	unsigned int i;
++	int rv;
++	struct json_object jsobj, jsvnnmap, jsnodemap;
++	char *json_output = NULL;
++
++	jsobj = json_new_object();
++	if (json_is_invalid(&jsobj)) {
++		fprintf(stderr, "Failed to create json object for output\n");
++		return;
++	}
++	jsnodemap = json_new_object();
++	if (json_is_invalid(&jsnodemap)){
++		fprintf(stderr, "Failed to create json object for nodemap\n");
++		goto failure;
++	}
++	rv = json_add_object(&jsobj, "nodemap", &jsnodemap);
++	if (rv != 0) {
++		goto failure;
++	}
++
++	print_nodemap_json(mem_ctx, ctdb, nodemap, mypnn, true, &jsnodemap);
++
++	rv = json_add_int(&jsobj, "generation", vnnmap->generation);
++	if (rv != 0) {
++		goto failure;
++	}
++	rv = json_add_int(&jsobj, "size", vnnmap->size);
++	if (rv != 0) {
++		goto failure;
++	}
++	jsvnnmap = json_get_array(&jsobj, "vnnmap");
++	if (json_is_invalid(&jsvnnmap)) {
++		goto failure;
++	}
++	for (i=0; i<vnnmap->size; i++) {
++		struct json_object tmp_obj;
++		tmp_obj = json_new_object();
++		if (json_is_invalid(&tmp_obj)) {
++			json_free(&jsvnnmap);
++			goto failure;
++		}
++		rv = json_add_int(&tmp_obj, "hash", i);
++		if (rv != 0) {
++			json_free(&tmp_obj);
++			json_free(&jsvnnmap);
++			goto failure;
++		}
++		rv = json_add_int(&tmp_obj, "lmaster", vnnmap->map[i]);
++		if (rv != 0) {
++			json_free(&tmp_obj);
++			json_free(&jsvnnmap);
++			goto failure;
++		}
++		rv = json_add_object(&jsvnnmap, NULL, &tmp_obj);
++		if (rv != 0) {
++			json_free(&tmp_obj);
++			json_free(&jsvnnmap);
++			goto failure;
++		}
++	}
++	rv = json_add_object(&jsobj, "vnnmap", &jsvnnmap);
++	if (rv != 0) {
++		json_free(&jsvnnmap);
++		goto failure;
++	}
++
++	rv = json_add_int(&jsobj, "recovery_mode_raw", recmode);
++	if (rv != 0) {
++		goto failure;
++	}
++
++	rv = json_add_string(&jsobj, "recovery_mode_str", recmode == CTDB_RECOVERY_NORMAL ? "NORMAL" : "RECOVERY");
++	if (rv != 0) {
++		goto failure;
++	}
++	json_output = json_to_string(mem_ctx, &jsobj);
++	printf("%s\n", json_output);
++	TALLOC_FREE(json_output);
++failure:
++	json_free(&jsobj);
++	return;
++}
++
+ static int control_status(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+ 			  int argc, const char **argv)
+ {
+@@ -906,8 +1093,16 @@ static int control_status(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+ 		return ret;
+ 	}
+ 
+-	print_status(mem_ctx, ctdb, nodemap, ctdb->cmd_pnn, vnnmap,
+-		     recmode, recmaster);
++	switch(options.format) {
++	case F_JSON:
++		print_status_json(mem_ctx, ctdb, nodemap, ctdb->cmd_pnn, vnnmap,
++			     recmode, recmaster);
++		break;
++	default:
++		print_status(mem_ctx, ctdb, nodemap, ctdb->cmd_pnn, vnnmap,
++			     recmode, recmaster);
++		break;
++	}
+ 	return 0;
+ }
+ 
+@@ -1424,7 +1619,122 @@ static int ctdb_public_ip_cmp(const void *a, const void *b)
+ 	return ctdb_sock_addr_cmp(&ip_a->addr, &ip_b->addr);
+ }
+ 
+-static void print_ip(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
++static bool print_ip_json(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
++		     struct ctdb_public_ip_list *ips,
++		     struct ctdb_public_ip_info **ipinfo,
++		     bool all_nodes)
++{
++	unsigned int i, j;
++	struct json_object jsobj, jsnodes;
++	int ret;
++	char *json_output = NULL;
++
++	jsobj = json_new_object();
++	if (json_is_invalid(&jsobj)) {
++		return false;
++	}
++	jsnodes = json_get_array(&jsobj, "nodes");
++	if (json_is_invalid(&jsnodes)) {
++		json_free(&jsobj);
++		return false;
++	}
++
++	for (i = 0; i < ips->num; i++) {
++		char *a = NULL;
++		struct json_object jsint, ifaces;
++		jsint = json_new_object();
++		if (json_is_invalid(&jsint)) {
++			goto failure;
++		}
++		a = ctdb_sock_addr_to_string(mem_ctx, &ips->ip[i].addr, false);
++		ret = json_add_string(&jsint, "public_ip", a);
++		if (ret != 0) {
++			json_free(&jsint);
++			goto failure;
++		}
++		ret = json_add_int(&jsint, "pnn", ips->ip[i].pnn);
++		if (ret != 0) {
++			json_free(&jsint);
++			goto failure;
++		}
++
++		ifaces = json_get_array(&jsint, "interfaces");
++		if (json_is_invalid(&ifaces)) {
++			json_free(&jsint);
++			goto failure;
++		}
++
++		if (ipinfo[i] == NULL) {
++			goto skip_ipinfo;
++		}
++
++		for (j=0; j<ipinfo[i]->ifaces->num; j++) {
++			struct ctdb_iface *iface;
++			struct json_object to_add;
++			bool active, available;
++			to_add = json_new_object();
++			if (json_is_invalid(&to_add)) {
++				json_free(&jsint);
++				goto failure;
++			}
++
++			iface = &ipinfo[i]->ifaces->iface[j];
++			active = ipinfo[i]->active_idx == j ? true : false;
++			available = iface->link_state == 0 ? false : true;
++
++			ret = json_add_string(&to_add, "name", iface->name);
++			if (ret != 0) {
++				json_free(&jsint);
++				json_free(&to_add);
++				goto failure;
++			}
++			ret = json_add_bool(&to_add, "active", active);
++			if (ret != 0 ) {
++				json_free(&jsint);
++				json_free(&to_add);
++				goto failure;
++			}
++
++			ret = json_add_bool(&to_add, "available", available);
++			if (ret != 0) {
++				json_free(&jsint);
++				json_free(&to_add);
++				goto failure;
++			}
++			ret = json_add_object(&ifaces, NULL, &to_add);
++			if (ret != 0) {
++				json_free(&jsint);
++				goto failure;
++			}
++		}
++	skip_ipinfo:
++		ret = json_add_object(&jsint, "interfaces", &ifaces);
++		if (ret != 0) {
++			goto failure;
++		}
++
++		ret = json_add_object(&jsnodes, NULL, &jsint);
++		if (ret != 0) {
++			goto failure;
++		}
++		TALLOC_FREE(a);
++	}
++	ret = json_add_object(&jsobj, "nodes", &jsnodes);
++	if (ret != 0) {
++		goto failure;
++	}
++	json_output = json_to_string(mem_ctx, &jsobj);
++	printf("%s\n", json_output);
++	TALLOC_FREE(json_output);
++	return true;
++failure:
++	json_free(&jsnodes);
++	json_free(&jsobj);
++	return false;
++}
++
++
++static bool print_ip(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+ 		     struct ctdb_public_ip_list *ips,
+ 		     struct ctdb_public_ip_info **ipinfo,
+ 		     bool all_nodes)
+@@ -1523,6 +1833,7 @@ static void print_ip(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+ 			       avail ? avail : "", conf ? conf : "");
+ 		}
+ 	}
++	return true;
+ }
+ 
+ static int collect_ips(uint8_t *keybuf, size_t keylen, uint8_t *databuf,
+@@ -1657,6 +1968,7 @@ static int control_ip(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+ 	unsigned int i;
+ 	int ret;
+ 	bool do_all = false;
++	bool ok;
+ 
+ 	if (argc > 1) {
+ 		usage("ip");
+@@ -1709,8 +2021,14 @@ static int control_ip(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+ 		}
+ 	}
+ 
+-	print_ip(mem_ctx, ctdb, ips, ipinfo, do_all);
+-	return 0;
++	switch (options.format) {
++	case F_JSON:
++		ok = print_ip_json(mem_ctx, ctdb, ips, ipinfo, do_all);
++		break;
++	default:
++		ok = print_ip(mem_ctx, ctdb, ips, ipinfo, do_all);
++	}
++	return ok ? 0 : 1;
+ }
+ 
+ static int control_ipinfo(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+@@ -1924,23 +2242,12 @@ static int control_process_exists(TALLOC_CTX *mem_ctx,
+ 	return status;
+ }
+ 
+-static int control_getdbmap(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+-			    int argc, const char **argv)
++static int print_dbmap(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
++		       struct ctdb_dbid_map *dbmap)
+ {
+-	struct ctdb_dbid_map *dbmap;
+ 	unsigned int i;
+ 	int ret;
+ 
+-	if (argc != 0) {
+-		usage("getdbmap");
+-	}
+-
+-	ret = ctdb_ctrl_get_dbmap(mem_ctx, ctdb->ev, ctdb->client,
+-				  ctdb->cmd_pnn, TIMEOUT(), &dbmap);
+-	if (ret != 0) {
+-		return ret;
+-	}
+-
+ 	if (options.machinereadable == 1) {
+ 		printf("%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
+ 		       options.sep,
+@@ -2023,6 +2330,229 @@ static int control_getdbmap(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+ 	return 0;
+ }
+ 
++static int print_db_status_json(TALLOC_CTX *mem_ctx, uint32_t db_id, const char *db_name,
++				const char *db_path, const char *db_health,
++				uint8_t db_flags, struct json_object *_jsobj);
++
++static int print_dbmap_json(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
++			    struct ctdb_dbid_map *dbmap)
++{
++	struct json_object jsobj, jsdbmap;
++	unsigned int i;
++	int ret;
++	char *json_output = NULL;
++
++	jsobj = json_new_object();
++	if (json_is_invalid(&jsobj)) {
++		return 1;
++	}
++
++	ret = json_add_int(&jsobj, "database_cnt", dbmap->num);
++	if (ret != 0) {
++		goto failure;
++	}
++
++	jsdbmap = json_get_array(&jsobj, "dbmap");
++	if (json_is_invalid(&jsdbmap)) {
++		goto failure;
++	}
++
++	for (i=0; i<dbmap->num; i++) {
++		struct json_object tmp_obj;
++		const char *name;
++		const char *path;
++		const char *health;
++		bool persistent;
++		bool readonly;
++		bool sticky;
++		bool replicated;
++		uint32_t db_id;
++
++
++		tmp_obj = json_new_object();
++		if (json_is_invalid(&tmp_obj)) {
++			json_free(&jsdbmap);
++			goto failure;
++		}
++
++		db_id = dbmap->dbs[i].db_id;
++
++		ret = ctdb_ctrl_get_dbname(mem_ctx, ctdb->ev, ctdb->client,
++					   ctdb->cmd_pnn, TIMEOUT(), db_id,
++					   &name);
++		if (ret != 0) {
++			return ret;
++		}
++
++		ret = ctdb_ctrl_getdbpath(mem_ctx, ctdb->ev, ctdb->client,
++					  ctdb->cmd_pnn, TIMEOUT(), db_id,
++					  &path);
++		if (ret != 0) {
++			return ret;
++		}
++
++		ret = ctdb_ctrl_db_get_health(mem_ctx, ctdb->ev, ctdb->client,
++					      ctdb->cmd_pnn, TIMEOUT(), db_id,
++					      &health);
++		if (ret != 0) {
++			return ret;
++		}
++
++		ret = print_db_status_json(mem_ctx, db_id, name, path, health,
++					   dbmap->dbs[i].flags, &tmp_obj);
++
++		if (ret != 0) {
++			json_free(&jsdbmap);
++			goto failure;
++		}
++		talloc_free(discard_const(name));
++		talloc_free(discard_const(path));
++		talloc_free(discard_const(health));
++		ret = json_add_object(&jsdbmap, NULL, &tmp_obj);
++		if (ret != 0) {
++			json_free(&jsdbmap);
++			goto failure;
++		}
++	}
++	ret = json_add_object(&jsobj, "dbmap", &jsdbmap);
++	if (ret != 0) {
++		json_free(&jsdbmap);
++		goto failure;
++	}
++
++	json_output = json_to_string(mem_ctx, &jsobj);
++	printf("%s\n", json_output);
++	TALLOC_FREE(json_output);
++
++	return 0;
++failure:
++	json_free(&jsobj);
++	return 1;
++}
++
++static int control_getdbmap(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
++			    int argc, const char **argv)
++{
++	struct ctdb_dbid_map *dbmap;
++	unsigned int i;
++	int ret;
++
++	ret = ctdb_ctrl_get_dbmap(mem_ctx, ctdb->ev, ctdb->client,
++				  ctdb->cmd_pnn, TIMEOUT(), &dbmap);
++	if (ret != 0) {
++		return ret;
++	}
++	switch (options.format) {
++	case F_JSON:
++		ret = print_dbmap_json(mem_ctx, ctdb, dbmap);
++		break;
++	default:
++		ret = print_dbmap(mem_ctx, ctdb, dbmap);
++	}
++	return ret;
++}
++
++static int print_db_status(uint32_t db_id, const char *db_name,
++			   const char *db_path, const char *db_health,
++			   uint8_t db_flags)
++{
++	printf("dbid: 0x%08x\nname: %s\npath: %s\n", db_id, db_name, db_path);
++	printf("PERSISTENT: %s\nREPLICATED: %s\nSTICKY: %s\nREADONLY: %s\n",
++	       (db_flags & CTDB_DB_FLAGS_PERSISTENT ? "yes" : "no"),
++	       (db_flags & CTDB_DB_FLAGS_REPLICATED ? "yes" : "no"),
++	       (db_flags & CTDB_DB_FLAGS_STICKY ? "yes" : "no"),
++	       (db_flags & CTDB_DB_FLAGS_READONLY ? "yes" : "no"));
++	printf("HEALTH: %s\n", (db_health ? db_health : "OK"));
++	return 0;
++
++}
++
++static int print_db_status_json(TALLOC_CTX *mem_ctx, uint32_t db_id, const char *db_name,
++				const char *db_path, const char *db_health,
++				uint8_t db_flags, struct json_object *_jsobj)
++{
++	int rv;
++	bool print_output = false;
++	struct json_object jsobj;
++	char dbid_hex[12] = {0};
++
++	if (_jsobj != NULL) {
++		jsobj = *_jsobj;
++	}
++	else {
++		jsobj = json_new_object();
++		print_output = true;
++	}
++	if (json_is_invalid(&jsobj)) {
++		fprintf(stderr, "Failed to generate JSON object for output: %s\n",
++			strerror(errno));
++		return 1;
++	}
++	snprintf(dbid_hex, sizeof(dbid_hex), "0x%08x", db_id);
++	rv = json_add_string(&jsobj, "dbid", dbid_hex);
++	if (rv != 0) {
++		goto failure;
++	}
++
++	rv = json_add_string(&jsobj, "name", db_name);
++	if (rv != 0) {
++		goto failure;
++	}
++
++	rv = json_add_string(&jsobj, "path", db_path);
++	if (rv != 0) {
++		goto failure;
++	}
++
++	rv = json_add_bool(&jsobj, "persistent", db_flags & CTDB_DB_FLAGS_PERSISTENT);
++	if (rv != 0) {
++		goto failure;
++	}
++
++
++	rv = json_add_bool(&jsobj, "replicated", db_flags & CTDB_DB_FLAGS_REPLICATED);
++	if (rv != 0) {
++		goto failure;
++	}
++
++	rv = json_add_bool(&jsobj, "sticky", db_flags & CTDB_DB_FLAGS_STICKY);
++	if (rv != 0) {
++		goto failure;
++	}
++
++	rv = json_add_bool(&jsobj, "readonly", db_flags & CTDB_DB_FLAGS_READONLY);
++	if (rv != 0) {
++		goto failure;
++	}
++
++	rv = json_add_int(&jsobj, "flags_raw", db_flags);
++	if (rv != 0) {
++		goto failure;
++	}
++
++	rv = json_add_string(&jsobj, "health", db_health ? db_health : "OK");
++	if (rv != 0) {
++		goto failure;
++	}
++
++	if (print_output) {
++		char *json_output = NULL;
++		json_output = json_to_string(mem_ctx, &jsobj);
++		printf("%s\n", json_output);
++		TALLOC_FREE(json_output);
++		json_free(&jsobj);
++	}
++	return 0;
++
++failure:
++	fprintf(stderr, "Failed to generate json output for DB status\n");
++	if (print_output) {
++		// If caller passed in json oject to this function, then memory should
++		// be freed there.
++		json_free(&jsobj);
++	}
++	return 1;
++}
+ static int control_getdbstatus(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+ 			       int argc, const char **argv)
+ {
+@@ -2052,15 +2582,17 @@ static int control_getdbstatus(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+ 	if (ret != 0) {
+ 		return ret;
+ 	}
+-
+-	printf("dbid: 0x%08x\nname: %s\npath: %s\n", db_id, db_name, db_path);
+-	printf("PERSISTENT: %s\nREPLICATED: %s\nSTICKY: %s\nREADONLY: %s\n",
+-	       (db_flags & CTDB_DB_FLAGS_PERSISTENT ? "yes" : "no"),
+-	       (db_flags & CTDB_DB_FLAGS_REPLICATED ? "yes" : "no"),
+-	       (db_flags & CTDB_DB_FLAGS_STICKY ? "yes" : "no"),
+-	       (db_flags & CTDB_DB_FLAGS_READONLY ? "yes" : "no"));
+-	printf("HEALTH: %s\n", (db_health ? db_health : "OK"));
+-	return 0;
++	switch (options.format) {
++	case F_JSON:
++		ret = print_db_status_json(mem_ctx, db_id, db_name, db_path, db_health,
++					   db_flags, NULL);
++		break;
++	default:
++		ret = print_db_status(db_id, db_name, db_path, db_health,
++				      db_flags);
++		break;
++	}
++	return ret;
+ }
+ 
+ struct dump_record_state {
+@@ -3371,11 +3903,112 @@ static int control_deltickle(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+ 	return 0;
+ }
+ 
++static bool print_nodelist(TALLOC_CTX *mem_ctx, struct ctdb_node_map *nodemap)
++{
++	int i;
++	for (i=0; i<nodemap->num; i++) {
++		char *addr = NULL;
++		if (nodemap->node[i].flags & NODE_FLAGS_DELETED) {
++			continue;
++		}
++
++		addr = ctdb_sock_addr_to_string(mem_ctx,
++						&nodemap->node[i].addr,
++						false);
++
++		if (options.machinereadable) {
++			printf("%s%u%s%s%s\n", options.sep,
++			       nodemap->node[i].pnn, options.sep,
++			       addr, options.sep);
++		} else {
++			printf("%s\n", addr);
++		}
++		TALLOC_FREE(addr);
++	}
++	return true;
++}
++
++static bool print_nodelist_json(TALLOC_CTX *mem_ctx, struct ctdb_node_map *nodemap)
++{
++	struct json_object jsobj, jsnodelist;
++	int rv, i;
++	char *json_output = NULL;
++	jsobj = json_new_object();
++	if (json_is_invalid(&jsobj)) {
++		return false;
++	}
++
++	jsnodelist = json_get_array(&jsobj, "nodeslist");
++	if (json_is_invalid(&jsnodelist)) {
++		goto failure;
++	}
++
++	for (i=0; i<nodemap->num; i++) {
++		struct json_object jsnode;
++		char *addr = NULL;
++		bool enabled;
++		if ((nodemap->node[i].flags & NODE_FLAGS_DELETED) &&
++		    (options.verbose == 0)) {
++			continue;
++		}
++		enabled = (nodemap->node[i].flags & NODE_FLAGS_DELETED) ? false : true;
++		jsnode = json_new_object();
++		if (json_is_invalid(&jsnode)) {
++			return false;
++		}
++		addr = ctdb_sock_addr_to_string(mem_ctx,
++						&nodemap->node[i].addr,
++						false);
++
++		rv = json_add_int(&jsnode, "pnn", nodemap->node[i].pnn);
++		if (rv != 0) {
++			json_free(&jsnode);
++			goto failure;
++		}
++
++		rv = json_add_string(&jsnode, "address", addr);
++		if (rv != 0) {
++			json_free(&jsnode);
++			goto failure;
++		}
++		TALLOC_FREE(addr);
++		if (options.verbose == 1) {
++			rv = json_add_bool(&jsnode, "enabled", enabled);
++			if (rv != 0) {
++				json_free(&jsnode);
++				goto failure;
++			}
++		}
++		rv = json_add_object(&jsnodelist, NULL, &jsnode);
++		if (rv != 0) {
++			json_free(&jsnode);
++			goto failure;
++		}
++
++	}
++	rv = json_add_object(&jsobj, "nodelist", &jsnodelist);
++	if (rv != 0) {
++		json_free(&jsnodelist);
++		goto failure;
++	}
++
++	json_output = json_to_string(mem_ctx, &jsobj);
++	printf("%s\n", json_output);
++	TALLOC_FREE(json_output);
++
++	return true;
++
++failure:
++	json_free(&jsobj);
++	return false;
++}
++
+ static int control_listnodes(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+ 			     int argc, const char **argv)
+ {
+ 	struct ctdb_node_map *nodemap;
+ 	unsigned int i;
++	bool ok;
+ 
+ 	if (argc != 0) {
+ 		usage("listnodes");
+@@ -3386,25 +4019,15 @@ static int control_listnodes(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+ 		return 1;
+ 	}
+ 
+-	for (i=0; i<nodemap->num; i++) {
+-		if (nodemap->node[i].flags & NODE_FLAGS_DELETED) {
+-			continue;
+-		}
+-
+-		if (options.machinereadable) {
+-			printf("%s%u%s%s%s\n", options.sep,
+-			       nodemap->node[i].pnn, options.sep,
+-			       ctdb_sock_addr_to_string(
+-				       mem_ctx, &nodemap->node[i].addr, false),
+-			       options.sep);
+-		} else {
+-			printf("%s\n",
+-			       ctdb_sock_addr_to_string(
+-				       mem_ctx, &nodemap->node[i].addr, false));
+-		}
++	switch (options.format) {
++	case F_JSON:
++		ok = print_nodelist_json(mem_ctx, nodemap);
++		break;
++	default:
++		ok = print_nodelist(mem_ctx, nodemap);
+ 	}
+ 
+-	return 0;
++	return ok ? 0 : 1;
+ }
+ 
+ static bool nodemap_identical(struct ctdb_node_map *nodemap1,
+@@ -5554,6 +6177,8 @@ static int control_nodestatus(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+ 	unsigned int i;
+ 	int ret;
+ 	bool print_hdr = false;
++	struct json_object jsobj;
++	char *json_output = NULL;
+ 
+ 	if (argc > 1) {
+ 		usage("nodestatus");
+@@ -5570,10 +6195,25 @@ static int control_nodestatus(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+ 		return 1;
+ 	}
+ 
+-	if (options.machinereadable) {
+-		print_nodemap_machine(mem_ctx, ctdb, nodemap, ctdb->cmd_pnn);
+-	} else {
+-		print_nodemap(mem_ctx, ctdb, nodemap, ctdb->cmd_pnn, print_hdr);
++	switch (options.format) {
++	case F_JSON:
++		jsobj = json_new_object();
++		if (json_is_invalid(&jsobj)) {
++			fprintf(stderr, "Failed to create json object for tmp_obj\n");
++			return ENOMEM;
++		}
++		print_nodemap_json(mem_ctx, ctdb, nodemap, ctdb->cmd_pnn, print_hdr, &jsobj);
++		json_output = json_to_string(mem_ctx, &jsobj);
++		printf("%s\n", json_output);
++		TALLOC_FREE(json_output);
++		break;
++	default:
++		if (options.machinereadable) {
++			print_nodemap_machine(mem_ctx, ctdb, nodemap, ctdb->cmd_pnn);
++		} else {
++			print_nodemap(mem_ctx, ctdb, nodemap, ctdb->cmd_pnn, print_hdr);
++		}
++		break;
+ 	}
+ 
+ 	ret = 0;
+@@ -6139,6 +6779,13 @@ struct poptOption cmdline_options[] = {
+ 		.val        = 0,
+ 		.descrip    = "enable machine parsable output with separator |",
+ 	},
++	{
++		.shortName  = 'j',
++		.argInfo    = POPT_ARG_NONE,
++		.arg        = &options.json,
++		.val        = 0,
++		.descrip    = "Do JSON output",
++	},
+ 	{
+ 		.longName   = "verbose",
+ 		.shortName  = 'v',
+@@ -6306,7 +6953,9 @@ int main(int argc, const char *argv[])
+ 			options.maxruntime = 120;
+ 		}
+ 	}
+-
++	if (options.json) {
++		options.format = F_JSON;
++	}
+ 	if (options.machineparsable) {
+ 		options.machinereadable = 1;
+ 	}
+diff --git a/ctdb/wscript b/ctdb/wscript
+index b883990c55e..8f9f6a66031 100644
+--- a/ctdb/wscript
++++ b/ctdb/wscript
+@@ -35,6 +35,7 @@ samba_dist.DIST_DIRS('''ctdb:. lib/replace:lib/replace lib/talloc:lib/talloc
+                         lib/async_req:lib/async_req
+                         lib/pthreadpool:lib/pthreadpool
+                         lib/messaging:lib/messaging
++                        lib/json_minimal:lib/json_minimal
+                         buildtools:buildtools third_party/waf:third_party/waf''')
+ 
+ manpages_binary = [
+@@ -367,6 +368,7 @@ def build(bld):
+     bld.RECURSE('lib/async_req')
+     bld.RECURSE('lib/pthreadpool')
+     bld.RECURSE('lib/messaging')
++    bld.RECURSE('lib/json_minimal')
+ 
+     bld.RECURSE('lib/talloc')
+     bld.RECURSE('lib/tevent')
+@@ -592,7 +594,7 @@ def build(bld):
+     bld.SAMBA_BINARY('ctdb',
+                      source='tools/ctdb.c',
+                      deps='''ctdb-client ctdb-protocol ctdb-protocol-util
+-                             ctdb-util ctdb-system samba-util sys_rw popt''',
++                             ctdb-util ctdb-system samba-util sys_rw popt jansson json_minimal''',
+                      install_path='${BINDIR}',
+                      manpages='ctdb.1')
+ 
+diff --git a/lib/json_minimal/json_minimal.c b/lib/json_minimal/json_minimal.c
+new file mode 100644
+index 00000000000..d0509d3bb70
+--- /dev/null
++++ b/lib/json_minimal/json_minimal.c
+@@ -0,0 +1,663 @@
++/*
++   common routines for audit logging
++
++   Copyright (C) Andrew Bartlett <abartlet@samba.org> 2018
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++/*
++ * Error handling:
++ *
++ */
++
++#include "includes.h"
++
++#include "json_minimal.h"
++
++/*
++ * @brief Get a human readable timestamp.
++ *
++ * Returns the current time formatted as
++ *  "Tue, 14 Mar 2017 08:38:42.209028 NZDT"
++ *
++ * The returned string is allocated by talloc in the supplied context.
++ * It is the callers responsibility to free it.
++ *
++ * @param mem_ctx talloc memory context that owns the returned string.
++ *
++ * @return a human readable time stamp, or NULL in the event of an error.
++ *
++ */
++char* audit_get_timestamp(TALLOC_CTX *frame)
++{
++	char buffer[40];	/* formatted time less usec and timezone */
++	char tz[10];		/* formatted time zone			 */
++	struct tm* tm_info;	/* current local time			 */
++	struct timeval tv;	/* current system time			 */
++	int ret;		/* response code			 */
++	char * ts;		/* formatted time stamp			 */
++
++	ret = gettimeofday(&tv, NULL);
++	if (ret != 0) {
++		DBG_ERR("Unable to get time of day: (%d) %s\n",
++			errno,
++			strerror(errno));
++		return NULL;
++	}
++
++	tm_info = localtime(&tv.tv_sec);
++	if (tm_info == NULL) {
++		DBG_ERR("Unable to determine local time\n");
++		return NULL;
++	}
++
++	strftime(buffer, sizeof(buffer)-1, "%a, %d %b %Y %H:%M:%S", tm_info);
++	strftime(tz, sizeof(tz)-1, "%Z", tm_info);
++	ts = talloc_asprintf(frame, "%s.%06ld %s", buffer, tv.tv_usec, tz);
++	if (ts == NULL) {
++		DBG_ERR("Out of memory formatting time stamp\n");
++	}
++	return ts;
++}
++
++#ifdef HAVE_JANSSON
++/*
++ * Constant for empty json object initialisation
++ */
++const struct json_object json_empty_object = {.valid = false, .root = NULL};
++
++/*
++ * @brief Create a new struct json_object, wrapping a JSON Object.
++ *
++ * Create a new json object, the json_object wraps the underlying json
++ * implementations JSON Object representation.
++ *
++ * Free with a call to json_free_object, note that the jansson inplementation
++ * allocates memory with malloc and not talloc.
++ *
++ * @return a struct json_object, valid will be set to false if the object
++ *         could not be created.
++ *
++ */
++struct json_object json_new_object(void) {
++
++	struct json_object object = json_empty_object;
++
++	object.root = json_object();
++	if (object.root == NULL) {
++		object.valid = false;
++		DBG_ERR("Unable to create JSON object\n");
++		return object;
++	}
++	object.valid = true;
++	return object;
++}
++
++/*
++ * @brief Create a new struct json_object wrapping a JSON Array.
++ *
++ * Create a new json object, the json_object wraps the underlying json
++ * implementations JSON Array representation.
++ *
++ * Free with a call to json_free_object, note that the jansson inplementation
++ * allocates memory with malloc and not talloc.
++ *
++ * @return a struct json_object, error will be set to true if the array
++ *         could not be created.
++ *
++ */
++struct json_object json_new_array(void) {
++
++	struct json_object array = json_empty_object;
++
++	array.root = json_array();
++	if (array.root == NULL) {
++		array.valid = false;
++		DBG_ERR("Unable to create JSON array\n");
++		return array;
++	}
++	array.valid = true;
++	return array;
++}
++
++
++/*
++ * @brief free and invalidate a previously created JSON object.
++ *
++ * Release any resources owned by a json_object, and then mark the structure
++ * as invalid.  It is safe to call this multiple times on an object.
++ *
++ */
++void json_free(struct json_object *object)
++{
++	if (object->root != NULL) {
++		json_decref(object->root);
++	}
++	object->root = NULL;
++	object->valid = false;
++}
++
++/*
++ * @brief is the current JSON object invalid?
++ *
++ * Check the state of the object to determine if it is invalid.
++ *
++ * @return is the object valid?
++ *
++ */
++bool json_is_invalid(const struct json_object *object)
++{
++	return !object->valid;
++}
++
++/*
++ * @brief Add an integer value to a JSON object.
++ *
++ * Add an integer value named 'name' to the json object.
++ *
++ * @param object the JSON object to be updated.
++ * @param name the name of the value.
++ * @param value the value.
++ *
++ * @return 0 the operation was successful
++ *        -1 the operation failed
++ *
++ */
++int json_add_int(struct json_object *object, const char *name, const int value)
++{
++	int ret = 0;
++	json_t *integer = NULL;
++
++	if (json_is_invalid(object)) {
++		DBG_ERR("Unable to add int [%s] value [%d], "
++			"target object is invalid\n",
++			name,
++			value);
++		return JSON_ERROR;
++	}
++
++	integer = json_integer(value);
++	if (integer == NULL) {
++		DBG_ERR("Unable to create integer value [%s] value [%d]\n",
++			name,
++			value);
++		return JSON_ERROR;
++	}
++
++	ret = json_object_set_new(object->root, name, integer);
++	if (ret != 0) {
++		json_decref(integer);
++		DBG_ERR("Unable to add int [%s] value [%d]\n", name, value);
++	}
++	return ret;
++}
++
++/*
++ * @brief Add a boolean value to a JSON object.
++ *
++ * Add a boolean value named 'name' to the json object.
++ *
++ * @param object the JSON object to be updated.
++ * @param name the name.
++ * @param value the value.
++ *
++ * @return 0 the operation was successful
++ *        -1 the operation failed
++ *
++ */
++int json_add_bool(struct json_object *object,
++		  const char *name,
++		  const bool value)
++{
++	int ret = 0;
++
++	if (json_is_invalid(object)) {
++		DBG_ERR("Unable to add boolean [%s] value [%d], "
++			"target object is invalid\n",
++			name,
++			value);
++		return JSON_ERROR;
++	}
++
++	ret = json_object_set_new(object->root, name, json_boolean(value));
++	if (ret != 0) {
++		DBG_ERR("Unable to add boolean [%s] value [%d]\n", name, value);
++	}
++	return ret;
++}
++
++/*
++ * @brief Add a string value to a JSON object.
++ *
++ * Add a string value named 'name' to the json object.
++ *
++ * @param object the JSON object to be updated.
++ * @param name the name.
++ * @param value the value.
++ *
++ * @return 0 the operation was successful
++ *        -1 the operation failed
++ *
++ */
++int json_add_string(struct json_object *object,
++		    const char *name,
++		    const char *value)
++{
++	int ret = 0;
++
++	if (json_is_invalid(object)) {
++		DBG_ERR("Unable to add string [%s], target object is invalid\n",
++			name);
++		return JSON_ERROR;
++	}
++	if (value) {
++		json_t *string = json_string(value);
++		if (string == NULL) {
++			DBG_ERR("Unable to add string [%s], "
++				"could not create string object\n",
++				name);
++			return JSON_ERROR;
++		}
++		ret = json_object_set_new(object->root, name, string);
++		if (ret != 0) {
++			json_decref(string);
++			DBG_ERR("Unable to add string [%s]\n", name);
++			return ret;
++		}
++	} else {
++		ret = json_object_set_new(object->root, name, json_null());
++		if (ret != 0) {
++			DBG_ERR("Unable to add null string [%s]\n", name);
++			return ret;
++		}
++	}
++	return ret;
++}
++
++/*
++ * @brief Assert that the current JSON object is an array.
++ *
++ * Check that the current object is a JSON array, and if not
++ * invalidate the object. We also log an error message as this indicates
++ * bug in the calling code.
++ *
++ * @param object the JSON object to be validated.
++ */
++void json_assert_is_array(struct json_object *array) {
++
++	if (json_is_invalid(array)) {
++		return;
++	}
++
++	if (json_is_array(array->root) == false) {
++		DBG_ERR("JSON object is not an array\n");
++		array->valid = false;
++		return;
++	}
++}
++
++/*
++ * @brief Add a JSON object to a JSON object.
++ *
++ * Add a JSON object named 'name' to the json object.
++ *
++ * @param object the JSON object to be updated.
++ * @param name the name.
++ * @param value the value.
++ *
++ * @return 0 the operation was successful
++ *        -1 the operation failed
++ *
++ */
++int json_add_object(struct json_object *object,
++		    const char *name,
++		    struct json_object *value)
++{
++	int ret = 0;
++	json_t *jv = NULL;
++
++	if (value != NULL && json_is_invalid(value)) {
++		DBG_ERR("Invalid JSON object [%s] supplied\n", name);
++		return JSON_ERROR;
++	}
++	if (json_is_invalid(object)) {
++		DBG_ERR("Unable to add object [%s], target object is invalid\n",
++			name);
++		return JSON_ERROR;
++	}
++
++	jv = value == NULL ? json_null() : value->root;
++
++	if (json_is_array(object->root)) {
++		ret = json_array_append_new(object->root, jv);
++	} else if (json_is_object(object->root)) {
++		ret = json_object_set_new(object->root, name, jv);
++	} else {
++		DBG_ERR("Invalid JSON object type\n");
++		ret = JSON_ERROR;
++	}
++	if (ret != 0) {
++		DBG_ERR("Unable to add object [%s]\n", name);
++	}
++	return ret;
++}
++
++/*
++ * @brief Add a string to a JSON object, truncating if necessary.
++ *
++ *
++ * Add a string value named 'name' to the json object, the string will be
++ * truncated if it is more than len characters long. If len is 0 the value
++ * is encoded as a JSON null.
++ *
++ *
++ * @param object the JSON object to be updated.
++ * @param name the name.
++ * @param value the value.
++ * @param len the maximum number of characters to be copied.
++ *
++ * @return 0 the operation was successful
++ *        -1 the operation failed
++ *
++ */
++int json_add_stringn(struct json_object *object,
++		     const char *name,
++		     const char *value,
++		     const size_t len)
++{
++
++	int ret = 0;
++	if (json_is_invalid(object)) {
++		DBG_ERR("Unable to add string [%s], target object is invalid\n",
++			name);
++		return JSON_ERROR;
++	}
++
++	if (value != NULL && len > 0) {
++		json_t *string = NULL;
++		char buffer[len+1];
++
++		strncpy(buffer, value, len);
++		buffer[len] = '\0';
++
++		string = json_string(buffer);
++		if (string == NULL) {
++			DBG_ERR("Unable to add string [%s], "
++				"could not create string object\n",
++				name);
++			return JSON_ERROR;
++		}
++		ret = json_object_set_new(object->root, name, string);
++		if (ret != 0) {
++			json_decref(string);
++			DBG_ERR("Unable to add string [%s]\n", name);
++			return ret;
++		}
++	} else {
++		ret = json_object_set_new(object->root, name, json_null());
++		if (ret != 0) {
++			DBG_ERR("Unable to add null string [%s]\n", name);
++			return ret;
++		}
++	}
++	return ret;
++}
++
++/*
++ * @brief Add a version object to a JSON object
++ *
++ * Add a version object to the JSON object
++ * 	"version":{"major":1, "minor":0}
++ *
++ * The version tag is intended to aid the processing of the JSON messages
++ * The major version number should change when an attribute is:
++ *  - renamed
++ *  - removed
++ *  - its meaning changes
++ *  - its contents change format
++ * The minor version should change whenever a new attribute is added and for
++ * minor bug fixes to an attributes content.
++ *
++ *
++ * @param object the JSON object to be updated.
++ * @param major the major version number
++ * @param minor the minor version number
++ *
++ * @return 0 the operation was successful
++ *        -1 the operation failed
++ */
++int json_add_version(struct json_object *object, int major, int minor)
++{
++	int ret = 0;
++	struct json_object version;
++
++	if (json_is_invalid(object)) {
++		DBG_ERR("Unable to add version, target object is invalid\n");
++		return JSON_ERROR;
++	}
++
++	version = json_new_object();
++	if (json_is_invalid(&version)) {
++		DBG_ERR("Unable to add version, failed to create object\n");
++		return JSON_ERROR;
++	}
++	ret = json_add_int(&version, "major", major);
++	if (ret != 0) {
++		json_free(&version);
++		return ret;
++	}
++	ret = json_add_int(&version, "minor", minor);
++	if (ret != 0) {
++		json_free(&version);
++		return ret;
++	}
++	ret = json_add_object(object, "version", &version);
++	if (ret != 0) {
++		json_free(&version);
++		return ret;
++	}
++	return ret;
++}
++
++/*
++ * @brief add an ISO 8601 timestamp to the object.
++ *
++ * Add the current date and time as a timestamp in ISO 8601 format
++ * to a JSON object
++ *
++ * "timestamp":"2017-03-06T17:18:04.455081+1300"
++ *
++ *
++ * @param object the JSON object to be updated.
++ *
++ * @return 0 the operation was successful
++ *        -1 the operation failed
++ */
++int json_add_timestamp(struct json_object *object)
++{
++	char buffer[40];	/* formatted time less usec and timezone */
++	char timestamp[65];	/* the formatted ISO 8601 time stamp	 */
++	char tz[10];		/* formatted time zone			 */
++	struct tm* tm_info;	/* current local time			 */
++	struct timeval tv;	/* current system time			 */
++	int r;			/* response code from gettimeofday	 */
++	int ret;		/* return code from json operations	*/
++
++	if (json_is_invalid(object)) {
++		DBG_ERR("Unable to add time stamp, target object is invalid\n");
++		return JSON_ERROR;
++	}
++
++	r = gettimeofday(&tv, NULL);
++	if (r) {
++		DBG_ERR("Unable to get time of day: (%d) %s\n",
++			errno,
++			strerror(errno));
++		return JSON_ERROR;
++	}
++
++	tm_info = localtime(&tv.tv_sec);
++	if (tm_info == NULL) {
++		DBG_ERR("Unable to determine local time\n");
++		return JSON_ERROR;
++	}
++
++	strftime(buffer, sizeof(buffer)-1, "%Y-%m-%dT%T", tm_info);
++	strftime(tz, sizeof(tz)-1, "%z", tm_info);
++	snprintf(
++		timestamp,
++		sizeof(timestamp),
++		"%s.%06ld%s",
++		buffer,
++		tv.tv_usec,
++		tz);
++	ret = json_add_string(object, "timestamp", timestamp);
++	if (ret != 0) {
++		DBG_ERR("Unable to add time stamp to JSON object\n");
++	}
++	return ret;
++}
++
++/*
++ * @brief Convert a JSON object into a string
++ *
++ * Convert the jsom object into a string suitable for printing on a log line,
++ * i.e. with no embedded line breaks.
++ *
++ * If the object is invalid it logs an error and returns NULL.
++ *
++ * @param mem_ctx the talloc memory context owning the returned string
++ * @param object the json object.
++ *
++ * @return A string representation of the object or NULL if the object
++ *         is invalid.
++ */
++char *json_to_string(TALLOC_CTX *mem_ctx, const struct json_object *object)
++{
++	char *json = NULL;
++	char *json_string = NULL;
++
++	if (json_is_invalid(object)) {
++		DBG_ERR("Invalid JSON object, unable to convert to string\n");
++		return NULL;
++	}
++
++	if (object->root == NULL) {
++		return NULL;
++	}
++
++	/*
++	 * json_dumps uses malloc, so need to call free(json) to release
++	 * the memory
++	 */
++	json = json_dumps(object->root, 0);
++	if (json == NULL) {
++		DBG_ERR("Unable to convert JSON object to string\n");
++		return NULL;
++	}
++
++	json_string = talloc_strdup(mem_ctx, json);
++	if (json_string == NULL) {
++		free(json);
++		DBG_ERR("Unable to copy JSON object string to talloc string\n");
++		return NULL;
++	}
++	free(json);
++
++	return json_string;
++}
++
++/*
++ * @brief get a json array named "name" from the json object.
++ *
++ * Get the array attribute named name, creating it if it does not exist.
++ *
++ * @param object the json object.
++ * @param name the name of the array attribute
++ *
++ * @return The array object, will be created if it did not exist.
++ */
++struct json_object json_get_array(struct json_object *object, const char *name)
++{
++
++	struct json_object array = json_empty_object;
++	json_t *a = NULL;
++	int ret = 0;
++
++	if (json_is_invalid(object)) {
++		DBG_ERR("Invalid JSON object, unable to get array [%s]\n",
++			name);
++		json_free(&array);
++		return array;
++	}
++
++	array = json_new_array();
++	if (json_is_invalid(&array)) {
++		DBG_ERR("Unable to create new array for [%s]\n", name);
++		return array;
++	}
++
++	a = json_object_get(object->root, name);
++	if (a == NULL) {
++		return array;
++	}
++
++	ret = json_array_extend(array.root, a);
++	if (ret != 0) {
++		DBG_ERR("Unable to get array [%s]\n", name);
++		json_free(&array);
++		return array;
++	}
++
++	return array;
++}
++
++/*
++ * @brief get a json object named "name" from the json object.
++ *
++ * Get the object attribute named name, creating it if it does not exist.
++ *
++ * @param object the json object.
++ * @param name the name of the object attribute
++ *
++ * @return The object, will be created if it did not exist.
++ */
++struct json_object json_get_object(struct json_object *object, const char *name)
++{
++
++	struct json_object o = json_new_object();
++	json_t *v = NULL;
++	int ret = 0;
++
++	if (json_is_invalid(object)) {
++		DBG_ERR("Invalid JSON object, unable to get object [%s]\n",
++			name);
++		json_free(&o);
++		return o;
++	}
++
++	v = json_object_get(object->root, name);
++	if (v == NULL) {
++		return o;
++	}
++	ret = json_object_update(o.root, v);
++	if (ret != 0) {
++		DBG_ERR("Unable to get object [%s]\n", name);
++		json_free(&o);
++		return o;
++	}
++	return o;
++}
++#endif
+diff --git a/lib/json_minimal/json_minimal.h b/lib/json_minimal/json_minimal.h
+new file mode 100644
+index 00000000000..bf52019dd32
+--- /dev/null
++++ b/lib/json_minimal/json_minimal.h
+@@ -0,0 +1,75 @@
++/*
++   common routines for audit logging
++
++   Copyright (C) Andrew Bartlett <abartlet@samba.org> 2018
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program.  If not, see <http://www.gnu.org/licenses/>.
++*/
++#ifndef _AUDIT_LOGGING_H_
++#define _AUDIT_LOGGING_H_
++#include <talloc.h>
++
++_WARN_UNUSED_RESULT_ char *audit_get_timestamp(TALLOC_CTX *frame);
++#ifdef HAVE_JANSSON
++#include <jansson.h>
++/*
++ * Wrapper for jannson JSON object
++ *
++ */
++struct json_object {
++	json_t *root;
++	bool valid;
++};
++extern const struct json_object json_empty_object;
++
++#define JSON_ERROR -1
++
++void audit_log_json(struct json_object *message,
++		    int debug_class,
++		    int debug_level);
++_WARN_UNUSED_RESULT_ struct json_object json_new_object(void);
++_WARN_UNUSED_RESULT_ struct json_object json_new_array(void);
++void json_free(struct json_object *object);
++void json_assert_is_array(struct json_object *array);
++_WARN_UNUSED_RESULT_ bool json_is_invalid(const struct json_object *object);
++
++_WARN_UNUSED_RESULT_ int json_add_int(struct json_object *object,
++				      const char *name,
++				      const int value);
++_WARN_UNUSED_RESULT_ int json_add_bool(struct json_object *object,
++				       const char *name,
++				       const bool value);
++_WARN_UNUSED_RESULT_ int json_add_string(struct json_object *object,
++					 const char *name,
++					 const char *value);
++_WARN_UNUSED_RESULT_ int json_add_object(struct json_object *object,
++					 const char *name,
++					 struct json_object *value);
++_WARN_UNUSED_RESULT_ int json_add_stringn(struct json_object *object,
++					  const char *name,
++					  const char *value,
++					  const size_t len);
++_WARN_UNUSED_RESULT_ int json_add_version(struct json_object *object,
++					  int major,
++					  int minor);
++_WARN_UNUSED_RESULT_ int json_add_timestamp(struct json_object *object);
++
++_WARN_UNUSED_RESULT_ struct json_object json_get_array(
++    struct json_object *object, const char *name);
++_WARN_UNUSED_RESULT_ struct json_object json_get_object(
++    struct json_object *object, const char *name);
++_WARN_UNUSED_RESULT_ char *json_to_string(TALLOC_CTX *mem_ctx,
++					  const struct json_object *object);
++#endif
++#endif
+diff --git a/lib/json_minimal/wscript_build b/lib/json_minimal/wscript_build
+new file mode 100644
+index 00000000000..35301c5afba
+--- /dev/null
++++ b/lib/json_minimal/wscript_build
+@@ -0,0 +1,8 @@
++#!/usr/bin/env python
++
++bld.SAMBA_SUBSYSTEM(
++    'json_minimal',
++    deps='''jansson
++            samba-debug ''',
++    source='json_minimal.c'
++)
+-- 
+2.28.0
+
