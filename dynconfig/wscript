@@ -220,7 +220,7 @@ dynconfig = {
     },
     'LOGFILEBASE' : {
          'STD-PATH':  '${LOCALSTATEDIR}',
-         'FHS-PATH':  '${LOCALSTATEDIR}/log/samba',
+         'FHS-PATH':  '${LOCALSTATEDIR}/log/samba4',
          'OPTION':    '--with-logfilebase',
          'HELPTEXT':  'Where to put log files',
     },
@@ -257,8 +257,8 @@ dynconfig = {
          'DELAY':     True,
     },
     'CONFIGFILE' : {
-         'STD-PATH':  '${SYSCONFDIR}/smb4.conf',
-         'FHS-PATH':  '${SYSCONFDIR}/smb4.conf',
+         'STD-PATH':  '${SYSCONFDIR}/local/smb4.conf',
+         'FHS-PATH':  '${SYSCONFDIR}/local/smb4.conf',
          'DELAY':     True,
     },
     'LMHOSTSFILE' : {
