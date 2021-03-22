@@ -150,6 +150,7 @@ static bool snap_path_exists(TALLOC_CTX *ctx, struct messaging_context *msg_ctx,
 	struct smb_filename *smb_fname = NULL;
 	char *service = NULL;
 	char *share;
+	struct auth_session_info *session_info = NULL;
 	int snum;
 	int ret;
 	NTSTATUS status;
@@ -168,7 +169,19 @@ static bool snap_path_exists(TALLOC_CTX *ctx, struct messaging_context *msg_ctx,
 		goto out;
 	}
 
-	status = fss_conn_create_tos(msg_ctx, NULL, snum, &conn);
+	status = init_system_session_info(ctx);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("init_system_session_info failed\n");
+		goto out;
+	}
+
+	status = make_session_info_system(ctx, &session_info);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("make_session_info_system failed\n");
+		goto out;
+	}
+
+	status = fss_conn_create_tos(ctx, session_info, snum, &conn);
 	if(!NT_STATUS_IS_OK(status)) {
 		goto out;
 	}
