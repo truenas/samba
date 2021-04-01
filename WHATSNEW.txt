@@ -1,19 +1,79 @@
-Release Announcements
-=====================
-
-This is the first release candidate of Samba 4.14.  This is *not*
-intended for production environments and is designed for testing
-purposes only.  Please report any defects via the Samba bug reporting
-system at https://bugzilla.samba.org/.
-
-Samba 4.14 will be the next version of the Samba suite.
+                   ==============================
+                   Release Notes for Samba 4.14.1
+                           March 24, 2021
+                   ==============================
 
 
-UPGRADING
-=========
+This is a security release in order to address the following defects:
+
+o CVE-2020-27840: Heap corruption via crafted DN strings.
+o CVE-2021-20277: Out of bounds read in AD DC LDAP server.
+
+
+=======
+Details
+=======
+
+o  CVE-2020-27840:
+   An anonymous attacker can crash the Samba AD DC LDAP server by sending easily
+   crafted DNs as part of a bind request. More serious heap corruption is likely
+   also possible.
+
+o  CVE-2021-20277:
+   User-controlled LDAP filter strings against the AD DC LDAP server may crash
+   the LDAP server.
+
+For more details, please refer to the security advisories.
+
+
+Changes since 4.14.0
+--------------------
+
+o  Andrew Bartlett <abartlet@samba.org>
+   * BUG 14655: CVE-2021-20277: Fix out of bounds read in ldb_handler_fold.
+
+o  Douglas Bagnall <douglas.bagnall@catalyst.net.nz>
+   * BUG 14595: CVE-2020-27840: Fix unauthenticated remote heap corruption via
+     bad DNs.
+   * BUG 14655: CVE-2021-20277: Fix out of bounds read in ldb_handler_fold.
+
+
+#######################################
+Reporting bugs & Development Discussion
+#######################################
+
+Please discuss this release on the samba-technical mailing list or by
+joining the #samba-technical IRC channel on irc.freenode.net.
+
+If you do report problems then please try to send high quality
+feedback. If you don't provide vital information to help us track down
+the problem then you will probably be ignored.  All bug reports should
+be filed under the Samba 4.1 and newer product in the project's Bugzilla
+database (https://bugzilla.samba.org/).
+
+
+======================================================================
+== Our Code, Our Bugs, Our Responsibility.
+== The Samba Team
+======================================================================
+
+
+Release notes for older releases follow:
+----------------------------------------
+
+
+                   ==============================
+                   Release Notes for Samba 4.14.0
+                          March 09, 2021
+                   ==============================
+
+
+This is the first stable release of the Samba 4.14 release series.
+Please read the release notes carefully before upgrading.
+
 
 New GPG key
------------
+===========
 
 The GPG release key for Samba releases changed from:
 
@@ -86,7 +146,6 @@ Publishing printers in AD is more reliable and more printer features are
 added to the published information in AD. Samba now also supports Windows
 drivers for the ARM64 architecture.
 
-
 Client Group Policy
 -------------------
 This release extends Samba to support Group Policy functionality for Winbind
@@ -111,7 +170,6 @@ Configuration/Policies/Administrative Templates. Alternatively, Samba policy
 may be managed using the `samba-tool gpo manage` command. This tool does not
 require the admx templates to be installed.
 
-
 Python 3.6 or later required
 ----------------------------
 
@@ -123,39 +181,21 @@ Samba's minimum runtime requirement for python was raised to Python
 As Python 2.7 has been End Of Life upstream since April 2020, Samba
 is dropping ALL Python 2.x support in this release.
 
-
-NT4-like 'classic' Samba domain controllers
--------------------------------------------
-
-Samba 4.13 deprecates Samba's original domain controller mode.
-
-Sites using Samba as a Domain Controller should upgrade from the
-NT4-like 'classic' Domain Controller to a Samba Active Directory DC
-to ensure full operation with modern windows clients.
-
-
-SMBv1 only protocol options deprecated
---------------------------------------
-
-A number of smb.conf parameters for less-secure authentication methods
-which are only possible over SMBv1 are deprecated in this release.
-
-
 Miscellaneous samba-tool changes
 --------------------------------
 
-The samba-tool commands to manage AD objects (e.g. users, computers and
+The 'samba-tool' subcommands to manage AD objects (e.g. users, computers and
 groups) now consistently use the "add" command when adding a new object to
-the AD. The previous deprecation warnings when using the "add" commands
-have been removed. For compatibility reasons, both the "add" and "create"
+the AD. The previous deprecation warnings when using the 'add' commands
+have been removed. For compatibility reasons, both the 'add' and 'create'
 commands can be used now.
 
 Users, groups and contacts can now be renamed with the respective rename
 commands.
 
-Locked users can be unlocked with the new "samba-tool user unlock" command.
+Locked users can be unlocked with the new 'samba-tool user unlock' command.
 
-The "samba-tool user list" and "samba-tool group listmembers" commands
+The 'samba-tool user list' and 'samba-tool group listmembers' commands
 provide additional options to hide expired and disabled user accounts
 (--hide-expired and --hide-disabled).
 
@@ -177,30 +217,88 @@ CTDB CHANGES
   recmaster".
 
 
-REMOVED FEATURES
-================
-
-The deprecated "ldap ssl ads" smb.conf option has been removed.
-
-
 smb.conf changes
 ================
 
   Parameter Name                     Description                Default
   --------------                     -----------                -------
   smb encrypt                        Removed
-  ldap ssl ads                       Removed
-  client plaintext auth              Deprecated                 no
-  client NTLMv2 auth                 Deprecated                 yes
-  client lanman auth                 Deprecated                 no
-  client use spnego                  Deprecated                 yes
-  domain logons                      Deprecated                 no
-  raw NTLMv2 auth                    Deprecated                 no
   async dns timeout                  New                        10
   client smb encrypt                 New                        default
   honor change notify privilege      New                        No
   smbd force process locks           New                        No
   server smb encrypt                 New                        default
+
+
+CHANGES SINCE 4.14.0rc4
+=======================
+
+o  Trever L. Adams <trever.adams@gmail.com>
+   * BUG 14634: s3:modules:vfs_virusfilter: Recent talloc changes cause infinite
+     start-up failure.
+
+o  Peter Eriksson <pen@lysator.liu.se>
+   * BUG 14648: s3: VFS: nfs4_acls. Add missing TALLOC_FREE(frame) in error
+     path.
+
+o  Volker Lendecke <vl@samba.org>
+   * BUG 14636: g_lock: Fix uninitalized variable reads.
+
+
+CHANGES SINCE 4.14.0rc3
+=======================
+
+o  Jeremy Allison <jra@samba.org>
+   * BUG 14604: smbd: In conn_force_tdis_done() when forcing a connection closed
+     force a full reload of services.
+
+o  Andrew Bartlett <abartlet@samba.org>
+   * BUG 14593: dbcheck: Check Deleted Objects and reduce noise in reports about
+     expired tombstones.
+
+o  Ralph Boehme <slow@samba.org>
+   * BUG 14619: vfs: Restore platform specific POSIX sys_acl_set_file()
+     functions.
+   * BUG 14620: Fix the build on AIX.
+   * BUG 14629: smbd: Don't overwrite _mode if neither a msdfs symlink nor
+     get_dosmode is requested.
+   * BUG 14635: Fix printer driver upload.
+
+
+CHANGES SINCE 4.14.0rc2
+=======================
+
+o  Björn Jacke <bj@sernet.de>
+   * BUG 14624: classicupgrade: Treat old never expires value right.
+
+o  Stefan Metzmacher <metze@samba.org>
+   * BUG 13898: s3:pysmbd: fix fd leak in py_smbd_create_file().
+
+o  Andreas Schneider <asn@samba.org>
+   * BUG 14625: Fix smbd share mode double free crash.
+
+o  Paul Wise <pabs3@bonedaddy.net>
+   * BUG 12505: HEIMDAL: krb5_storage_free(NULL) should work.
+
+
+CHANGES SINCE 4.14.0rc1
+=======================
+
+o  Jeremy Allison <jra@samba.org>
+   * BUG 13992: Fix SAMBA RPC share error.
+
+o  Ralph Boehme <slow@samba.org>
+   * BUG 14602: "winbind:ignore domains" doesn't prevent user login from trusted
+     domain.
+   * BUG 14617: smbd tries to delete files with wrong permissions (uses guest
+     instead of user from force user =).
+
+o  Stefan Metzmacher <metze@samba.org>
+   * BUG 14539: s3:idmap_hash: Reliably return ID_TYPE_BOTH.
+
+o  Andreas Schneider <asn@samba.org>
+   * BUG 14627: s3:smbd: Fix invalid memory access in
+     posix_sys_acl_blob_get_fd().
 
 
 KNOWN ISSUES

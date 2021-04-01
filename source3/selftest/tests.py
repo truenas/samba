@@ -518,13 +518,13 @@ for env in ["fileserver"]:
                   [os.path.join(samba3srcdir, "script/tests/test_smbclient_tarmode.pl"),
                    '-n', '$SERVER', '-i', '$SERVER_IP', '-s', 'tarmode2',
                    '-u', '$USERNAME', '-p', '$PASSWORD', '-l', '$LOCAL_PATH/tarmode2',
-                   '-d', '$PREFIX', '-b', smbclient3,
+                   '-d', 'smbclient_tar.NT1', '-b', smbclient3,
                    '--subunit', '--', configuration, '-mNT1'])
     plantestsuite("samba3.blackbox.smbclient_tar.SMB3", env,
                   [os.path.join(samba3srcdir, "script/tests/test_smbclient_tarmode.pl"),
                    '-n', '$SERVER', '-i', '$SERVER_IP', '-s', 'tarmode2',
                    '-u', '$USERNAME', '-p', '$PASSWORD', '-l', '$LOCAL_PATH/tarmode2',
-                   '-d', '$PREFIX', '-b', smbclient3,
+                   '-d', 'smbclient_tar.SMB3', '-b', smbclient3,
                    '--subunit', '--', configuration, '-mSMB3'])
 
 for env in ["fileserver:local"]:
@@ -1037,6 +1037,9 @@ plantestsuite("samba3.blackbox.smbd_no_krb5", "ad_member:local",
               [os.path.join(samba3srcdir, "script/tests/test_smbd_no_krb5.sh"),
                smbclient3, '$SERVER', "$DC_USERNAME", "$DC_PASSWORD", "$PREFIX"])
 
+plantestsuite("samba3.blackbox.winbind_ignore_domain", "ad_member_idmap_ad:local",
+              [os.path.join(samba3srcdir, "script/tests/test_winbind_ignore_domains.sh")])
+
 plantestsuite("samba3.blackbox.durable_v2_delay", "simpleserver:local",
               [os.path.join(samba3srcdir, "script/tests/test_durable_handle_reconnect.sh")])
 
@@ -1185,6 +1188,11 @@ plantestsuite(
      "bin/net",
      "bin/samba-tool",
      '$DNSNAME'])
+
+plantestsuite("samba3.blackbox.force-user-unlink",
+              "maptoguest:local",
+              [os.path.join(samba3srcdir,
+                            "script/tests/test_force_user_unlink.sh")])
 
 def planclusteredmembertestsuite(tname, prefix):
     '''Define a clustered test for the clusteredmember environment'''

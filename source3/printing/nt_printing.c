@@ -833,7 +833,8 @@ static int file_version_is_newer(connection_struct *conn, fstring new_file, fstr
 
 	status = openat_pathref_fsp(conn->cwd_fsp, smb_fname);
 	if (!NT_STATUS_IS_OK(status)) {
-		return false;
+		ret = 1;
+		goto done;
 	}
 
 	status = SMB_VFS_CREATE_FILE(
@@ -892,7 +893,9 @@ static int file_version_is_newer(connection_struct *conn, fstring new_file, fstr
 
 	status = openat_pathref_fsp(conn->cwd_fsp, smb_fname);
 	if (!NT_STATUS_IS_OK(status)) {
-		return false;
+		DBG_NOTICE("Can't open new file [%s], errno = %d\n",
+			   smb_fname_str_dbg(smb_fname), errno);
+		goto error_exit;
 	}
 
 	status = SMB_VFS_CREATE_FILE(
@@ -1101,7 +1104,10 @@ static uint32_t get_correct_cversion(const struct auth_session_info *session_inf
 
 	nt_status = openat_pathref_fsp(conn->cwd_fsp, smb_fname);
 	if (!NT_STATUS_IS_OK(nt_status)) {
-		return false;
+		DBG_NOTICE("Can't open file [%s], errno =%d\n",
+			   smb_fname_str_dbg(smb_fname), errno);
+		*perr = WERR_ACCESS_DENIED;
+		goto error_exit;
 	}
 
 	nt_status = SMB_VFS_CREATE_FILE(
