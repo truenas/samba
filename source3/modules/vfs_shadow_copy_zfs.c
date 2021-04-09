@@ -99,7 +99,7 @@ static struct zfs_dataset *shadow_path_to_dataset(struct dataset_list *dl,
 	 * memory context of our dataset list.
 	 */
 	child = smb_zfs_path_get_dataset(dl->root->zhandle->lz, dl,
-					 path, true, false);
+					 path, true, false, true);
 	if (child != NULL) {
 		DLIST_ADD(dl->children, child);
 		return child;
