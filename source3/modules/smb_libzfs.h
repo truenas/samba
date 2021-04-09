@@ -223,10 +223,11 @@ int smb_zfs_set_user_prop(struct smbzhandle *hdl,
  * in the returned zfs_dataset struct.
  */
 struct zfs_dataset *smb_zfs_path_get_dataset(struct smblibzfshandle *smblibzfsp,
-                                             TALLOC_CTX *mem_ctx,
-                                             const char *path,
-                                             bool get_props,
-					     bool open_zhandle);
+					     TALLOC_CTX *mem_ctx,
+					     const char *path,
+					     bool get_props,
+					     bool open_zhandle,
+					     bool resolve_path);
 
 int smb_get_dataset_name(struct smbzhandle *zhandle_ext, const char **dataset_name_out);
 /*

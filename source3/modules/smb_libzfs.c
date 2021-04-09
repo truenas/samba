@@ -559,7 +559,7 @@ struct dataset_list *path_to_dataset_list(TALLOC_CTX *mem_ctx,
 		errno = ENOMEM;
 		return NULL;
 	}
-	ds = smb_zfs_path_get_dataset(lz, dl, path, true, false);
+	ds = smb_zfs_path_get_dataset(lz, dl, path, true, false, false);
 	if (ds == NULL) {
 		TALLOC_FREE(dl);
 		return NULL;
@@ -581,7 +581,7 @@ struct dataset_list *path_to_dataset_list(TALLOC_CTX *mem_ctx,
 		}
 		*slashp = '\0';
 		ds = smb_zfs_path_get_dataset(lz, dl, tmp_path,
-					      true, false);
+					      true, false, false);
 		if (ds == NULL) {
 			TALLOC_FREE(dl);
 			return NULL;
@@ -849,12 +849,13 @@ struct zfs_dataset *smb_zfs_path_get_dataset(struct smblibzfshandle *smblibzfsp,
 					     TALLOC_CTX *mem_ctx,
 					     const char *path,
 					     bool get_props,
-					     bool open_zhandle)
+					     bool open_zhandle,
+					     bool resolve_path)
 {
 	int ret;
 	struct zfs_dataset *dsout = NULL;
 	struct smbzhandle *zfs_ext = NULL;
-	ret = get_smbzhandle(smblibzfsp, mem_ctx, path, &zfs_ext, false);
+	ret = get_smbzhandle(smblibzfsp, mem_ctx, path, &zfs_ext, resolve_path);
 	if (ret != 0) {
 		DBG_ERR("Failed to get zhandle\n");
 		return NULL;

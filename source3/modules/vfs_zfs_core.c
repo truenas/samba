@@ -89,7 +89,7 @@ static struct zfs_dataset *smbfname_to_ds(const struct connection_struct *conn,
 	}
 
 	child = smb_zfs_path_get_dataset(dl->root->zhandle->lz,
-					 dl, path, true, true);
+					 dl, path, true, true, true);
 	TALLOC_FREE(to_free);
 	if (child != NULL) {
 		DLIST_ADD(dl->children, child);
