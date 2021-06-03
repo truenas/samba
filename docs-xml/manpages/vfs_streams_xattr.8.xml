@@ -71,6 +71,31 @@
 	    </listitem>
 	  </varlistentry>
 
+	  <varlistentry>
+	    <term>streams_xattr:xattr_compat = [yes|no]</term>
+	    <listitem>
+	      <para>When enabled, the module does not append a trailing 0
+	      byte to the end of the extended attribute data. This parameter
+	      must not be changed once data has been written to the share
+	      since it may result in dropping the last byte from xattr data.
+
+	      This is primarily a consideration when the administrator
+	      wishes to expose extended attributes that have been written
+	      by another application as alternate data streams via
+	      Samba.
+
+	      An example where this parameter may be required is when
+	      migrating a netatalk share to Samba. See manpage for
+	      vfs_fruit for additional considerations regarding.
+	      Netatalk and Samba compatibility.
+
+	      WARNING: this parameter must not be changed on existing
+	      Samba shares or new shares that export paths currently
+	      or previously have been shared by Samba.
+	      The default is <command>no</command>.</para>
+	    </listitem>
+	  </varlistentry>
+
 	</variablelist>
 
 </refsect1>
