@@ -36,6 +36,7 @@ struct streams_xattr_config {
 	size_t prefix_len;
 	size_t max_xattr_size;
 	bool store_stream_type;
+	int xattr_compat_bytes;
 };
 
 struct stream_io {
@@ -46,22 +47,26 @@ struct stream_io {
 	vfs_handle_struct *handle;
 };
 
-static ssize_t get_xattr_size(connection_struct *conn,
+static ssize_t get_xattr_size(vfs_handle_struct *handle,
 				const struct smb_filename *smb_fname,
 				const char *xattr_name)
 {
 	NTSTATUS status;
 	struct ea_struct ea;
 	ssize_t result;
+	struct streams_xattr_config *config = NULL;
 
-	status = get_ea_value(talloc_tos(), conn, NULL, smb_fname,
+	SMB_VFS_HANDLE_GET_DATA(handle, config, struct streams_xattr_config,
+				return -1);
+
+	status = get_ea_value(talloc_tos(), handle->conn, NULL, smb_fname,
 			      xattr_name, &ea);
 
 	if (!NT_STATUS_IS_OK(status)) {
 		return -1;
 	}
 
-	result = ea.value.length-1;
+	result = ea.value.length - config->xattr_compat_bytes;
 	TALLOC_FREE(ea.value.data);
 	return result;
 }
@@ -235,7 +240,7 @@ static int streams_xattr_fstat(vfs_handle_struct *handle, files_struct *fsp,
 		return -1;
 	}
 
-	sbuf->st_ex_size = get_xattr_size(handle->conn,
+	sbuf->st_ex_size = get_xattr_size(handle,
 					smb_fname_base, io->xattr_name);
 	if (sbuf->st_ex_size == -1) {
 		TALLOC_FREE(smb_fname_base);
@@ -285,7 +290,7 @@ static int streams_xattr_stat(vfs_handle_struct *handle,
 	}
 
 	/* Augment the base file's stat information before returning. */
-	smb_fname->st.st_ex_size = get_xattr_size(handle->conn,
+	smb_fname->st.st_ex_size = get_xattr_size(handle,
 						  smb_fname,
 						  xattr_name);
 	if (smb_fname->st.st_ex_size == -1) {
@@ -333,7 +338,7 @@ static int streams_xattr_lstat(vfs_handle_struct *handle,
 	}
 
 	/* Augment the base file's stat information before returning. */
-	smb_fname->st.st_ex_size = get_xattr_size(handle->conn,
+	smb_fname->st.st_ex_size = get_xattr_size(handle,
 						  smb_fname,
 						  xattr_name);
 	if (smb_fname->st.st_ex_size == -1) {
@@ -791,12 +796,16 @@ static bool collect_one_stream(struct ea_struct *ea, void *private_data)
 {
 	struct streaminfo_state *state =
 		(struct streaminfo_state *)private_data;
+	struct streams_xattr_config *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(state->handle, config, struct streams_xattr_config,
+				return false);
 
 	if (!add_one_stream(state->mem_ctx,
 			    &state->num_streams, &state->streams,
-			    ea->name, ea->value.length-1,
+			    ea->name, ea->value.length - config->xattr_compat_bytes,
 			    smb_roundup(state->handle->conn,
-					ea->value.length-1))) {
+					ea->value.length - config->xattr_compat_bytes))) {
 		state->status = NT_STATUS_NO_MEMORY;
 		return false;
 	}
@@ -875,6 +884,7 @@ static int streams_xattr_connect(vfs_handle_struct *handle,
 	const char *default_prefix = SAMBA_XATTR_DOSSTREAM_PREFIX;
 	const char *prefix;
 	int rc;
+	bool xattr_compat;
 
 	rc = SMB_VFS_NEXT_CONNECT(handle, service, user);
 	if (rc != 0) {
@@ -904,6 +914,13 @@ static int streams_xattr_connect(vfs_handle_struct *handle,
 						 "streams_xattr",
 						 "store_stream_type",
 						 true);
+
+	xattr_compat = lp_parm_bool(SNUM(handle->conn),
+				    "streams_xattr",
+				    "xattr_compat",
+				    false);
+
+        config->xattr_compat_bytes = xattr_compat ? 0 : 1;
 
 	config->max_xattr_size = (size_t)lp_parm_ulonglong(
 		SNUM(handle->conn), "smbd", "max_xattr_size", 65536);
@@ -979,11 +996,11 @@ static ssize_t streams_xattr_pwrite(vfs_handle_struct *handle,
 		return -1;
 	}
 
-        if ((offset + n) > ea.value.length-1) {
+        if ((offset + n) > ea.value.length - config->xattr_compat_bytes) {
 		uint8_t *tmp;
 
 		tmp = talloc_realloc(talloc_tos(), ea.value.data, uint8_t,
-					   offset + n + 1);
+					   offset + n + config->xattr_compat_bytes);
 
 		if (tmp == NULL) {
 			TALLOC_FREE(ea.value.data);
@@ -991,8 +1008,10 @@ static ssize_t streams_xattr_pwrite(vfs_handle_struct *handle,
                         return -1;
                 }
 		ea.value.data = tmp;
-		ea.value.length = offset + n + 1;
-		ea.value.data[offset+n] = 0;
+		ea.value.length = offset + n + config->xattr_compat_bytes;
+		if (config->xattr_compat_bytes) {
+			ea.value.data[offset+n] = 0;
+		}
         }
 
         memcpy(ea.value.data + offset, data, n);
@@ -1020,6 +1039,10 @@ static ssize_t streams_xattr_pread(vfs_handle_struct *handle,
 	NTSTATUS status;
 	size_t length, overlap;
 	struct smb_filename *smb_fname_base = NULL;
+	struct streams_xattr_config *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config, struct streams_xattr_config,
+				return -1);
 
 	DEBUG(10, ("streams_xattr_pread: offset=%d, size=%d\n",
 		   (int)offset, (int)n));
@@ -1050,7 +1073,7 @@ static ssize_t streams_xattr_pread(vfs_handle_struct *handle,
 		return -1;
 	}
 
-	length = ea.value.length-1;
+	length = ea.value.length - config->xattr_compat_bytes;
 
 	DEBUG(10, ("streams_xattr_pread: get_ea_value returned %d bytes\n",
 		   (int)length));
@@ -1238,6 +1261,11 @@ static int streams_xattr_ftruncate(struct vfs_handle_struct *handle,
         struct stream_io *sio =
 		(struct stream_io *)VFS_FETCH_FSP_EXTENSION(handle, fsp);
 	struct smb_filename *smb_fname_base = NULL;
+	struct streams_xattr_config *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config, struct streams_xattr_config,
+				return -1);
+
 
 	DEBUG(10, ("streams_xattr_ftruncate called for file %s offset %.0f\n",
 		   fsp_str_dbg(fsp), (double)offset));
@@ -1278,14 +1306,16 @@ static int streams_xattr_ftruncate(struct vfs_handle_struct *handle,
 	}
 
 	/* Did we expand ? */
-	if (ea.value.length < offset + 1) {
+	if (ea.value.length < offset + config->xattr_compat_bytes) {
 		memset(&tmp[ea.value.length], '\0',
-			offset + 1 - ea.value.length);
+			offset + config->xattr_compat_bytes - ea.value.length);
 	}
 
 	ea.value.data = tmp;
-	ea.value.length = offset + 1;
-	ea.value.data[offset] = 0;
+	ea.value.length = offset + config->xattr_compat_bytes;
+	if (config->xattr_compat_bytes) {
+		ea.value.data[offset] = 0;
+	}
 
 	ret = SMB_VFS_SETXATTR(fsp->conn,
 			       fsp->fsp_name,
