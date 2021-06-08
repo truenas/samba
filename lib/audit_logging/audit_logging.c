@@ -1035,4 +1035,258 @@ struct json_object json_get_object(struct json_object *object, const char *name)
 	}
 	return o;
 }
+
+/*
+ * @brief iterate through objects in a json array
+ *
+ * Iterate through elements of json array and call callback
+ * function for each of them.
+ *
+ * @param object the json object
+ * @param fn callback function
+ * @param private_data private data to pass to callback function
+ *
+ * @return 0 on success -1 on failure
+ */
+int iter_json_array(struct json_object *object,
+		    bool (*fn)(int index,
+			       struct json_object *entry,
+			       void *state),
+		    void *private_data)
+{
+	int i;
+	size_t array_size;
+
+	if (json_is_invalid(object)) {
+		DBG_ERR("Invalid JSON object.\n");
+		return -1;
+	}
+	if (!json_is_array(object->root)) {
+		DBG_ERR("JSON object is not an array\n");
+		return -1;
+	}
+
+	array_size = json_array_size(object->root);
+	for (i = 0; i < array_size; i++) {
+		bool ok;
+		json_t *entry = NULL;
+		struct json_object jsobj = json_empty_object;
+
+		entry = json_array_get(object->root, i);
+		if (entry == NULL) {
+			DBG_ERR("Idx [%d] in JSON array is invalid\n", i);
+			return -1;
+		}
+
+		jsobj = (struct json_object) {
+			.root = entry,
+			.valid = true,
+		};
+
+		ok = fn(i, &jsobj, private_data);
+		if (!ok) {
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * @brief iterate through keys in a json object
+ *
+ * Iterate through keys in a json object, and call callback
+ * function for each of them.
+ *
+ * @param object the json object
+ * @param fn callback function
+ * @param private_data private data to pass to callback function
+ *
+ * @return 0 on success -1 on failure
+ */
+int iter_json_object(struct json_object *object,
+		     bool (*fn)(const char *key,
+				struct json_object *value,
+				void *state),
+		     void *private_data)
+{
+	void *tmp = NULL;
+	const char *key = NULL;
+	json_t *value = NULL;
+
+	if (json_is_invalid(object)) {
+		DBG_ERR("Invalid JSON object.\n");
+		return -1;
+	}
+
+	json_object_foreach_safe(object->root, tmp, key, value) {
+		bool ok;
+		struct json_object jsobj = json_empty_object;
+
+		jsobj = (struct json_object) {
+			.root = value,
+			.valid = true,
+		};
+
+		ok = fn(key, &jsobj, private_data);
+		if (!ok) {
+			return -1;
+		}
+	}
+	return 0;
+}
+
+int json_get_string_value(const struct json_object *object,
+			  const char *key,
+			  const char **valp)
+{
+	json_t *to_check = NULL;
+	const char *value = NULL;
+
+	if (json_is_invalid(object)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	to_check = json_object_get(object->root, key);
+	if (to_check == NULL) {
+		errno = ENOENT;
+		return -1;
+	}
+
+	if (!json_is_string(to_check)) {
+		DBG_ERR("%s: Unexpected JSON type: %d\n",
+			key, json_typeof(to_check));
+		errno = EINVAL;
+		return -1;
+	}
+
+	value = json_string_value(to_check);
+	*valp = value;
+	return 0;
+}
+
+int json_get_bool_value(const struct json_object *object,
+			const char *key,
+			bool *valp)
+{
+	json_t *to_check = NULL;
+	bool value;
+
+	if (json_is_invalid(object)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	to_check = json_object_get(object->root, key);
+	if (to_check == NULL) {
+		errno = ENOENT;
+		return -1;
+	}
+
+	if (!json_is_boolean(to_check)) {
+		DBG_ERR("%s: unexpected JSON type: %d\n",
+			key, json_typeof(to_check));
+		errno = EINVAL;
+		return -1;
+	}
+
+	value = json_boolean_value(to_check);
+	*valp = value;
+	return 0;
+}
+
+int json_get_int_value(const struct json_object *object,
+		       const char *key,
+		       int *valp)
+{
+	json_t *to_check = NULL;
+	int value;
+
+	if (json_is_invalid(object)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	to_check = json_object_get(object->root, key);
+	if (to_check == NULL) {
+		errno = ENOENT;
+		return -1;
+	}
+
+	if (!json_is_integer(to_check)) {
+		DBG_ERR("%d: unexpected JSON type: %d\n",
+			key, json_typeof(to_check));
+		errno = EINVAL;
+		return -1;
+	}
+
+	value = json_integer_value(to_check);
+	*valp = value;
+	return 0;
+}
+
+int json_get_array_value(const struct json_object *object,
+			 const char *key,
+			 struct json_object *valp)
+{
+	json_t *to_check = NULL;
+	int value;
+
+	if (json_is_invalid(object)) {
+		errno = EINVAL;
+		valp->valid = false;
+		return -1;
+	}
+
+	to_check = json_object_get(object->root, key);
+	if (to_check == NULL) {
+		errno = ENOENT;
+		valp->valid = false;
+		return -1;
+	}
+
+	if (!json_is_array(to_check)) {
+		DBG_ERR("%d: unexpected JSON type: %d\n",
+			key, json_typeof(to_check));
+		errno = EINVAL;
+		valp->valid = false;
+		return -1;
+	}
+
+	valp->root = to_check;
+	valp->valid = true;
+	return 0;
+}
+
+/*
+ * @brief convert text into a json object
+ *
+ * Load json from text. This is primarily useful for adding
+ * json input support for utilities. libjansson will perform
+ * validation and report errors, which we print at DBG_ERR.
+ *
+ * @param text string to convert to struct json object
+ *
+ * @return a struct json_object, valid will be set to false if the object
+ *         could not be created.
+ */
+struct json_object load_json(const char *text)
+{
+	struct json_object object = json_empty_object;
+	json_t *root = NULL;
+	json_error_t error;
+
+	root = json_loads(text, 0, &error);
+	if (root == NULL) {
+		DBG_ERR("JSON error on line %d: %s\n",
+			error.line, error.text);
+		object.valid = false;
+		return object;
+	}
+	object = (struct json_object) {
+		.root = root,
+		.valid = true,
+	};
+	return object;
+}
 #endif
