@@ -36,11 +36,40 @@
 #include "lib/smbconf/smbconf_reg.h"
 #include "lib/param/loadparm.h"
 
+#ifdef HAVE_JANSSON
+#include <jansson.h>
+#include "audit_logging.h"
+#define JS_MAJ_VER      0
+#define JS_MIN_VER      1
+#endif /* HAVE_JANSSON */
+
+
 /**********************************************************************
  *
  * usage functions
  *
  **********************************************************************/
+static const char *json_sample(void) {
+	return \
+	"\t{\n"
+	"\t  \"service\": \"share\",\n"
+	"\t  \"parameters\": {\n"
+	"\t    \"vfs objects\": {\n"
+	"\t      \"raw\": \"streams_xattr zfsacl\",\n"
+	"\t      \"parsed\": \"streams_xattr zfsacl\"\n"
+	"\t    },\n"
+	"\t    \"read only\": {\n"
+	"\t      \"raw\": \"true\",\n"
+	"\t      \"parsed\": true\n"
+	"\t    },\n"
+	"\t    \"path\": {\n"
+	"\t      \"raw\": \"/tank\",\n"
+	"\t      \"parsed\": \"/tank\"\n"
+	"\t    }\n"
+	"\t  }\n"
+	"\t}";
+}
+
 
 static int net_conf_list_usage(struct net_context *c, int argc,
 			       const char **argv)
@@ -86,6 +115,21 @@ static int net_conf_showshare_usage(struct net_context *c, int argc,
 	return -1;
 }
 
+static int net_conf_addshare_json_usage(struct net_context *c, int argc,
+					const char **argv)
+{
+	d_printf("%s\n%s\n%s\n",
+		 _("Usage:"),
+		 _(" net --json conf addshare  '{\"service\": \"SHARE\", "
+		   "\"parameters\": {\"path\": {\"raw\": \"/tank\"}}}'\n"
+		   " Multiple parameters may be set in one command. \"raw\" "
+		   " values take precedence over typed \"parsed\" values. \n"
+		   " \"path\" key is required. \n\n"
+		   "\tsample service definition:"),
+		 json_sample());
+	return -1;
+}
+
 static int net_conf_addshare_usage(struct net_context *c, int argc,
 				   const char **argv)
 {
@@ -112,6 +156,20 @@ static int net_conf_delshare_usage(struct net_context *c, int argc,
 	return -1;
 }
 
+static int net_conf_setparm_json_usage(struct net_context *c, int argc,
+				       const char **argv)
+{
+	d_printf("%s\n%s\n%s\n",
+		 _("Usage:"),
+		 _(" net --json conf setparm  '{\"service\": \"SHARE\", "
+		   "\"parameters\": {\"read only\": {\"parsed\": true}}}'\n"
+		   " Multiple <parameters> may be set in one command. \"raw\" "
+		   " values take precedence over typed \"parsed\" values.\n\n"
+		   "\tsample service definition:"),
+		 json_sample());
+	return -1;
+}
+
 static int net_conf_setparm_usage(struct net_context *c, int argc,
 				  const char **argv)
 {
@@ -127,6 +185,20 @@ static int net_conf_getparm_usage(struct net_context *c, int argc,
 	d_printf("%s\n%s",
 		 _("Usage:"),
 		 _(" net conf getparm <section> <param>\n"));
+	return -1;
+}
+
+static int net_conf_delparm_json_usage(struct net_context *c, int argc,
+				       const char **argv)
+{
+	d_printf("%s\n%s\n%s\n",
+		 _("Usage:"),
+		 _(" net --json conf delparm  '{\"service\": \"SHARE\", "
+		   "\"parameters\": {\"read only\": {}}}'\n"
+		   " Multiple <parameters> may be deleted in one command."
+		   " Values are not required."
+		   "\tsample service definition:"),
+		 json_sample());
 	return -1;
 }
 
@@ -211,12 +283,437 @@ done:
 	return err;
 }
 
+#ifdef HAVE_JANSSON
+
+/*
+ * Convert JSON parameter to string. Precedence granted to raw values.
+ */
+static bool json_value_string(TALLOC_CTX *mem_ctx, json_t *param, char **value)
+{
+	json_t *parsed = NULL, *raw= NULL;
+	char *out = NULL;
+	double v_double;
+	int v_int;
+	const char *v_string = NULL;
+
+	raw = json_object_get(param, "raw");
+	if ((raw != NULL) && json_is_string(raw)) {
+		v_string = json_string_value(raw);
+		out = talloc_strdup(mem_ctx, v_string);
+		*value = out;
+		return true;
+	}
+
+	parsed = json_object_get(param, "parsed");
+	if (parsed == NULL) {
+		return false;
+	}
+
+	switch(json_typeof(parsed)) {
+	case JSON_STRING:
+		v_string = json_string_value(parsed);
+		out = talloc_strdup(mem_ctx, v_string);
+		break;
+	case JSON_INTEGER:
+		v_int = json_integer_value(parsed);
+		out = talloc_asprintf(mem_ctx, "%d", v_int);
+		break;
+	case JSON_TRUE:
+		out = talloc_strdup(mem_ctx, "true");
+		break;
+	case JSON_FALSE:
+		out = talloc_strdup(mem_ctx, "false");
+		break;
+	case JSON_REAL:
+		v_double = json_real_value(parsed);
+		out = talloc_asprintf(mem_ctx, "%f", v_double);
+		break;
+	case JSON_NULL:
+		out = talloc_strdup(mem_ctx, "");
+		break;
+	case JSON_OBJECT:
+	case JSON_ARRAY:
+		d_fprintf(stderr, _("Invalid JSON type: %d\n"),
+			  json_typeof(parsed));
+		return false;
+	default:
+		d_fprintf(stderr, _("Unknown JSON type: %d\n"),
+			  json_typeof(parsed));
+		return false;
+	}
+
+	*value = out;
+	return true;
+}
+
+
+/*
+ * Attempt to convert raw text value into JSON type.
+ * Fall through to string.
+ */
+static bool add_parsed(struct json_object *param,
+		       const char *name,
+		       const char *value)
+{
+	int error;
+	long val;
+	char *endptr = NULL;
+	bool ok, bool_val;
+
+	ok = conv_str_bool(value, &bool_val);
+	if (ok) {
+		error = json_add_bool(param, "parsed", bool_val);
+		if (error) {
+			return false;
+		}
+		return true;
+	}
+
+	val = strtol(value, &endptr, 0);
+	if ((endptr != value) && (*endptr == '\0')) {
+		error = json_add_int(param, "parsed", val);
+		if (error) {
+			return false;
+		}
+		return true;
+	}
+
+	error = json_add_string(param, "parsed", value);
+	if (error) {
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * Very basic conversion of key/value pair into JSON object.
+ * JSON object structered as follows:
+ * {
+ *     "raw":    <parameter value as string>,
+ *     "parsed": <typed parameter value>
+ * }
+ */
+static bool param_to_json(struct json_object *param,
+			  const char *name,
+			  const char *value)
+{
+	int error;
+	bool ok;
+
+	error = json_add_string(param, "raw", value);
+	if (error) {
+		return false;
+	}
+
+	ok = add_parsed(param, name, value);
+	if (!ok) {
+		return false;
+	}
+
+	return true;
+}
+
+static bool service_to_json(struct smbconf_service *service,
+			    struct json_object *share)
+{
+	struct json_object params;
+	uint32_t param_count;
+	int error;
+	bool is_share = true;
+
+	if (json_is_invalid(share)) {
+		return false;
+	}
+
+	params = json_new_object();
+	if (json_is_invalid(&params)) {
+		return false;
+	}
+
+	error = json_add_string(share, "service", service->name);
+	if (error) {
+		goto fail;
+	}
+
+	if (strequal(service->name, GLOBAL_NAME)) {
+		is_share = false;
+	}
+
+	error = json_add_bool(share, "is_share", is_share);
+	if (error) {
+		goto fail;
+	}
+
+	for (param_count = 0;
+	     param_count < service->num_params;
+	     param_count++) {
+		struct json_object param;
+		bool ok;
+		const char *key = service->param_names[param_count];
+		const char *val = service->param_values[param_count];
+
+		param = json_new_object();
+		if (json_is_invalid(&param)) {
+			goto fail;
+		}
+
+		ok = param_to_json(&param, key, val);
+		if (!ok) {
+			json_free(&param);
+			goto fail;
+		}
+
+		error = json_add_object(&params, key, &param);
+		if (error) {
+			goto fail;
+		}
+	}
+
+	error = json_add_object(share, "parameters", &params);
+	if (error) {
+		goto fail;
+	}
+
+	return true;
+
+fail:
+	json_free(&params);
+	return false;
+}
+
+struct batch_json_state {
+	TALLOC_CTX *mem_ctx;
+	struct smbconf_ctx *conf_ctx;
+	const char *service;
+	bool(*fn)(const char *key, struct json_object *parameter,
+	     void *private_data);
+};
+
+static bool set_json_parameter(const char *key,
+			       struct json_object *parameter,
+			       void *private_data)
+{
+	char *value = NULL;
+	bool ok;
+	sbcErr err;
+	struct batch_json_state *state = NULL;
+
+	state = talloc_get_type_abort(private_data, struct batch_json_state);
+
+	ok = json_value_string(state->mem_ctx, parameter->root, &value);
+	if (!ok) {
+		d_fprintf(stderr, _("malformed JSON for parameter value\n"));
+		return false;
+	}
+
+	err = smbconf_set_parameter(state->conf_ctx,
+				    state->service,
+				    key, value);
+	if (!SBC_ERROR_IS_OK(err)) {
+		d_fprintf(stderr, _("Error setting parameter %s to %s: %s\n"),
+			  key, value,  sbcErrorString(err));
+		TALLOC_FREE(value);
+		return false;
+	}
+	TALLOC_FREE(value);
+	return true;
+}
+
+static bool del_json_parameter(const char *key,
+			       struct json_object *parameter,
+			       void *private_data)
+{
+	sbcErr err;
+
+	struct batch_json_state *state = NULL;
+
+	state = talloc_get_type_abort(private_data, struct batch_json_state);
+
+	err = smbconf_delete_parameter(state->conf_ctx,
+				       state->service,
+				       key);
+	if (!SBC_ERROR_IS_OK(err)) {
+		d_fprintf(stderr, _("Error deleting parameter %s: %s\n"),
+			  key,  sbcErrorString(err));
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * This applies a list of parameters for a service
+ * by calling the json object iterator for the parameter list
+ */
+static bool apply_json_parameter(int idx,
+				 struct json_object *service,
+				 void *private_data)
+{
+	int error;
+	const char *sharename = NULL;
+	struct batch_json_state *state = NULL;
+	struct json_object parameters;
+
+	state = talloc_get_type_abort(private_data, struct batch_json_state);
+
+	error = json_get_string_value(service, "service", &sharename);
+	if (error) {
+		return false;
+	}
+
+	state->service = sharename;
+	parameters = json_get_object(service, "parameters");
+	if (json_is_invalid(&parameters)) {
+		return false;
+	}
+
+	error = iter_json_object(&parameters, state->fn, state);
+	if (error) {
+		return false;
+	}
+	return true;
+}
+
+/*
+ * transaction should be started prior to calling this function.
+ *
+ * json data will be something like as follows:
+ * { "SET": [ { <JSON Service Object> }, ... ],
+ *   "DEL": [ { <JSON Service Object> }, ... ] }
+ *
+ * This allows batch processing of multiple share configurations to multiple
+ * shares at once. It does not add or remove shares. SET is processed prior to
+ *  DEL. Transaction shou.
+ */
+static bool batch_apply_json_parameters(TALLOC_CTX *mem_ctx,
+					struct smbconf_ctx *conf_ctx,
+					struct json_object *jsdata)
+{
+	struct json_object to_set, to_del;
+	int error;
+	struct batch_json_state *state = NULL;
+
+	state = talloc_zero(mem_ctx, struct batch_json_state);
+	state->mem_ctx = mem_ctx;
+	state->conf_ctx = conf_ctx;
+
+	to_set = json_get_array(jsdata, "SET");
+	if (!json_is_invalid(&to_set)) {
+		state->fn = set_json_parameter;
+		error = iter_json_array(&to_set, apply_json_parameter, state);
+		if (error) {
+			return false;
+		}
+	}
+
+	to_del = json_get_array(jsdata, "DEL");
+	if (!json_is_invalid(&to_del)) {
+		state->fn = del_json_parameter;
+		error = iter_json_array(&to_del, apply_json_parameter, state);
+		if (error) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+#endif /* HAVE_JANSSON */
+
 
 /**********************************************************************
  *
  * the main conf functions
  *
  **********************************************************************/
+static int net_conf_list_json(struct net_context *c, struct smbconf_ctx *conf_ctx,
+			 int argc, const char **argv)
+{
+#ifdef HAVE_JANSSON
+	sbcErr err;
+	int ret = -1, error;
+	TALLOC_CTX *mem_ctx;
+	uint32_t num_shares;
+	uint32_t share_count;
+	struct smbconf_service **shares = NULL;
+	struct json_object jsobj, js_shares;
+	char *output = NULL;
+
+	jsobj = json_new_object();
+	if (json_is_invalid(&jsobj)) {
+		goto done;
+	}
+
+	js_shares = json_new_array();
+	if (json_is_invalid(&js_shares)) {
+		json_free(&jsobj);
+		goto done;
+	}
+
+	error = json_add_version(&jsobj, JS_MAJ_VER, JS_MIN_VER);
+	if (error) {
+		goto fail;
+	}
+
+	mem_ctx = talloc_stackframe();
+
+	if (argc != 0 || c->display_usage) {
+		net_conf_list_usage(c, argc, argv);
+		goto done;
+	}
+
+	err = smbconf_get_config(conf_ctx, mem_ctx, &num_shares, &shares);
+	if (!SBC_ERROR_IS_OK(err)) {
+		d_fprintf(stderr, _("Error getting config: %s\n"),
+			  sbcErrorString(err));
+		goto done;
+	}
+
+	for (share_count = 0; share_count < num_shares; share_count++) {
+		struct json_object share;
+		bool ok;
+
+		share = json_new_object();
+		if (json_is_invalid(&share)) {
+			goto fail;
+		}
+
+		ok = service_to_json(shares[share_count], &share);
+		if (!ok) {
+			json_free(&share);
+			goto fail;
+		}
+
+		error = json_add_object(&js_shares, NULL, &share);
+		if (error) {
+			goto fail;
+		}
+	}
+
+	error = json_add_object(&jsobj, "sections", &js_shares);
+	if (error) {
+		json_free(&jsobj);
+		goto done;
+	}
+
+	output = json_to_string(mem_ctx, &jsobj);
+	printf("%s\n", output);
+
+	ret = 0;
+
+done:
+	TALLOC_FREE(mem_ctx);
+	return ret;
+fail:
+	json_free(&jsobj);
+	json_free(&js_shares);
+	TALLOC_FREE(mem_ctx);
+	return ret;
+#else
+	return -1;
+#endif /* HAVE_JANSSON */
+}
 
 static int net_conf_list(struct net_context *c, struct smbconf_ctx *conf_ctx,
 			 int argc, const char **argv)
@@ -428,6 +925,107 @@ done:
 	return ret;
 }
 
+
+static int net_conf_listshares_json(struct net_context *c,
+				    struct smbconf_ctx *conf_ctx, int argc,
+				    const char **argv)
+{
+#ifdef HAVE_JANSSON
+	sbcErr err;
+	int ret = -1, error;
+	uint32_t count, num_shares = 0;
+	char **share_names = NULL;
+	TALLOC_CTX *mem_ctx = NULL;
+	struct json_object jsobj, jsarray;
+	char *output = NULL;
+
+	mem_ctx = talloc_stackframe();
+
+	if (argc != 0 || c->display_usage) {
+		net_conf_listshares_usage(c, argc, argv);
+		goto done;
+	}
+
+	jsobj = json_new_object();
+	if (json_is_invalid(&jsobj)) {
+		d_fprintf(stderr, _("Failed to create JSON object.\n"));
+		return -1;
+	}
+
+	jsarray = json_new_array();
+	if (json_is_invalid(&jsarray)) {
+		json_free(&jsobj);
+		d_fprintf(stderr, _("Failed to create JSON object.\n"));
+		return -1;
+	}
+
+	error = json_add_version(&jsobj, JS_MAJ_VER, JS_MIN_VER);
+	if (error) {
+		d_fprintf(stderr, _("Failed to add JSON version.\n"));
+		goto fail;
+	}
+
+	err = smbconf_get_share_names(conf_ctx, mem_ctx, &num_shares,
+				      &share_names);
+	if (!SBC_ERROR_IS_OK(err)) {
+		goto done;
+	}
+
+	for (count = 0; count < num_shares; count++)
+	{
+		struct json_object share;
+
+		share = json_new_object();
+		if (json_is_invalid(&share)) {
+			d_fprintf(stderr, _("Failed to create JSON object.\n"));
+			goto fail;
+		}
+
+		error = json_add_string(&share, "name",
+					share_names[count]);
+		if (error) {
+			d_fprintf(stderr, _("Failed to add JSON string.\n"));
+			json_free(&share);
+			goto fail;
+		}
+
+		error = json_add_object(&jsarray, NULL, &share);
+		if (error) {
+			d_fprintf(stderr, _("Failed to add share to array.\n"));
+			goto fail;
+		}
+	}
+
+	error = json_add_object(&jsobj, "shares", &jsarray);
+	if (error) {
+		d_fprintf(stderr, _("Failed to add array to JSON object.\n"));
+		json_free(&jsobj);
+		return -1;
+	}
+
+	output = json_to_string(mem_ctx, &jsobj);
+	if (output == NULL) {
+		d_fprintf(stderr, _("Failed to generate JSON output.\n"));
+		json_free(&jsobj);
+		return -1;
+	}
+
+	printf("%s\n", output);
+	json_free(&jsobj);
+
+	ret = 0;
+
+done:
+	TALLOC_FREE(mem_ctx);
+	return ret;
+fail:
+	json_free(&jsobj);
+	json_free(&jsarray);
+	TALLOC_FREE(mem_ctx);
+#endif
+	return -1;
+}
+
 static int net_conf_listshares(struct net_context *c,
 			       struct smbconf_ctx *conf_ctx, int argc,
 			       const char **argv)
@@ -487,6 +1085,79 @@ done:
 	return ret;
 }
 
+static int net_conf_showshare_json(struct net_context *c,
+				   struct smbconf_ctx *conf_ctx, int argc,
+				   const char **argv)
+{
+	int ret = -1, error;
+#ifdef HAVE_JANSSON
+	sbcErr err;
+	const char *sharename = NULL;
+	TALLOC_CTX *mem_ctx = NULL;
+	struct smbconf_service *service = NULL;
+	struct json_object share;
+	char *output = NULL;
+	bool ok;
+
+	mem_ctx = talloc_stackframe();
+
+	if (argc != 1 || c->display_usage) {
+		net_conf_showshare_usage(c, argc, argv);
+		goto done;
+	}
+
+	share = json_new_object();
+	if (json_is_invalid(&share)) {
+		d_fprintf(stderr, _("Failed to create JSON object.\n"));
+		goto done;
+	}
+
+	error = json_add_version(&share, JS_MAJ_VER, JS_MIN_VER);
+	if (error) {
+		d_fprintf(stderr, _("Failed to add version string.\n"));
+		json_free(&share);
+		goto done;
+	}
+
+	sharename = talloc_strdup(mem_ctx, argv[0]);
+	if (sharename == NULL) {
+		d_fprintf(stderr, "error: out of memory!\n");
+		json_free(&share);
+		goto done;
+	}
+
+	err = smbconf_get_share(conf_ctx, mem_ctx, sharename, &service);
+	if (!SBC_ERROR_IS_OK(err)) {
+		d_fprintf(stderr, _("error getting share parameters: %s\n"),
+			  sbcErrorString(err));
+		json_free(&share);
+		goto done;
+	}
+
+	ok = service_to_json(service, &share);
+	if (!ok) {
+		d_fprintf(stderr, _("Failed to convert share to JSON.\n"));
+		json_free(&share);
+		goto done;
+	}
+
+	output = json_to_string(mem_ctx, &share);
+	if (output == NULL) {
+		json_free(&share);
+		d_fprintf(stderr, "Memory error\n");
+		goto done;
+	}
+
+	printf("%s\n", output);
+	json_free(&share);
+	ret = 0;
+
+done:
+	TALLOC_FREE(mem_ctx);
+#endif
+	return ret;
+}
+
 static int net_conf_showshare(struct net_context *c,
 			      struct smbconf_ctx *conf_ctx, int argc,
 			      const char **argv)
@@ -538,6 +1209,232 @@ done:
  * This is a high level utility function of the net conf utility,
  * not a direct frontend to the smbconf API.
  */
+#ifdef HAVE_JANSSON
+struct validate_parms_state {
+	TALLOC_CTX *mem_ctx;
+	const char *path;
+};
+
+static bool validate_param(const char *key, struct json_object *parm, void *private_data)
+{
+	struct validate_parms_state *state = NULL;
+	json_t *value = NULL;
+
+	state = talloc_get_type_abort(private_data, struct validate_parms_state);
+
+	value = json_object_get(parm->root, "raw");
+	if (value == NULL) {
+		value = json_object_get(parm->root, "parsed");
+		if (value == NULL) {
+			d_fprintf(stderr,
+				  _("\"parameters\" object %s is invalid. "
+				    "\"raw\" or \"parsed\" keys must be "
+				    "present in object.\n"), key);
+			return false;
+		}
+	}
+
+	if (strequal(key, "path")) {
+		if (state->path != NULL) {
+			d_fprintf(stderr,
+				  _("\"params\" object \"path\" is invalid. "
+				    "more than one path specified.\n"));
+			return false;
+		}
+		if (!json_is_string(value)) {
+			d_fprintf(stderr,
+				  _("\"params\" object \"path\" is invalid. "
+				    "path must be a string.\n"));
+			return false;
+		}
+		state->path = json_string_value(value);
+	}
+
+	return true;
+}
+
+static bool validate_share_json(TALLOC_CTX *mem_ctx,
+			        struct smbconf_ctx *conf_ctx,
+				struct json_object *data)
+{
+	int error;
+	struct json_object params;
+	json_t *service = NULL;
+	const char *sname = NULL;
+	struct validate_parms_state *state = NULL;
+
+	/* validate share name */
+	service = json_object_get(data->root, "service");
+	if ((service == NULL) || !json_is_string(service)) {
+		d_fprintf(stderr,
+			  _("\"service\" string is required in JSON data.\n"));
+		return false;
+	}
+
+	sname = json_string_value(service);
+	if (!validate_net_name(sname, INVALID_SHARENAME_CHARS, strlen(sname))) {
+		d_fprintf(stderr, _("ERROR: share name %s contains "
+			  "invalid characters (any of %s)\n"),
+			  sname, INVALID_SHARENAME_CHARS);
+		return false;
+	}
+
+	if (strequal(sname, GLOBAL_NAME)) {
+		d_fprintf(stderr,
+			  _("ERROR: 'global' is not a valid share name.\n"));
+		return false;
+	}
+
+	if (smbconf_share_exists(conf_ctx, sname)) {
+		d_fprintf(stderr, _("ERROR: share %s already exists.\n"),
+			  sname);
+		return false;
+	}
+
+	params = json_get_object(data, "parameters");
+	if (json_is_invalid(&params)) {
+		return false;
+	}
+
+	state = talloc_zero(mem_ctx, struct validate_parms_state);
+	if (state == NULL) {
+		d_fprintf(stderr, _("Memory failure.\n"));
+		return false;
+	}
+	error = iter_json_object(&params, validate_param, state);
+	if (error) {
+		return false;
+	}
+
+	/* validate path */
+	if (state->path == NULL) {
+		d_fprintf(stderr, _("Service path is required.\n"));
+		return false;
+	}
+	if (state->path[0] != '/') {
+		bool ok = false;
+
+		if (strequal(sname, HOMES_NAME) && state->path[0] == '\0') {
+			/* The homes share can be an empty path. */
+			ok = true;
+		}
+		if (!ok) {
+			d_fprintf(stderr,
+				  _("Error: path '%s' is not an absolute path.\n"),
+				 state->path);
+			return false;
+		}
+	}
+
+	return true;
+}
+#endif /* HAVE_JANSSON */
+
+static int net_conf_addshare_json(struct net_context *c,
+			          struct smbconf_ctx *conf_ctx, int argc,
+				  const char **argv)
+{
+	int ret = -1, error;
+#ifdef HAVE_JANSSON
+	sbcErr err;
+	struct json_object data, payload, to_set;
+	json_t *jsservice = NULL;
+	const char *sharename = NULL;
+	bool ok;
+	TALLOC_CTX *mem_ctx = talloc_stackframe();
+
+	if (argc != 1 || c->display_usage) {
+		net_conf_addshare_json_usage(c, argc, argv);
+		TALLOC_FREE(mem_ctx);
+		return 0;
+	}
+
+	data = load_json(argv[0]);
+	if (json_is_invalid(&data)) {
+		TALLOC_FREE(mem_ctx);
+		return ret;
+	}
+
+	ok = validate_share_json(mem_ctx, conf_ctx, &data);
+	if (!ok) {
+		goto done;
+	}
+
+	payload = json_new_object();
+	if (json_is_invalid(&payload)) {
+		json_free(&data);
+		goto done;
+	}
+
+	to_set = json_new_array();
+	if (json_is_invalid(&to_set)) {
+		json_free(&data);
+		goto done;
+	}
+
+	error = json_array_append_new(to_set.root, data.root);
+	if (error) {
+		json_free(&to_set);
+		json_free(&data);
+		goto done;
+	}
+
+	error = json_add_object(&payload, "SET", &to_set);
+	if (error) {
+		json_free(&to_set);
+		goto done;
+	}
+
+	jsservice = json_object_get(data.root, "service");
+	if (jsservice == NULL) {
+		goto done;
+	}
+
+	sharename = json_string_value(jsservice);
+
+	err = smbconf_transaction_start(conf_ctx);
+	if (!SBC_ERROR_IS_OK(err)) {
+		d_printf("error starting transaction: %s\n",
+			 sbcErrorString(err));
+		goto done;
+	}
+
+	err = smbconf_create_share(conf_ctx, sharename);
+	if (!SBC_ERROR_IS_OK(err)) {
+		d_fprintf(stderr, _("Error creating share %s: %s\n"),
+			  sharename, sbcErrorString(err));
+		goto cancel;
+	}
+
+	ok = batch_apply_json_parameters(mem_ctx, conf_ctx, &payload);
+	if (!ok) {
+		goto cancel;
+	}
+
+	err = smbconf_transaction_commit(conf_ctx);
+	if (!SBC_ERROR_IS_OK(err)) {
+		d_fprintf(stderr, "error committing transaction: %s\n",
+			 sbcErrorString(err));
+	} else {
+		ret = 0;
+	}
+
+	goto done;
+
+cancel:
+	err = smbconf_transaction_cancel(conf_ctx);
+	if (!SBC_ERROR_IS_OK(err)) {
+		d_printf("error cancelling transaction: %s\n",
+			 sbcErrorString(err));
+	}
+
+done:
+	json_free(&payload);
+	TALLOC_FREE(mem_ctx);
+#endif /* HAVE_JANSSON */
+	return ret;
+}
+
 static int net_conf_addshare(struct net_context *c,
 			     struct smbconf_ctx *conf_ctx, int argc,
 			     const char **argv)
@@ -628,8 +1525,8 @@ static int net_conf_addshare(struct net_context *c,
 			       strlen(sharename)))
 	{
 		d_fprintf(stderr, _("ERROR: share name %s contains "
-                        "invalid characters (any of %s)\n"),
-                        sharename, INVALID_SHARENAME_CHARS);
+			  "invalid characters (any of %s)\n"),
+			  sharename, INVALID_SHARENAME_CHARS);
 		goto done;
 	}
 
@@ -787,6 +1684,96 @@ done:
 	return ret;
 }
 
+
+static int net_conf_setparm_json(struct net_context *c, struct smbconf_ctx *conf_ctx,
+				 int argc, const char **argv)
+{
+	int ret = -1, error;
+#ifdef HAVE_JANSSON
+	sbcErr err;
+	bool ok;
+	TALLOC_CTX *mem_ctx = talloc_stackframe();
+	struct json_object data, payload, to_set;
+	json_t *jsservice = NULL;
+
+	if (argc != 1 || c->display_usage) {
+		net_conf_setparm_json_usage(c, argc, argv);
+		TALLOC_FREE(mem_ctx);
+		return ret;
+	}
+
+	data = load_json(argv[0]);
+	if (json_is_invalid(&data)) {
+		TALLOC_FREE(mem_ctx);
+		return ret;
+	}
+
+	payload = json_new_object();
+	if (json_is_invalid(&payload)) {
+		json_free(&data);
+		goto done;
+	}
+
+	to_set = json_new_array();
+	if (json_is_invalid(&to_set)) {
+		json_free(&data);
+		goto done;
+	}
+
+	error = json_array_append_new(to_set.root, data.root);
+	if (error) {
+		json_free(&to_set);
+		json_free(&data);
+		goto done;
+	}
+
+	error = json_add_object(&payload, "SET", &to_set);
+	if (error) {
+		json_free(&to_set);
+		goto done;
+	}
+
+	jsservice = json_object_get(data.root, "service");
+	if (jsservice == NULL) {
+		goto done;
+	}
+
+	err = smbconf_transaction_start(conf_ctx);
+	if (!SBC_ERROR_IS_OK(err)) {
+		d_printf("error starting transaction: %s\n",
+			 sbcErrorString(err));
+		goto done;
+	}
+
+	ok = batch_apply_json_parameters(mem_ctx, conf_ctx, &payload);
+	if (!ok) {
+		goto cancel;
+	}
+
+	err = smbconf_transaction_commit(conf_ctx);
+	if (!SBC_ERROR_IS_OK(err)) {
+		d_printf(_("error committing transaction: %s\n"),
+			 sbcErrorString(err));
+	} else {
+		ret = 0;
+	}
+
+	goto done;
+
+cancel:
+	err = smbconf_transaction_cancel(conf_ctx);
+	if (!SBC_ERROR_IS_OK(err)) {
+		d_printf(_("error cancelling transaction: %s\n"),
+			 sbcErrorString(err));
+	}
+
+done:
+	json_free(&payload);
+	TALLOC_FREE(mem_ctx);
+#endif /* HAVE_JANSSON */
+	return ret;
+}
+
 static int net_conf_setparm(struct net_context *c, struct smbconf_ctx *conf_ctx,
 			    int argc, const char **argv)
 {
@@ -923,6 +1910,95 @@ static int net_conf_getparm(struct net_context *c, struct smbconf_ctx *conf_ctx,
 	ret = 0;
 done:
 	TALLOC_FREE(mem_ctx);
+	return ret;
+}
+
+static int net_conf_delparm_json(struct net_context *c, struct smbconf_ctx *conf_ctx,
+				 int argc, const char **argv)
+{
+	int ret = -1, error;
+#ifdef HAVE_JANSSON
+	sbcErr err;
+	bool ok;
+	TALLOC_CTX *mem_ctx = talloc_stackframe();
+	struct json_object data, payload, to_del;
+	json_t *jsservice = NULL;
+
+	if (argc != 1 || c->display_usage) {
+		net_conf_delparm_json_usage(c, argc, argv);
+		TALLOC_FREE(mem_ctx);
+		return ret;
+	}
+
+	data = load_json(argv[0]);
+	if (json_is_invalid(&data)) {
+		TALLOC_FREE(mem_ctx);
+		return ret;
+	}
+
+	payload = json_new_object();
+	if (json_is_invalid(&payload)) {
+		json_free(&data);
+		goto done;
+	}
+
+	to_del = json_new_array();
+	if (json_is_invalid(&payload)) {
+		json_free(&data);
+		goto done;
+	}
+
+	error = json_array_append_new(to_del.root, data.root);
+	if (error) {
+		json_free(&to_del);
+		json_free(&data);
+		goto done;
+	}
+
+	error = json_add_object(&payload, "DEL", &to_del);
+	if (error) {
+		json_free(&to_del);
+		goto done;
+	}
+
+	jsservice = json_object_get(data.root, "service");
+	if (jsservice == NULL) {
+		goto done;
+	}
+
+	err = smbconf_transaction_start(conf_ctx);
+	if (!SBC_ERROR_IS_OK(err)) {
+		d_printf("error starting transaction: %s\n",
+			 sbcErrorString(err));
+		goto done;
+	}
+
+	ok = batch_apply_json_parameters(mem_ctx, conf_ctx, &payload);
+	if (!ok) {
+		goto cancel;
+	}
+
+	err = smbconf_transaction_commit(conf_ctx);
+	if (!SBC_ERROR_IS_OK(err)) {
+		d_printf(_("error committing transaction: %s\n"),
+			 sbcErrorString(err));
+	} else {
+		ret = 0;
+	}
+
+	goto done;
+
+cancel:
+	err = smbconf_transaction_cancel(conf_ctx);
+	if (!SBC_ERROR_IS_OK(err)) {
+		d_printf(_("error cancelling transaction: %s\n"),
+			 sbcErrorString(err));
+	}
+
+done:
+	json_free(&payload);
+	TALLOC_FREE(mem_ctx);
+#endif /* HAVE_JANSSON */
 	return ret;
 }
 
@@ -1142,6 +2218,8 @@ struct conf_functable {
 	const char *funcname;
 	int (*fn)(struct net_context *c, struct smbconf_ctx *ctx, int argc,
 		  const char **argv);
+	int (*json_fn)(struct net_context *c, struct smbconf_ctx *ctx, int argc,
+		  const char **argv);
 	int valid_transports;
 	const char *description;
 	const char *usage;
@@ -1159,10 +2237,23 @@ static int net_conf_run_function(struct net_context *c, int argc,
 
 	if (argc != 0) {
 		for (i=0; table[i].funcname; i++) {
-			if (strcasecmp_m(argv[0], table[i].funcname) == 0)
+			if (strcasecmp_m(argv[0], table[i].funcname) == 0) {
+				if (c->opt_json && table[i].json_fn == NULL) {
+					d_fprintf(stderr,
+						  _("JSON variant for [%s] is "
+						    "not available.\n"),
+						  table[i].funcname);
+					break;
+				}
+				else if (c->opt_json) {
+					return net_conf_wrap_function(
+					    c, table[i].json_fn,
+					    argc-1, argv+1);
+				}
 				return net_conf_wrap_function(c, table[i].fn,
 							      argc-1,
 							      argv+1);
+			}
 		}
 	}
 
@@ -1189,6 +2280,7 @@ int net_conf(struct net_context *c, int argc, const char **argv)
 		{
 			"list",
 			net_conf_list,
+			net_conf_list_json,
 			NET_TRANSPORT_LOCAL,
 			N_("Dump the complete configuration in smb.conf like "
 			   "format."),
@@ -1200,6 +2292,7 @@ int net_conf(struct net_context *c, int argc, const char **argv)
 		{
 			"import",
 			net_conf_import,
+			NULL,
 			NET_TRANSPORT_LOCAL,
 			N_("Import configuration from file in smb.conf "
 			   "format."),
@@ -1210,6 +2303,7 @@ int net_conf(struct net_context *c, int argc, const char **argv)
 		{
 			"listshares",
 			net_conf_listshares,
+			net_conf_listshares_json,
 			NET_TRANSPORT_LOCAL,
 			N_("List the share names."),
 			N_("net conf listshares\n"
@@ -1218,6 +2312,7 @@ int net_conf(struct net_context *c, int argc, const char **argv)
 		{
 			"drop",
 			net_conf_drop,
+			NULL,
 			NET_TRANSPORT_LOCAL,
 			N_("Delete the complete configuration."),
 			N_("net conf drop\n"
@@ -1226,6 +2321,7 @@ int net_conf(struct net_context *c, int argc, const char **argv)
 		{
 			"showshare",
 			net_conf_showshare,
+			net_conf_showshare_json,
 			NET_TRANSPORT_LOCAL,
 			N_("Show the definition of a share."),
 			N_("net conf showshare\n"
@@ -1234,6 +2330,7 @@ int net_conf(struct net_context *c, int argc, const char **argv)
 		{
 			"addshare",
 			net_conf_addshare,
+			net_conf_addshare_json,
 			NET_TRANSPORT_LOCAL,
 			N_("Create a new share."),
 			N_("net conf addshare\n"
@@ -1242,6 +2339,7 @@ int net_conf(struct net_context *c, int argc, const char **argv)
 		{
 			"delshare",
 			net_conf_delshare,
+			NULL,
 			NET_TRANSPORT_LOCAL,
 			N_("Delete a share."),
 			N_("net conf delshare\n"
@@ -1250,6 +2348,7 @@ int net_conf(struct net_context *c, int argc, const char **argv)
 		{
 			"setparm",
 			net_conf_setparm,
+			net_conf_setparm_json,
 			NET_TRANSPORT_LOCAL,
 			N_("Store a parameter."),
 			N_("net conf setparm\n"
@@ -1258,6 +2357,7 @@ int net_conf(struct net_context *c, int argc, const char **argv)
 		{
 			"getparm",
 			net_conf_getparm,
+			NULL,
 			NET_TRANSPORT_LOCAL,
 			N_("Retrieve the value of a parameter."),
 			N_("net conf getparm\n"
@@ -1266,6 +2366,7 @@ int net_conf(struct net_context *c, int argc, const char **argv)
 		{
 			"delparm",
 			net_conf_delparm,
+			net_conf_delparm_json,
 			NET_TRANSPORT_LOCAL,
 			N_("Delete a parameter."),
 			N_("net conf delparm\n"
@@ -1274,6 +2375,7 @@ int net_conf(struct net_context *c, int argc, const char **argv)
 		{
 			"getincludes",
 			net_conf_getincludes,
+			NULL,
 			NET_TRANSPORT_LOCAL,
 			N_("Show the includes of a share definition."),
 			N_("net conf getincludes\n"
@@ -1282,6 +2384,7 @@ int net_conf(struct net_context *c, int argc, const char **argv)
 		{
 			"setincludes",
 			net_conf_setincludes,
+			NULL,
 			NET_TRANSPORT_LOCAL,
 			N_("Set includes for a share."),
 			N_("net conf setincludes\n"
@@ -1290,12 +2393,13 @@ int net_conf(struct net_context *c, int argc, const char **argv)
 		{
 			"delincludes",
 			net_conf_delincludes,
+			NULL,
 			NET_TRANSPORT_LOCAL,
 			N_("Delete includes from a share definition."),
 			N_("net conf delincludes\n"
 			   "    Delete includes from a share definition.")
 		},
-		{NULL, NULL, 0, NULL, NULL}
+		{NULL, NULL, NULL, 0, NULL, NULL}
 	};
 
 	ret = net_conf_run_function(c, argc, argv, "net conf", func_table);
