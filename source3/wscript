@@ -1817,6 +1817,9 @@ main() {
     if conf.CHECK_HEADERS('ftw.h') and conf.CHECK_FUNCS('nftw'):
         conf.env.build_mvxattr = True
 
+    if conf.CHECK_HEADERS('fts.h') and conf.CHECK_FUNCS('fts_open'):
+        conf.env.build_convxattr = True
+
     conf.env.build_winexe = False
     if not Options.options.with_winexe == False:
         if conf.CONFIG_SET('HAVE_WINEXE_CC_WIN32') or conf.CONFIG_SET('HAVE_WINEXE_CC_WIN64'):
