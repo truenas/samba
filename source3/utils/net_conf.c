@@ -1253,11 +1253,29 @@ static bool validate_param(const char *key, struct json_object *parm, void *priv
 	return true;
 }
 
-static bool validate_share_json(TALLOC_CTX *mem_ctx,
-			        struct smbconf_ctx *conf_ctx,
-				struct json_object *data)
+static bool validate_share_path(const char *sname, const char *path)
+{
+	if (path == NULL) {
+		return false;
+	}
+	else if (path[0] == '/') {
+		return true;
+	}
+
+	if (strequal(sname, HOMES_NAME) && path[0] == '\0') {
+		/* The homes share can be an empty path. */
+		return true;
+	}
+
+	return false;
+}
+
+static int validate_share_json(TALLOC_CTX *mem_ctx,
+			       struct smbconf_ctx *conf_ctx,
+			       struct json_object *data)
 {
 	int error;
+	bool ok;
 	struct json_object params;
 	json_t *service = NULL;
 	const char *sname = NULL;
@@ -1268,7 +1286,7 @@ static bool validate_share_json(TALLOC_CTX *mem_ctx,
 	if ((service == NULL) || !json_is_string(service)) {
 		d_fprintf(stderr,
 			  _("\"service\" string is required in JSON data.\n"));
-		return false;
+		return EINVAL;
 	}
 
 	sname = json_string_value(service);
@@ -1276,57 +1294,42 @@ static bool validate_share_json(TALLOC_CTX *mem_ctx,
 		d_fprintf(stderr, _("ERROR: share name %s contains "
 			  "invalid characters (any of %s)\n"),
 			  sname, INVALID_SHARENAME_CHARS);
-		return false;
+		return EINVAL;
 	}
 
 	if (strequal(sname, GLOBAL_NAME)) {
 		d_fprintf(stderr,
 			  _("ERROR: 'global' is not a valid share name.\n"));
-		return false;
+		return EINVAL;
 	}
 
 	if (smbconf_share_exists(conf_ctx, sname)) {
 		d_fprintf(stderr, _("ERROR: share %s already exists.\n"),
 			  sname);
-		return false;
+		return EEXIST;
 	}
 
 	params = json_get_object(data, "parameters");
 	if (json_is_invalid(&params)) {
-		return false;
+		return EINVAL;
 	}
 
 	state = talloc_zero(mem_ctx, struct validate_parms_state);
 	if (state == NULL) {
 		d_fprintf(stderr, _("Memory failure.\n"));
-		return false;
+		return EINVAL;
 	}
 	error = iter_json_object(&params, validate_param, state);
 	if (error) {
-		return false;
+		return EINVAL;
 	}
 
-	/* validate path */
-	if (state->path == NULL) {
-		d_fprintf(stderr, _("Service path is required.\n"));
-		return false;
-	}
-	if (state->path[0] != '/') {
-		bool ok = false;
-
-		if (strequal(sname, HOMES_NAME) && state->path[0] == '\0') {
-			/* The homes share can be an empty path. */
-			ok = true;
-		}
-		if (!ok) {
-			d_fprintf(stderr,
-				  _("Error: path '%s' is not an absolute path.\n"),
-				 state->path);
-			return false;
-		}
+	ok = validate_share_path(sname, state->path);
+	if (!ok) {
+		return EINVAL;
 	}
 
-	return true;
+	return 0;
 }
 #endif /* HAVE_JANSSON */
 
@@ -1355,9 +1358,11 @@ static int net_conf_addshare_json(struct net_context *c,
 		return ret;
 	}
 
-	ok = validate_share_json(mem_ctx, conf_ctx, &data);
-	if (!ok) {
-		goto done;
+	error = validate_share_json(mem_ctx, conf_ctx, &data);
+	if (error) {
+		json_free(&data);
+		TALLOC_FREE(mem_ctx);
+		return error;
 	}
 
 	payload = json_new_object();
