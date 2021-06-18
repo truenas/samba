@@ -1,3 +1,11 @@
+samba (2:4.14.2+ix-3) unstable; urgency=medium
+
+  * Fix json_decref() of uninitialized memory, and return EEXIST
+    in net_conf addshare if share exists. 
+
+ -- Andrew Walker <awalker@ixsystems.com>  Fri, 18 Jun 2021 17:00:00 +0000
+
+
 samba (2:4.14.2+ix-2) unstable; urgency=medium
 
   * Add streams_xattr AFP compatibility feature 
