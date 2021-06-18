@@ -31,6 +31,7 @@ static int vfs_zfs_core_debug_level = DBGC_VFS;
 
 struct zfs_core_config_data {
 	struct dataset_list *dl;
+	struct dataset_list *created;
 	bool zfs_space_enabled;
 	bool zfs_quota_enabled;
 	bool zfs_auto_create;
@@ -287,6 +288,114 @@ static int zfs_core_set_quota(struct vfs_handle_struct *handle,
 	return ret;
 }
 
+static bool get_synthetic_fsp(vfs_handle_struct *handle,
+			      const char *fname_in,
+			      files_struct **out)
+{
+	NTSTATUS status;
+	files_struct *tmp_fsp = NULL;
+	struct smb_filename *tmp_fname = NULL;
+	mode_t unix_mode;
+	int fd;
+
+	tmp_fname = synthetic_smb_fname(talloc_tos(),
+					fname_in,
+					NULL,
+					NULL,
+					0,
+					0);
+	if (tmp_fname == NULL) {
+		errno = ENOMEM;
+		return false;
+	}
+
+	status = create_internal_fsp(handle->conn, tmp_fname, &tmp_fsp);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("Failed to create internal FSP for %s: %s\n",
+			smb_fname_str_dbg(tmp_fname), nt_errstr(status));
+		return false;
+	}
+	TALLOC_FREE(tmp_fname);
+
+	unix_mode = (0777 & lp_directory_mask(SNUM(handle->conn)));
+
+	fd = open(fname_in, O_DIRECTORY, unix_mode);
+	if (fd == -1) {
+		DBG_ERR("Failed to open %s, mode: 0o%o: %s\n",
+			smb_fname_str_dbg(tmp_fname), unix_mode,
+			strerror(errno));
+		return false;
+	}
+	tmp_fsp->fsp_flags.is_directory = true;
+
+	fsp_set_fd(tmp_fsp, fd);
+
+	*out = tmp_fsp;
+	return true;
+}
+
+static bool zfs_inherit_acls(vfs_handle_struct *handle,
+			     const char *root,
+			     struct dataset_list *ds_list)
+{
+	struct zfs_dataset *ds = NULL;
+	size_t root_len;
+	struct stat st;
+	int error;
+
+	root_len = strlen(ds_list->root->mountpoint) + 1;
+
+	error = stat(handle->conn->connectpath, &st);
+	if (error) {
+		DBG_ERR("%s: stat() failed: %s\n", root, strerror(errno));
+		return false;
+	}
+
+	error = chdir(ds_list->root->mountpoint);
+	if (error != 0) {
+		DBG_ERR("failed to chdir into [%s]: %s\n",
+			ds_list->root->mountpoint, strerror(errno));
+		return false;
+	}
+
+	for (ds = ds_list->children; ds; ds = ds->next) {
+		struct files_struct *c_fsp = NULL;
+		bool ok;
+		NTSTATUS status;
+
+		ok = get_synthetic_fsp(handle, ds->mountpoint + root_len, &c_fsp);
+		if (!ok) {
+			return false;
+		}
+
+		status = inherit_new_acl(c_fsp);
+		if (!NT_STATUS_IS_OK(status)) {
+			DBG_ERR("fail: %s: %s\n", ds->mountpoint, nt_errstr(status));
+		}
+
+		fd_close(c_fsp);
+		TALLOC_FREE(c_fsp);
+	}
+	error = chdir(handle->conn->connectpath);
+	if (error != 0) {
+		DBG_ERR("failed to chdir into [%s]: %s\n",
+			handle->conn->connectpath, strerror(errno));
+		return false;
+	}
+
+	/*
+	 * Restore owner after inheriting ACL from parent dataset.
+	 */
+	error = chown(handle->conn->connectpath, st.st_uid, st.st_gid);
+	if (error) {
+		DBG_ERR("%s: failed to restore ownership after "
+			"forced ACL inheritance: %s\n",
+			root, strerror(errno));
+	}
+
+	return true;
+}
+
 static int create_zfs_connectpath(vfs_handle_struct *handle,
 				  struct zfs_core_config_data *config,
 				  const char *user)
@@ -294,92 +403,37 @@ static int create_zfs_connectpath(vfs_handle_struct *handle,
 	bool do_chown;
 	int rv;
 	NTSTATUS status;
-	char *parent = NULL;
-	TALLOC_CTX *tmp_ctx = talloc_stackframe();
 	struct smblibzfshandle *libzp = NULL;
 	struct dataset_list *ds_list = NULL;
-	struct zfs_dataset *ds = NULL;
 
 	if (access(handle->conn->connectpath, F_OK) == 0) {
 		DBG_INFO("Connectpath for %s already exists. "
 			 "skipping dataset creation\n",
 			 handle->conn->connectpath);
-		TALLOC_FREE(tmp_ctx);
 		return 0;
 	}
 
-	rv = get_smblibzfs_handle(tmp_ctx, &libzp);
+	rv = get_smblibzfs_handle(handle->conn, &libzp);
 	if (rv != 0) {
 		DBG_ERR("Failed to obtain libzfshandle on connectpath: %s\n",
 			strerror(errno));
 		return -1;
 	}
 
-	rv = smb_zfs_create_dataset(tmp_ctx, libzp, handle->conn->connectpath,
-				    config->dataset_auto_quota, &ds_list, true);
+	rv = smb_zfs_create_dataset(handle->conn, libzp,
+				    handle->conn->connectpath,
+				    config->dataset_auto_quota,
+				    &config->created, true);
 	if (rv !=0) {
-		TALLOC_FREE(tmp_ctx);
 		return -1;
-	}
-
-	/*
-	 * chdir() to root of newly-created datasets is required due to
-	 * wide-link related access checks in open_internal_dirfsp().
-	 */
-	rv = chdir(ds_list->root->mountpoint);
-	if (rv != 0) {
-		DBG_ERR("failed to chdir into [%s]: %s\n",
-			ds_list->root->mountpoint, strerror(errno));
-		TALLOC_FREE(tmp_ctx);
-		return rv;
-	}
-	for (ds = ds_list->children; ds; ds = ds->next) {
-		struct smb_filename *child_smbfname = NULL;
-		struct files_struct *fsp = NULL;
-
-		child_smbfname = synthetic_smb_fname(talloc_tos(),
-						     ds->mountpoint,
-						     NULL,
-						     NULL,
-						     0,
-						     0);
-
-		status = open_internal_dirfsp(handle->conn,
-					      child_smbfname,
-					      O_RDONLY,
-					      &fsp);
-		if (!NT_STATUS_IS_OK(status)) {
-			TALLOC_FREE(tmp_ctx);
-			DBG_ERR("Failed to open internal dirfsp for %s: %s\n",
-				ds->mountpoint, strerror(errno));
-			return -1;
-		}
-		status = inherit_new_acl(fsp);
-		if (!NT_STATUS_IS_OK(status)) {
-			file_free(NULL, fsp);
-			TALLOC_FREE(tmp_ctx);
-			DBG_ERR("Failed to create inherited ACL for %s: %s\n",
-				ds->mountpoint, strerror(errno));
-			return -1;
-		}
-		file_free(NULL, fsp);
-		TALLOC_FREE(child_smbfname);
-	}
-	rv = chdir(handle->conn->connectpath);
-	if (rv != 0) {
-		DBG_ERR("failed to chdir into [%s]: %s\n",
-			ds_list->root->mountpoint, strerror(errno));
-		TALLOC_FREE(tmp_ctx);
-		return rv;
 	}
 
 	do_chown = lp_parm_bool(SNUM(handle->conn), "zfs_core",
 			        "chown_homedir", true);
 	if (do_chown) {
-		struct passwd *current_user = Get_Pwnam_alloc(tmp_ctx, user);
+		struct passwd *current_user = Get_Pwnam_alloc(handle->conn, user);
 		if ( !current_user ) {
 			DBG_ERR("Get_Pwnam_alloc failed for (%s).\n", user);
-			TALLOC_FREE(tmp_ctx);
 			return -1;
 		}
 		rv = chown(handle->conn->connectpath,
@@ -390,8 +444,9 @@ static int create_zfs_connectpath(vfs_handle_struct *handle,
 				handle->conn->connectpath,
 				current_user->pw_uid, getegid() );
 		}
+		TALLOC_FREE(user);
 	}
-	TALLOC_FREE(tmp_ctx);
+	TALLOC_FREE(libzp);
 	return rv;
 }
 
@@ -443,6 +498,38 @@ static int set_base_user_quota(vfs_handle_struct *handle,
 		}
 	}
 	return ret;
+}
+
+static int zfs_core_chdir(vfs_handle_struct *handle,
+			  const struct smb_filename *smb_fname)
+{
+	static bool checked = false;
+	struct zfs_core_config_data *config = NULL;
+
+	if (checked) {
+		return SMB_VFS_NEXT_CHDIR(handle, smb_fname);
+	}
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct zfs_core_config_data,
+				return -1);
+
+	if (config->created != NULL) {
+		bool ok;
+
+		become_root();
+		ok = zfs_inherit_acls(handle,
+				      config->created->root->mountpoint,
+				      config->created);
+		unbecome_root();
+		if (!ok) {
+			checked = true;
+			return -1;
+		}
+	}
+
+	checked = true;
+	return SMB_VFS_NEXT_CHDIR(handle, smb_fname);
 }
 
 static int zfs_core_connect(struct vfs_handle_struct *handle,
@@ -523,6 +610,7 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 
 static struct vfs_fn_pointers zfs_core_fns = {
 	.fs_capabilities_fn = zfs_core_fs_capabilities,
+	.chdir_fn = zfs_core_chdir,
 	.connect_fn = zfs_core_connect,
 	.get_quota_fn = zfs_core_get_quota,
 	.set_quota_fn = zfs_core_set_quota,
