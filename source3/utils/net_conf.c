@@ -360,7 +360,7 @@ static bool add_parsed(struct json_object *param,
 	char *endptr = NULL;
 	bool ok, bool_val;
 
-	ok = conv_str_bool(value, &bool_val);
+	ok = set_boolean(value, &bool_val);
 	if (ok) {
 		error = json_add_bool(param, "parsed", bool_val);
 		if (error) {
@@ -1700,6 +1700,7 @@ static int net_conf_setparm_json(struct net_context *c, struct smbconf_ctx *conf
 	TALLOC_CTX *mem_ctx = talloc_stackframe();
 	struct json_object data, payload, to_set;
 	json_t *jsservice = NULL;
+	const char *service = NULL;
 
 	if (argc != 1 || c->display_usage) {
 		net_conf_setparm_json_usage(c, argc, argv);
@@ -1739,15 +1740,25 @@ static int net_conf_setparm_json(struct net_context *c, struct smbconf_ctx *conf
 	}
 
 	jsservice = json_object_get(data.root, "service");
-	if (jsservice == NULL) {
+	if (jsservice == NULL || !json_is_string(jsservice)) {
 		goto done;
 	}
+	service = json_string_value(jsservice);
 
 	err = smbconf_transaction_start(conf_ctx);
 	if (!SBC_ERROR_IS_OK(err)) {
 		d_printf("error starting transaction: %s\n",
 			 sbcErrorString(err));
 		goto done;
+	}
+
+	if (!smbconf_share_exists(conf_ctx, service)) {
+		err = smbconf_create_share(conf_ctx, service);
+		if (!SBC_ERROR_IS_OK(err)) {
+			d_fprintf(stderr, _("Error creating share '%s': %s\n"),
+				  service, sbcErrorString(err));
+			goto cancel;
+		}
 	}
 
 	ok = batch_apply_json_parameters(mem_ctx, conf_ctx, &payload);
