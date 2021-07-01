@@ -284,6 +284,20 @@ bld.SAMBA3_BINARY('mvxattr',
                  ''',
                  enabled=bld.env.build_mvxattr)
 
+bld.SAMBA3_BINARY('convxattr',
+                 source='convxattr.c',
+                 deps='''
+                 talloc
+                 popt
+                 samba-util
+                 smbd_base
+                 jansson
+                 audit_logging
+                 STRING_REPLACE
+                 ADOUBLE
+                 ''',
+                 enabled=bld.env.build_convxattr)
+
 bld.SAMBA3_BINARY('destroy_netlogon_creds_cli',
                   source='destroy_netlogon_creds_cli.c',
                   deps = '''
