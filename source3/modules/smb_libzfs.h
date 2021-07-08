@@ -129,21 +129,6 @@ int smb_zfs_path_to_dataset(struct smblibzfshandle *smblibzfsp,
 			    const char **dataset_name_out);
 
 /*
- * Get dataset name for a given path. This is useful because there may be
- * multiple ZFS datasets within a single SMB share.
- *
- * @param[in]	smblibzfsp		smblibzfs handle struct
- * @param[in]	mem_ctx			talloc memory context
- * @param[in]	dataset_name		name of ZFS dataset.
- * @param[out]	dataset_mp_out		mountpoint of ZFS dataset (talloc'ed string).
- *
- * @return	0 on success -1 on failure
- */
-int smb_zfs_dataset_name_to_mp(struct smblibzfshandle *smblibzfsp,
-			       TALLOC_CTX *mem_ctx,
-			       const char *dataset_name,
-			       char **dataset_mp_out);
-/*
  * Get userspace quotas for a given path, ID, and quota type.
  * @param[in]	smblibzfsp		smblibzfs handle struct
  * @param[in]	path		 	the full path in which to get quota.
@@ -260,7 +245,6 @@ struct zfs_dataset *smb_zfs_path_get_dataset(struct smblibzfshandle *smblibzfsp,
 					     bool open_zhandle,
 					     bool resolve_path);
 
-int smb_get_dataset_name(struct smbzhandle *zhandle_ext, const char **dataset_name_out);
 /*
  * This function returns a list of ZFS snapshots matching the specified
  * filters, allocated under a user-provided talloc memory context. Returns
@@ -385,16 +369,12 @@ void close_smbzhandle(struct smbzhandle *zfsp_ext);
  * @param[in]	smbzhandle_ext		smb zfs dataset handle
  * @param[in]	open_handles		specifies whether to leave zhandles on child
  *					datasets open
- * @param[out]	from_cache		true if returned from cache
  * @return	dataset_list		dataset->root->zhandle is a pointer to the
  *					same zhandle used to generate the dataset list.
  */
 struct dataset_list *zhandle_list_children( TALLOC_CTX *mem_ctx,
                                           struct smbzhandle *zhandle_ext,
                                           bool open_zhandles);
-
-struct dataset_list *cache_zhandle_list_children(TALLOC_CTX *mem_ctx,
-						 struct smbzhandle *zhandle_ext);
 
 /*
  * Initialize global libzfs handle if necessary and populate
