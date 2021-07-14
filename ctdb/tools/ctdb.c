@@ -2616,6 +2616,42 @@ static void dump_tdb_data(const char *name, TDB_DATA val)
 	fprintf(stdout, "\"\n");
 }
 
+static bool json_add_ltdb_header(TALLOC_CTX *mem_ctx,
+				 struct json_object *jsobj,
+				 struct ctdb_ltdb_header *header)
+{
+	char *flags = NULL;
+	int error;
+
+	if (json_is_invalid(jsobj)) {
+		return false;
+	}
+
+	error = json_add_int(jsobj, "dmaster", header->dmaster);
+	if (error) {
+		return false;
+	}
+
+	error = json_add_int(jsobj, "rsn", header->rsn);
+	if (error) {
+		return false;
+	}
+
+	flags = talloc_asprintf(mem_ctx, "0x%08x", header->flags);
+	if (flags == NULL) {
+		return false;
+	}
+
+	error = json_add_string(jsobj, "flags", flags);
+	if (flags == NULL) {
+		TALLOC_FREE(flags);
+		return false;
+	}
+
+	TALLOC_FREE(flags);
+	return true;
+}
+
 static void dump_ltdb_header(struct ctdb_ltdb_header *header)
 {
 	fprintf(stdout, "dmaster: %u\n", header->dmaster);
@@ -2646,6 +2682,65 @@ static void dump_ltdb_header(struct ctdb_ltdb_header *header)
 
 }
 
+struct traverse_cb_data_json {
+	struct json_object *jsobj;
+	size_t count;
+	const char *prefix;
+	TALLOC_CTX *mem_ctx;
+};
+
+static int record_to_json(uint32_t reqid, struct ctdb_ltdb_header *header,
+			  TDB_DATA key, TDB_DATA data, void *private_data)
+{
+	struct traverse_cb_data_json *state = NULL;
+	int error;
+	bool ok;
+	struct json_object tdb_entry;
+
+	state = talloc_get_type_abort(private_data,
+				      struct traverse_cb_data_json);
+
+	if (state->prefix &&
+	    (strncmp(key.dptr, state->prefix, strlen(state->prefix)) != 0)) {
+		return 0;
+	}
+
+	json_assert_is_array(state->jsobj);
+	if (json_is_invalid(state->jsobj)) {
+		return -1;
+	}
+
+	tdb_entry = json_new_object();
+	if (json_is_invalid(&tdb_entry)) {
+		return -1;
+	}
+
+	error = json_add_string(&tdb_entry, "key", key.dptr);
+	if (error) {
+		goto fail;
+	}
+
+	error = json_add_string(&tdb_entry, "val", data.dptr);
+	if (error) {
+		goto fail;
+	}
+
+	ok = json_add_ltdb_header(state->mem_ctx, &tdb_entry, header);
+	if (!ok) {
+		goto fail;
+	}
+
+	error = json_add_object(state->jsobj, NULL, &tdb_entry);
+	if (error) {
+		return -1;
+	}
+
+	return 0;
+fail:
+	json_free(&tdb_entry);
+	return -1;
+}
+
 static int dump_record(uint32_t reqid, struct ctdb_ltdb_header *header,
 		       TDB_DATA key, TDB_DATA data, void *private_data)
 {
@@ -2658,6 +2753,78 @@ static int dump_record(uint32_t reqid, struct ctdb_ltdb_header *header,
 	dump_ltdb_header(header);
 	dump_tdb_data("data", data);
 	fprintf(stdout, "\n");
+
+	return 0;
+}
+
+static int control_catdb_json(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+			      int argc, const char **argv)
+{
+	struct ctdb_db_context *db = NULL;
+	const char *db_name = NULL;
+	uint32_t db_id;
+	uint8_t db_flags;
+	struct traverse_cb_data_json *state = NULL;
+	struct json_object output, entries;
+	char *js = NULL;
+	int error;
+
+	if (argc != 1) {
+		usage("catdb");
+	}
+
+	if (! db_exists(mem_ctx, ctdb, argv[0], &db_id, &db_name, &db_flags)) {
+		return 1;
+	}
+
+	error = ctdb_attach(ctdb->ev, ctdb->client, TIMEOUT(), db_name,
+			    db_flags, &db);
+	if (error) {
+		fprintf(stderr, "Failed to attach to DB %s\n", db_name);
+		return error;
+	}
+
+	output = json_new_object();
+	if (json_is_invalid(&output)) {
+		return ENOMEM;
+	}
+
+	entries = json_new_array();
+	if (json_is_invalid(&entries)) {
+		json_free(&output);
+		return ENOMEM;
+	}
+
+	state = talloc_zero(mem_ctx, struct traverse_cb_data_json);
+	if (state == NULL) {
+		fprintf(stderr, "memory error");
+		return ENOMEM;
+	}
+
+	state->mem_ctx = mem_ctx;
+	state->jsobj = &entries;
+
+	error = ctdb_db_traverse(mem_ctx, ctdb->ev, ctdb->client, db,
+				 ctdb->cmd_pnn, TIMEOUT(),
+				 record_to_json, state);
+	if (error) {
+		TALLOC_FREE(state);
+		return error;
+	}
+
+	error = json_add_object(&output, "data", &entries);
+	if (error) {
+		TALLOC_FREE(state);
+		return error;
+	}
+
+	js = json_to_string(state, &output);
+	if (js == NULL) {
+		TALLOC_FREE(state);
+		return -1;
+	}
+	fprintf(stdout, "%s\n", js);
+	TALLOC_FREE(state);
 
 	return 0;
 }
@@ -6520,6 +6687,8 @@ static const struct ctdb_cmd {
 	{ "getdbstatus", control_getdbstatus, false, true,
 		"show database status", "<dbname|dbid>" },
 	{ "catdb", control_catdb, false, false,
+		"dump cluster-wide ctdb database", "<dbname|dbid>" },
+	{ "catdb_json", control_catdb_json, false, false,
 		"dump cluster-wide ctdb database", "<dbname|dbid>" },
 	{ "cattdb", control_cattdb, false, false,
 		"dump local ctdb database", "<dbname|dbid>" },
