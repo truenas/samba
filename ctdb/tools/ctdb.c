@@ -2689,6 +2689,24 @@ struct traverse_cb_data_json {
 	TALLOC_CTX *mem_ctx;
 };
 
+static int tdb_entry_to_json(TALLOC_CTX *mem_ctx,
+			     struct json_object *jsobj,
+			     const char *jskey,
+			     TDB_DATA data)
+{
+	char *to_write = NULL;
+	int error;
+
+	to_write = talloc_strndup(mem_ctx, data.dptr, data.dsize);
+	if (to_write == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	error = json_add_string(jsobj, jskey, to_write);
+	TALLOC_FREE(to_write);
+	return error;
+}
+
 static int record_to_json(uint32_t reqid, struct ctdb_ltdb_header *header,
 			  TDB_DATA key, TDB_DATA data, void *private_data)
 {
@@ -2715,12 +2733,12 @@ static int record_to_json(uint32_t reqid, struct ctdb_ltdb_header *header,
 		return -1;
 	}
 
-	error = json_add_string(&tdb_entry, "key", key.dptr);
+	error = tdb_entry_to_json(state->mem_ctx, &tdb_entry, "key", key);
 	if (error) {
 		goto fail;
 	}
 
-	error = json_add_string(&tdb_entry, "val", data.dptr);
+	error = tdb_entry_to_json(state->mem_ctx, &tdb_entry, "val", data);
 	if (error) {
 		goto fail;
 	}
