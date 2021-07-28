@@ -879,17 +879,15 @@ static int shadow_copy_zfs_ntimes(vfs_handle_struct *handle,
 }
 
 static int shadow_copy_zfs_readlinkat(vfs_handle_struct *handle,
-				      files_struct *dirfsp,
+				      const struct files_struct *dirfsp,
 				      const struct smb_filename *smb_fname,
 				      char *buf,
 				      size_t bufsiz)
 {
-	int ret, saved_errno;
+	int ret;
 	int shadow_fd = -1;
 	int orig_fd = -1;
 	char *shadow_name = NULL;
-	char *parent = NULL;
-	const char *base = NULL;
 	struct smb_filename *conv = NULL;
 
 	if (shadow_copy_zfs_match_name(smb_fname)) {
@@ -903,19 +901,10 @@ static int shadow_copy_zfs_readlinkat(vfs_handle_struct *handle,
 			TALLOC_FREE(conv);
 			return -1;
 		}
-		if (!parent_dirname(handle->conn, shadow_name, &parent, &base)) {
-			DBG_ERR("Failed to get parent dirname for [%s]: %s\n",
-				shadow_name, strerror(errno));
-			TALLOC_FREE(conv);
-			TALLOC_FREE(shadow_name);
-			return -1;
-		}
-		conv->base_name = discard_const(base);
+		conv->base_name = shadow_name;
 		ret = SMB_VFS_NEXT_READLINKAT(handle, dirfsp, conv, buf, bufsiz);
 		TALLOC_FREE(conv);
 		TALLOC_FREE(shadow_name);
-		TALLOC_FREE(base);
-		errno = saved_errno;
 		return ret;
 	} else {
 		return SMB_VFS_NEXT_READLINKAT(handle, dirfsp, smb_fname, buf, bufsiz);
@@ -1313,8 +1302,8 @@ static int shadow_copy_zfs_get_real_filename(struct vfs_handle_struct *handle,
 	struct smb_filename *conv_smb_fname = NULL;
 
 	if (shadow_copy_zfs_match_name(path)) {
-		conv = convert_shadow_zfs_name(handle, conv_smb_fname->base_name,
-					       conv_smb_fname->twrp, True);
+		conv = convert_shadow_zfs_name(handle, path->base_name,
+					       path->twrp, True);
 		if (conv == NULL) {
 			return -1;
 		}
