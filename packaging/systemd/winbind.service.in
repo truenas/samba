@@ -13,4 +13,5 @@ LimitCORE=infinity
 @systemd_winbind_extra@
 
 [Install]
+Alias=winbindd.service
 WantedBy=multi-user.target
