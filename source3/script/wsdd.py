@@ -17,6 +17,7 @@ import socket
 import selectors
 import struct
 import argparse
+import json
 import uuid
 import time
 import random
@@ -1306,6 +1307,7 @@ IN6_IFF_NOTREADY = IN6_IFF_TENTATIVE | IN6_IFF_DUPLICATED
 
 SA_ALIGNTO = ctypes.sizeof(ctypes.c_long)
 
+tn_config = {}
 
 class RouteSocketAddressMonitor(NetworkAddressMonitor):
     """
@@ -1449,6 +1451,17 @@ def sigterm_handler(signum, frame):
         # implictely raise SystemExit to cleanup properly
         sys.exit(0)
 
+def get_parm(key):
+    global tn_config
+
+    if tn_config:
+        return tn_config[key]
+
+    with open('/etc/wsdd.conf', 'r') as f:
+        contents = f.read()
+
+    tn_config = json.loads(contents)
+    return tn_config[key]
 
 def parse_args():
     global args, logger
@@ -1474,16 +1487,16 @@ def parse_args():
     parser.add_argument(
         '-d', '--domain',
         help='set domain name (disables workgroup)',
-        default=None)
+        default=get_parm('realm'))
     parser.add_argument(
         '-n', '--hostname',
         help='override (NetBIOS) hostname to be used (default hostname)',
         # use only the local part of a possible FQDN
-        default=socket.gethostname().partition('.')[0])
+        default=get_parm('netbios_name'))
     parser.add_argument(
         '-w', '--workgroup',
         help='set workgroup name (default WORKGROUP)',
-        default='WORKGROUP')
+        default=get_parm('workgroup'))
     parser.add_argument(
         '-t', '--no-http',
         help='disable http service (for debugging, e.g.)',
@@ -1661,6 +1674,10 @@ def drop_privileges(uid, gid):
 
 
 def main():
+    enabled = get_parm("enabled")
+    if not enabled:
+        return 0
+
     parse_args()
 
     if not args.discovery and args.listen:
