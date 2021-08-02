@@ -71,5 +71,29 @@ _WARN_UNUSED_RESULT_ struct json_object json_get_object(
     struct json_object *object, const char *name);
 _WARN_UNUSED_RESULT_ char *json_to_string(TALLOC_CTX *mem_ctx,
 					  const struct json_object *object);
+
+_WARN_UNUSED_RESULT_ int iter_json_array(struct json_object *object,
+					 bool (*fn)(int index,
+						    struct json_object *entry,
+						    void *private_data),
+					 void *private_data);
+
+_WARN_UNUSED_RESULT_ int iter_json_object(struct json_object *object,
+					  bool (*fn)(const char *key,
+						     struct json_object *value,
+						     void *private_data),
+					  void *private_data);
+
+_WARN_UNUSED_RESULT_ int json_get_string_value(
+    const struct json_object *object, const char *key, const char **valp);
+_WARN_UNUSED_RESULT_ int json_get_bool_value(
+    const struct json_object *object, const char *key, bool *valp);
+_WARN_UNUSED_RESULT_ int json_get_int_value(
+    const struct json_object *object, const char *key, int *valp);
+_WARN_UNUSED_RESULT_ int json_get_array_value(
+    const struct json_object *object, const char *key, struct json_object *valp);
+
+_WARN_UNUSED_RESULT_ struct json_object load_json(const char *text);
+
 #endif
 #endif
