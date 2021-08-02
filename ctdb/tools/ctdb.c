@@ -2697,6 +2697,15 @@ static int tdb_entry_to_json(TALLOC_CTX *mem_ctx,
 	char *to_write = NULL;
 	int error;
 
+	if (data.dsize == 0) {
+		error = json_object_set_new(jsobj->root, jskey, json_null());
+		if (error) {
+			errno = ENOMEM;
+			return -1;
+		}
+		return error;
+	}
+
 	to_write = talloc_strndup(mem_ctx, data.dptr, data.dsize);
 	if (to_write == NULL) {
 		errno = ENOMEM;
@@ -2724,6 +2733,10 @@ static int record_to_json(uint32_t reqid, struct ctdb_ltdb_header *header,
 		return 0;
 	}
 
+	if ((key.dsize == 23) &&
+	    (strncmp(key.dptr, "__db_sequence_number__", 22) == 0)) {
+		return 0;
+	}
 	json_assert_is_array(state->jsobj);
 	if (json_is_invalid(state->jsobj)) {
 		return -1;
@@ -5783,6 +5796,415 @@ static int control_pdelete(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
 	return 0;
 }
 
+struct batch_json_state {
+	TALLOC_CTX *mem_ctx;
+	struct ctdb_transaction_handle *h;
+	struct json_object *output;
+	bool has_output;
+};
+
+static bool json_entry_delete(const char *key,
+			      const char *val,
+			      struct batch_json_state *state)
+{
+	int error;
+	TDB_DATA tdb_key;
+
+	error = str_to_data(key, strlen(key), state->mem_ctx, &tdb_key);
+	if (error) {
+		return false;
+	}
+
+	error = ctdb_transaction_delete_record(state->h, tdb_key);
+
+	TALLOC_FREE(tdb_key.dptr);
+	return error ? false : true;
+}
+
+static bool json_entry_store(const char *key,
+			     const char *val,
+			     struct batch_json_state *state)
+{
+	int error;
+	TDB_DATA tdb_key, tdb_val;
+
+	error = str_to_data(key, strlen(key), state->mem_ctx, &tdb_key);
+	if (error) {
+		return false;
+	}
+
+	error = str_to_data(val, strlen(val), state->mem_ctx, &tdb_val);
+	if (error) {
+		TALLOC_FREE(tdb_key.dptr);
+		return false;
+	}
+
+	error = ctdb_transaction_store_record(state->h, tdb_key, tdb_val);
+
+	TALLOC_FREE(tdb_key.dptr);
+	TALLOC_FREE(tdb_val.dptr);
+
+	return error ? false : true;
+}
+
+static bool json_entry_fetch(const char *key,
+			     const char *val,
+			     struct batch_json_state *state)
+{
+	int error;
+	TDB_DATA tdb_key, data;
+	struct json_object entry;
+
+	error = str_to_data(key, strlen(key), state->mem_ctx, &tdb_key);
+	if (error) {
+		return false;
+	}
+
+	error = ctdb_transaction_fetch_record(state->h, tdb_key, state->mem_ctx, &data);
+	if (error) {
+		fprintf(stderr, "%s: failed to read record.\n", key);
+		TALLOC_FREE(tdb_key.dptr);
+		return false;
+	}
+
+	TALLOC_FREE(tdb_key.dptr);
+
+	entry = json_new_object();
+	if (json_is_invalid(&entry)) {
+		fprintf(stderr, "JSON library failure.\n");
+		return false;
+	}
+
+	error = json_add_string(&entry, "key", key);
+	if (error) {
+		fprintf(stderr, "Failed to add %s to json object\n.", key);
+		json_free(&entry);
+		return false;
+	}
+
+	error = tdb_entry_to_json(state->mem_ctx, &entry, "val", data);
+	if (error) {
+		fprintf(stderr, "%s: failed to convert entry to JSON.\n", key);
+		json_free(&entry);
+		return false;
+	}
+
+	error = json_add_object(state->output, NULL, &entry);
+	if (error) {
+		return false;
+	}
+
+	state->has_output = true;
+
+	return true;
+}
+
+const struct {
+        const char *name;
+        bool (*fn)(const char *key, const char *value, struct batch_json_state *state);
+} optable[] = {
+        { "FETCH", json_entry_fetch },
+        { "DELETE", json_entry_delete },
+        { "STORE", json_entry_store },
+};
+
+static bool dispatch_batch_op(int idx,
+			      struct json_object *req,
+			      void *private_data)
+{
+	int error, i;
+	const char *action = NULL, *key = NULL, *val = NULL;
+	struct batch_json_state *state = NULL;
+
+	state = talloc_get_type_abort(private_data, struct batch_json_state);
+
+	if (json_is_invalid(req)) {
+		fprintf(stderr, "%d: JSON library error.\n", idx);
+		errno = ENOMEM;
+		return false;
+	}
+
+	error = json_get_string_value(req, "action", &action);
+	if (error) {
+		fprintf(stderr, "%d: request lacks 'action'.\n", idx);
+		errno = EINVAL;
+		return false;
+	}
+
+	error = json_get_string_value(req, "key", &key);
+	if (error) {
+		fprintf(stderr, "%d: request lacks 'key'.\n", idx);
+		errno = EINVAL;
+		return false;
+	}
+
+	if (strcmp(action, "STORE") == 0) {
+		error = json_get_string_value(req, "val", &val);
+		if (error) {
+			fprintf(stderr, "%d: request lacks 'val'.\n", idx);
+			errno = EINVAL;
+			return false;
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(optable); i++) {
+		if (strcmp(optable[i].name, action) == 0) {
+			return optable[i].fn(key, val, state);
+		}
+	}
+	fprintf(stderr, "%d: unkown action [%s], choices are 'FETCH', 'DELETE', 'STORE'\n",
+		idx, action);
+
+	return false;
+}
+
+static int do_batch_json(const char *to_parse, struct batch_json_state *state)
+{
+	int error;
+	struct json_object jsdata;
+
+	jsdata = load_json(to_parse);
+	if (json_is_invalid(&jsdata)) {
+		return -1;
+	}
+
+	error = iter_json_array(&jsdata, dispatch_batch_op, state);
+	if (error) {
+		fprintf(stderr, "Failed to iter JSON array");
+	}
+
+	json_free(&jsdata);
+	return error;
+}
+
+static int file_do_batch_json(FILE *file, struct batch_json_state *state)
+{
+	int error, n;
+	char *data = NULL;
+	size_t len = 0;
+
+	do {
+		n = getline(&data, &len, file);
+		if (n == -1) {
+			if (feof(file)) {
+				break;
+			}
+			fprintf(stderr, "getline() failed: %s",
+				strerror(errno));
+			free(data);
+		}
+		/* optional command character to indicate process all input */
+		if (data[len -1] == ';') {
+			data[len -1] = '\0';
+			error = do_batch_json(data, state);
+			free(data);
+			/*
+			 * setting data to NULL forces allocation of new memory
+			 */
+			data = NULL;
+			if (error) {
+				return error;
+			}
+		}
+	} while (!feof(file));
+
+	error = do_batch_json(data, state);
+	return error;
+}
+
+static int control_ptrans_json(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+			       int argc, const char **argv)
+{
+	const char *db_name = NULL;
+	struct ctdb_db_context *db = NULL;
+	struct ctdb_transaction_handle *h = NULL;
+	uint8_t db_flags;
+	FILE *file = NULL;
+	struct batch_json_state *state = NULL;
+	struct json_object output;
+	int ret;
+
+	if (argc < 1 || argc > 2) {
+		usage("ptrans");
+	}
+
+	if (! db_exists(mem_ctx, ctdb, argv[0], NULL, &db_name, &db_flags)) {
+		return 1;
+	}
+
+	if (! (db_flags &
+	       (CTDB_DB_FLAGS_PERSISTENT | CTDB_DB_FLAGS_REPLICATED))) {
+		fprintf(stderr, "Transactions not supported on DB %s\n",
+			db_name);
+		return 1;
+	}
+
+	if (argc == 2) {
+		file = fopen(argv[1], "r");
+		if (file == NULL) {
+			fprintf(stderr, "Failed to open file %s\n", argv[1]);
+			return 1;
+		}
+	} else {
+		file = stdin;
+	}
+
+	ret = ctdb_attach(ctdb->ev, ctdb->client, TIMEOUT(), db_name,
+			  db_flags, &db);
+	if (ret != 0) {
+		fprintf(stderr, "Failed to attach to DB %s\n", db_name);
+		return 1;
+	}
+
+	ret = ctdb_transaction_start(mem_ctx, ctdb->ev, ctdb->client,
+				     TIMEOUT(), db, false, &h);
+	if (ret != 0) {
+		fprintf(stderr, "Failed to start transaction on db %s\n",
+			db_name);
+		return 1;
+	}
+
+	output = json_new_array();
+	if (json_is_invalid(&output)) {
+		fprintf(stderr, "JSON library failure.\n");
+		return 1;
+	}
+
+	state = talloc_zero(mem_ctx, struct batch_json_state);
+	if (state == NULL) {
+		fprintf(stderr, "memory error.");
+		json_free(&output);
+		return 1;
+	}
+
+	state->h = h;
+	state->mem_ctx = mem_ctx;
+	state->output = &output;
+
+	ret = file_do_batch_json(file, state);
+	if (ret != 0) {
+		ctdb_transaction_cancel(h);
+		goto cleanup;
+
+	}
+
+	ret = ctdb_transaction_commit(h);
+	if (ret != 0) {
+		fprintf(stderr, "Failed to commit transaction on db %s\n",
+			db_name);
+		ctdb_transaction_cancel(h);
+	}
+
+	if (state->has_output) {
+		char *output_str = NULL;
+		output_str = json_to_string(mem_ctx, state->output);
+		if (output_str == NULL) {
+			ret = 1;
+			goto cleanup;
+		}
+		fprintf(stdout, "%s\n", output_str);
+		TALLOC_FREE(output_str);
+	}
+
+cleanup:
+	if (file != stdin) {
+		fclose(file);
+	}
+	json_free(&output);
+	TALLOC_FREE(state);
+	return ret ? 1 : 0;
+}
+
+static int control_pbatch(TALLOC_CTX *mem_ctx, struct ctdb_context *ctdb,
+			  int argc, const char **argv)
+{
+	int ret;
+	const char *db_name = NULL;
+	struct ctdb_db_context *db = NULL;
+	struct ctdb_transaction_handle *h = NULL;
+	uint8_t db_flags;
+	struct batch_json_state *state = NULL;
+	struct json_object output;
+
+	if (!db_exists(mem_ctx, ctdb, argv[0], NULL, &db_name, &db_flags)) {
+		return 1;
+	}
+
+	if (!(db_flags &
+	      (CTDB_DB_FLAGS_PERSISTENT | CTDB_DB_FLAGS_REPLICATED))) {
+		fprintf(stderr, "Transactions not supported on DB %s\n",
+			db_name);
+		return 1;
+	}
+
+	ret = ctdb_attach(ctdb->ev, ctdb->client, TIMEOUT(), db_name,
+			  db_flags, &db);
+	if (ret != 0) {
+		fprintf(stderr, "Failed to attach to DB %s\n", db_name);
+		return ret;
+	}
+
+	output = json_new_array();
+	if (json_is_invalid(&output)) {
+		fprintf(stderr, "JSON library failure.\n");
+		return 1;
+	}
+
+	state = talloc_zero(mem_ctx, struct batch_json_state);
+	if (state == NULL) {
+		fprintf(stderr, "memory error.");
+		json_free(&output);
+		return 1;
+	}
+
+	ret = ctdb_transaction_start(mem_ctx, ctdb->ev, ctdb->client,
+				     TIMEOUT(), db, false, &h);
+	if (ret != 0) {
+		fprintf(stderr, "Failed to start transaction on db %s\n",
+			db_name);
+		goto cleanup;
+	}
+	state->h = h;
+	state->mem_ctx = mem_ctx;
+	state->output = &output;
+
+	if (strcmp(argv[1], "-") == 0) {
+		ret = file_do_batch_json(stdin, state);
+	}
+	else {
+		ret = do_batch_json(argv[1], state);
+	}
+
+        if (ret != 0) {
+		ctdb_transaction_cancel(h);
+		goto cleanup;
+        }
+
+	ret = ctdb_transaction_commit(h);
+	if (ret != 0) {
+		fprintf(stderr, "Failed to commit transaction on db %s\n",
+			db_name);
+		ctdb_transaction_cancel(h);
+		goto cleanup;
+	}
+
+	if (state->has_output) {
+		char *output_str = NULL;
+		output_str = json_to_string(mem_ctx, state->output);
+		if (output_str == NULL) {
+			ret = 1;
+			goto cleanup;
+		}
+		fprintf(stdout, "%s\n", output_str);
+		TALLOC_FREE(output_str);
+	}
+
+cleanup:
+	json_free(&output);
+	TALLOC_FREE(state);
+	return ret ? 1 : 0;
+}
+
 static int ptrans_parse_string(TALLOC_CTX *mem_ctx, const char **ptr, TDB_DATA *data)
 {
 	const char *t;
@@ -6806,6 +7228,10 @@ static const struct ctdb_cmd {
 		"delete record from persistent database", "<dbname|dbid> <key>" },
 	{ "ptrans", control_ptrans, false, false,
 		"update a persistent database (from file or stdin)", "<dbname|dbid> [<file>]" },
+	{ "ptrans_json", control_ptrans_json, false, false,
+		"update a persistent database (from file or stdin)", "<dbname|dbid> [<file>]" },
+	{ "pbatch", control_pbatch, false, false,
+		"update a persistent database using JSON list of ops", "<dbname|dbid> <JSON list>" },
 	{ "tfetch", control_tfetch, false, true,
 		"fetch a record", "<tdb-file> <key> [<file>]" },
 	{ "tstore", control_tstore, false, true,
