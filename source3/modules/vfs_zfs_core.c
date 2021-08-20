@@ -368,13 +368,23 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 			return false;
 		}
 
+		error = SMB_VFS_STAT(handle->conn, c_fsp->fsp_name);
+		if (error) {
+			DBG_ERR("%s: stat() failed: %s\n", fsp_str_dbg(c_fsp), strerror(errno));
+			fd_close(c_fsp);
+			return false;
+		}
+
+		/*
+		 * ensure we have valid stat on our synthetic FSP
+		 */
+
 		status = inherit_new_acl(c_fsp);
 		if (!NT_STATUS_IS_OK(status)) {
 			DBG_ERR("fail: %s: %s\n", ds->mountpoint, nt_errstr(status));
 		}
 
 		fd_close(c_fsp);
-		TALLOC_FREE(c_fsp);
 	}
 	error = chdir(handle->conn->connectpath);
 	if (error != 0) {
@@ -444,7 +454,7 @@ static int create_zfs_connectpath(vfs_handle_struct *handle,
 				handle->conn->connectpath,
 				current_user->pw_uid, getegid() );
 		}
-		TALLOC_FREE(user);
+		TALLOC_FREE(current_user);
 	}
 	TALLOC_FREE(libzp);
 	return rv;
