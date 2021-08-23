@@ -746,36 +746,66 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 	char *tmp = NULL;
 	struct smb_filename *conv_smb_fname = NULL;
 
-	if (shadow_copy_zfs_match_name(smb_fname)) {
-		tmp = convert_shadow_zfs_name(
-		    handle, smb_fname->base_name, smb_fname->twrp, True);
-
-		if (tmp == NULL) {
-			return -1;
-		}
-
-		conv_smb_fname = synthetic_smb_fname(talloc_tos(),
-						     tmp,
-						     NULL,
-						     NULL,
-						     0,
-						     smb_fname->flags);
-		if (conv_smb_fname == NULL) {
-			TALLOC_FREE(tmp);
-			return -1;
-		}
-
-		/*
-		 * Overwrite user requested flags with O_RDONLY.
-		 */
-		flags = O_RDONLY;
-
-		ret = SMB_VFS_NEXT_OPENAT(handle, dirfsp, conv_smb_fname,
-					  fsp, flags, mode);
-		return ret;
+	if (!shadow_copy_zfs_match_name(smb_fname)) {
+		return SMB_VFS_NEXT_OPENAT(handle,
+					   dirfsp,
+					   smb_fname,
+					   fsp, flags, mode);
 	}
 
-	return SMB_VFS_NEXT_OPENAT(handle, dirfsp, smb_fname, fsp, flags, mode);
+	/*
+	 * If dirfsp is an open in a snapshot directory, then concatenate the
+	 * dirfsp path with smb_fname relative path, convert into an absolute
+	 * path in the relevant snapdir, and pass to openat().
+	 */
+	if (shadow_copy_zfs_match_name(dirfsp->fsp_name)) {
+		char *dirfsp_path = NULL;
+		dirfsp_path = convert_shadow_zfs_name(handle,
+						      dirfsp->fsp_name->base_name,
+						      dirfsp->fsp_name->twrp,
+						      True);
+		if (dirfsp_path == NULL) {
+			return -1;
+		}
+
+		tmp = talloc_asprintf(talloc_tos(),
+				      "%s/%s",
+				      dirfsp_path,
+				      smb_fname->base_name);
+		TALLOC_FREE(dirfsp_path);
+	} else {
+		tmp = convert_shadow_zfs_name(handle,
+					      smb_fname->base_name,
+					      smb_fname->twrp,
+					      True);
+	}
+
+	if (tmp == NULL) {
+		return -1;
+	}
+
+	conv_smb_fname = synthetic_smb_fname(talloc_tos(),
+					     tmp,
+					     NULL,
+					     NULL,
+					     0,
+					     smb_fname->flags);
+	if (conv_smb_fname == NULL) {
+		TALLOC_FREE(tmp);
+		return -1;
+	}
+
+	/*
+	 * Overwrite user requested flags with O_RDONLY.
+	 */
+	flags = O_RDONLY;
+
+	ret = SMB_VFS_NEXT_OPENAT(handle, dirfsp, conv_smb_fname,
+				  fsp, flags, mode);
+
+	TALLOC_FREE(conv_smb_fname);
+
+	return ret;
 }
 
 static int shadow_copy_zfs_unlinkat(vfs_handle_struct *handle,
