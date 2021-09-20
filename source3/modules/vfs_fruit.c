@@ -2259,6 +2259,8 @@ static int fruit_unlinkat(vfs_handle_struct *handle,
 	 * delete_all_streams() can't remove 0 byte resource fork
 	 * streams, so we have to cleanup this here.
 	 */
+#if 0
+/* Remove resource stream - skip since we're deleting base file and only streams_xattr is supported. */
 	rsrc_smb_fname = synthetic_smb_fname(talloc_tos(),
 					     smb_fname->base_name,
 					     AFPRESOURCE_STREAM_NAME,
@@ -2277,6 +2279,7 @@ static int fruit_unlinkat(vfs_handle_struct *handle,
 		return -1;
 	}
 	TALLOC_FREE(rsrc_smb_fname);
+#endif
 
 	return SMB_VFS_NEXT_UNLINKAT(handle,
 			dirfsp,
