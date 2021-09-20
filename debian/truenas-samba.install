@@ -11,7 +11,6 @@ usr/bin/profiles
 usr/bin/sharesec
 usr/bin/smbcontrol
 usr/bin/smbstatus
-usr/bin/findsmb
 usr/lib/*/samba/libhdb-samba4.so.11
 usr/lib/*/samba/libhdb-samba4.so.11.0.2
 usr/lib/*/samba/libkdc-samba4.so.2
@@ -61,6 +60,7 @@ usr/lib/*/ctdb/ctdb_natgw
 usr/lib/*/ctdb/ctdb_recovery_helper
 usr/lib/*/ctdb/ctdb_takeover_helper
 usr/lib/*/ctdb/smnotify
+usr/lib/*/ctdb/tdb_mutex_check
 usr/lib/*/samba/libctdb-event-client.so.0
 usr/lib/tmpfiles.d/ctdb.conf
 usr/sbin/ctdbd
@@ -182,7 +182,7 @@ usr/lib/*/libndr-krb5pac.so.*
 usr/lib/*/libndr-nbt.so.0*
 usr/lib/*/libndr-standard.so.*
 usr/lib/*/libndr.so.*
-usr/lib/*/libnetapi.so.0
+usr/lib/*/libnetapi.so.1*
 usr/lib/*/libsamba-credentials.so.1*
 usr/lib/*/libsamba-errors.so.*
 usr/lib/*/libsamba-hostconfig.so.*
@@ -216,7 +216,6 @@ usr/lib/*/samba/libcliauth.so.*
 usr/lib/*/samba/libclidns.so.*
 usr/lib/*/samba/libcluster.so.*
 usr/lib/*/samba/libcmdline-contexts.so.0
-usr/lib/*/samba/libcmdline-credentials.so.*
 usr/lib/*/samba/libcom_err-samba4.so.0
 usr/lib/*/samba/libcom_err-samba4.so.0.25
 usr/lib/*/samba/libcommon-auth.so.0
@@ -259,8 +258,6 @@ usr/lib/*/samba/libnet-keytab.so.0
 usr/lib/*/samba/libnetif.so.*
 usr/lib/*/samba/libnpa-tstream.so.0
 usr/lib/*/samba/libnss-info.so.0
-usr/lib/*/samba/libpopt-samba3.so.0
-usr/lib/*/samba/libpopt-samba3-cmdline.so.0
 usr/lib/*/samba/libposix-eadb.so.0
 usr/lib/*/samba/libprinter-driver.so.0
 usr/lib/*/samba/libprinting-migrate.so.0
@@ -288,7 +285,6 @@ usr/lib/*/samba/libtalloc-report-printf.so.0
 usr/lib/*/samba/libtalloc-report.so.0
 usr/lib/*/samba/libtdb-wrap.so.*
 usr/lib/*/samba/libtrusts-util.so.0
-usr/lib/*/samba/libutil-cmdline.so.0
 usr/lib/*/samba/libutil-reg.so.0
 usr/lib/*/samba/libutil-setid.so.0
 usr/lib/*/samba/libutil-tdb.so.0
@@ -339,8 +335,7 @@ usr/share/man/man8/winbind_krb5_locator.8
 usr/share/man/man8/winbindd.8
 #XXX: smbclient.install
 usr/bin/cifsdd
-usr/bin/findsmb
-usr/bin/mdfind
+usr/bin/mdsearch
 usr/bin/rpcclient
 usr/bin/smbcacls
 usr/bin/smbclient
@@ -350,8 +345,7 @@ usr/bin/smbspool
 usr/bin/smbtar
 usr/bin/smbtree
 #usr/lib/*/samba/smbspool_krb5_wrapper
-usr/share/man/man1/findsmb.1
-usr/share/man/man1/mdfind.1
+usr/share/man/man1/mdsearch.1
 usr/share/man/man1/rpcclient.1
 usr/share/man/man1/smbcacls.1
 usr/share/man/man1/smbclient.1
@@ -361,6 +355,7 @@ usr/share/man/man1/smbtar.1
 usr/share/man/man1/smbtree.1
 usr/share/man/man5/smbgetrc.5
 usr/share/man/man8/cifsdd.8
+usr/share/man/man8/samba-bgqd.8
 usr/share/man/man8/smbspool.8
 usr/share/man/man8/smbspool_krb5_wrapper.8
 #YOLO
