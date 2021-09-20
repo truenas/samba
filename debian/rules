@@ -46,7 +46,6 @@ conf_args = \
 		--with-automount \
 		--with-ldap \
 		--with-ads \
-		--with-dnsupdate \
 		--without-gpgme \
 		--libdir=/usr/lib/$(DEB_HOST_MULTIARCH) \
 		--with-modulesdir=/usr/lib/$(DEB_HOST_MULTIARCH)/samba \
@@ -176,13 +175,3 @@ override_dh_makeshlibs:
 	# create symbols and shlibs files in separate wrapper script to deal with
 	# private libraries
 	debian/make_shlibs
-
-override_dh_auto_clean:
-	-$(WAF) clean
-	find . -name "*.pyc" | xargs rm -f
-	rm -rf buildtools/bin/.waf-*
-	rm -rf bin
-	rm -f .lock-wscript
-	rm -f ctdb/README.eventscripts
-	rm -f ctdb/README.notification
-	rm -rf ctdb/doc/examples/nfs-kernel-server/

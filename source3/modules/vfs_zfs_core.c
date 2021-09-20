@@ -342,6 +342,8 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 	size_t root_len;
 	struct stat st;
 	int error;
+	struct files_struct *pathref = NULL;
+	bool ok;
 
 	root_len = strlen(ds_list->root->mountpoint) + 1;
 
@@ -358,9 +360,13 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 		return false;
 	}
 
+	ok = get_synthetic_fsp(handle, ".", &pathref);
+	if (!ok) {
+		return false;
+	}
+
 	for (ds = ds_list->children; ds; ds = ds->next) {
 		struct files_struct *c_fsp = NULL;
-		bool ok;
 		NTSTATUS status;
 
 		ok = get_synthetic_fsp(handle, ds->mountpoint + root_len, &c_fsp);
@@ -379,12 +385,13 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 		 * ensure we have valid stat on our synthetic FSP
 		 */
 
-		status = inherit_new_acl(c_fsp);
+		status = inherit_new_acl(pathref->fsp_name, c_fsp);
 		if (!NT_STATUS_IS_OK(status)) {
 			DBG_ERR("fail: %s: %s\n", ds->mountpoint, nt_errstr(status));
 		}
 
-		fd_close(c_fsp);
+		fd_close(pathref);
+		pathref = c_fsp;
 	}
 	error = chdir(handle->conn->connectpath);
 	if (error != 0) {

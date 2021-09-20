@@ -745,7 +745,8 @@ NTSTATUS smbd_check_access_rights_fsp(struct files_struct *dirfsp,
 				      uint32_t access_mask);
 NTSTATUS check_parent_access_fsp(struct files_struct *fsp,
 				uint32_t access_mask);
-NTSTATUS inherit_new_acl(files_struct *fsp);
+NTSTATUS inherit_new_acl(struct smb_filename *parent_dir_fname,
+			 files_struct *fsp);
 NTSTATUS fd_openat(const struct files_struct *dirfsp,
 		   struct smb_filename *smb_fname,
 		   files_struct *fsp,

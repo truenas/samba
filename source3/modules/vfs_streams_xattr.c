@@ -396,11 +396,10 @@ static int streams_xattr_openat(struct vfs_handle_struct *handle,
 	}
 
 	if (set_empty_xattr && (config->xattr_compat_bytes == 0)) {
-		ret = SMB_VFS_SETXATTR(fsp->conn,
-				       smb_fname,
-				       xattr_name,
-				       NULL, 0,
-				       flags & O_EXCL ? XATTR_CREATE : 0);
+		ret = SMB_VFS_FSETXATTR(fsp->base_fsp,
+					xattr_name,
+					NULL, 0,
+					flags & O_EXCL ? XATTR_CREATE : 0);
 		if (ret != 0) {
 			goto fail;
 		}
@@ -932,9 +931,6 @@ static int streams_xattr_connect(vfs_handle_struct *handle,
 
         config->xattr_compat_bytes = xattr_compat ? 0 : 1;
 
-	config->max_xattr_size = (size_t)lp_parm_ulonglong(
-		SNUM(handle->conn), "smbd", "max_xattr_size", 65536);
-
 	SMB_VFS_HANDLE_SET_DATA(handle, config,
 				NULL, struct stream_xattr_config,
 				return -1);
@@ -951,6 +947,7 @@ static ssize_t streams_xattr_pwrite(vfs_handle_struct *handle,
 	struct ea_struct ea;
 	NTSTATUS status;
 	int ret;
+	struct streams_xattr_config *config = NULL;
 
 	DEBUG(10, ("streams_xattr_pwrite called for %d bytes\n", (int)n));
 
@@ -961,6 +958,9 @@ static ssize_t streams_xattr_pwrite(vfs_handle_struct *handle,
 	if (!streams_xattr_recheck(sio)) {
 		return -1;
 	}
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config, struct streams_xattr_config,
+				return -1);
 
 	if ((offset + n) >= lp_smbd_max_xattr_size(SNUM(handle->conn))) {
 		/*

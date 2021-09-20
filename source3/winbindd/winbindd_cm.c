@@ -277,12 +277,9 @@ static void set_domain_online(struct winbindd_domain *domain)
 					   MSG_WINBIND_ONLINE,
 					   (const uint8_t *)domain->name,
 					   strlen(domain->name)+1);
-<<<<<<< HEAD
-=======
 		}			
 		if (lp_winbind_status_fifo()) {
 			fifo_update_status(MSG_WINBIND_ONLINE, domain);
->>>>>>> 26c70715f70 (s3:winbind - add winbind status fifo)
 		}
 	}
 
