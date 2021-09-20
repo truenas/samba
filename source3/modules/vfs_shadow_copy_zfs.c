@@ -820,15 +820,15 @@ static int shadow_copy_zfs_unlinkat(vfs_handle_struct *handle,
 	return SMB_VFS_NEXT_UNLINKAT(handle, dirfsp, smb_fname, flags);
 }
 
-static int shadow_copy_zfs_chmod(vfs_handle_struct *handle,
-    const struct smb_filename *smb_fname,
-    mode_t mode)
+static int shadow_copy_zfs_fchmod(vfs_handle_struct *handle,
+				  struct files_struct *fsp,
+				  mode_t mode)
 {
-	if (shadow_copy_zfs_match_name(smb_fname)) {
+	if (shadow_copy_zfs_match_name(fsp->fsp_name)) {
 		errno = EROFS;
 		return -1;
 	}
-	return SMB_VFS_NEXT_CHMOD(handle, smb_fname, mode);
+	return SMB_VFS_NEXT_FCHMOD(handle, fsp, mode);
 }
 
 static int shadow_copy_zfs_fchown(vfs_handle_struct *handle,
@@ -897,15 +897,15 @@ static int shadow_copy_zfs_chdir(vfs_handle_struct *handle,
 	return ret;
 }
 
-static int shadow_copy_zfs_ntimes(vfs_handle_struct *handle,
-			       const struct smb_filename *smb_fname,
-			       struct smb_file_time *ft)
+static int shadow_copy_zfs_fntimes(vfs_handle_struct *handle,
+				   struct files_struct *fsp,
+				   struct smb_file_time *ft)
 {
-	if (shadow_copy_zfs_match_name(smb_fname)) {
+	if (shadow_copy_zfs_match_name(fsp->fsp_name)) {
 		errno = EROFS;
 		return -1;
 	}
-	return SMB_VFS_NEXT_NTIMES(handle, smb_fname, ft);
+	return SMB_VFS_NEXT_FNTIMES(handle, fsp, ft);
 }
 
 static int shadow_copy_zfs_readlinkat(vfs_handle_struct *handle,
@@ -1119,7 +1119,7 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 	TALLOC_FREE(tmp_ctx);
 	return 0;
 }
-
+#if 0
 static NTSTATUS shadow_copy_zfs_fget_nt_acl(vfs_handle_struct *handle,
 					struct files_struct *fsp,
 					uint32_t security_info,
@@ -1161,45 +1161,7 @@ static NTSTATUS shadow_copy_zfs_fget_nt_acl(vfs_handle_struct *handle,
 	return SMB_VFS_NEXT_FGET_NT_ACL(handle, fsp, security_info,
 				       mem_ctx, ppdesc);
 }
-
-static NTSTATUS shadow_copy_zfs_get_nt_acl(vfs_handle_struct *handle,
-    struct files_struct *dirfsp,
-    const struct smb_filename *smb_fname,
-    uint32_t security_info,
-    TALLOC_CTX *mem_ctx,
-    struct security_descriptor **ppdesc)
-{
-	NTSTATUS ret;
-	char *conv = NULL;
-	struct smb_filename *conv_smb_fname = NULL;
-
-	if (shadow_copy_zfs_match_name(smb_fname)) {
-		conv = convert_shadow_zfs_name(handle, smb_fname->base_name,
-					       smb_fname->twrp, True);
-		if (conv == NULL) {
-			return map_nt_error_from_unix(errno);
-		}
-
-		conv_smb_fname = synthetic_smb_fname(talloc_tos(),
-						     conv,
-						     NULL,
-						     NULL,
-						     0,
-						     smb_fname->flags);
-		if (conv_smb_fname == NULL) {
-			TALLOC_FREE(conv);
-			return NT_STATUS_NO_MEMORY;
-		}
-
-		ret = SMB_VFS_NEXT_GET_NT_ACL_AT(handle, dirfsp, conv_smb_fname,
-					         security_info, mem_ctx, ppdesc);
-		TALLOC_FREE(conv);
-		TALLOC_FREE(conv_smb_fname);
-		return ret;
-	}
-	return SMB_VFS_NEXT_GET_NT_ACL_AT(handle, dirfsp, smb_fname, security_info,
-				          mem_ctx, ppdesc);
-}
+#endif
 
 static int shadow_copy_zfs_mkdirat(vfs_handle_struct *handle,
 				   struct files_struct *dirfsp,
@@ -1213,17 +1175,18 @@ static int shadow_copy_zfs_mkdirat(vfs_handle_struct *handle,
 	return SMB_VFS_NEXT_MKDIRAT(handle, dirfsp, smb_fname, mode);
 }
 
-static int shadow_copy_zfs_chflags(vfs_handle_struct *handle,
-				const struct smb_filename *smb_fname,
-				unsigned int flags)
+static int shadow_copy_zfs_fchflags(vfs_handle_struct *handle,
+				    struct files_struct *fsp,
+				    unsigned int flags)
 {
-	if (shadow_copy_zfs_match_name(smb_fname)) {
+	if (shadow_copy_zfs_match_name(fsp->fsp_name)) {
 		errno = EROFS;
 		return -1;
 	}
-	return SMB_VFS_NEXT_CHFLAGS(handle, smb_fname, flags);
+	return SMB_VFS_NEXT_FCHFLAGS(handle, fsp, flags);
 }
 
+#if 0
 static ssize_t shadow_copy_zfs_getxattr(vfs_handle_struct *handle,
 				const struct smb_filename *smb_fname,
 				const char *aname,
@@ -1294,7 +1257,9 @@ static ssize_t shadow_copy_zfs_listxattr(struct vfs_handle_struct *handle,
 	}
 	return SMB_VFS_NEXT_LISTXATTR(handle, smb_fname, list, size);
 }
+#endif
 
+#if 0
 static int shadow_copy_zfs_removexattr(vfs_handle_struct *handle,
 				const struct smb_filename *smb_fname,
 				const char *aname)
@@ -1305,20 +1270,20 @@ static int shadow_copy_zfs_removexattr(vfs_handle_struct *handle,
 	}
 	return SMB_VFS_NEXT_REMOVEXATTR(handle, smb_fname, aname);
 }
+#endif
 
-static int shadow_copy_zfs_setxattr(struct vfs_handle_struct *handle,
-				const struct smb_filename *smb_fname,
-				const char *aname,
-				const void *value,
-				size_t size,
-				int flags)
+static int shadow_copy_zfs_fsetxattr(struct vfs_handle_struct *handle,
+				     struct files_struct *fsp,
+				     const char *aname,
+				     void *value,
+				     size_t size,
+				     int flags)
 {
-	if (shadow_copy_zfs_match_name(smb_fname)) {
+	if (shadow_copy_zfs_match_name(fsp->fsp_name)) {
 		errno = EROFS;
 		return -1;
 	}
-	return SMB_VFS_NEXT_SETXATTR(handle, smb_fname, aname, value, size,
-				     flags);
+	return SMB_VFS_NEXT_FSETXATTR(handle, fsp, aname, value, size, flags);
 }
 
 static int shadow_copy_zfs_get_real_filename(struct vfs_handle_struct *handle,
@@ -1520,23 +1485,26 @@ static struct vfs_fn_pointers vfs_shadow_copy_zfs_fns = {
 	.fstat_fn = shadow_copy_zfs_fstat,
 	.openat_fn = shadow_copy_zfs_open,
 	.unlinkat_fn = shadow_copy_zfs_unlinkat,
-	.chmod_fn = shadow_copy_zfs_chmod,
+	.fchmod_fn = shadow_copy_zfs_fchmod,
 	.fchown_fn = shadow_copy_zfs_fchown,
 	.lchown_fn = shadow_copy_zfs_lchown,
 	.chdir_fn = shadow_copy_zfs_chdir,
-	.ntimes_fn = shadow_copy_zfs_ntimes,
+	.fntimes_fn = shadow_copy_zfs_fntimes,
 	.readlinkat_fn = shadow_copy_zfs_readlinkat,
 	.mknodat_fn = shadow_copy_zfs_mknodat,
 	.realpath_fn = shadow_copy_zfs_realpath,
-	.get_nt_acl_at_fn = shadow_copy_zfs_get_nt_acl,
+#if 0
 	.fget_nt_acl_fn = shadow_copy_zfs_fget_nt_acl,
+#endif
 	.get_shadow_copy_data_fn = shadow_copy_zfs_get_shadow_copy_zfs_data,
 	.mkdirat_fn = shadow_copy_zfs_mkdirat,
-	.getxattr_fn = shadow_copy_zfs_getxattr,
-	.listxattr_fn = shadow_copy_zfs_listxattr,
-	.removexattr_fn = shadow_copy_zfs_removexattr,
-	.setxattr_fn = shadow_copy_zfs_setxattr,
-	.chflags_fn = shadow_copy_zfs_chflags,
+#if 0
+	.fgetxattr_fn = shadow_copy_zfs_fgetxattr,
+	.flistxattr_fn = shadow_copy_zfs_flistxattr,
+	.fremovexattr_fn = shadow_copy_zfs_fremovexattr,
+#endif
+	.fsetxattr_fn = shadow_copy_zfs_fsetxattr,
+	.fchflags_fn = shadow_copy_zfs_fchflags,
 	.get_real_filename_fn = shadow_copy_zfs_get_real_filename,
 	.connectpath_fn = shadow_copy_zfs_connectpath,
 };
