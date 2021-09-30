@@ -317,6 +317,10 @@ static NTSTATUS nfs4acli_to_smb4acl(struct vfs_handle_struct *handle,
 		smbace.aceFlags = nace->flag;
 		smbace.aceMask = nace->access_mask;
 
+		if (smbace.aceType == SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE) {
+			smbace.aceMask |= SMB_ACE4_SYNCHRONIZE;
+		}
+
 		if (nace->iflag & ACEI4_SPECIAL_WHO) {
 			smbace.flags |= SMB_ACE4_ID_SPECIAL;
 
