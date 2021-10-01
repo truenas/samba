@@ -35,6 +35,7 @@ struct nfs4acl_config {
 	enum default_acl_style default_acl_style;
 	bool nfs4_id_numeric;
 	bool validate_mode;
+	bool map_modify;
 };
 
 #endif /* __NFS4ACL_XATTR_H__ */
