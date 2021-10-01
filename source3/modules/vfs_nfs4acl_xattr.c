@@ -491,6 +491,11 @@ static int nfs4acl_connect(struct vfs_handle_struct *handle,
 					       "nfs4_id_numeric",
 					       false);
 
+	config->map_modify = lp_parm_bool(SNUM(handle->conn),
+					  "nfs4acl_xattr",
+					  "map_modify",
+					  true);
+
 
 	config->validate_mode = lp_parm_bool(SNUM(handle->conn),
 					     "nfs4acl_xattr",

@@ -337,6 +337,15 @@ static NTSTATUS nfs4acli_to_smb4acl(struct vfs_handle_struct *handle,
 				DBG_ERR("Unknown special id [%d]\n", nace->who);
 				continue;
 			}
+			if (config->map_modify &&
+			    (smbace.aceType == SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE) &&
+			    (smbace.aceMask & SMB_ACE4_WRITE_DATA)) {
+				smbace.aceMask |= (
+				    SMB_ACE4_DELETE |
+				    SMB_ACE4_WRITE_ATTRIBUTES |
+				    SMB_ACE4_WRITE_NAMED_ATTRS
+				);
+			}
 		} else {
 			if (nace->flag & ACE4_IDENTIFIER_GROUP) {
 				smbace.who.gid = nace->who;
