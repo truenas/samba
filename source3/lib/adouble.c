@@ -2591,10 +2591,7 @@ int ad_fset(struct vfs_handle_struct *handle,
 
 	DBG_DEBUG("Path [%s]\n", fsp_str_dbg(fsp));
 
-	if ((fsp == NULL)
-	    || (fsp->fh == NULL)
-	    || (fsp_get_io_fd(fsp) == -1))
-	{
+	if ((fsp == NULL) || (fsp->fh == NULL)) {
 		smb_panic("bad fsp");
 	}
 
@@ -2612,6 +2609,9 @@ int ad_fset(struct vfs_handle_struct *handle,
 				   AD_DATASZ_XATTR, 0);
 		break;
 	case ADOUBLE_RSRC:
+		if (fsp_get_io_fd(fsp) == -1) {
+			smb_panic("Not an IO fd");
+		}
 		len = SMB_VFS_NEXT_PWRITE(handle,
 					  fsp,
 					  ad->ad_data,
