@@ -571,17 +571,9 @@ static int recycle_unlink_internal(vfs_handle_struct *handle,
 	 */
 
 	/* extract filename and path */
-	base = strrchr(full_fname->base_name, '/');
-	if (base == NULL) {
-		base = full_fname->base_name;
-		path_name = SMB_STRDUP("/");
-		ALLOC_CHECK(path_name, done);
-	}
-	else {
-		path_name = SMB_STRDUP(full_fname->base_name);
-		ALLOC_CHECK(path_name, done);
-		path_name[base - smb_fname->base_name] = '\0';
-		base++;
+	if (!parent_dirname(handle, full_fname->base_name, &path_name, &base)) {
+		errno = ENOMEM;
+		return -1;
 	}
 
 	/* original filename with path */
@@ -716,7 +708,7 @@ static int recycle_unlink_internal(vfs_handle_struct *handle,
 				 recycle_touch_mtime(handle));
 
 done:
-	SAFE_FREE(path_name);
+	TALLOC_FREE(path_name);
 	SAFE_FREE(temp_name);
 	SAFE_FREE(final_name);
 	TALLOC_FREE(full_fname);
