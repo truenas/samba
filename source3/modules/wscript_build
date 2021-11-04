@@ -289,6 +289,45 @@ bld.SAMBA3_MODULE('vfs_zfsacl',
                  internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_zfsacl'),
                  enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_zfsacl'))
 
+bld.SAMBA3_MODULE('vfs_winmsa',
+                 subsystem='vfs',
+                 source='vfs_winmsa.c',
+                 deps='NFS4_ACLS sunacl',
+                 init_function='',
+                 internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_winmsa'),
+                 enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_winmsa'))
+
+bld.SAMBA3_MODULE('vfs_aio_fbsd',
+                 subsystem='vfs',
+                 source='vfs_aio_fbsd.c',
+                 deps='samba-util tevent',
+                 init_function='',
+                 internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_aio_fbsd'),
+                 enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_aio_fbsd'))
+
+bld.SAMBA3_MODULE('vfs_ixnas',
+                 subsystem='vfs',
+                 source='vfs_ixnas.c',
+                 deps='NFS4_ACLS sunacl smb_libzfs',
+                 init_function='',
+                 internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_ixnas'),
+                 enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_ixnas'))
+
+bld.SAMBA3_MODULE('vfs_zfs_space',
+                 subsystem='vfs',
+                 source='vfs_zfs_space.c',
+                 deps='smb_libzfs',
+                 allow_undefined_symbols=True,
+                 init_function='',
+                 internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_zfs_space'),
+                 enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_zfs_space'))
+
+bld.SAMBA3_MODULE('vfs_noacl',
+                 subsystem='vfs',
+                 source='vfs_noacl.c',
+                 internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_noacl'),
+                 enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_noacl'))
+
 bld.SAMBA_GENERATOR('nfs41acl-h',
                     source='nfs41acl.x',
                     target='nfs41acl.h',
