@@ -54,6 +54,11 @@ def configure(conf):
     if conf.CHECK_FUNCS('epoll_create', headers='sys/epoll.h'):
         conf.DEFINE('HAVE_EPOLL', 1)
 
+    if conf.CHECK_FUNCS('kqueue', headers='sys/event.h'):
+        conf.DEFINE('HAVE_KQUEUE', 1)
+        if conf.CHECK_DECLS('EVFILT_AIO', headers='sys/event.h'):
+           conf.DEFINE('HAVE_EVFILT_AIO', 1)
+
     tevent_num_signals = 64
     v = conf.CHECK_VALUEOF('NSIG', headers='signal.h')
     if v is not None:
@@ -92,6 +97,9 @@ def build(bld):
 
     if bld.CONFIG_SET('HAVE_EPOLL'):
         SRC += ' tevent_epoll.c'
+
+    if bld.CONFIG_SET('HAVE_KQUEUE'):
+        SRC += ' tevent_kqueue.c'
 
     if bld.CONFIG_SET('HAVE_SOLARIS_PORTS'):
         SRC += ' tevent_port.c'

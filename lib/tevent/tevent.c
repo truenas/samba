@@ -132,6 +132,9 @@ static void tevent_backend_init(void)
 	tevent_epoll_init();
 #elif defined(HAVE_SOLARIS_PORTS)
 	tevent_port_init();
+#elif defined(HAVE_KQUEUE)
+	tevent_kqueue_init();
+
 #endif
 
 	tevent_standard_init();
