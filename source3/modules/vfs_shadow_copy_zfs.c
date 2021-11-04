@@ -1194,7 +1194,7 @@ static int shadow_copy_zfs_fchflags(vfs_handle_struct *handle,
 static int shadow_copy_zfs_fsetxattr(struct vfs_handle_struct *handle,
 				     struct files_struct *fsp,
 				     const char *aname,
-				     void *value,
+				     const void *value,
 				     size_t size,
 				     int flags)
 {
