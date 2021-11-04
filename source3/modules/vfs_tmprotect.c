@@ -271,6 +271,7 @@ static int tmprotect_connect(struct vfs_handle_struct *handle,
 	SMB_VFS_HANDLE_SET_DATA(handle, config,
 				tmprotect_free_data, struct tmprotect_config_data,
 				return -1);
+	return 0;
 }
 
 static struct vfs_fn_pointers tmprotect_fns = {
