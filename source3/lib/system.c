@@ -1081,26 +1081,67 @@ static struct proc_fd_pattern {
 } proc_fd_patterns[] = {
 	/* Linux */
 	{ "/proc/self/fd/%d", "/proc/self/fd/0" },
+	/* Preferred fdescfs path on FreeBSD */
+	{ "/var/run/samba/fd/%d", "/var/run/samba/fd/0" },
+	/* Alternative fdescfs path on FreeBSD */
+	{ "/dev/fd/%d", "/dev/fd/0" },
 	{ NULL, NULL },
 };
 
 static const char *proc_fd_pattern;
+
+bool check_procfd_path(const char *test_path)
+{
+	int ret;
+	struct stat sb;
+
+	ret = stat(test_path, &sb);
+	if (ret != 0) {
+		return false;
+	}
+
+#ifdef FREEBSD
+	struct statfs sfs;
+	char *slash = NULL;
+	char *to_check = strdup(test_path);
+
+	SMB_ASSERT(to_check != NULL);
+
+	slash = strrchr(to_check, '/');
+	SMB_ASSERT(slash != NULL);
+	slash[0] = '\0';
+
+	ret = statfs(to_check, &sfs);
+	free(to_check);
+
+	if (ret != 0) {
+		DBG_ERR("%s: statfs failed: %s\n",
+			test_path, strerror(errno));
+		return false;
+	}
+	else if (strcmp(sfs.f_fstypename, "fdescfs") != 0) {
+		DBG_ERR("%s: fdescfs filesystem must "
+			"be mounted on this path with nodup "
+			"option. current fstype: %s\n",
+			test_path, sfs.f_fstypename);
+		return false;
+	}
+#endif
+	return true;
+}
 
 bool sys_have_proc_fds(void)
 {
 	static bool checked;
 	static bool have_proc_fds;
 	struct proc_fd_pattern *p = NULL;
-	struct stat sb;
-	int ret;
 
 	if (checked) {
 		return have_proc_fds;
 	}
 
 	for (p = &proc_fd_patterns[0]; p->test_path != NULL; p++) {
-		ret = stat(p->test_path, &sb);
-		if (ret != 0) {
+		if (!check_procfd_path(p->test_path)) {
 			continue;
 		}
 		have_proc_fds = true;
