@@ -151,6 +151,8 @@ dynconfig = {
     'PKGCONFIGDIR' : {
          'STD-PATH':  '${LIBDIR}/pkgconfig',
          'FHS-PATH':  '${LIBDIR}/pkgconfig',
+         'OPTION': '--with-pkgconfigdir',
+         'HELPTEXT': 'Where to put .pc files'
     },
     'CODEPAGEDIR' : {
          'STD-PATH':  '${DATADIR}/codepages',
@@ -317,9 +319,6 @@ def configure(conf):
         flavor = 'FHS-PATH'
     else:
         flavor = 'STD-PATH'
-        if conf.env.PREFIX == '/usr' or conf.env.PREFIX == '/usr/local':
-           Logs.error("Don't install directly under /usr or /usr/local without using the FHS option (--enable-fhs)")
-           raise Errors.WafError("ERROR: invalid --prefix=%s value" % (conf.env.PREFIX))
 
     explicit_set ={}
 
