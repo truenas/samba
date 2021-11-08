@@ -25,10 +25,7 @@ import collections
 import ldb
 
 from samba.dcerpc import security
-from samba.tests.krb5.raw_testcase import (
-    KerberosTicketCreds,
-    Krb5EncryptionKey
-)
+from samba.tests.krb5.raw_testcase import Krb5EncryptionKey
 from samba.tests.krb5.kdc_base_test import KDCBaseTest
 from samba.tests.krb5.rfc4120_constants import (
     AD_FX_FAST_ARMOR,
@@ -45,14 +42,11 @@ from samba.tests.krb5.rfc4120_constants import (
     KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTIONS,
     KRB_AS_REP,
     KRB_TGS_REP,
-    KU_AS_REP_ENC_PART,
-    KU_TICKET,
     NT_PRINCIPAL,
+    NT_SRV_HST,
     NT_SRV_INST,
-    NT_WELLKNOWN,
     PADATA_FX_COOKIE,
     PADATA_FX_FAST,
-    PADATA_PAC_OPTIONS
 )
 import samba.tests.krb5.rfc4120_pyasn1 as krb5_asn1
 import samba.tests.krb5.kcrypto as kcrypto
@@ -70,11 +64,9 @@ class FAST_Tests(KDCBaseTest):
         super().setUpClass()
 
         cls.user_tgt = None
-        cls.user_enc_part = None
         cls.user_service_ticket = None
 
         cls.mach_tgt = None
-        cls.mach_enc_part = None
         cls.mach_service_ticket = None
 
     def setUp(self):
@@ -108,11 +100,7 @@ class FAST_Tests(KDCBaseTest):
         ])
 
     def test_simple_no_sname(self):
-        krbtgt_creds = self.get_krbtgt_creds()
-        krbtgt_username = krbtgt_creds.get_username()
-        krbtgt_realm = krbtgt_creds.get_realm()
-        expected_sname = self.PrincipalName_create(
-            name_type=NT_SRV_INST, names=[krbtgt_username, krbtgt_realm])
+        expected_sname = self.get_krbtgt_sname()
 
         self._run_test_sequence([
             {
@@ -120,16 +108,13 @@ class FAST_Tests(KDCBaseTest):
                 'expected_error_mode': (KDC_ERR_GENERIC, KDC_ERR_S_PRINCIPAL_UNKNOWN),
                 'use_fast': False,
                 'sname': None,
-                'expected_sname': expected_sname
+                'expected_sname': expected_sname,
+                'expect_edata': False
             }
         ])
 
     def test_simple_tgs_no_sname(self):
-        krbtgt_creds = self.get_krbtgt_creds()
-        krbtgt_username = krbtgt_creds.get_username()
-        krbtgt_realm = krbtgt_creds.get_realm()
-        expected_sname = self.PrincipalName_create(
-            name_type=NT_SRV_INST, names=[krbtgt_username, krbtgt_realm])
+        expected_sname = self.get_krbtgt_sname()
 
         self._run_test_sequence([
             {
@@ -138,16 +123,13 @@ class FAST_Tests(KDCBaseTest):
                 'use_fast': False,
                 'gen_tgt_fn': self.get_user_tgt,
                 'sname': None,
-                'expected_sname': expected_sname
+                'expected_sname': expected_sname,
+                'expect_edata': False
             }
         ])
 
     def test_fast_no_sname(self):
-        krbtgt_creds = self.get_krbtgt_creds()
-        krbtgt_username = krbtgt_creds.get_username()
-        krbtgt_realm = krbtgt_creds.get_realm()
-        expected_sname = self.PrincipalName_create(
-            name_type=NT_SRV_INST, names=[krbtgt_username, krbtgt_realm])
+        expected_sname = self.get_krbtgt_sname()
 
         self._run_test_sequence([
             {
@@ -162,11 +144,7 @@ class FAST_Tests(KDCBaseTest):
         ])
 
     def test_fast_tgs_no_sname(self):
-        krbtgt_creds = self.get_krbtgt_creds()
-        krbtgt_username = krbtgt_creds.get_username()
-        krbtgt_realm = krbtgt_creds.get_realm()
-        expected_sname = self.PrincipalName_create(
-            name_type=NT_SRV_INST, names=[krbtgt_username, krbtgt_realm])
+        expected_sname = self.get_krbtgt_sname()
 
         self._run_test_sequence([
             {
@@ -181,6 +159,8 @@ class FAST_Tests(KDCBaseTest):
         ])
 
     def test_fast_inner_no_sname(self):
+        expected_sname = self.get_krbtgt_sname()
+
         self._run_test_sequence([
             {
                 'rep_type': KRB_AS_REP,
@@ -190,11 +170,14 @@ class FAST_Tests(KDCBaseTest):
                 'gen_armor_tgt_fn': self.get_mach_tgt,
                 'inner_req': {
                     'sname': None  # should be ignored
-                }
+                },
+                'expected_sname': expected_sname
             }
         ])
 
     def test_fast_tgs_inner_no_sname(self):
+        expected_sname = self.get_krbtgt_sname()
+
         self._run_test_sequence([
             {
                 'rep_type': KRB_TGS_REP,
@@ -204,23 +187,18 @@ class FAST_Tests(KDCBaseTest):
                 'fast_armor': None,
                 'inner_req': {
                     'sname': None  # should be ignored
-                }
+                },
+                'expected_sname': expected_sname
             }
         ])
 
     def test_simple_tgs_wrong_principal(self):
-        mach_creds = self.get_mach_creds()
-        mach_name = mach_creds.get_username()
-        expected_cname = self.PrincipalName_create(
-            name_type=NT_PRINCIPAL, names=[mach_name])
-
         self._run_test_sequence([
             {
                 'rep_type': KRB_TGS_REP,
                 'expected_error_mode': 0,
                 'use_fast': False,
-                'gen_tgt_fn': self.get_mach_tgt,
-                'expected_cname': expected_cname
+                'gen_tgt_fn': self.get_mach_tgt
             }
         ])
 
@@ -231,6 +209,7 @@ class FAST_Tests(KDCBaseTest):
                 'expected_error_mode': KDC_ERR_NOT_US,
                 'use_fast': False,
                 'gen_tgt_fn': self.get_user_service_ticket,
+                'expect_edata': False
             }
         ])
 
@@ -241,6 +220,7 @@ class FAST_Tests(KDCBaseTest):
                 'expected_error_mode': KDC_ERR_NOT_US,
                 'use_fast': False,
                 'gen_tgt_fn': self.get_mach_service_ticket,
+                'expect_edata': False
             }
         ])
 
@@ -353,7 +333,8 @@ class FAST_Tests(KDCBaseTest):
                 'expected_error_mode': KDC_ERR_ETYPE_NOSUPP,
                 'use_fast': False,
                 'gen_tgt_fn': self.get_mach_tgt,
-                'etypes': ()
+                'etypes': (),
+                'expect_edata': False
             }
         ])
 
@@ -401,7 +382,8 @@ class FAST_Tests(KDCBaseTest):
                 'use_fast': True,
                 'gen_fast_fn': self.generate_empty_fast,
                 'fast_armor': None,
-                'gen_armor_tgt_fn': self.get_mach_tgt
+                'gen_armor_tgt_fn': self.get_mach_tgt,
+                'expect_edata': False
             }
         ])
 
@@ -424,7 +406,8 @@ class FAST_Tests(KDCBaseTest):
                 'expected_error_mode': KDC_ERR_GENERIC,
                 'use_fast': True,
                 'fast_armor': None,  # no armor,
-                'gen_armor_tgt_fn': self.get_mach_tgt
+                'gen_armor_tgt_fn': self.get_mach_tgt,
+                'expect_edata': False
             }
         ])
 
@@ -883,11 +866,14 @@ class FAST_Tests(KDCBaseTest):
                 # should be KRB_APP_ERR_MODIFIED
                 'use_fast': False,
                 'gen_authdata_fn': self.generate_fast_used_auth_data,
-                'gen_tgt_fn': self.get_user_tgt
+                'gen_tgt_fn': self.get_user_tgt,
+                'expect_edata': False
             }
         ])
 
     def test_fast_ad_fx_fast_armor(self):
+        expected_sname = self.get_krbtgt_sname()
+
         # If the authenticator or TGT authentication data contains the
         # AD-fx-fast-armor authdata type, the KDC must reject the request
         # (RFC6113 5.4.1.1).
@@ -907,7 +893,9 @@ class FAST_Tests(KDCBaseTest):
                 'use_fast': True,
                 'gen_authdata_fn': self.generate_fast_armor_auth_data,
                 'gen_tgt_fn': self.get_user_tgt,
-                'fast_armor': None
+                'fast_armor': None,
+                'expected_sname': expected_sname,
+                'expect_edata': False
             }
         ])
 
@@ -935,6 +923,8 @@ class FAST_Tests(KDCBaseTest):
         ])
 
     def test_fast_ad_fx_fast_armor_ticket(self):
+        expected_sname = self.get_krbtgt_sname()
+
         # If the authenticator or TGT authentication data contains the
         # AD-fx-fast-armor authdata type, the KDC must reject the request
         # (RFC6113 5.4.2).
@@ -954,7 +944,9 @@ class FAST_Tests(KDCBaseTest):
                 'expected_error_mode': KDC_ERR_GENERIC,
                 'use_fast': True,
                 'gen_tgt_fn': self.gen_tgt_fast_armor_auth_data,
-                'fast_armor': None
+                'fast_armor': None,
+                'expected_sname': expected_sname,
+                'expect_edata': False
             }
         ])
 
@@ -1014,6 +1006,8 @@ class FAST_Tests(KDCBaseTest):
         ])
 
     def test_fast_tgs_no_subkey(self):
+        expected_sname = self.get_krbtgt_sname()
+
         # Show that omitting the subkey in the TGS-REQ authenticator fails
         # (RFC6113 5.4.2).
         self._run_test_sequence([
@@ -1023,19 +1017,13 @@ class FAST_Tests(KDCBaseTest):
                 'use_fast': True,
                 'gen_tgt_fn': self.get_user_tgt,
                 'fast_armor': None,
-                'include_subkey': False
+                'include_subkey': False,
+                'expected_sname': expected_sname,
+                'expect_edata': False
             }
         ])
 
     def test_fast_hide_client_names(self):
-        user_creds = self.get_client_creds()
-        user_name = user_creds.get_username()
-        user_cname = self.PrincipalName_create(name_type=NT_PRINCIPAL,
-                                               names=[user_name])
-
-        expected_cname = self.PrincipalName_create(
-            name_type=NT_WELLKNOWN, names=['WELLKNOWN', 'ANONYMOUS'])
-
         self._run_test_sequence([
             {
                 'rep_type': KRB_AS_REP,
@@ -1044,7 +1032,7 @@ class FAST_Tests(KDCBaseTest):
                 'fast_armor': FX_FAST_ARMOR_AP_REQUEST,
                 'gen_armor_tgt_fn': self.get_mach_tgt,
                 'fast_options': '01',  # hide client names
-                'expected_cname': expected_cname
+                'expected_anon': True
             },
             {
                 'rep_type': KRB_AS_REP,
@@ -1054,20 +1042,11 @@ class FAST_Tests(KDCBaseTest):
                 'fast_armor': FX_FAST_ARMOR_AP_REQUEST,
                 'gen_armor_tgt_fn': self.get_mach_tgt,
                 'fast_options': '01',  # hide client names
-                'expected_cname': expected_cname,
-                'expected_cname_private': user_cname
+                'expected_anon': True
             }
         ])
 
     def test_fast_tgs_hide_client_names(self):
-        user_creds = self.get_client_creds()
-        user_name = user_creds.get_username()
-        user_cname = self.PrincipalName_create(name_type=NT_PRINCIPAL,
-                                               names=[user_name])
-
-        expected_cname = self.PrincipalName_create(
-            name_type=NT_WELLKNOWN, names=['WELLKNOWN', 'ANONYMOUS'])
-
         self._run_test_sequence([
             {
                 'rep_type': KRB_TGS_REP,
@@ -1076,8 +1055,7 @@ class FAST_Tests(KDCBaseTest):
                 'gen_tgt_fn': self.get_user_tgt,
                 'fast_armor': None,
                 'fast_options': '01',  # hide client names
-                'expected_cname': expected_cname,
-                'expected_cname_private': user_cname
+                'expected_anon': True
             }
         ])
 
@@ -1086,19 +1064,6 @@ class FAST_Tests(KDCBaseTest):
         # replays (RFC6113 5.4.6), but timestamps may be reused; an encrypted
         # challenge is only considered a replay if the ciphertext is identical
         # to a previous challenge. Windows does not perform this check.
-
-        class GenerateEncChallengePadataReplay:
-            def __init__(replay):
-                replay._padata = None
-
-            def __call__(replay, key, armor_key):
-                if replay._padata is None:
-                    client_challenge_key = (
-                        self.generate_client_challenge_key(armor_key, key))
-                    replay._padata = self.get_challenge_pa_data(
-                        client_challenge_key)
-
-                return replay._padata
 
         self._run_test_sequence([
             {
@@ -1112,28 +1077,72 @@ class FAST_Tests(KDCBaseTest):
                 'rep_type': KRB_AS_REP,
                 'expected_error_mode': 0,
                 'use_fast': True,
-                'gen_padata_fn': GenerateEncChallengePadataReplay(),
+                'gen_padata_fn': self.generate_enc_challenge_padata_replay,
                 'fast_armor': FX_FAST_ARMOR_AP_REQUEST,
                 'gen_armor_tgt_fn': self.get_mach_tgt,
                 'repeat': 2
             }
         ])
 
-    def generate_enc_timestamp_padata(self, key, _armor_key):
-        return self.get_enc_timestamp_pa_data_from_key(key)
+    def generate_enc_timestamp_padata(self,
+                                      kdc_exchange_dict,
+                                      callback_dict,
+                                      req_body):
+        key = kdc_exchange_dict['preauth_key']
 
-    def generate_enc_challenge_padata(self, key, armor_key, skew=0):
+        padata = self.get_enc_timestamp_pa_data_from_key(key)
+        return [padata], req_body
+
+    def generate_enc_challenge_padata(self,
+                                      kdc_exchange_dict,
+                                      callback_dict,
+                                      req_body,
+                                      skew=0):
+        armor_key = kdc_exchange_dict['armor_key']
+        key = kdc_exchange_dict['preauth_key']
+
         client_challenge_key = (
             self.generate_client_challenge_key(armor_key, key))
-        return self.get_challenge_pa_data(client_challenge_key, skew=skew)
+        padata = self.get_challenge_pa_data(client_challenge_key, skew=skew)
+        return [padata], req_body
 
-    def generate_enc_challenge_padata_wrong_key_kdc(self, key, armor_key):
+    def generate_enc_challenge_padata_wrong_key_kdc(self,
+                                      kdc_exchange_dict,
+                                      callback_dict,
+                                      req_body):
+        armor_key = kdc_exchange_dict['armor_key']
+        key = kdc_exchange_dict['preauth_key']
+
         kdc_challenge_key = (
             self.generate_kdc_challenge_key(armor_key, key))
-        return self.get_challenge_pa_data(kdc_challenge_key)
+        padata = self.get_challenge_pa_data(kdc_challenge_key)
+        return [padata], req_body
 
-    def generate_enc_challenge_padata_wrong_key(self, key, _armor_key):
-        return self.get_challenge_pa_data(key)
+    def generate_enc_challenge_padata_wrong_key(self,
+                                                kdc_exchange_dict,
+                                                callback_dict,
+                                                req_body):
+        key = kdc_exchange_dict['preauth_key']
+
+        padata = self.get_challenge_pa_data(key)
+        return [padata], req_body
+
+    def generate_enc_challenge_padata_replay(self,
+                                             kdc_exchange_dict,
+                                             callback_dict,
+                                             req_body):
+        padata = callback_dict.get('replay_padata')
+
+        if padata is None:
+            armor_key = kdc_exchange_dict['armor_key']
+            key = kdc_exchange_dict['preauth_key']
+
+            client_challenge_key = (
+                self.generate_client_challenge_key(armor_key, key))
+            padata = self.get_challenge_pa_data(client_challenge_key)
+            callback_dict['replay_padata'] = padata
+
+        return [padata], req_body
 
     def generate_empty_fast(self,
                             _kdc_exchange_dict,
@@ -1156,8 +1165,6 @@ class FAST_Tests(KDCBaseTest):
                                                        'canonicalize,'
                                                        'renewable-ok'))
 
-        pac_request = self.get_pa_pac_request()
-
         client_creds = self.get_client_creds()
         target_creds = self.get_service_creds()
         krbtgt_creds = self.get_krbtgt_creds()
@@ -1173,19 +1180,19 @@ class FAST_Tests(KDCBaseTest):
             name_type=NT_SRV_INST, names=[krbtgt_username, krbtgt_realm])
         krbtgt_decryption_key = self.TicketDecryptionKey_from_creds(
             krbtgt_creds)
+        krbtgt_etypes = krbtgt_creds.tgs_supported_enctypes
 
         target_username = target_creds.get_username()[:-1]
         target_realm = target_creds.get_realm()
         target_service = 'host'
         target_sname = self.PrincipalName_create(
-            name_type=NT_SRV_INST, names=[target_service, target_username])
+            name_type=NT_SRV_HST, names=[target_service, target_username])
         target_decryption_key = self.TicketDecryptionKey_from_creds(
-            target_creds, etype=kcrypto.Enctype.RC4)
+            target_creds)
+        target_etypes = target_creds.tgs_supported_enctypes
 
         fast_cookie = None
         preauth_etype_info2 = None
-
-        preauth_key = None
 
         for kdc_dict in test_sequence:
             rep_type = kdc_dict.pop('rep_type')
@@ -1258,9 +1265,18 @@ class FAST_Tests(KDCBaseTest):
             else:  # KRB_TGS_REP
                 srealm = target_realm
 
-            expected_cname = kdc_dict.pop('expected_cname', client_cname)
-            expected_cname_private = kdc_dict.pop('expected_cname_private',
-                                                  None)
+            if rep_type == KRB_TGS_REP:
+                tgt_cname = tgt.cname
+            else:
+                tgt_cname = client_cname
+
+            expect_edata = kdc_dict.pop('expect_edata', None)
+            if expect_edata is not None:
+                self.assertTrue(expected_error_mode)
+
+            expected_cname = kdc_dict.pop('expected_cname', tgt_cname)
+            expected_anon = kdc_dict.pop('expected_anon',
+                                         False)
             expected_crealm = kdc_dict.pop('expected_crealm', client_realm)
             expected_sname = kdc_dict.pop('expected_sname', sname)
             expected_srealm = kdc_dict.pop('expected_srealm', srealm)
@@ -1313,60 +1329,32 @@ class FAST_Tests(KDCBaseTest):
                                       _callback_dict,
                                       req_body,
                                       padata):
-                return padata, req_body
-
-            def _check_padata_preauth_key(_kdc_exchange_dict,
-                                          _callback_dict,
-                                          _rep,
-                                          _padata):
-                as_rep_usage = KU_AS_REP_ENC_PART
-                return preauth_key, as_rep_usage
+                return list(padata), req_body
 
             pac_options = kdc_dict.pop('pac_options', '1')  # claims support
-            pac_options = self.get_pa_pac_options(pac_options)
 
             kdc_options = kdc_dict.pop('kdc_options', kdc_options_default)
 
-            if rep_type == KRB_AS_REP:
-                padata = [pac_request, pac_options]
-            else:
-                padata = [pac_options]
-
             gen_padata_fn = kdc_dict.pop('gen_padata_fn', None)
-            if gen_padata_fn is not None:
-                self.assertEqual(KRB_AS_REP, rep_type)
+
+            if rep_type == KRB_AS_REP and gen_padata_fn is not None:
                 self.assertIsNotNone(preauth_etype_info2)
 
                 preauth_key = self.PasswordKey_from_etype_info2(
                     client_creds,
                     preauth_etype_info2[0],
                     client_creds.get_kvno())
-                gen_padata = gen_padata_fn(preauth_key, armor_key)
-                padata.insert(0, gen_padata)
             else:
                 preauth_key = None
 
-            if rep_type == KRB_AS_REP:
-                check_padata_fn = _check_padata_preauth_key
-            else:
-                check_padata_fn = self.check_simple_tgs_padata
-
             if use_fast:
-                inner_padata = padata
-                outer_padata = []
+                generate_fast_padata_fn = gen_padata_fn
+                generate_padata_fn = (functools.partial(_generate_padata_copy,
+                                                         padata=[fast_cookie])
+                                       if fast_cookie is not None else None)
             else:
-                inner_padata = []
-                outer_padata = padata
-
-            if use_fast and fast_cookie is not None:
-                outer_padata.append(fast_cookie)
-
-            generate_fast_padata_fn = (functools.partial(_generate_padata_copy,
-                                                         padata=inner_padata)
-                                       if inner_padata else None)
-            generate_padata_fn = (functools.partial(_generate_padata_copy,
-                                                    padata=outer_padata)
-                                  if outer_padata else None)
+                generate_fast_padata_fn = None
+                generate_padata_fn = gen_padata_fn
 
             gen_authdata_fn = kdc_dict.pop('gen_authdata_fn', None)
             if gen_authdata_fn is not None:
@@ -1380,13 +1368,23 @@ class FAST_Tests(KDCBaseTest):
             inner_req = kdc_dict.pop('inner_req', None)
             outer_req = kdc_dict.pop('outer_req', None)
 
+            expected_flags = kdc_dict.pop('expected_flags', None)
+            if expected_flags is not None:
+                expected_flags = krb5_asn1.TicketFlags(expected_flags)
+            unexpected_flags = kdc_dict.pop('unexpected_flags', None)
+            if unexpected_flags is not None:
+                unexpected_flags = krb5_asn1.TicketFlags(unexpected_flags)
+
             if rep_type == KRB_AS_REP:
                 kdc_exchange_dict = self.as_exchange_dict(
                     expected_crealm=expected_crealm,
                     expected_cname=expected_cname,
-                    expected_cname_private=expected_cname_private,
+                    expected_anon=expected_anon,
                     expected_srealm=expected_srealm,
                     expected_sname=expected_sname,
+                    expected_supported_etypes=krbtgt_etypes,
+                    expected_flags=expected_flags,
+                    unexpected_flags=unexpected_flags,
                     ticket_decryption_key=krbtgt_decryption_key,
                     generate_fast_fn=generate_fast_fn,
                     generate_fast_armor_fn=generate_fast_armor_fn,
@@ -1395,27 +1393,33 @@ class FAST_Tests(KDCBaseTest):
                     generate_padata_fn=generate_padata_fn,
                     check_error_fn=check_error_fn,
                     check_rep_fn=check_rep_fn,
-                    check_padata_fn=check_padata_fn,
                     check_kdc_private_fn=self.generic_check_kdc_private,
                     callback_dict={},
                     expected_error_mode=expected_error_mode,
                     client_as_etypes=etypes,
                     expected_salt=expected_salt,
                     authenticator_subkey=authenticator_subkey,
+                    preauth_key=preauth_key,
                     auth_data=auth_data,
                     armor_key=armor_key,
                     armor_tgt=armor_tgt,
                     armor_subkey=armor_subkey,
                     kdc_options=kdc_options,
                     inner_req=inner_req,
-                    outer_req=outer_req)
+                    outer_req=outer_req,
+                    pac_request=True,
+                    pac_options=pac_options,
+                    expect_edata=expect_edata)
             else:  # KRB_TGS_REP
                 kdc_exchange_dict = self.tgs_exchange_dict(
                     expected_crealm=expected_crealm,
                     expected_cname=expected_cname,
-                    expected_cname_private=expected_cname_private,
+                    expected_anon=expected_anon,
                     expected_srealm=expected_srealm,
                     expected_sname=expected_sname,
+                    expected_supported_etypes=target_etypes,
+                    expected_flags=expected_flags,
+                    unexpected_flags=unexpected_flags,
                     ticket_decryption_key=target_decryption_key,
                     generate_fast_fn=generate_fast_fn,
                     generate_fast_armor_fn=generate_fast_armor_fn,
@@ -1424,7 +1428,6 @@ class FAST_Tests(KDCBaseTest):
                     generate_padata_fn=generate_padata_fn,
                     check_error_fn=check_error_fn,
                     check_rep_fn=check_rep_fn,
-                    check_padata_fn=check_padata_fn,
                     check_kdc_private_fn=self.generic_check_kdc_private,
                     expected_error_mode=expected_error_mode,
                     callback_dict={},
@@ -1437,7 +1440,10 @@ class FAST_Tests(KDCBaseTest):
                     body_checksum_type=None,
                     kdc_options=kdc_options,
                     inner_req=inner_req,
-                    outer_req=outer_req)
+                    outer_req=outer_req,
+                    pac_request=None,
+                    pac_options=pac_options,
+                    expect_edata=expect_edata)
 
             repeat = kdc_dict.pop('repeat', 1)
             for _ in range(repeat):
@@ -1482,44 +1488,19 @@ class FAST_Tests(KDCBaseTest):
     def gen_tgt_fast_armor_auth_data(self):
         user_tgt = self.get_user_tgt()
 
-        ticket_decryption_key = user_tgt.decryption_key
-
-        tgt_encpart = self.getElementValue(user_tgt.ticket, 'enc-part')
-        self.assertElementEqual(tgt_encpart, 'etype',
-                                ticket_decryption_key.etype)
-        self.assertElementKVNO(tgt_encpart, 'kvno',
-                               ticket_decryption_key.kvno)
-        tgt_cipher = self.getElementValue(tgt_encpart, 'cipher')
-        tgt_decpart = ticket_decryption_key.decrypt(KU_TICKET, tgt_cipher)
-        tgt_private = self.der_decode(tgt_decpart,
-                                      asn1Spec=krb5_asn1.EncTicketPart())
-
         auth_data = self.generate_fast_armor_auth_data()
-        tgt_private['authorization-data'].append(auth_data)
 
-        # Re-encrypt the user TGT.
-        tgt_private_new = self.der_encode(
-            tgt_private,
-            asn1Spec=krb5_asn1.EncTicketPart())
-        tgt_encpart = self.EncryptedData_create(ticket_decryption_key,
-                                                KU_TICKET,
-                                                tgt_private_new)
-        user_ticket = user_tgt.ticket.copy()
-        user_ticket['enc-part'] = tgt_encpart
+        def modify_fn(enc_part):
+            enc_part['authorization-data'].append(auth_data)
 
-        user_tgt = KerberosTicketCreds(
-            user_ticket,
-            session_key=user_tgt.session_key,
-            crealm=user_tgt.crealm,
-            cname=user_tgt.cname,
-            srealm=user_tgt.srealm,
-            sname=user_tgt.sname,
-            decryption_key=user_tgt.decryption_key,
-            ticket_private=tgt_private,
-            encpart_private=user_tgt.encpart_private)
+            return enc_part
+
+        checksum_keys = self.get_krbtgt_checksum_key()
 
         # Use our modifed TGT to replace the one in the request.
-        return user_tgt
+        return self.modified_ticket(user_tgt,
+                                    modify_fn=modify_fn,
+                                    checksum_keys=checksum_keys)
 
     def create_fast_cookie(self, cookie):
         self.assertIsNotNone(cookie)
@@ -1528,25 +1509,12 @@ class FAST_Tests(KDCBaseTest):
 
         return self.PA_DATA_create(PADATA_FX_COOKIE, cookie)
 
-    def get_pa_pac_request(self, request_pac=True):
-        pac_request = self.KERB_PA_PAC_REQUEST_create(request_pac)
-
-        return pac_request
-
-    def get_pa_pac_options(self, options):
-        pac_options = self.PA_PAC_OPTIONS_create(options)
-        pac_options = self.der_encode(pac_options,
-                                      asn1Spec=krb5_asn1.PA_PAC_OPTIONS())
-        pac_options = self.PA_DATA_create(PADATA_PAC_OPTIONS, pac_options)
-
-        return pac_options
-
     def check_kdc_fast_support(self):
         # Check that the KDC supports FAST
 
         samdb = self.get_samdb()
 
-        krbtgt_rid = 502
+        krbtgt_rid = security.DOMAIN_RID_KRBTGT
         krbtgt_sid = '%s-%d' % (samdb.get_domain_sid(), krbtgt_rid)
 
         res = samdb.search(base='<SID=%s>' % krbtgt_sid,
@@ -1562,149 +1530,17 @@ class FAST_Tests(KDCBaseTest):
         self.assertTrue(
             security.KERB_ENCTYPE_CLAIMS_SUPPORTED & krbtgt_etypes)
 
-    def get_service_ticket(self, tgt, target_creds, service='host'):
-        etype = (AES256_CTS_HMAC_SHA1_96, ARCFOUR_HMAC_MD5)
-
-        key = tgt.session_key
-        ticket = tgt.ticket
-
-        cname = tgt.cname
-        realm = tgt.crealm
-
-        target_name = target_creds.get_username()[:-1]
-        sname = self.PrincipalName_create(name_type=NT_PRINCIPAL,
-                                          names=[service, target_name])
-
-        rep, enc_part = self.tgs_req(cname, sname, realm, ticket, key, etype)
-
-        service_ticket = rep['ticket']
-
-        ticket_etype = service_ticket['enc-part']['etype']
-        target_key = self.TicketDecryptionKey_from_creds(target_creds,
-                                                         etype=ticket_etype)
-
-        session_key = self.EncryptionKey_import(enc_part['key'])
-
-        service_ticket_creds = KerberosTicketCreds(service_ticket,
-                                                   session_key,
-                                                   crealm=realm,
-                                                   cname=cname,
-                                                   srealm=realm,
-                                                   sname=sname,
-                                                   decryption_key=target_key)
-
-        return service_ticket_creds
-
-    def get_tgt(self, creds):
-        user_name = creds.get_username()
-        realm = creds.get_realm()
-
-        salt = creds.get_salt()
-
-        etype = (AES256_CTS_HMAC_SHA1_96, ARCFOUR_HMAC_MD5)
-        cname = self.PrincipalName_create(name_type=NT_PRINCIPAL,
-                                          names=[user_name])
-        sname = self.PrincipalName_create(name_type=NT_SRV_INST,
-                                          names=['krbtgt', realm])
-
-        till = self.get_KerberosTime(offset=36000)
-
-        krbtgt_creds = self.get_krbtgt_creds()
-        ticket_decryption_key = (
-            self.TicketDecryptionKey_from_creds(krbtgt_creds))
-
-        kdc_options = str(krb5_asn1.KDCOptions('forwardable,'
-                                               'renewable,'
-                                               'canonicalize,'
-                                               'renewable-ok'))
-
-        pac_request = self.get_pa_pac_request()
-        pac_options = self.get_pa_pac_options('1')  # supports claims
-
-        padata = [pac_request, pac_options]
-
-        rep, kdc_exchange_dict = self._test_as_exchange(
-            cname=cname,
-            realm=realm,
-            sname=sname,
-            till=till,
-            client_as_etypes=etype,
-            expected_error_mode=KDC_ERR_PREAUTH_REQUIRED,
-            expected_crealm=realm,
-            expected_cname=cname,
-            expected_srealm=realm,
-            expected_sname=sname,
-            expected_salt=salt,
-            etypes=etype,
-            padata=padata,
-            kdc_options=kdc_options,
-            preauth_key=None,
-            ticket_decryption_key=ticket_decryption_key)
-        self.check_pre_authentication(rep)
-
-        etype_info2 = kdc_exchange_dict['preauth_etype_info2']
-
-        preauth_key = self.PasswordKey_from_etype_info2(creds,
-                                                        etype_info2[0],
-                                                        creds.get_kvno())
-
-        ts_enc_padata = self.get_enc_timestamp_pa_data(creds, rep)
-
-        padata = [ts_enc_padata, pac_request, pac_options]
-
-        expected_realm = realm.upper()
-
-        expected_sname = self.PrincipalName_create(
-            name_type=NT_SRV_INST, names=['krbtgt', realm.upper()])
-
-        rep, kdc_exchange_dict = self._test_as_exchange(
-            cname=cname,
-            realm=realm,
-            sname=sname,
-            till=till,
-            client_as_etypes=etype,
-            expected_error_mode=0,
-            expected_crealm=expected_realm,
-            expected_cname=cname,
-            expected_srealm=expected_realm,
-            expected_sname=expected_sname,
-            expected_salt=salt,
-            etypes=etype,
-            padata=padata,
-            kdc_options=kdc_options,
-            preauth_key=preauth_key,
-            ticket_decryption_key=ticket_decryption_key)
-        self.check_as_reply(rep)
-
-        tgt = rep['ticket']
-
-        enc_part = self.get_as_rep_enc_data(preauth_key, rep)
-        session_key = self.EncryptionKey_import(enc_part['key'])
-
-        ticket_creds = KerberosTicketCreds(
-            tgt,
-            session_key,
-            crealm=realm,
-            cname=cname,
-            srealm=realm,
-            sname=sname,
-            decryption_key=ticket_decryption_key)
-
-        return ticket_creds, enc_part
-
     def get_mach_tgt(self):
         if self.mach_tgt is None:
             mach_creds = self.get_mach_creds()
-            type(self).mach_tgt, type(self).mach_enc_part = (
-                self.get_tgt(mach_creds))
+            type(self).mach_tgt = self.get_tgt(mach_creds)
 
         return self.mach_tgt
 
     def get_user_tgt(self):
         if self.user_tgt is None:
             user_creds = self.get_client_creds()
-            type(self).user_tgt, type(self).user_enc_part = (
-                self.get_tgt(user_creds))
+            type(self).user_tgt = self.get_tgt(user_creds)
 
         return self.user_tgt
 

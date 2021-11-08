@@ -171,9 +171,10 @@ class KerberosASCanonicalizationTests(KDCBaseTest):
     def machine_account_creds(self):
         if self.machine_creds is None:
             samdb = self.get_samdb()
-            self.machine_creds, _ = self.create_account(samdb,
-                                                        MACHINE_NAME,
-                                                        machine_account=True)
+            self.machine_creds, _ = self.create_account(
+                samdb,
+                MACHINE_NAME,
+                account_type=self.AccountType.COMPUTER)
             self.machine_creds.set_secure_channel_type(SEC_CHAN_WKSTA)
             self.machine_creds.set_kerberos_state(DONT_USE_KERBEROS)
 
@@ -427,8 +428,8 @@ class KerberosASCanonicalizationTests(KDCBaseTest):
 
 
 if __name__ == "__main__":
-    global_asn1_print = True
-    global_hexdump = True
+    global_asn1_print = False
+    global_hexdump = False
     import unittest
 
     unittest.main()
