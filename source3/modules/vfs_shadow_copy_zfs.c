@@ -6,7 +6,7 @@
  * Copyright (C) Christian Ambach  2011
  * Copyright (C) Michael Adam      2013
  * Copyright (C) XStor Systems Inc 2011
- * Copyright (C) iXsystems Inc     2016
+ * Copyright (C) iXsystems Inc     2021
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -1194,7 +1194,7 @@ static int shadow_copy_zfs_fchflags(vfs_handle_struct *handle,
 static int shadow_copy_zfs_fsetxattr(struct vfs_handle_struct *handle,
 				     struct files_struct *fsp,
 				     const char *aname,
-				     void *value,
+				     const void *value,
 				     size_t size,
 				     int flags)
 {

@@ -1,6 +1,6 @@
 /* tmprotect: a module for automatic ZFS snapshot maintenance.
  *
- * Copyright (C) iXsystems Inc     2019
+ * Copyright (C) iXsystems Inc     2021
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -271,6 +271,7 @@ static int tmprotect_connect(struct vfs_handle_struct *handle,
 	SMB_VFS_HANDLE_SET_DATA(handle, config,
 				tmprotect_free_data, struct tmprotect_config_data,
 				return -1);
+	return 0;
 }
 
 static struct vfs_fn_pointers tmprotect_fns = {
