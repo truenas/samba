@@ -30,6 +30,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <string.h>
+#ifndef FREEBSD_LIBZFS
 #include <mntent.h>
 #ifndef mntent
 struct mntent
@@ -42,6 +43,7 @@ struct mntent
     int mnt_passno;             /* Pass number for `fsck'.  */
   };
 #endif
+#endif /* FREEBSD_LIBZFS */
 #include <libzfs/sys/nvpair.h>
 #include <libzfs/libzfs.h>
 #include <fnmatch.h>
