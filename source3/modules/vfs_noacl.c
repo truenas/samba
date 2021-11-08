@@ -199,7 +199,7 @@ static NTSTATUS noacl_get_nt_acl_common(TALLOC_CTX *ctx,
 			return map_nt_error_from_unix(errno);
 		}
 		psbuf = &sbuf;
-        }
+	}
 	mode = psbuf->st_ex_mode;
 
 	DBG_DEBUG("file %s mode = 0%o\n",smb_fname->base_name, (int)mode);
