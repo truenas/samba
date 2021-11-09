@@ -129,13 +129,19 @@ static NTSTATUS add_trusted_domain(const char *domain_name,
 	struct winbindd_domain *domain = NULL;
 	int role = lp_server_role();
 	struct dom_sid_buf buf;
+	bool is_builtin = false;
 
 	if (is_null_sid(sid)) {
 		DBG_ERR("Got null SID for domain [%s]\n", domain_name);
 		return NT_STATUS_INVALID_PARAMETER;
 	}
 
-	if (!is_allowed_domain(domain_name)) {
+	if (strequal(domain_name, "BUILTIN") &&
+	    sid_check_is_builtin(sid)) {
+		is_builtin = True;
+	}
+
+	if (!is_builtin && !is_allowed_domain(domain_name)) {
 		return NT_STATUS_NO_SUCH_DOMAIN;
 	}
 
