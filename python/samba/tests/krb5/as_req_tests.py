@@ -56,11 +56,11 @@ class AsReqKerberosTests(KDCBaseTest):
 
     def _test_as_req_nopreauth(self,
                                initial_etypes,
-                               initial_padata=None,
+                               pac=None,
                                initial_kdc_options=None):
         client_creds = self.get_client_creds()
         client_account = client_creds.get_username()
-        client_as_etypes = client_creds.get_as_krb5_etypes()
+        client_as_etypes = self.get_default_enctypes()
         krbtgt_creds = self.get_krbtgt_creds(require_keys=False)
         krbtgt_account = krbtgt_creds.get_username()
         realm = krbtgt_creds.get_realm()
@@ -74,7 +74,7 @@ class AsReqKerberosTests(KDCBaseTest):
         expected_cname = cname
         expected_srealm = realm
         expected_sname = sname
-        expected_salt = client_creds.get_forced_salt()
+        expected_salt = client_creds.get_salt()
 
         if any(etype in client_as_etypes and etype in initial_etypes
                for etype in (kcrypto.Enctype.AES256,
@@ -84,27 +84,19 @@ class AsReqKerberosTests(KDCBaseTest):
         else:
             expected_error_mode = KDC_ERR_ETYPE_NOSUPP
 
-        def _generate_padata_copy(_kdc_exchange_dict,
-                                  _callback_dict,
-                                  req_body):
-            return initial_padata, req_body
-
-        generate_padata_fn = (_generate_padata_copy
-                              if initial_padata is not None
-                              else None)
-
         kdc_exchange_dict = self.as_exchange_dict(
             expected_crealm=expected_crealm,
             expected_cname=expected_cname,
             expected_srealm=expected_srealm,
             expected_sname=expected_sname,
-            generate_padata_fn=generate_padata_fn,
+            generate_padata_fn=None,
             check_error_fn=self.generic_check_kdc_error,
             check_rep_fn=None,
             expected_error_mode=expected_error_mode,
             client_as_etypes=client_as_etypes,
             expected_salt=expected_salt,
-            kdc_options=str(initial_kdc_options))
+            kdc_options=str(initial_kdc_options),
+            pac_request=pac)
 
         self._generic_kdc_exchange(kdc_exchange_dict,
                                    cname=cname,
@@ -114,20 +106,22 @@ class AsReqKerberosTests(KDCBaseTest):
 
     def _test_as_req_no_preauth_with_args(self, etype_idx, pac):
         name, etypes = self.etype_test_permutation_by_idx(etype_idx)
-        if pac is None:
-            padata = None
-        else:
-            pa_pac = self.KERB_PA_PAC_REQUEST_create(pac)
-            padata = [pa_pac]
         self._test_as_req_nopreauth(
-                     initial_padata=padata,
+                     pac=pac,
                      initial_etypes=etypes,
                      initial_kdc_options=krb5_asn1.KDCOptions('forwardable'))
 
     def test_as_req_enc_timestamp(self):
         client_creds = self.get_client_creds()
+        self._run_as_req_enc_timestamp(client_creds)
+
+    def test_as_req_enc_timestamp_mac(self):
+        client_creds = self.get_mach_creds()
+        self._run_as_req_enc_timestamp(client_creds)
+
+    def _run_as_req_enc_timestamp(self, client_creds):
         client_account = client_creds.get_username()
-        client_as_etypes = client_creds.get_as_krb5_etypes()
+        client_as_etypes = self.get_default_enctypes()
         client_kvno = client_creds.get_kvno()
         krbtgt_creds = self.get_krbtgt_creds(require_strongest_key=True)
         krbtgt_account = krbtgt_creds.get_username()
@@ -142,12 +136,10 @@ class AsReqKerberosTests(KDCBaseTest):
         expected_cname = cname
         expected_srealm = realm
         expected_sname = sname
-        expected_salt = client_creds.get_forced_salt()
+        expected_salt = client_creds.get_salt()
 
         till = self.get_KerberosTime(offset=36000)
 
-        pa_pac = self.KERB_PA_PAC_REQUEST_create(True)
-        initial_padata = [pa_pac]
         initial_etypes = client_as_etypes
         initial_kdc_options = krb5_asn1.KDCOptions('forwardable')
         initial_error_mode = KDC_ERR_PREAUTH_REQUIRED
@@ -164,8 +156,9 @@ class AsReqKerberosTests(KDCBaseTest):
                                                         expected_sname,
                                                         expected_salt,
                                                         initial_etypes,
-                                                        initial_padata,
-                                                        initial_kdc_options)
+                                                        None,
+                                                        initial_kdc_options,
+                                                        pac_request=True)
         etype_info2 = kdc_exchange_dict['preauth_etype_info2']
         self.assertIsNotNone(etype_info2)
 
@@ -183,7 +176,7 @@ class AsReqKerberosTests(KDCBaseTest):
 
         pa_ts = self.PA_DATA_create(PADATA_ENC_TIMESTAMP, pa_ts)
 
-        preauth_padata = [pa_ts, pa_pac]
+        preauth_padata = [pa_ts]
         preauth_etypes = client_as_etypes
         preauth_kdc_options = krb5_asn1.KDCOptions('forwardable')
         preauth_error_mode = 0 # AS-REP
@@ -207,12 +200,16 @@ class AsReqKerberosTests(KDCBaseTest):
             preauth_padata,
             preauth_kdc_options,
             preauth_key=preauth_key,
-            ticket_decryption_key=krbtgt_decryption_key)
+            ticket_decryption_key=krbtgt_decryption_key,
+            pac_request=True)
         self.assertIsNotNone(as_rep)
 
+        return etype_info2
+
+
 if __name__ == "__main__":
-    global_asn1_print = True
-    global_hexdump = True
+    global_asn1_print = False
+    global_hexdump = False
     import unittest
     unittest.main()
 

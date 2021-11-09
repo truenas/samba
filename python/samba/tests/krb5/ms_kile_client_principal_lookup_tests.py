@@ -95,7 +95,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
         realm = uc.get_realm().lower()
 
         mach_name = "mskilemac"
-        (mc, _) = self.create_account(samdb, mach_name, machine_account=True)
+        (mc, _) = self.create_account(samdb, mach_name,
+                                      account_type=self.AccountType.COMPUTER)
 
         # Do the initial AS-REQ, should get a pre-authentication required
         # response
@@ -126,7 +127,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
             names=[mc.get_username()])
 
         (rep, enc_part) = self.tgs_req(
-            cname, sname, uc.get_realm(), ticket, key, etype)
+            cname, sname, uc.get_realm(), ticket, key, etype,
+            service_creds=mc)
         self.check_tgs_reply(rep)
 
         # Check the contents of the pac, and the ticket
@@ -149,18 +151,16 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
         # Create a machine account for the test.
         #
         samdb = self.get_samdb()
-        user_name = "mskilemac"
-        (mc, dn) = self.create_account(samdb, user_name, machine_account=True)
-        realm = mc.get_realm().lower()
-
         mach_name = "mskilemac"
-        (mc, _) = self.create_account(samdb, mach_name, machine_account=True)
+        (mc, dn) = self.create_account(samdb, mach_name,
+                                       account_type=self.AccountType.COMPUTER)
+        realm = mc.get_realm().lower()
 
         # Do the initial AS-REQ, should get a pre-authentication required
         # response
         etype = (AES256_CTS_HMAC_SHA1_96, ARCFOUR_HMAC_MD5)
         cname = self.PrincipalName_create(
-            name_type=NT_PRINCIPAL, names=[user_name])
+            name_type=NT_PRINCIPAL, names=[mach_name])
         sname = self.PrincipalName_create(
             name_type=NT_SRV_INST, names=["krbtgt", realm])
 
@@ -179,13 +179,14 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
         key = self.EncryptionKey_import(enc_part2['key'])
         cname = self.PrincipalName_create(
             name_type=NT_PRINCIPAL,
-            names=[user_name])
+            names=[mach_name])
         sname = self.PrincipalName_create(
             name_type=NT_PRINCIPAL,
             names=[mc.get_username()])
 
         (rep, enc_part) = self.tgs_req(
-            cname, sname, mc.get_realm(), ticket, key, etype)
+            cname, sname, mc.get_realm(), ticket, key, etype,
+            service_creds=mc)
         self.check_tgs_reply(rep)
 
         # Check the contents of the pac, and the ticket
@@ -195,7 +196,7 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
         # check the crealm and cname
         cname = enc_part['cname']
         self.assertEqual(NT_PRINCIPAL, cname['name-type'])
-        self.assertEqual(user_name.encode('UTF8'), cname['name-string'][0])
+        self.assertEqual(mach_name.encode('UTF8'), cname['name-string'][0])
         self.assertEqual(realm.upper().encode('UTF8'), enc_part['crealm'])
 
     def test_nt_principal_step_3(self):
@@ -216,7 +217,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
         realm = uc.get_realm().lower()
 
         mach_name = "mskilemac"
-        (mc, _) = self.create_account(samdb, mach_name, machine_account=True)
+        (mc, _) = self.create_account(samdb, mach_name,
+                                      account_type=self.AccountType.COMPUTER)
 
         # Do the initial AS-REQ, should get a pre-authentication required
         # response
@@ -247,7 +249,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
             names=[mc.get_username()])
 
         (rep, enc_part) = self.tgs_req(
-            cname, sname, uc.get_realm(), ticket, key, etype)
+            cname, sname, uc.get_realm(), ticket, key, etype,
+            service_creds=mc)
         self.check_tgs_reply(rep)
 
         # Check the contents of the service ticket
@@ -279,18 +282,15 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
         samdb = self.get_samdb()
         user_name = "mskileusr"
         alt_name = "mskilealtsec"
-        (uc, dn) = self.create_account(samdb, user_name)
+        (uc, dn) = self.create_account(samdb, user_name,
+                                       account_control=UF_DONT_REQUIRE_PREAUTH)
         realm = uc.get_realm().lower()
         alt_sec = "Kerberos:%s@%s" % (alt_name, realm)
         self.add_attribute(samdb, dn, "altSecurityIdentities", alt_sec)
-        self.modify_attribute(
-            samdb,
-            dn,
-            "userAccountControl",
-            str(UF_NORMAL_ACCOUNT | UF_DONT_REQUIRE_PREAUTH))
 
         mach_name = "mskilemac"
-        (mc, _) = self.create_account(samdb, mach_name, machine_account=True)
+        (mc, _) = self.create_account(samdb, mach_name,
+                                      account_type=self.AccountType.COMPUTER)
 
         # Do the initial AS-REQ, as we've set UF_DONT_REQUIRE_PREAUTH
         # we should get a valid AS-RESP
@@ -321,7 +321,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
             names=[mc.get_username()])
 
         (rep, enc_part) = self.tgs_req(
-            cname, sname, uc.get_realm(), ticket, key, etype)
+            cname, sname, uc.get_realm(), ticket, key, etype,
+            service_creds=mc, expect_pac=False)
         self.check_tgs_reply(rep)
 
         # Check the contents of the service ticket
@@ -354,7 +355,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
         self.add_attribute(samdb, dn, "altSecurityIdentities", alt_sec)
 
         mach_name = "mskilemac"
-        (mc, _) = self.create_account(samdb, mach_name, machine_account=True)
+        (mc, _) = self.create_account(samdb, mach_name,
+                                      account_type=self.AccountType.COMPUTER)
 
         # Do the initial AS-REQ, should get a pre-authentication required
         # response
@@ -389,7 +391,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
             names=[mc.get_username()])
 
         (rep, enc_part) = self.tgs_req(
-            cname, sname, uc.get_realm(), ticket, key, etype)
+            cname, sname, uc.get_realm(), ticket, key, etype,
+            service_creds=mc)
         self.check_tgs_reply(rep)
 
         # Check the contents of the pac, and the ticket
@@ -422,7 +425,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
         self.add_attribute(samdb, dn, "altSecurityIdentities", alt_sec)
 
         mach_name = "mskilemac"
-        (mc, _) = self.create_account(samdb, mach_name, machine_account=True)
+        (mc, _) = self.create_account(samdb, mach_name,
+                                      account_type=self.AccountType.COMPUTER)
 
         # Do the initial AS-REQ, should get a pre-authentication required
         # response
@@ -461,7 +465,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
         realm = uc.get_realm().lower()
 
         mach_name = "mskilemac"
-        (mc, _) = self.create_account(samdb, mach_name, machine_account=True)
+        (mc, _) = self.create_account(samdb, mach_name,
+                                      account_type=self.AccountType.COMPUTER)
 
         # Do the initial AS-REQ, should get a pre-authentication required
         # response
@@ -491,7 +496,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
             names=[mc.get_username()])
 
         (rep, enc_part) = self.tgs_req(
-            cname, sname, uc.get_realm(), ticket, key, etype)
+            cname, sname, uc.get_realm(), ticket, key, etype,
+            service_creds=mc)
         self.check_tgs_reply(rep)
 
         # Check the contents of the pac, and the ticket
@@ -524,7 +530,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
         ename = user_name + "@" + realm
 
         mach_name = "mskilemac"
-        (mc, _) = self.create_account(samdb, mach_name, machine_account=True)
+        (mc, _) = self.create_account(samdb, mach_name,
+                                      account_type=self.AccountType.COMPUTER)
 
         # Do the initial AS-REQ, should get a pre-authentication required
         # response
@@ -554,7 +561,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
             names=[mc.get_username()])
 
         (rep, enc_part) = self.tgs_req(
-            cname, sname, uc.get_realm(), ticket, key, etype)
+            cname, sname, uc.get_realm(), ticket, key, etype,
+            service_creds=mc)
         self.check_tgs_reply(rep)
 
         # Check the contents of the pac, and the ticket
@@ -586,7 +594,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
         realm = uc.get_realm().lower()
 
         mach_name = "mskilemac"
-        (mc, dn) = self.create_account(samdb, mach_name, machine_account=True)
+        (mc, dn) = self.create_account(samdb, mach_name,
+                                      account_type=self.AccountType.COMPUTER)
         ename = mach_name + "@" + realm
         uname = mach_name + "$@" + realm
 
@@ -618,7 +627,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
             names=[mc.get_username()])
 
         (rep, enc_part) = self.tgs_req(
-            cname, sname, uc.get_realm(), ticket, key, etype)
+            cname, sname, uc.get_realm(), ticket, key, etype,
+            service_creds=mc)
         self.check_tgs_reply(rep)
 
         # Check the contents of the pac, and the ticket
@@ -652,19 +662,16 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
         samdb = self.get_samdb()
         user_name = "mskileusr"
         alt_name = "mskilealtsec"
-        (uc, dn) = self.create_account(samdb, user_name)
+        (uc, dn) = self.create_account(samdb, user_name,
+                                       account_control=UF_DONT_REQUIRE_PREAUTH)
         realm = uc.get_realm().lower()
         alt_sec = "Kerberos:%s@%s" % (alt_name, realm)
         self.add_attribute(samdb, dn, "altSecurityIdentities", alt_sec)
-        self.modify_attribute(
-            samdb,
-            dn,
-            "userAccountControl",
-            str(UF_NORMAL_ACCOUNT | UF_DONT_REQUIRE_PREAUTH))
         ename = alt_name + "@" + realm
 
         mach_name = "mskilemac"
-        (mc, _) = self.create_account(samdb, mach_name, machine_account=True)
+        (mc, _) = self.create_account(samdb, mach_name,
+                                      account_type=self.AccountType.COMPUTER)
 
         # Do the initial AS-REQ, as we've set UF_DONT_REQUIRE_PREAUTH
         # we should get a valid AS-RESP
@@ -695,7 +702,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
             names=[mc.get_username()])
 
         (rep, enc_part) = self.tgs_req(
-            cname, sname, uc.get_realm(), ticket, key, etype)
+            cname, sname, uc.get_realm(), ticket, key, etype,
+            service_creds=mc, expect_pac=False)
         self.check_tgs_reply(rep)
 
         # Check the contents of the service ticket
@@ -730,7 +738,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
         uname = user_name + "@" + realm
 
         mach_name = "mskilemac"
-        (mc, _) = self.create_account(samdb, mach_name, machine_account=True)
+        (mc, _) = self.create_account(samdb, mach_name,
+                                      account_type=self.AccountType.COMPUTER)
 
         # Do the initial AS-REQ, should get a pre-authentication required
         # response
@@ -765,7 +774,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
             names=[mc.get_username()])
 
         (rep, enc_part) = self.tgs_req(
-            cname, sname, uc.get_realm(), ticket, key, etype)
+            cname, sname, uc.get_realm(), ticket, key, etype,
+            service_creds=mc)
         self.check_tgs_reply(rep)
 
         # Check the contents of the pac, and the ticket
@@ -799,7 +809,8 @@ class MS_Kile_Client_Principal_Lookup_Tests(KDCBaseTest):
         ename = alt_name + "@" + realm
 
         mach_name = "mskilemac"
-        (mc, _) = self.create_account(samdb, mach_name, machine_account=True)
+        (mc, _) = self.create_account(samdb, mach_name,
+                                      account_type=self.AccountType.COMPUTER)
 
         # Do the initial AS-REQ, should get a pre-authentication required
         # response

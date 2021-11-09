@@ -23,15 +23,18 @@ import os
 sys.path.insert(0, "bin/python")
 os.environ["PYTHONUNBUFFERED"] = "1"
 
+import samba.tests.krb5.kcrypto as kcrypto
 from samba.tests.krb5.kdc_base_test import KDCBaseTest
 from samba.tests.krb5.rfc4120_constants import (
     AES256_CTS_HMAC_SHA1_96,
     ARCFOUR_HMAC_MD5,
     KRB_ERROR,
+    KRB_TGS_REP,
     KDC_ERR_BADMATCH,
     NT_PRINCIPAL,
     NT_SRV_INST,
 )
+import samba.tests.krb5.rfc4120_pyasn1 as krb5_asn1
 
 global_asn1_print = False
 global_hexdump = False
@@ -84,7 +87,9 @@ class KdcTgsTests(KDCBaseTest):
             name_type=NT_PRINCIPAL,
             names=["host", samdb.host_dns_name()])
 
-        (rep, enc_part) = self.tgs_req(cname, sname, realm, ticket, key, etype)
+        (rep, enc_part) = self.tgs_req(cname, sname, realm, ticket, key, etype,
+                                       expected_error_mode=KDC_ERR_BADMATCH,
+                                       expect_edata=False)
 
         self.assertIsNone(
             enc_part,
@@ -131,7 +136,8 @@ class KdcTgsTests(KDCBaseTest):
             names=["ldap", samdb.host_dns_name()])
 
         (rep, _) = self.tgs_req(
-            cname, sname, uc.get_realm(), ticket, key, etype)
+            cname, sname, uc.get_realm(), ticket, key, etype,
+            service_creds=self.get_dc_creds())
 
         self.check_tgs_reply(rep)
 
@@ -142,7 +148,8 @@ class KdcTgsTests(KDCBaseTest):
         samdb = self.get_samdb()
         user_name = "tsttktusr"
         (uc, dn) = self.create_account(samdb, user_name)
-        (mc, _) = self.create_account(samdb, "tsttktmac", machine_account=True)
+        (mc, _) = self.create_account(samdb, "tsttktmac",
+                                      account_type=self.AccountType.COMPUTER)
         realm = uc.get_realm().lower()
 
         # Do the initial AS-REQ, should get a pre-authentication required
@@ -174,7 +181,8 @@ class KdcTgsTests(KDCBaseTest):
             names=[mc.get_username()])
 
         (rep, enc_part) = self.tgs_req(
-            cname, sname, uc.get_realm(), ticket, key, etype)
+            cname, sname, uc.get_realm(), ticket, key, etype,
+            service_creds=mc)
         self.check_tgs_reply(rep)
 
         # Check the contents of the service ticket
@@ -205,9 +213,126 @@ class KdcTgsTests(KDCBaseTest):
             pac_data.account_sid,
             "rep = {%s},%s" % (rep, pac_data))
 
+    def _make_tgs_request(self, client_creds, service_creds, tgt,
+                          expect_pac=True):
+        client_account = client_creds.get_username()
+        cname = self.PrincipalName_create(name_type=NT_PRINCIPAL,
+                                          names=[client_account])
+
+        service_account = service_creds.get_username()
+        sname = self.PrincipalName_create(name_type=NT_PRINCIPAL,
+                                          names=[service_account])
+
+        realm = service_creds.get_realm()
+
+        expected_crealm = realm
+        expected_cname = cname
+        expected_srealm = realm
+        expected_sname = sname
+
+        expected_supported_etypes = service_creds.tgs_supported_enctypes
+
+        etypes = (AES256_CTS_HMAC_SHA1_96, ARCFOUR_HMAC_MD5)
+
+        kdc_options = str(krb5_asn1.KDCOptions('canonicalize'))
+
+        target_decryption_key = self.TicketDecryptionKey_from_creds(
+            service_creds)
+
+        authenticator_subkey = self.RandomKey(kcrypto.Enctype.AES256)
+
+        kdc_exchange_dict = self.tgs_exchange_dict(
+            expected_crealm=expected_crealm,
+            expected_cname=expected_cname,
+            expected_srealm=expected_srealm,
+            expected_sname=expected_sname,
+            expected_supported_etypes=expected_supported_etypes,
+            ticket_decryption_key=target_decryption_key,
+            check_rep_fn=self.generic_check_kdc_rep,
+            check_kdc_private_fn=self.generic_check_kdc_private,
+            expected_error_mode=0,
+            tgt=tgt,
+            authenticator_subkey=authenticator_subkey,
+            kdc_options=kdc_options,
+            expect_pac=expect_pac)
+
+        rep = self._generic_kdc_exchange(kdc_exchange_dict,
+                                         cname=cname,
+                                         realm=realm,
+                                         sname=sname,
+                                         etypes=etypes)
+        self.check_reply(rep, KRB_TGS_REP)
+
+        return kdc_exchange_dict['rep_ticket_creds']
+
+    def test_request_no_pac(self):
+        client_creds = self.get_client_creds()
+        service_creds = self.get_service_creds()
+
+        tgt = self.get_tgt(client_creds, pac_request=False,
+                           expect_pac=False)
+
+        pac = self.get_ticket_pac(tgt, expect_pac=False)
+        self.assertIsNone(pac)
+
+        ticket = self._make_tgs_request(client_creds, service_creds, tgt,
+                                        expect_pac=False)
+
+        pac = self.get_ticket_pac(ticket, expect_pac=False)
+        self.assertIsNone(pac)
+
+    def test_client_no_auth_data_required(self):
+        client_creds = self.get_cached_creds(
+            account_type=self.AccountType.USER,
+            opts={'no_auth_data_required': True})
+        service_creds = self.get_service_creds()
+
+        tgt = self.get_tgt(client_creds)
+
+        pac = self.get_ticket_pac(tgt)
+        self.assertIsNotNone(pac)
+
+        ticket = self._make_tgs_request(client_creds, service_creds, tgt)
+
+        pac = self.get_ticket_pac(ticket)
+        self.assertIsNotNone(pac)
+
+    def test_service_no_auth_data_required(self):
+        client_creds = self.get_client_creds()
+        service_creds = self.get_cached_creds(
+            account_type=self.AccountType.COMPUTER,
+            opts={'no_auth_data_required': True})
+
+        tgt = self.get_tgt(client_creds)
+
+        pac = self.get_ticket_pac(tgt)
+        self.assertIsNotNone(pac)
+
+        ticket = self._make_tgs_request(client_creds, service_creds, tgt,
+                                        expect_pac=False)
+
+        pac = self.get_ticket_pac(ticket, expect_pac=False)
+        self.assertIsNone(pac)
+
+    def test_remove_pac(self):
+        client_creds = self.get_client_creds()
+        service_creds = self.get_service_creds()
+
+        tgt = self.modified_ticket(self.get_tgt(client_creds),
+                                   exclude_pac=True)
+
+        pac = self.get_ticket_pac(tgt, expect_pac=False)
+        self.assertIsNone(pac)
+
+        ticket = self._make_tgs_request(client_creds, service_creds, tgt,
+                                        expect_pac=False)
+
+        pac = self.get_ticket_pac(ticket, expect_pac=False)
+        self.assertIsNone(pac)
+
 
 if __name__ == "__main__":
-    global_asn1_print = True
-    global_hexdump = True
+    global_asn1_print = False
+    global_hexdump = False
     import unittest
     unittest.main()

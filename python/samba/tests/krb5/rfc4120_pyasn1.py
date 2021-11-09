@@ -120,7 +120,7 @@ class EncryptedData(univ.Sequence):
 
 EncryptedData.componentType = namedtype.NamedTypes(
     namedtype.NamedType('etype', EncryptionType().subtype(explicitTag=tag.Tag(tag.tagClassContext, tag.tagFormatSimple, 0))),
-    namedtype.OptionalNamedType('kvno', UInt32().subtype(explicitTag=tag.Tag(tag.tagClassContext, tag.tagFormatSimple, 1))),
+    namedtype.OptionalNamedType('kvno', Int32().subtype(explicitTag=tag.Tag(tag.tagClassContext, tag.tagFormatSimple, 1))),
     namedtype.NamedType('cipher', univ.OctetString().subtype(explicitTag=tag.Tag(tag.tagClassContext, tag.tagFormatSimple, 2)))
 )
 
@@ -649,6 +649,7 @@ KDCOptionsValues.namedValues = namedval.NamedValues(
     ('opt-hardware-auth', 11),
     ('unused12', 12),
     ('unused13', 13),
+    ('cname-in-addl-tkt', 14),
     ('canonicalize', 15),
     ('disable-transited-check', 26),
     ('renewable-ok', 27),
