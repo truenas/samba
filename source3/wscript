@@ -1720,6 +1720,13 @@ main() {
                 '/usr/include/libzfs/sys',
                 '/usr/include/libzfs/sys/fs',
             ]
+        elif os.path.exists('/usr/local/include/libzfs/libzfs.h'):
+            conf.env['CPPPATH_ZFS'] = [
+                '/usr/local/include/libspl',
+                '/usr/local/include/libzfs',
+                '/usr/local/include/libzfs/sys',
+                '/usr/local/include/libzfs/sys/fs',
+            ]
         else:
             src_base = conf.CONFIG_GET("SRC_BASE")
             if src_base is None:
