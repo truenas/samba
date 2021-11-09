@@ -980,6 +980,8 @@ static void init_globals(struct loadparm_context *lp_ctx, bool reinit_globals)
 	Globals.server_smb3_encryption_algorithms =
 		str_list_make_v3_const(NULL, DEFAULT_SMB3_ENCRYPTION_ALGORITHMS, NULL);
 
+	Globals.min_domain_uid = 1000;
+
 	/* Now put back the settings that were set with lp_set_cmdline() */
 	apply_lp_set_cmdline();
 }
@@ -4423,6 +4425,7 @@ int lp_default_server_announce(void)
 			default_server_announce |= SV_TYPE_DOMAIN_MEMBER;
 			break;
 		case ROLE_DOMAIN_PDC:
+		case ROLE_IPA_DC:
 			default_server_announce |= SV_TYPE_DOMAIN_CTRL;
 			break;
 		case ROLE_DOMAIN_BDC:
@@ -4448,7 +4451,8 @@ int lp_default_server_announce(void)
 bool lp_domain_master(void)
 {
 	if (Globals._domain_master == Auto)
-		return (lp_server_role() == ROLE_DOMAIN_PDC);
+		return (lp_server_role() == ROLE_DOMAIN_PDC ||
+			lp_server_role() == ROLE_IPA_DC);
 
 	return (bool)Globals._domain_master;
 }

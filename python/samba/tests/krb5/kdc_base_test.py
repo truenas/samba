@@ -38,12 +38,14 @@ from samba.dsdb import (
     DS_DOMAIN_FUNCTION_2000,
     DS_DOMAIN_FUNCTION_2008,
     DS_GUID_COMPUTERS_CONTAINER,
+    DS_GUID_DOMAIN_CONTROLLERS_CONTAINER,
     DS_GUID_USERS_CONTAINER,
     UF_WORKSTATION_TRUST_ACCOUNT,
     UF_NO_AUTH_DATA_REQUIRED,
     UF_NORMAL_ACCOUNT,
     UF_NOT_DELEGATED,
     UF_PARTIAL_SECRETS_ACCOUNT,
+    UF_SERVER_TRUST_ACCOUNT,
     UF_TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION
 )
 from samba.join import DCJoinContext
@@ -94,6 +96,8 @@ class KDCBaseTest(RawKerberosTest):
     class AccountType(Enum):
         USER = auto()
         COMPUTER = auto()
+        SERVER = auto()
+        RODC = auto()
 
     @classmethod
     def setUpClass(cls):
@@ -245,6 +249,8 @@ class KDCBaseTest(RawKerberosTest):
         if ou is None:
             if account_type is account_type.COMPUTER:
                 guid = DS_GUID_COMPUTERS_CONTAINER
+            elif account_type is account_type.SERVER:
+                guid = DS_GUID_DOMAIN_CONTROLLERS_CONTAINER
             else:
                 guid = DS_GUID_USERS_CONTAINER
 
@@ -265,6 +271,8 @@ class KDCBaseTest(RawKerberosTest):
                 account_name += '$'
             if account_type is self.AccountType.COMPUTER:
                 account_control |= UF_WORKSTATION_TRUST_ACCOUNT
+            elif account_type is self.AccountType.SERVER:
+                account_control |= UF_SERVER_TRUST_ACCOUNT
             else:
                 self.fail()
 
@@ -649,7 +657,8 @@ class KDCBaseTest(RawKerberosTest):
             'delegation_to_spn': None,
             'delegation_from_dn': None,
             'trusted_to_auth_for_delegation': False,
-            'fast_support': False
+            'fast_support': False,
+            'id': None
         }
 
         account_opts = {
@@ -690,7 +699,8 @@ class KDCBaseTest(RawKerberosTest):
                             delegation_to_spn,
                             delegation_from_dn,
                             trusted_to_auth_for_delegation,
-                            fast_support):
+                            fast_support,
+                            id):
         if account_type is self.AccountType.USER:
             self.assertIsNone(spn)
             self.assertIsNone(delegation_to_spn)
@@ -700,12 +710,8 @@ class KDCBaseTest(RawKerberosTest):
             self.assertFalse(not_delegated)
 
         samdb = self.get_samdb()
-        rodc_samdb = self.get_rodc_samdb()
 
-        rodc_dn = self.get_server_dn(rodc_samdb)
-
-        user_name = self.account_base + str(self.account_id)
-        type(self).account_id += 1
+        user_name = self.get_new_username()
         if name_prefix is not None:
             user_name = name_prefix + user_name
         if name_suffix is not None:
@@ -755,6 +761,9 @@ class KDCBaseTest(RawKerberosTest):
         # Handle secret replication to the RODC.
 
         if allowed_replication or revealed_to_rodc:
+            rodc_samdb = self.get_rodc_samdb()
+            rodc_dn = self.get_server_dn(rodc_samdb)
+
             # Allow replicating this account's secrets if requested, or allow
             # it only temporarily if we're about to replicate them.
             allowed_cleanup = self.add_to_group(
@@ -775,6 +784,9 @@ class KDCBaseTest(RawKerberosTest):
                                 revealed=revealed_to_rodc)
 
         if denied_replication:
+            rodc_samdb = self.get_rodc_samdb()
+            rodc_dn = self.get_server_dn(rodc_samdb)
+
             # Deny replicating this account's secrets to the RODC.
             self.add_to_group(dn, rodc_dn, 'msDS-NeverRevealGroup')
 
@@ -813,6 +825,12 @@ class KDCBaseTest(RawKerberosTest):
             self.add_to_group(dn, mock_rodc_dn, 'msDS-NeverRevealGroup')
 
         return creds
+
+    def get_new_username(self):
+        user_name = self.account_base + str(self.account_id)
+        type(self).account_id += 1
+
+        return user_name
 
     def get_client_creds(self,
                          allow_missing_password=False,
@@ -1271,12 +1289,16 @@ class KDCBaseTest(RawKerberosTest):
         return rep, enc_part
 
     def get_service_ticket(self, tgt, target_creds, service='host',
+                           target_name=None,
                            to_rodc=False, kdc_options=None,
                            expected_flags=None, unexpected_flags=None,
-                           fresh=False):
+                           pac_request=True, expect_pac=True, fresh=False):
         user_name = tgt.cname['name-string'][0]
-        target_name = target_creds.get_username()
-        cache_key = (user_name, target_name, service, to_rodc, kdc_options)
+        if target_name is None:
+            target_name = target_creds.get_username()[:-1]
+        cache_key = (user_name, target_name, service, to_rodc, kdc_options,
+                     pac_request, str(expected_flags), str(unexpected_flags),
+                     expect_pac)
 
         if not fresh:
             ticket = self.tkt_cache.get(cache_key)
@@ -1288,40 +1310,42 @@ class KDCBaseTest(RawKerberosTest):
 
         if kdc_options is None:
             kdc_options = '0'
-        kdc_options = krb5_asn1.KDCOptions(kdc_options)
+        kdc_options = str(krb5_asn1.KDCOptions(kdc_options))
 
-        key = tgt.session_key
-        ticket = tgt.ticket
-
-        cname = tgt.cname
-        realm = tgt.crealm
-
-        target_name = target_creds.get_username()[:-1]
         sname = self.PrincipalName_create(name_type=NT_PRINCIPAL,
                                           names=[service, target_name])
+        srealm = target_creds.get_realm()
 
-        rep, enc_part = self.tgs_req(cname, sname, realm, ticket, key, etype,
-                                     to_rodc=to_rodc,
-                                     service_creds=target_creds,
-                                     kdc_options=kdc_options,
-                                     expected_flags=expected_flags,
-                                     unexpected_flags=unexpected_flags)
+        authenticator_subkey = self.RandomKey(kcrypto.Enctype.AES256)
 
-        service_ticket = rep['ticket']
+        decryption_key = self.TicketDecryptionKey_from_creds(target_creds)
 
-        ticket_etype = service_ticket['enc-part']['etype']
-        target_key = self.TicketDecryptionKey_from_creds(target_creds,
-                                                         etype=ticket_etype)
+        kdc_exchange_dict = self.tgs_exchange_dict(
+            expected_crealm=tgt.crealm,
+            expected_cname=tgt.cname,
+            expected_srealm=srealm,
+            expected_sname=sname,
+            expected_supported_etypes=target_creds.tgs_supported_enctypes,
+            expected_flags=expected_flags,
+            unexpected_flags=unexpected_flags,
+            ticket_decryption_key=decryption_key,
+            check_rep_fn=self.generic_check_kdc_rep,
+            check_kdc_private_fn=self.generic_check_kdc_private,
+            tgt=tgt,
+            authenticator_subkey=authenticator_subkey,
+            kdc_options=kdc_options,
+            pac_request=pac_request,
+            expect_pac=expect_pac,
+            to_rodc=to_rodc)
 
-        session_key = self.EncryptionKey_import(enc_part['key'])
+        rep = self._generic_kdc_exchange(kdc_exchange_dict,
+                                         cname=None,
+                                         realm=srealm,
+                                         sname=sname,
+                                         etypes=etype)
+        self.check_tgs_reply(rep)
 
-        service_ticket_creds = KerberosTicketCreds(service_ticket,
-                                                   session_key,
-                                                   crealm=realm,
-                                                   cname=cname,
-                                                   srealm=realm,
-                                                   sname=sname,
-                                                   decryption_key=target_key)
+        service_ticket_creds = kdc_exchange_dict['rep_ticket_creds']
 
         if to_rodc:
             krbtgt_creds = self.get_rodc_krbtgt_creds()
@@ -1329,6 +1353,7 @@ class KDCBaseTest(RawKerberosTest):
             krbtgt_creds = self.get_krbtgt_creds()
         krbtgt_key = self.TicketDecryptionKey_from_creds(krbtgt_creds)
         self.verify_ticket(service_ticket_creds, krbtgt_key,
+                           expect_pac=expect_pac,
                            expect_ticket_checksum=self.tkt_sig_support)
 
         self.tkt_cache[cache_key] = service_ticket_creds
@@ -1337,9 +1362,18 @@ class KDCBaseTest(RawKerberosTest):
 
     def get_tgt(self, creds, to_rodc=False, kdc_options=None,
                 expected_flags=None, unexpected_flags=None,
-                pac_request=True, expect_pac=True, fresh=False):
+                expected_account_name=None, expected_upn_name=None,
+                expected_sid=None,
+                pac_request=True, expect_pac=True,
+                expect_pac_attrs=None, expect_pac_attrs_pac_request=None,
+                expect_requester_sid=None,
+                fresh=False):
         user_name = creds.get_username()
-        cache_key = (user_name, to_rodc, kdc_options, pac_request)
+        cache_key = (user_name, to_rodc, kdc_options, pac_request,
+                     str(expected_flags), str(unexpected_flags),
+                     expected_account_name, expected_upn_name, expected_sid,
+                     expect_pac, expect_pac_attrs,
+                     expect_pac_attrs_pac_request, expect_requester_sid)
 
         if not fresh:
             tgt = self.tkt_cache.get(cache_key)
@@ -1366,6 +1400,8 @@ class KDCBaseTest(RawKerberosTest):
         ticket_decryption_key = (
             self.TicketDecryptionKey_from_creds(krbtgt_creds))
 
+        expected_etypes = krbtgt_creds.tgs_supported_enctypes
+
         if kdc_options is None:
             kdc_options = ('forwardable,'
                            'renewable,'
@@ -1386,9 +1422,13 @@ class KDCBaseTest(RawKerberosTest):
             expected_cname=cname,
             expected_srealm=realm,
             expected_sname=sname,
+            expected_account_name=expected_account_name,
+            expected_upn_name=expected_upn_name,
+            expected_sid=expected_sid,
             expected_salt=salt,
             expected_flags=expected_flags,
             unexpected_flags=unexpected_flags,
+            expected_supported_etypes=expected_etypes,
             etypes=etype,
             padata=None,
             kdc_options=kdc_options,
@@ -1396,6 +1436,10 @@ class KDCBaseTest(RawKerberosTest):
             ticket_decryption_key=ticket_decryption_key,
             pac_request=pac_request,
             pac_options=pac_options,
+            expect_pac=expect_pac,
+            expect_pac_attrs=expect_pac_attrs,
+            expect_pac_attrs_pac_request=expect_pac_attrs_pac_request,
+            expect_requester_sid=expect_requester_sid,
             to_rodc=to_rodc)
         self.check_pre_authentication(rep)
 
@@ -1414,8 +1458,6 @@ class KDCBaseTest(RawKerberosTest):
         expected_sname = self.PrincipalName_create(
             name_type=NT_SRV_INST, names=['krbtgt', realm.upper()])
 
-        expected_etypes = krbtgt_creds.tgs_supported_enctypes
-
         rep, kdc_exchange_dict = self._test_as_exchange(
             cname=cname,
             realm=realm,
@@ -1427,6 +1469,9 @@ class KDCBaseTest(RawKerberosTest):
             expected_cname=cname,
             expected_srealm=expected_realm,
             expected_sname=expected_sname,
+            expected_account_name=expected_account_name,
+            expected_upn_name=expected_upn_name,
+            expected_sid=expected_sid,
             expected_salt=salt,
             expected_flags=expected_flags,
             unexpected_flags=unexpected_flags,
@@ -1439,6 +1484,9 @@ class KDCBaseTest(RawKerberosTest):
             pac_request=pac_request,
             pac_options=pac_options,
             expect_pac=expect_pac,
+            expect_pac_attrs=expect_pac_attrs,
+            expect_pac_attrs_pac_request=expect_pac_attrs_pac_request,
+            expect_requester_sid=expect_requester_sid,
             to_rodc=to_rodc)
         self.check_as_reply(rep)
 
@@ -1649,51 +1697,31 @@ class KDCBaseTest(RawKerberosTest):
 
         return cachefile
 
-    def create_ccache_with_user(self, user_credentials, mach_name,
-                                service="host"):
+    def create_ccache_with_user(self, user_credentials, mach_credentials,
+                                service="host", target_name=None, pac=True):
         # Obtain a service ticket authorising the user and place it into a
         # newly created credentials cache file.
 
         user_name = user_credentials.get_username()
         realm = user_credentials.get_realm()
 
-        # Do the initial AS-REQ, should get a pre-authentication required
-        # response
-        etype = (AES256_CTS_HMAC_SHA1_96, ARCFOUR_HMAC_MD5)
         cname = self.PrincipalName_create(name_type=NT_PRINCIPAL,
                                           names=[user_name])
-        sname = self.PrincipalName_create(name_type=NT_SRV_HST,
-                                          names=["krbtgt", realm])
 
-        rep = self.as_req(cname, sname, realm, etype)
-        self.check_pre_authentication(rep)
-
-        # Do the next AS-REQ
-        padata = self.get_enc_timestamp_pa_data(user_credentials, rep)
-        key = self.get_as_rep_key(user_credentials, rep)
-        rep = self.as_req(cname, sname, realm, etype, padata=[padata])
-        self.check_as_reply(rep)
+        tgt = self.get_tgt(user_credentials)
 
         # Request a ticket to the host service on the machine account
-        ticket = rep['ticket']
-        enc_part = self.get_as_rep_enc_data(key, rep)
-        key = self.EncryptionKey_import(enc_part['key'])
-        cname = self.PrincipalName_create(name_type=NT_PRINCIPAL,
-                                          names=[user_name])
-        sname = self.PrincipalName_create(name_type=NT_SRV_HST,
-                                          names=[service, mach_name])
+        ticket = self.get_service_ticket(tgt, mach_credentials,
+                                         service=service,
+                                         target_name=target_name)
 
-        (rep, enc_part) = self.tgs_req(
-            cname, sname, realm, ticket, key, etype)
-        self.check_tgs_reply(rep)
-        key = self.EncryptionKey_import(enc_part['key'])
-
-        # Check the contents of the pac, and the ticket
-        ticket = rep['ticket']
+        if not pac:
+            ticket = self.modified_ticket(ticket, exclude_pac=True)
 
         # Write the ticket into a credentials cache file that can be ingested
         # by the main credentials code.
-        cachefile = self.create_ccache(cname, ticket, enc_part)
+        cachefile = self.create_ccache(cname, ticket.ticket,
+                                       ticket.encpart_private)
 
         # Create a credentials object to reference the credentials cache.
         creds = Credentials()

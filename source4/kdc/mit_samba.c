@@ -460,9 +460,15 @@ int mit_samba_get_pac(struct mit_samba_context *smb_ctx,
 					    skdc_entry,
 					    &logon_info_blob,
 					    cred_ndr_ptr,
-					    &upn_dns_info_blob);
+					    &upn_dns_info_blob,
+					    NULL, NULL, NULL,
+					    NULL);
 	if (!NT_STATUS_IS_OK(nt_status)) {
 		talloc_free(tmp_ctx);
+		if (NT_STATUS_EQUAL(nt_status,
+				    NT_STATUS_OBJECT_NAME_NOT_FOUND)) {
+			return ENOENT;
+		}
 		return EINVAL;
 	}
 
@@ -483,6 +489,8 @@ int mit_samba_get_pac(struct mit_samba_context *smb_ctx,
 				   logon_info_blob,
 				   pcred_blob,
 				   upn_dns_info_blob,
+				   NULL,
+				   NULL,
 				   NULL,
 				   pac);
 
@@ -508,6 +516,7 @@ krb5_error_code mit_samba_reget_pac(struct mit_samba_context *ctx,
 	DATA_BLOB *deleg_blob = NULL;
 	struct samba_kdc_entry *client_skdc_entry = NULL;
 	struct samba_kdc_entry *krbtgt_skdc_entry = NULL;
+	struct samba_kdc_entry *server_skdc_entry = NULL;
 	bool is_in_db = false;
 	bool is_untrusted = false;
 	size_t num_types = 0;
@@ -521,28 +530,52 @@ krb5_error_code mit_samba_reget_pac(struct mit_samba_context *ctx,
 	ssize_t srv_checksum_idx = -1;
 	ssize_t kdc_checksum_idx = -1;
 	krb5_pac new_pac = NULL;
+	bool ok;
+
+	/* Create a memory context early so code can use talloc_stackframe() */
+	tmp_ctx = talloc_named(ctx, 0, "mit_samba_reget_pac context");
+	if (tmp_ctx == NULL) {
+		return ENOMEM;
+	}
 
 	if (client != NULL) {
 		client_skdc_entry =
 			talloc_get_type_abort(client->e_data,
 					      struct samba_kdc_entry);
+
+		/*
+		 * Check the objectSID of the client and pac data are the same.
+		 * Does a parse and SID check, but no crypto.
+		 */
+		code = samba_kdc_validate_pac_blob(context, client_skdc_entry, *pac);
+		if (code != 0) {
+			goto done;
+		}
 	}
 
 	if (server == NULL) {
-		return EINVAL;
+		code = EINVAL;
+		goto done;
+	}
+
+	server_skdc_entry =
+		talloc_get_type_abort(server->e_data,
+				      struct samba_kdc_entry);
+
+	/* The account may be set not to want the PAC */
+	ok = samba_princ_needs_pac(server_skdc_entry);
+	if (!ok) {
+		code = EINVAL;
+		goto done;
 	}
 
 	if (krbtgt == NULL) {
-		return EINVAL;
+		code = EINVAL;
+		goto done;
 	}
 	krbtgt_skdc_entry =
 		talloc_get_type_abort(krbtgt->e_data,
 				      struct samba_kdc_entry);
-
-	tmp_ctx = talloc_named(ctx, 0, "mit_samba_reget_pac context");
-	if (tmp_ctx == NULL) {
-		return ENOMEM;
-	}
 
 	code = samba_krbtgt_is_in_db(krbtgt_skdc_entry,
 				     &is_in_db,
@@ -561,7 +594,10 @@ krb5_error_code mit_samba_reget_pac(struct mit_samba_context *ctx,
 						    client_skdc_entry,
 						    &pac_blob,
 						    NULL,
-						    &upn_blob);
+						    &upn_blob,
+						    NULL, NULL,
+						    NULL,
+						    NULL);
 		if (!NT_STATUS_IS_OK(nt_status)) {
 			code = EINVAL;
 			goto done;
@@ -1175,4 +1211,12 @@ void mit_samba_update_bad_password_count(krb5_db_entry *db_entry)
 	authsam_update_bad_pwd_count(p->kdc_db_ctx->samdb,
 				     p->msg,
 				     ldb_get_default_basedn(p->kdc_db_ctx->samdb));
+}
+
+bool mit_samba_princ_needs_pac(krb5_db_entry *db_entry)
+{
+	struct samba_kdc_entry *skdc_entry =
+		talloc_get_type_abort(db_entry->e_data, struct samba_kdc_entry);
+
+	return samba_princ_needs_pac(skdc_entry);
 }

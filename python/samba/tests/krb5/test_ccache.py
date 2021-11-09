@@ -20,11 +20,14 @@
 import sys
 import os
 
+import ldb
+
 from ldb import SCOPE_SUBTREE
-from samba import gensec
+from samba import NTSTATUSError, gensec
 from samba.auth import AuthContext
 from samba.dcerpc import security
 from samba.ndr import ndr_unpack
+from samba.ntstatus import NT_STATUS_NO_IMPERSONATION_TOKEN
 
 from samba.tests.krb5.kdc_base_test import KDCBaseTest
 
@@ -41,18 +44,31 @@ class CcacheTests(KDCBaseTest):
     """
 
     def test_ccache(self):
+        self._run_ccache_test()
+
+    def test_ccache_rename(self):
+        self._run_ccache_test(rename=True)
+
+    def test_ccache_no_pac(self):
+        self._run_ccache_test(include_pac=False,
+                              expect_anon=True, allow_error=True)
+
+    def _run_ccache_test(self, rename=False, include_pac=True,
+                         expect_anon=False, allow_error=False):
         # Create a user account and a machine account, along with a Kerberos
         # credentials cache file where the service ticket authenticating the
         # user are stored.
 
-        user_name = "ccacheusr"
         mach_name = "ccachemac"
         service = "host"
 
         samdb = self.get_samdb()
 
         # Create the user account.
-        (user_credentials, _) = self.create_account(samdb, user_name)
+        user_credentials = self.get_cached_creds(
+            account_type=self.AccountType.USER,
+            use_cache=False)
+        user_name = user_credentials.get_username()
 
         # Create the machine account.
         (mach_credentials, _) = self.create_account(
@@ -67,12 +83,34 @@ class CcacheTests(KDCBaseTest):
         # ticket, to ensure that the krbtgt ticket doesn't also need to be
         # stored.
         (creds, cachefile) = self.create_ccache_with_user(user_credentials,
-                                                          mach_name)
+                                                          mach_credentials,
+                                                          pac=include_pac)
+        # Remove the cached credentials file.
+        self.addCleanup(os.remove, cachefile.name)
+
+        # Retrieve the user account's SID.
+        ldb_res = samdb.search(scope=SCOPE_SUBTREE,
+                               expression="(sAMAccountName=%s)" % user_name,
+                               attrs=["objectSid"])
+        self.assertEqual(1, len(ldb_res))
+        sid = ndr_unpack(security.dom_sid, ldb_res[0]["objectSid"][0])
+
+        if rename:
+            # Rename the account.
+
+            new_name = self.get_new_username()
+
+            msg = ldb.Message(user_credentials.get_dn())
+            msg['sAMAccountName'] = ldb.MessageElement(new_name,
+                                                       ldb.FLAG_MOD_REPLACE,
+                                                       'sAMAccountName')
+            samdb.modify(msg)
 
         # Authenticate in-process to the machine account using the user's
         # cached credentials.
 
         lp = self.get_lp()
+        lp.set('server role', 'active directory domain controller')
 
         settings = {}
         settings["lp_ctx"] = lp
@@ -109,24 +147,23 @@ class CcacheTests(KDCBaseTest):
         # Ensure that the first SID contained within the obtained security
         # token is the SID of the user we created.
 
-        # Retrieve the user account's SID.
-        ldb_res = samdb.search(scope=SCOPE_SUBTREE,
-                               expression="(sAMAccountName=%s)" % user_name,
-                               attrs=["objectSid"])
-        self.assertEqual(1, len(ldb_res))
-        sid = ndr_unpack(security.dom_sid, ldb_res[0]["objectSid"][0])
-
         # Retrieve the SIDs from the security token.
-        session = gensec_server.session_info()
+        try:
+            session = gensec_server.session_info()
+        except NTSTATUSError as e:
+            if not allow_error:
+                self.fail()
+
+            enum, _ = e.args
+            self.assertEqual(NT_STATUS_NO_IMPERSONATION_TOKEN, enum)
+            return
+
         token = session.security_token
         token_sids = token.sids
         self.assertGreater(len(token_sids), 0)
 
         # Ensure that they match.
         self.assertEqual(sid, token_sids[0])
-
-        # Remove the cached credentials file.
-        os.remove(cachefile.name)
 
 
 if __name__ == "__main__":

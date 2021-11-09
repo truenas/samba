@@ -74,13 +74,19 @@ static WERROR dns_domain_from_principal(TALLOC_CTX *mem_ctx, struct smb_krb5_con
 
 	info1->status = DRSUAPI_DS_NAME_STATUS_DOMAIN_ONLY;
 	return WERR_OK;
-}		
+}
 
-static enum drsuapi_DsNameStatus LDB_lookup_spn_alias(krb5_context context, struct ldb_context *ldb_ctx, 
+static enum drsuapi_DsNameStatus LDB_lookup_spn_alias(struct ldb_context *ldb_ctx,
 						      TALLOC_CTX *mem_ctx,
 						      const char *alias_from,
 						      char **alias_to)
 {
+	/*
+	 * Some of the logic of this function is mirrored in find_spn_alias()
+	 * in source4/dsdb.samdb/ldb_modules/samldb.c. If you change this to
+	 * not return the first matched alias, you will need to rethink that
+	 * function too.
+	 */
 	unsigned int i;
 	int ret;
 	struct ldb_result *res;
@@ -101,10 +107,12 @@ static enum drsuapi_DsNameStatus LDB_lookup_spn_alias(krb5_context context, stru
 
 	service_dn = ldb_dn_new(tmp_ctx, ldb_ctx, "CN=Directory Service,CN=Windows NT,CN=Services");
 	if ( ! ldb_dn_add_base(service_dn, ldb_get_config_basedn(ldb_ctx))) {
+		talloc_free(tmp_ctx);
 		return DRSUAPI_DS_NAME_STATUS_RESOLVE_ERROR;
 	}
 	service_dn_str = ldb_dn_alloc_linearized(tmp_ctx, service_dn);
 	if ( ! service_dn_str) {
+		talloc_free(tmp_ctx);
 		return DRSUAPI_DS_NAME_STATUS_RESOLVE_ERROR;
 	}
 
@@ -113,13 +121,15 @@ static enum drsuapi_DsNameStatus LDB_lookup_spn_alias(krb5_context context, stru
 
 	if (ret != LDB_SUCCESS && ret != LDB_ERR_NO_SUCH_OBJECT) {
 		DEBUG(1, ("ldb_search: dn: %s not found: %s\n", service_dn_str, ldb_errstring(ldb_ctx)));
+		talloc_free(tmp_ctx);
 		return DRSUAPI_DS_NAME_STATUS_RESOLVE_ERROR;
 	} else if (ret == LDB_ERR_NO_SUCH_OBJECT) {
 		DEBUG(1, ("ldb_search: dn: %s not found\n", service_dn_str));
+		talloc_free(tmp_ctx);
 		return DRSUAPI_DS_NAME_STATUS_NOT_FOUND;
 	} else if (res->count != 1) {
-		talloc_free(res);
 		DEBUG(1, ("ldb_search: dn: %s not found\n", service_dn_str));
+		talloc_free(tmp_ctx);
 		return DRSUAPI_DS_NAME_STATUS_NOT_FOUND;
 	}
 
@@ -217,8 +227,7 @@ static WERROR DsCrackNameSPNAlias(struct ldb_context *sam_ctx, TALLOC_CTX *mem_c
 	dns_name = (const char *)component->data;
 
 	/* MAP it */
-	namestatus = LDB_lookup_spn_alias(smb_krb5_context->krb5_context, 
-					  sam_ctx, mem_ctx, 
+	namestatus = LDB_lookup_spn_alias(sam_ctx, mem_ctx,
 					  service, &new_service);
 
 	if (namestatus == DRSUAPI_DS_NAME_STATUS_NOT_FOUND) {

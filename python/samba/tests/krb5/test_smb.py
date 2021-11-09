@@ -20,9 +20,13 @@
 import sys
 import os
 
+import ldb
+
 from ldb import SCOPE_SUBTREE
+from samba import NTSTATUSError
 from samba.dcerpc import security
 from samba.ndr import ndr_unpack
+from samba.ntstatus import NT_STATUS_NO_IMPERSONATION_TOKEN
 from samba.samba3 import libsmb_samba_internal as libsmb
 from samba.samba3 import param as s3param
 
@@ -41,27 +45,66 @@ class SmbTests(KDCBaseTest):
     """
 
     def test_smb(self):
+        self._run_smb_test()
+
+    def test_smb_rename(self):
+        self._run_smb_test(rename=True)
+
+    def test_smb_no_pac(self):
+        self._run_smb_test(include_pac=False,
+                           expect_error=True)
+
+    def _run_smb_test(self, rename=False, include_pac=True,
+                      expect_error=False):
         # Create a user account and a machine account, along with a Kerberos
         # credentials cache file where the service ticket authenticating the
         # user are stored.
 
         samdb = self.get_samdb()
 
-        user_name = "smbusr"
         mach_name = samdb.host_dns_name()
         service = "cifs"
         share = "tmp"
 
         # Create the user account.
-        (user_credentials, _) = self.create_account(samdb, user_name)
+        user_credentials = self.get_cached_creds(
+            account_type=self.AccountType.USER,
+            use_cache=False)
+        user_name = user_credentials.get_username()
+
+        mach_credentials = self.get_dc_creds()
+
+        mach_credentials = self.get_dc_creds()
 
         # Talk to the KDC to obtain the service ticket, which gets placed into
         # the cache. The machine account name has to match the name in the
         # ticket, to ensure that the krbtgt ticket doesn't also need to be
         # stored.
         (creds, cachefile) = self.create_ccache_with_user(user_credentials,
+                                                          mach_credentials,
+                                                          service,
                                                           mach_name,
-                                                          service)
+                                                          pac=include_pac)
+        # Remove the cached credentials file.
+        self.addCleanup(os.remove, cachefile.name)
+
+        # Retrieve the user account's SID.
+        ldb_res = samdb.search(scope=SCOPE_SUBTREE,
+                               expression="(sAMAccountName=%s)" % user_name,
+                               attrs=["objectSid"])
+        self.assertEqual(1, len(ldb_res))
+        sid = ndr_unpack(security.dom_sid, ldb_res[0]["objectSid"][0])
+
+        if rename:
+            # Rename the account.
+
+            new_name = self.get_new_username()
+
+            msg = ldb.Message(user_credentials.get_dn())
+            msg['sAMAccountName'] = ldb.MessageElement(new_name,
+                                                       ldb.FLAG_MOD_REPLACE,
+                                                       'sAMAccountName')
+            samdb.modify(msg)
 
         # Set the Kerberos 5 credentials cache environment variable. This is
         # required because the codepath that gets run (gse_krb5) looks for it
@@ -72,13 +115,6 @@ class SmbTests(KDCBaseTest):
 
         # Authenticate in-process to the machine account using the user's
         # cached credentials.
-
-        # Retrieve the user account's SID.
-        ldb_res = samdb.search(scope=SCOPE_SUBTREE,
-                               expression="(sAMAccountName=%s)" % user_name,
-                               attrs=["objectSid"])
-        self.assertEqual(1, len(ldb_res))
-        sid = ndr_unpack(security.dom_sid, ldb_res[0]["objectSid"][0])
 
         # Connect to a share and retrieve the user SID.
         s3_lp = s3param.get_context()
@@ -92,15 +128,22 @@ class SmbTests(KDCBaseTest):
         self.addCleanup(s3_lp.set, "client max protocol", max_protocol)
         s3_lp.set("client max protocol", "NT1")
 
-        conn = libsmb.Conn(mach_name, share, lp=s3_lp, creds=creds)
+        try:
+            conn = libsmb.Conn(mach_name, share, lp=s3_lp, creds=creds)
+        except NTSTATUSError as e:
+            if not expect_error:
+                self.fail()
+
+            enum, _ = e.args
+            self.assertEqual(NT_STATUS_NO_IMPERSONATION_TOKEN, enum)
+            return
+        else:
+            self.assertFalse(expect_error)
 
         (uid, gid, gids, sids, guest) = conn.posix_whoami()
 
         # Ensure that they match.
         self.assertEqual(sid, sids[0])
-
-        # Remove the cached credentials file.
-        os.remove(cachefile.name)
 
 
 if __name__ == "__main__":
