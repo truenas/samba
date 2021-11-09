@@ -596,6 +596,12 @@ class RawKerberosTest(TestCaseInTempDir):
             tkt_sig_support = '0'
         cls.tkt_sig_support = bool(int(tkt_sig_support))
 
+        expect_pac = samba.tests.env_get_var_value('EXPECT_PAC',
+                                                   allow_missing=True)
+        if expect_pac is None:
+            expect_pac = '1'
+        cls.expect_pac = bool(int(expect_pac))
+
     def setUp(self):
         super().setUp()
         self.do_asn1_print = False
@@ -1102,13 +1108,14 @@ class RawKerberosTest(TestCaseInTempDir):
                                      f"unexpected in {v}")
 
     def assertSequenceElementsEqual(self, expected, got, *,
-                                    require_strict=None):
-        if self.strict_checking:
+                                    require_strict=None,
+                                    require_ordered=True):
+        if self.strict_checking and require_ordered:
             self.assertEqual(expected, got)
         else:
             fail_msg = f'expected: {expected} got: {got}'
 
-            if require_strict is not None:
+            if not self.strict_checking and require_strict is not None:
                 fail_msg += f' (ignoring: {require_strict})'
                 expected = (x for x in expected if x not in require_strict)
                 got = (x for x in got if x not in require_strict)
@@ -1984,6 +1991,9 @@ class RawKerberosTest(TestCaseInTempDir):
                          expected_anon=False,
                          expected_srealm=None,
                          expected_sname=None,
+                         expected_account_name=None,
+                         expected_upn_name=None,
+                         expected_sid=None,
                          expected_supported_etypes=None,
                          expected_flags=None,
                          unexpected_flags=None,
@@ -2016,6 +2026,10 @@ class RawKerberosTest(TestCaseInTempDir):
                          expect_edata=None,
                          expect_pac=True,
                          expect_claims=True,
+                         expect_upn_dns_info_ex=None,
+                         expect_pac_attrs=None,
+                         expect_pac_attrs_pac_request=None,
+                         expect_requester_sid=None,
                          to_rodc=False):
         if expected_error_mode == 0:
             expected_error_mode = ()
@@ -2033,6 +2047,9 @@ class RawKerberosTest(TestCaseInTempDir):
             'expected_anon': expected_anon,
             'expected_srealm': expected_srealm,
             'expected_sname': expected_sname,
+            'expected_account_name': expected_account_name,
+            'expected_upn_name': expected_upn_name,
+            'expected_sid': expected_sid,
             'expected_supported_etypes': expected_supported_etypes,
             'expected_flags': expected_flags,
             'unexpected_flags': unexpected_flags,
@@ -2065,6 +2082,10 @@ class RawKerberosTest(TestCaseInTempDir):
             'expect_edata': expect_edata,
             'expect_pac': expect_pac,
             'expect_claims': expect_claims,
+            'expect_upn_dns_info_ex': expect_upn_dns_info_ex,
+            'expect_pac_attrs': expect_pac_attrs,
+            'expect_pac_attrs_pac_request': expect_pac_attrs_pac_request,
+            'expect_requester_sid': expect_requester_sid,
             'to_rodc': to_rodc
         }
         if callback_dict is None:
@@ -2078,6 +2099,9 @@ class RawKerberosTest(TestCaseInTempDir):
                           expected_anon=False,
                           expected_srealm=None,
                           expected_sname=None,
+                          expected_account_name=None,
+                          expected_upn_name=None,
+                          expected_sid=None,
                           expected_supported_etypes=None,
                           expected_flags=None,
                           unexpected_flags=None,
@@ -2109,6 +2133,10 @@ class RawKerberosTest(TestCaseInTempDir):
                           expect_edata=None,
                           expect_pac=True,
                           expect_claims=True,
+                          expect_upn_dns_info_ex=None,
+                          expect_pac_attrs=None,
+                          expect_pac_attrs_pac_request=None,
+                          expect_requester_sid=None,
                           expected_proxy_target=None,
                           expected_transited_services=None,
                           to_rodc=False):
@@ -2128,6 +2156,9 @@ class RawKerberosTest(TestCaseInTempDir):
             'expected_anon': expected_anon,
             'expected_srealm': expected_srealm,
             'expected_sname': expected_sname,
+            'expected_account_name': expected_account_name,
+            'expected_upn_name': expected_upn_name,
+            'expected_sid': expected_sid,
             'expected_supported_etypes': expected_supported_etypes,
             'expected_flags': expected_flags,
             'unexpected_flags': unexpected_flags,
@@ -2159,6 +2190,10 @@ class RawKerberosTest(TestCaseInTempDir):
             'expect_edata': expect_edata,
             'expect_pac': expect_pac,
             'expect_claims': expect_claims,
+            'expect_upn_dns_info_ex': expect_upn_dns_info_ex,
+            'expect_pac_attrs': expect_pac_attrs,
+            'expect_pac_attrs_pac_request': expect_pac_attrs_pac_request,
+            'expect_requester_sid': expect_requester_sid,
             'expected_proxy_target': expected_proxy_target,
             'expected_transited_services': expected_transited_services,
             'to_rodc': to_rodc
@@ -2208,9 +2243,19 @@ class RawKerberosTest(TestCaseInTempDir):
             self.assertIsNotNone(ticket_encpart)
             if ticket_encpart is not None:  # Never None, but gives indentation
                 self.assertElementPresent(ticket_encpart, 'etype')
-                # 'unspecified' means present, with any value != 0
-                self.assertElementKVNO(ticket_encpart, 'kvno',
-                                       self.unspecified_kvno)
+
+                kdc_options = kdc_exchange_dict['kdc_options']
+                pos = len(tuple(krb5_asn1.KDCOptions('enc-tkt-in-skey'))) - 1
+                expect_kvno = (pos >= len(kdc_options)
+                               or kdc_options[pos] != '1')
+                if expect_kvno:
+                    # 'unspecified' means present, with any value != 0
+                    self.assertElementKVNO(ticket_encpart, 'kvno',
+                                           self.unspecified_kvno)
+                else:
+                    # For user-to-user, don't expect a kvno.
+                    self.assertElementMissing(ticket_encpart, 'kvno')
+
                 self.assertElementPresent(ticket_encpart, 'cipher')
                 ticket_cipher = self.getElementValue(ticket_encpart, 'cipher')
         self.assertElementPresent(rep, 'enc-part')
@@ -2342,6 +2387,10 @@ class RawKerberosTest(TestCaseInTempDir):
         renewable_pos = len(tuple(krb5_asn1.KDCOptions('renewable'))) - 1
         renewable = (renewable_pos < len(kdc_options)
                      and kdc_options[renewable_pos] == '1')
+        renew_pos = len(tuple(krb5_asn1.KDCOptions('renew'))) - 1
+        renew = (renew_pos < len(kdc_options)
+                 and kdc_options[renew_pos] == '1')
+        expect_renew_till = renewable or renew
 
         expected_crealm = kdc_exchange_dict['expected_crealm']
         expected_cname = kdc_exchange_dict['expected_cname']
@@ -2367,7 +2416,17 @@ class RawKerberosTest(TestCaseInTempDir):
             krbtgt_creds = self.get_krbtgt_creds()
         krbtgt_key = self.TicketDecryptionKey_from_creds(krbtgt_creds)
 
-        expect_pac = kdc_exchange_dict['expect_pac']
+        krbtgt_keys = [krbtgt_key]
+        if not self.strict_checking:
+            krbtgt_key_rc4 = self.TicketDecryptionKey_from_creds(
+                krbtgt_creds,
+                etype=kcrypto.Enctype.RC4)
+            krbtgt_keys.append(krbtgt_key_rc4)
+
+        if self.expect_pac and self.is_tgs(expected_sname):
+            expect_pac = True
+        else:
+            expect_pac = kdc_exchange_dict['expect_pac']
 
         ticket_session_key = None
         if ticket_private is not None:
@@ -2391,15 +2450,16 @@ class RawKerberosTest(TestCaseInTempDir):
             if self.strict_checking:
                 self.assertElementPresent(ticket_private, 'starttime')
             self.assertElementPresent(ticket_private, 'endtime')
-            if renewable:
+            if expect_renew_till:
                 if self.strict_checking:
                     self.assertElementPresent(ticket_private, 'renew-till')
             else:
                 self.assertElementMissing(ticket_private, 'renew-till')
             if self.strict_checking:
                 self.assertElementEqual(ticket_private, 'caddr', [])
-            self.assertElementPresent(ticket_private, 'authorization-data',
-                                      expect_empty=not expect_pac)
+            if expect_pac is not None:
+                self.assertElementPresent(ticket_private, 'authorization-data',
+                                          expect_empty=not expect_pac)
 
         encpart_session_key = None
         if encpart_private is not None:
@@ -2427,7 +2487,7 @@ class RawKerberosTest(TestCaseInTempDir):
             if self.strict_checking:
                 self.assertElementPresent(encpart_private, 'starttime')
             self.assertElementPresent(encpart_private, 'endtime')
-            if renewable:
+            if expect_renew_till:
                 if self.strict_checking:
                     self.assertElementPresent(encpart_private, 'renew-till')
             else:
@@ -2504,17 +2564,20 @@ class RawKerberosTest(TestCaseInTempDir):
 
         if ticket_private is not None:
             pac_data = self.get_ticket_pac(ticket_creds, expect_pac=expect_pac)
-            if expect_pac:
-                self.check_pac_buffers(pac_data, kdc_exchange_dict)
-            else:
+            if expect_pac is True:
+                self.assertIsNotNone(pac_data)
+            elif expect_pac is False:
                 self.assertIsNone(pac_data)
+
+            if pac_data is not None:
+                self.check_pac_buffers(pac_data, kdc_exchange_dict)
 
         expect_ticket_checksum = kdc_exchange_dict['expect_ticket_checksum']
         if expect_ticket_checksum:
             self.assertIsNotNone(ticket_decryption_key)
 
         if ticket_decryption_key is not None:
-            self.verify_ticket(ticket_creds, krbtgt_key, expect_pac=expect_pac,
+            self.verify_ticket(ticket_creds, krbtgt_keys, expect_pac=expect_pac,
                                expect_ticket_checksum=expect_ticket_checksum
                                or self.tkt_sig_support)
 
@@ -2554,12 +2617,37 @@ class RawKerberosTest(TestCaseInTempDir):
         if not self.is_tgs(expected_sname):
             expected_types.append(krb5pac.PAC_TYPE_TICKET_CHECKSUM)
 
-        if self.strict_checking:
-            buffer_types = [pac_buffer.type
-                            for pac_buffer in pac.buffers]
-            self.assertCountEqual(expected_types, buffer_types,
-                                  f'expected: {expected_types} '
-                                  f'got: {buffer_types}')
+        require_strict = {krb5pac.PAC_TYPE_CLIENT_CLAIMS_INFO}
+        if not self.tkt_sig_support:
+            require_strict.add(krb5pac.PAC_TYPE_TICKET_CHECKSUM)
+
+        expect_pac_attrs = kdc_exchange_dict['expect_pac_attrs']
+        if expect_pac_attrs:
+            expected_types.append(krb5pac.PAC_TYPE_ATTRIBUTES_INFO)
+        elif expect_pac_attrs is None:
+            require_strict.add(krb5pac.PAC_TYPE_ATTRIBUTES_INFO)
+
+        expect_requester_sid = kdc_exchange_dict['expect_requester_sid']
+        if expect_requester_sid:
+            expected_types.append(krb5pac.PAC_TYPE_REQUESTER_SID)
+        elif expect_requester_sid is None:
+            require_strict.add(krb5pac.PAC_TYPE_REQUESTER_SID)
+
+        buffer_types = [pac_buffer.type
+                        for pac_buffer in pac.buffers]
+        self.assertSequenceElementsEqual(
+            expected_types, buffer_types,
+            require_ordered=False,
+            require_strict=require_strict)
+
+        expected_account_name = kdc_exchange_dict['expected_account_name']
+        expected_sid = kdc_exchange_dict['expected_sid']
+
+        expect_upn_dns_info_ex = kdc_exchange_dict['expect_upn_dns_info_ex']
+        if expect_upn_dns_info_ex is None and (
+                expected_account_name is not None
+                or expected_sid is not None):
+            expect_upn_dns_info_ex = True
 
         for pac_buffer in pac.buffers:
             if pac_buffer.type == krb5pac.PAC_TYPE_CONSTRAINED_DELEGATION:
@@ -2583,6 +2671,68 @@ class RawKerberosTest(TestCaseInTempDir):
                 account_name = expected_cname['name-string'][0]
 
                 self.assertEqual(account_name, pac_buffer.info.account_name)
+
+            elif pac_buffer.type == krb5pac.PAC_TYPE_LOGON_INFO:
+                logon_info = pac_buffer.info.info.info3.base
+
+                if expected_account_name is not None:
+                    self.assertEqual(expected_account_name,
+                                     str(logon_info.account_name))
+
+                if expected_sid is not None:
+                    expected_rid = int(expected_sid.rsplit('-', 1)[1])
+                    self.assertEqual(expected_rid, logon_info.rid)
+
+            elif pac_buffer.type == krb5pac.PAC_TYPE_UPN_DNS_INFO:
+                upn_dns_info = pac_buffer.info
+                upn_dns_info_ex = upn_dns_info.ex
+
+                expected_realm = kdc_exchange_dict['expected_crealm']
+                self.assertEqual(expected_realm,
+                                 upn_dns_info.dns_domain_name)
+
+                expected_upn_name = kdc_exchange_dict['expected_upn_name']
+                if expected_upn_name is not None:
+                    self.assertEqual(expected_upn_name,
+                                     upn_dns_info.upn_name)
+
+                if expect_upn_dns_info_ex:
+                    self.assertIsNotNone(upn_dns_info_ex)
+
+                if upn_dns_info_ex is not None:
+                    if expected_account_name is not None:
+                        self.assertEqual(expected_account_name,
+                                         upn_dns_info_ex.samaccountname)
+
+                    if expected_sid is not None:
+                        self.assertEqual(expected_sid,
+                                         str(upn_dns_info_ex.objectsid))
+
+            elif (pac_buffer.type == krb5pac.PAC_TYPE_ATTRIBUTES_INFO
+                      and expect_pac_attrs):
+                attr_info = pac_buffer.info
+
+                self.assertEqual(2, attr_info.flags_length)
+
+                flags = attr_info.flags
+
+                requested_pac = bool(flags & 1)
+                given_pac = bool(flags & 2)
+
+                expect_pac_attrs_pac_request = kdc_exchange_dict[
+                    'expect_pac_attrs_pac_request']
+
+                self.assertEqual(expect_pac_attrs_pac_request is True,
+                                 requested_pac)
+                self.assertEqual(expect_pac_attrs_pac_request is None,
+                                 given_pac)
+
+            elif (pac_buffer.type == krb5pac.PAC_TYPE_REQUESTER_SID
+                      and expect_requester_sid):
+                requester_sid = pac_buffer.info.sid
+
+                self.assertIsNotNone(expected_sid)
+                self.assertEqual(expected_sid, str(requester_sid))
 
     def generic_check_kdc_error(self,
                                 kdc_exchange_dict,
@@ -3061,11 +3211,10 @@ class RawKerberosTest(TestCaseInTempDir):
                                         ticket_blob)
         self.assertEqual(expected_checksum, checksum)
 
-    def verify_ticket(self, ticket, krbtgt_key, expect_pac=True,
+    def verify_ticket(self, ticket, krbtgt_keys, expect_pac=True,
                       expect_ticket_checksum=True):
         # Check if the ticket is a TGT.
-        sname = ticket.ticket['sname']
-        is_tgt = self.is_tgs(sname)
+        is_tgt = self.is_tgt(ticket)
 
         # Decrypt the ticket.
 
@@ -3150,6 +3299,16 @@ class RawKerberosTest(TestCaseInTempDir):
 
         kdc_checksum, kdc_ctype = checksums[
             krb5pac.PAC_TYPE_KDC_CHECKSUM]
+
+        if isinstance(krbtgt_keys, collections.abc.Container):
+            if self.strict_checking:
+                krbtgt_key = krbtgt_keys[0]
+            else:
+                krbtgt_key = next(key for key in krbtgt_keys
+                                  if key.ctype == kdc_ctype)
+        else:
+            krbtgt_key = krbtgt_keys
+
         krbtgt_key.verify_rodc_checksum(KU_NON_KERB_CKSUM_SALT,
                                         server_checksum,
                                         kdc_ctype,
@@ -3181,6 +3340,7 @@ class RawKerberosTest(TestCaseInTempDir):
                         modify_fn=None,
                         modify_pac_fn=None,
                         exclude_pac=False,
+                        allow_empty_authdata=False,
                         update_pac_checksums=True,
                         checksum_keys=None,
                         include_checksums=None):
@@ -3210,7 +3370,7 @@ class RawKerberosTest(TestCaseInTempDir):
             self.assertFalse(checksum_keys)
             self.assertFalse(include_checksums)
 
-        expect_pac = update_pac_checksums or modify_pac_fn is not None
+        expect_pac = modify_pac_fn is not None
 
         key = ticket.decryption_key
 
@@ -3289,8 +3449,10 @@ class RawKerberosTest(TestCaseInTempDir):
 
             # Replace the PAC in the authorization data and re-add it to the
             # ticket enc-part.
-            auth_data, _ = self.replace_pac(auth_data, new_pac,
-                                            expect_pac=expect_pac)
+            auth_data, _ = self.replace_pac(
+                auth_data, new_pac,
+                expect_pac=expect_pac,
+                allow_empty_authdata=allow_empty_authdata)
             enc_part['authorization-data'] = auth_data
 
         # Re-encrypt the ticket enc-part with the new key.
@@ -3411,7 +3573,8 @@ class RawKerberosTest(TestCaseInTempDir):
 
             kdc_checksum_buffer.info.signature = kdc_checksum
 
-    def replace_pac(self, auth_data, new_pac, expect_pac=True):
+    def replace_pac(self, auth_data, new_pac, expect_pac=True,
+                    allow_empty_authdata=False):
         if new_pac is not None:
             self.assertElementEqual(new_pac, 'ad-type', AD_WIN2K_PAC)
             self.assertElementPresent(new_pac, 'ad-data')
@@ -3440,7 +3603,7 @@ class RawKerberosTest(TestCaseInTempDir):
                 if expect_pac:
                     self.assertIsNotNone(old_pac, 'Expected PAC')
 
-                if relevant_elems:
+                if relevant_elems or allow_empty_authdata:
                     ad_relevant = self.der_encode(
                         relevant_elems,
                         asn1Spec=krb5_asn1.AD_IF_RELEVANT())
@@ -3451,7 +3614,7 @@ class RawKerberosTest(TestCaseInTempDir):
                 else:
                     authdata_elem = None
 
-            if authdata_elem is not None:
+            if authdata_elem is not None or allow_empty_authdata:
                 new_auth_data.append(authdata_elem)
 
         if expect_pac:
@@ -3483,6 +3646,10 @@ class RawKerberosTest(TestCaseInTempDir):
     def is_tgs(self, principal):
         name = principal['name-string'][0]
         return name in ('krbtgt', b'krbtgt')
+
+    def is_tgt(self, ticket):
+        sname = ticket.ticket['sname']
+        return self.is_tgs(sname)
 
     def get_empty_pac(self):
         return self.AuthorizationData_create(AD_WIN2K_PAC, bytes(1))
@@ -3548,6 +3715,9 @@ class RawKerberosTest(TestCaseInTempDir):
                           etypes,
                           padata,
                           kdc_options,
+                          expected_account_name=None,
+                          expected_upn_name=None,
+                          expected_sid=None,
                           expected_flags=None,
                           unexpected_flags=None,
                           expected_supported_etypes=None,
@@ -3556,6 +3726,9 @@ class RawKerberosTest(TestCaseInTempDir):
                           pac_request=None,
                           pac_options=None,
                           expect_pac=True,
+                          expect_pac_attrs=None,
+                          expect_pac_attrs_pac_request=None,
+                          expect_requester_sid=None,
                           to_rodc=False):
 
         def _generate_padata_copy(_kdc_exchange_dict,
@@ -3580,6 +3753,9 @@ class RawKerberosTest(TestCaseInTempDir):
             expected_cname=expected_cname,
             expected_srealm=expected_srealm,
             expected_sname=expected_sname,
+            expected_account_name=expected_account_name,
+            expected_upn_name=expected_upn_name,
+            expected_sid=expected_sid,
             expected_supported_etypes=expected_supported_etypes,
             ticket_decryption_key=ticket_decryption_key,
             generate_padata_fn=generate_padata_fn,
@@ -3596,6 +3772,9 @@ class RawKerberosTest(TestCaseInTempDir):
             pac_request=pac_request,
             pac_options=pac_options,
             expect_pac=expect_pac,
+            expect_pac_attrs=expect_pac_attrs,
+            expect_pac_attrs_pac_request=expect_pac_attrs_pac_request,
+            expect_requester_sid=expect_requester_sid,
             to_rodc=to_rodc)
 
         rep = self._generic_kdc_exchange(kdc_exchange_dict,

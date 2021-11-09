@@ -417,7 +417,6 @@ struct PAC_LOGON_INFO;
 NTSTATUS get_user_from_kerberos_info(TALLOC_CTX *mem_ctx,
 				     const char *cli_name,
 				     const char *princ_name,
-				     struct PAC_LOGON_INFO *logon_info,
 				     bool *is_mapped,
 				     bool *mapped_to_guest,
 				     char **ntuser,
@@ -429,9 +428,7 @@ NTSTATUS make_session_info_krb5(TALLOC_CTX *mem_ctx,
 				char *ntdomain,
 				char *username,
 				struct passwd *pw,
-				const struct netr_SamInfo3 *info3,
 				bool mapped_to_guest, bool username_was_mapped,
-				DATA_BLOB *session_key,
 				struct auth_session_info **session_info);
 
 /* The following definitions come from auth/auth_samba4.c  */

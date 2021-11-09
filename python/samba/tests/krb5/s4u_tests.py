@@ -238,6 +238,10 @@ class S4UKerberosTests(KDCBaseTest):
         client_cname = self.PrincipalName_create(name_type=NT_PRINCIPAL,
                                                  names=[client_name])
 
+        samdb = self.get_samdb()
+        client_dn = client_creds.get_dn()
+        sid = self.get_objectSid(samdb, client_dn)
+
         service_name = service_creds.get_username()[:-1]
         service_sname = self.PrincipalName_create(name_type=NT_PRINCIPAL,
                                                   names=['host', service_name])
@@ -251,6 +255,17 @@ class S4UKerberosTests(KDCBaseTest):
         unexpected_flags = kdc_dict.pop('unexpected_flags', None)
         if unexpected_flags is not None:
             unexpected_flags = krb5_asn1.TicketFlags(unexpected_flags)
+
+        expected_error_mode = kdc_dict.pop('expected_error_mode', 0)
+        expected_status = kdc_dict.pop('expected_status', None)
+        if expected_error_mode:
+            check_error_fn = self.generic_check_kdc_error
+            check_rep_fn = None
+        else:
+            check_error_fn = None
+            check_rep_fn = self.generic_check_kdc_rep
+
+            self.assertIsNone(expected_status)
 
         kdc_options = kdc_dict.pop('kdc_options', '0')
         kdc_options = krb5_asn1.KDCOptions(kdc_options)
@@ -279,14 +294,18 @@ class S4UKerberosTests(KDCBaseTest):
             expected_cname=client_cname,
             expected_srealm=realm,
             expected_sname=service_sname,
+            expected_account_name=client_name,
+            expected_sid=sid,
             expected_flags=expected_flags,
             unexpected_flags=unexpected_flags,
             ticket_decryption_key=service_decryption_key,
             expect_ticket_checksum=True,
             generate_padata_fn=generate_s4u2self_padata,
-            check_rep_fn=self.generic_check_kdc_rep,
+            check_error_fn=check_error_fn,
+            check_rep_fn=check_rep_fn,
             check_kdc_private_fn=self.generic_check_kdc_private,
-            expected_error_mode=0,
+            expected_error_mode=expected_error_mode,
+            expected_status=expected_status,
             tgt=service_tgt,
             authenticator_subkey=authenticator_subkey,
             kdc_options=str(kdc_options),
@@ -312,6 +331,26 @@ class S4UKerberosTests(KDCBaseTest):
                 'kdc_options': 'forwardable',
                 'modify_service_tgt_fn': functools.partial(
                     self.set_ticket_forwardable, flag=True),
+                'expected_flags': 'forwardable'
+            })
+
+    # Test performing an S4U2Self operation with a forwardable ticket that does
+    # not contain a PAC. The request should fail.
+    def test_s4u2self_no_pac(self):
+        def forwardable_no_pac(ticket):
+            ticket = self.set_ticket_forwardable(ticket, flag=True)
+            return self.remove_ticket_pac(ticket)
+
+        self._run_s4u2self_test(
+            {
+                'expected_error_mode': (KDC_ERR_GENERIC,
+                                        KDC_ERR_BADOPTION),
+                'expected_status': ntstatus.NT_STATUS_INVALID_PARAMETER,
+                'client_opts': {
+                    'not_delegated': False
+                },
+                'kdc_options': 'forwardable',
+                'modify_service_tgt_fn': forwardable_no_pac,
                 'expected_flags': 'forwardable'
             })
 
@@ -438,6 +477,10 @@ class S4UKerberosTests(KDCBaseTest):
             account_type=self.AccountType.USER,
             opts=client_opts)
 
+        samdb = self.get_samdb()
+        client_dn = client_creds.get_dn()
+        sid = self.get_objectSid(samdb, client_dn)
+
         service1_opts = kdc_dict.pop('service1_opts', {})
         service2_opts = kdc_dict.pop('service2_opts', {})
 
@@ -552,6 +595,8 @@ class S4UKerberosTests(KDCBaseTest):
             expected_cname=client_cname,
             expected_srealm=service2_realm,
             expected_sname=service2_sname,
+            expected_account_name=client_username,
+            expected_sid=sid,
             expected_supported_etypes=service2_etypes,
             ticket_decryption_key=service2_decryption_key,
             check_error_fn=check_error_fn,
