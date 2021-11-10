@@ -1166,7 +1166,6 @@ smb_zfs_snapshot(struct smbzhandle *hdl,
 		return -1;
 	}
 	dataset_name = zfs_get_name(zfsp);
-	zfs_close(zfsp);
 	ret = snprintf(snap, sizeof(snap), "%s@%s",
 		       dataset_name, snapshot_name);
 	if (ret < 0) {
@@ -1177,10 +1176,9 @@ smb_zfs_snapshot(struct smbzhandle *hdl,
 	ret = zfs_snapshot(hdl->lz->sli->libzfsp,
 			   snap, recursive, NULL);
 	if (ret != 0) {
-		DBG_ERR("Failed to create snapshot %s: [%s]\n",
+		DBG_ERR("Failed to create snapshot %s: %s\n",
 			snap, strerror(errno));
 	}
-	DBG_INFO("Successfully created snapshot: %s\n", snap);
 	return ret;
 }
 
