@@ -1196,7 +1196,7 @@ static NTSTATUS reopen_from_procfd(struct files_struct *fsp,
 				fsp,
 				&proc_fname,
 				fsp,
-				flag | O_EMPTY_PATH,
+				flags | O_EMPTY_PATH,
 				mode);
 
 #else
