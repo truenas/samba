@@ -1178,6 +1178,29 @@ static NTSTATUS reopen_from_procfd(struct files_struct *fsp,
 		return NT_STATUS_INVALID_HANDLE;
 	}
 
+#ifdef O_EMPTY_PATH
+	/*
+	 * This is the FreeBSD method of converting
+	 * an O_PATH descriptor into a regular open.
+	 * In this situation, dirfsp will be the
+	 * the pathref fsp / target. The path for the
+	 * openat syscall is an empty string, and
+	 * the O_EMPTY_PATH flag must be added.
+	 */
+	proc_fname = (struct smb_filename) {
+		.base_name = "",
+	};
+
+	fsp->fsp_flags.is_pathref = false;
+	new_fd = SMB_VFS_OPENAT(fsp->conn,
+				fsp,
+				&proc_fname,
+				fsp,
+				flag | O_EMPTY_PATH,
+				mode);
+
+#else
+
 	p = sys_proc_fd_path(old_fd, buf, sizeof(buf));
 	if (p == NULL) {
 		return NT_STATUS_NO_MEMORY;
@@ -1195,6 +1218,8 @@ static NTSTATUS reopen_from_procfd(struct files_struct *fsp,
 				fsp,
 				flags,
 				mode);
+#endif /* O_EMPTY_PATH */
+
 	if (new_fd == -1) {
 		status = map_nt_error_from_unix(errno);
 		SMB_VFS_CLOSE(fsp);
