@@ -179,6 +179,7 @@ static int zfs_core_get_quota(struct vfs_handle_struct *handle,
 	if (ds == NULL) {
 		DBG_ERR("Failed to retrive ZFS dataset handle on %s: %s\n",
 			smb_fname_str_dbg(smb_fname), strerror(errno));
+		return -1;
 	}
 	ZERO_STRUCT(zfs_qt);
 	switch (qtype) {
