@@ -283,8 +283,6 @@ static void bsdentry2smbace(acl_entry_t ae, SMB_ACE4PROP_T *aceprop)
 		}
 	}
 
-	aceprop->who.id = ae->ae_id;
-
 	if (ae->ae_entry_type == ACL_ENTRY_TYPE_ALLOW) {
 		aceprop->aceType = SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE;
 		aceprop->aceMask |= SMB_ACE4_SYNCHRONIZE;
@@ -310,6 +308,7 @@ static void bsdentry2smbace(acl_entry_t ae, SMB_ACE4PROP_T *aceprop)
 	case ACL_GROUP:
 		aceprop->aceFlags |= SMB_ACE4_IDENTIFIER_GROUP;
 	case ACL_USER:
+		aceprop->who.id = ae->ae_id;
 		aceprop->flags = 0;
 		break;
 	default:
@@ -408,6 +407,7 @@ static NTSTATUS ixnas_get_nt_acl_nfs4_common(struct connection_struct *conn,
 
 	for (cnt=0; cnt<bsdacl->ats_acl.acl_cnt; cnt++) {
 		SMB_ACE4PROP_T aceprop;
+		ZERO_STRUCT(aceprop);
 
 		bsdentry2smbace(&bsdacl->ats_acl.acl_entry[cnt], &aceprop);
 
