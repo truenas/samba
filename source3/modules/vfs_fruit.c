@@ -209,6 +209,7 @@ static struct adouble *ad_get_meta_fsp(TALLOC_CTX *ctx,
 				       const struct smb_filename *smb_fname)
 {
 	NTSTATUS status;
+	int rc;
 	struct adouble *ad = NULL;
 	struct smb_filename *smb_fname_cp = NULL;
 	struct fruit_config_data *config = NULL;
@@ -232,6 +233,10 @@ static struct adouble *ad_get_meta_fsp(TALLOC_CTX *ctx,
 		return NULL;
 	}
 	TALLOC_FREE(smb_fname_cp->stream_name);
+
+	rc = SMB_VFS_NEXT_STAT(handle, smb_fname_cp);
+	SMB_ASSERT(rc == 0);
+
 	config->in_openat_pathref_fsp = true;
 	status = openat_pathref_fsp(handle->conn->cwd_fsp,
 				    smb_fname_cp);
