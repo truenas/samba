@@ -235,12 +235,43 @@ static bool zfs_process_smbacl(vfs_handle_struct *handle, files_struct *fsp,
 	SMB_ASSERT(i == naces);
 
 	/* store acl */
+#ifdef O_PATH
+	if (fsp->fsp_flags.is_pathref) {
+		const char *proc_fd_path = NULL;
+		char buf[PATH_MAX];
+
+		if (!fsp->fsp_flags.have_proc_fds) {
+			DBG_ERR("fdescfs filesystem must be mounted with 'nodup' "
+				"option \n");
+			errno = EBADF;
+			return -1;
+		}
+
+		fd = fsp_get_pathref_fd(fsp);
+		proc_fd_path = sys_proc_fd_path(fd, buf, sizeof(buf));
+		if (proc_fd_path == NULL) {
+			DBG_ERR("%s: failed to generate pathref fd for %d\n",
+				fsp_str_dbg(fsp), fd);
+			errno = EBADF;
+			return -1;
+		}
+		rv = acl(proc_fd_path, ACE_SETACL, naces, acebuf);
+	} else {
+		fd = fsp_get_io_fd(fsp);
+		if (fd == -1) {
+			errno = EBADF;
+			return false;
+		}
+		rv = facl(fd, ACE_SETACL, naces, acebuf);
+	}
+#else
 	fd = fsp_get_pathref_fd(fsp);
 	if (fd == -1) {
 		errno = EBADF;
 		return false;
 	}
 	rv = facl(fd, ACE_SETACL, naces, acebuf);
+#endif
 	if (rv != 0) {
 		if(errno == ENOSYS) {
 			DEBUG(9, ("acl(ACE_SETACL, %s): Operation is not "
@@ -321,7 +352,38 @@ static int fget_zfsacl(TALLOC_CTX *mem_ctx,
 	ace_t *acebuf = NULL;
 	int fd;
 
+#ifdef O_PATH
+	if (fsp->fsp_flags.is_pathref) {
+		const char *proc_fd_path = NULL;
+		char buf[PATH_MAX];
+		struct smb_filename smb_fname;
+
+		if (!fsp->fsp_flags.have_proc_fds) {
+			DBG_ERR("fdescfs filesystem must be mounted with 'nodup' "
+				"option \n");
+			errno = EBADF;
+			return -1;
+		}
+
+		fd = fsp_get_pathref_fd(fsp);
+		proc_fd_path = sys_proc_fd_path(fd, buf, sizeof(buf));
+		if (proc_fd_path == NULL) {
+			DBG_ERR("%s: failed to generate pathref fd for %d\n",
+				fsp_str_dbg(fsp), fd);
+			errno = EBADF;
+			return -1;
+		}
+
+		smb_fname = (struct smb_filename) {
+			.base_name = discard_const_p(char, proc_fd_path)
+		};
+
+		return get_zfsacl(mem_ctx, &smb_fname, outbuf);
+	}
+	fd = fsp_get_io_fd(fsp);
+#else
 	fd = fsp_get_pathref_fd(fsp);
+#endif
 	if (fd == -1) {
 		errno = EBADF;
 		return -1;
