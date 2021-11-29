@@ -448,6 +448,7 @@ static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 {
 	struct SMB4ACL_T *pacl = NULL;
 	TALLOC_CTX *frame = NULL;
+	struct files_struct *to_check = NULL;
 	NTSTATUS status;
 	acl_t bsdacl;
 	struct ixnas_config_data *config = NULL;
@@ -460,7 +461,8 @@ static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 		return SMB_VFS_NEXT_FGET_NT_ACL(handle, fsp, security_info, mem_ctx, ppdesc);
 	}
 
-	bsdacl = fsp_get_bsdacl(fsp);
+	to_check = fsp->base_fsp ? fsp->base_fsp : fsp;
+	bsdacl = fsp_get_bsdacl(to_check);
 	if (bsdacl == NULL) {
 		if ((errno == EINVAL) &&
 		    (fsp_get_acl_brand(fsp) == ACL_BRAND_POSIX)) {

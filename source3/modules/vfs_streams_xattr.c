@@ -354,6 +354,7 @@ static int streams_xattr_openat(struct vfs_handle_struct *handle,
 	SMB_ASSERT(fsp_is_alternate_stream(fsp));
 	SMB_ASSERT(dirfsp == NULL);
 
+	fsp->fsp_flags.have_proc_fds = fsp->conn->have_proc_fds;
 	status = streams_xattr_get_name(handle, talloc_tos(),
 					smb_fname->stream_name, &xattr_name);
 	if (!NT_STATUS_IS_OK(status)) {
