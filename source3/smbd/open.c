@@ -1231,20 +1231,22 @@ static NTSTATUS reopen_from_procfd(struct files_struct *fsp,
 	 * openat syscall is an empty string, and
 	 * the O_EMPTY_PATH flag must be added.
 	 */
+	struct vfs_open_how tmp_how = {
+		.flags = flags | O_EMPTY_PATH,
+		.mode = mode
+	};
 	proc_fname = (struct smb_filename) {
 		.base_name = "",
+		.stream_name = fsp->fsp_name->stream_name,
 	};
 
-	how.flags |= O_EMPTY_PATH;
-
+	tmp_how.flags &= ~O_CREAT;
 	fsp->fsp_flags.is_pathref = false;
 	new_fd = SMB_VFS_OPENAT(fsp->conn,
 				fsp,
 				&proc_fname,
 				fsp,
 				&how);
-
-	how.flags &= ~O_EMPTY_PATH;
 #else
 
 	p = sys_proc_fd_path(old_fd, buf, sizeof(buf));
