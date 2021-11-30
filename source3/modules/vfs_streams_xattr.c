@@ -1589,6 +1589,24 @@ static bool streams_xattr_strict_lock_check(struct vfs_handle_struct *handle,
 	return true;
 }
 
+static NTSTATUS streams_xattr_get_nt_acl(vfs_handle_struct *handle,
+					 files_struct *fsp,
+					 uint32_t security_info,
+					 TALLOC_CTX *mem_ctx,
+					 struct security_descriptor **ppdesc)
+{
+	struct files_struct *to_check = NULL;
+
+	to_check = fsp->base_fsp ? fsp->base_fsp : fsp;
+
+	return SMB_VFS_NEXT_FGET_NT_ACL(handle,
+					to_check,
+					security_info,
+					mem_ctx,
+					ppdesc);
+}
+
+
 static struct vfs_fn_pointers vfs_streams_xattr_fns = {
 	.fs_capabilities_fn = streams_xattr_fs_capabilities,
 	.connect_fn = streams_xattr_connect,
@@ -1608,6 +1626,8 @@ static struct vfs_fn_pointers vfs_streams_xattr_fns = {
 	.ftruncate_fn = streams_xattr_ftruncate,
 	.fallocate_fn = streams_xattr_fallocate,
 	.fstreaminfo_fn = streams_xattr_fstreaminfo,
+
+	.fget_nt_acl_fn = streams_xattr_get_nt_acl,
 
 	.fsync_send_fn = streams_xattr_fsync_send,
 	.fsync_recv_fn = streams_xattr_fsync_recv,
