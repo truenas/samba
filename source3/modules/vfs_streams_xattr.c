@@ -355,11 +355,9 @@ static int streams_xattr_openat(struct vfs_handle_struct *handle,
 	SMB_ASSERT(dirfsp == NULL);
 #if 0 /* Logic from TrueNAS samba 4.15... need to investigate whether applies in 4.17 */
 #ifdef O_EMPTY_PATH
-	if (!flags & O_EMPTY_PATH) {
-		SMB_ASSERT(fsp_get_pathref_fd(dirfsp) == AT_FDCWD);
+	if (flags & O_EMPTY_PATH) {
+		return vfs_fake_fd();
 	}
-#else
-	SMB_ASSERT(fsp_get_pathref_fd(dirfsp) == AT_FDCWD);
 #endif
 #endif 
 	fsp->fsp_flags.have_proc_fds = fsp->conn->have_proc_fds;
