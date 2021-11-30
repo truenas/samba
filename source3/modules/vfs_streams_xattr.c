@@ -355,12 +355,11 @@ static int streams_xattr_openat(struct vfs_handle_struct *handle,
 	 * For now assert this, so the below SMB_VFS_SETXATTR() works.
 	 */
 #ifdef O_EMPTY_PATH
-	if (!flags & O_EMPTY_PATH) {
-		SMB_ASSERT(fsp_get_pathref_fd(dirfsp) == AT_FDCWD);
+	if (flags & O_EMPTY_PATH) {
+		return vfs_fake_fd();
 	}
-#else
-	SMB_ASSERT(fsp_get_pathref_fd(dirfsp) == AT_FDCWD);
 #endif
+	SMB_ASSERT(fsp_get_pathref_fd(dirfsp) == AT_FDCWD);
 	fsp->fsp_flags.have_proc_fds = fsp->conn->have_proc_fds;
 
 	status = streams_xattr_get_name(handle, talloc_tos(),
