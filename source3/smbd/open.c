@@ -1189,14 +1189,17 @@ static NTSTATUS reopen_from_procfd(struct files_struct *fsp,
 	 */
 	proc_fname = (struct smb_filename) {
 		.base_name = "",
+		.stream_name = fsp->fsp_name->stream_name,
 	};
 
 	fsp->fsp_flags.is_pathref = false;
+	flags &= ~O_CREAT;
+	flags |= O_EMPTY_PATH;
 	new_fd = SMB_VFS_OPENAT(fsp->conn,
 				fsp,
 				&proc_fname,
 				fsp,
-				flags | O_EMPTY_PATH,
+				flags,
 				mode);
 
 #else
