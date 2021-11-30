@@ -2264,26 +2264,26 @@ static int fruit_unlinkat(vfs_handle_struct *handle,
 	 * delete_all_streams() can't remove 0 byte resource fork
 	 * streams, so we have to cleanup this here.
 	 */
-#if 0
-	rsrc_smb_fname = synthetic_smb_fname(talloc_tos(),
-					     smb_fname->base_name,
-					     AFPRESOURCE_STREAM_NAME,
-					     NULL,
-					     smb_fname->twrp,
-					     smb_fname->flags);
-	if (rsrc_smb_fname == NULL) {
-		return -1;
-	}
+	if (config->rsrc == FRUIT_RSRC_ADFILE) {
+		rsrc_smb_fname = synthetic_smb_fname(talloc_tos(),
+						     smb_fname->base_name,
+						     AFPRESOURCE_STREAM_NAME,
+						     NULL,
+						     smb_fname->twrp,
+						     smb_fname->flags);
+		if (rsrc_smb_fname == NULL) {
+			return -1;
+		}
 
-	ret = fruit_unlink_rsrc(handle, dirfsp, rsrc_smb_fname, true);
-	if ((ret != 0) && (errno != ENOENT)) {
-		DBG_ERR("Forced unlink of [%s] failed [%s]\n",
-			smb_fname_str_dbg(rsrc_smb_fname), strerror(errno));
+		ret = fruit_unlink_rsrc(handle, dirfsp, rsrc_smb_fname, true);
+		if ((ret != 0) && (errno != ENOENT)) {
+			DBG_ERR("Forced unlink of [%s] failed [%s]\n",
+				smb_fname_str_dbg(rsrc_smb_fname), strerror(errno));
+			TALLOC_FREE(rsrc_smb_fname);
+			return -1;
+		}
 		TALLOC_FREE(rsrc_smb_fname);
-		return -1;
 	}
-	TALLOC_FREE(rsrc_smb_fname);
-#endif
 
 	return SMB_VFS_NEXT_UNLINKAT(handle,
 			dirfsp,
