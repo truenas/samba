@@ -2188,6 +2188,11 @@ static struct tevent_req *vfswrap_offload_write_send(
 		return tevent_req_post(req, ev);
 	}
 
+	if (vfswrap_offload_ctx == NULL) {
+		DBG_ERR("vfswrap_offload_ctx is not initialized\n");
+		tevent_req_nterror(req, NT_STATUS_INTERNAL_ERROR);
+		return tevent_req_post(req, ev);
+	}
 	status = vfs_offload_token_db_fetch_fsp(vfswrap_offload_ctx,
 						token, &src_fsp);
 	if (tevent_req_nterror(req, status)) {
