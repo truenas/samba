@@ -1384,33 +1384,31 @@ static int put_share_dataset_list(TALLOC_CTX *mem_ctx, const char *connectpath,
 int conn_zfs_init(TALLOC_CTX *mem_ctx,
 		  const char *connectpath,
 		  struct smblibzfshandle **plibzp,
-		  struct dataset_list **pdsl)
+		  struct dataset_list **pdsl,
+		  bool has_tcon)
 {
 	int ret = 0;
 	struct smbzhandle *conn_zfsp = NULL;
+	struct smblibzfshandle *libzp = NULL;
 	char *tmp_name = NULL;
 	size_t to_remove, new_len;
 	struct dataset_list *dl = NULL;
 
-	get_global_smblibzfs_handle(mem_ctx);
-	if (global_libzfs_handle == NULL) {
-		/*
-		 * Attempt to get libzfs handle should succeed even if share
-		 * is not on ZFS. Failure here is significant error condition
-		 * and therefore fatal.
-		 */
-		DBG_ERR("Failed to initialize global libzfs handle: %s\n",
-			strerror(errno));
-		errno = ENOMEM;
-		return -1;
+	if (!has_tcon) {
+		ret = get_smblibzfs_handle(mem_ctx, &libzp);
+		SMB_ASSERT(ret == 0);
+	} else {
+		get_global_smblibzfs_handle(mem_ctx);
+		SMB_ASSERT(global_libzfs_handle != NULL);
+		dl = share_lookup_dataset_list(connectpath);
+		if (dl != NULL) {
+			*plibzp = global_libzfs_handle;
+			*pdsl = dl;
+			return 0;
+		}
+		libzp = global_libzfs_handle;
 	}
-	dl = share_lookup_dataset_list(connectpath);
-	if (dl != NULL) {
-		*plibzp = global_libzfs_handle;
-		*pdsl = dl;
-		return 0;
-	}
-	get_smbzhandle(global_libzfs_handle, mem_ctx, connectpath, &conn_zfsp, true);
+	get_smbzhandle(libzp, mem_ctx, connectpath, &conn_zfsp, true);
 	/*
 	 * Attempt to get zfs dataset handle will fail if the dataset is a
 	 * snapshot. This may occur if the share is one dynamically created
@@ -1434,7 +1432,7 @@ int conn_zfs_init(TALLOC_CTX *mem_ctx,
 			TALLOC_FREE(tmp_name);
 		}
 	}
-	*plibzp = global_libzfs_handle;
+	*plibzp = libzp;
 	if (conn_zfsp == NULL) {
 		/*
 		 * The filesystem is most likely not ZFS. Jailed processes
@@ -1447,9 +1445,11 @@ int conn_zfs_init(TALLOC_CTX *mem_ctx,
 	if (dl == NULL) {
 		return 0;
 	}
-	ret = put_share_dataset_list(mem_ctx, connectpath, dl);
-	if (ret != 0) {
-		DBG_ERR("Failed to store share dataset list\n");
+	if (has_tcon) {
+		ret = put_share_dataset_list(mem_ctx, connectpath, dl);
+		if (ret != 0) {
+			DBG_ERR("Failed to store share dataset list\n");
+		}
 	}
 	*pdsl = dl;
 	return 0;

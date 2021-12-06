@@ -363,11 +363,13 @@ struct dataset_list *zhandle_list_children(TALLOC_CTX *mem_ctx,
  * @param[in]	mem_ctx			talloc memory context on which to hang results.
  * @param[in]	connectpath		connectpath to share.
  * @param[out]	ppdsl			returned dataset list for connectpath.
+ * @param[in]	has_tcon		indicates whether talloc ctx is short-lived
  * @return	0 on success -1 on failure
  */
 int conn_zfs_init(TALLOC_CTX *mem_ctx,
 		  const char *connectpath,
 		  struct smblibzfshandle **plibzfs,
-		  struct dataset_list **ppdsl);
+		  struct dataset_list **ppdsl,
+		  bool has_tcon);
 
 #endif	/* !__SMB_LIBZFS_H */
