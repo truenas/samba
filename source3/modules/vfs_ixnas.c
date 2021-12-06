@@ -1187,7 +1187,7 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 	ret = conn_zfs_init(handle->conn->sconn,
 			    handle->conn->connectpath,
 			    &config->libzp,
-			    &config->dsl);
+			    &config->dsl, handle->conn->tcon != NULL);
 
 	if (ret != 0) {
 		TALLOC_FREE(config);
