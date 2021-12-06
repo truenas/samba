@@ -43,6 +43,7 @@ static NTSTATUS zfs_fsrvp_check_path(struct vfs_handle_struct *handle,
 				     const char *service_path,
 				     char **base_volume)
 {
+
 	struct zfs_fsrvp_config_data *config = NULL;
 	SMB_VFS_HANDLE_GET_DATA(handle,
 				config,
@@ -192,7 +193,7 @@ static int zfs_fsrvp_connect(struct vfs_handle_struct *handle,
 	}
 	ret = conn_zfs_init(handle->conn->sconn,
 			    handle->conn->connectpath,
-			    &libzp, &ds_list);
+			    &libzp, &ds_list, handle->conn->tcon != NULL);
 
 	if (ds_list == NULL) {
 		DBG_ERR("Failed to obtain dataset list for connect path. "
