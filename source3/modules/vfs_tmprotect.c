@@ -138,7 +138,8 @@ static int tmprotect_connect(struct vfs_handle_struct *handle,
 	ret = conn_zfs_init(handle->conn->sconn,
 			    handle->conn->connectpath,
 			    &config->libzp,
-			    &ds_list);
+			    &ds_list,
+			    handle->conn->tcon != NULL);
 	if (ret != 0) {
 		return -1;
 	}

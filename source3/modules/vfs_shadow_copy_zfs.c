@@ -275,7 +275,8 @@ static bool shadow_copy_zfs_update_snaplist(struct vfs_handle_struct *handle,
 
 	if (((seconds > config->timedelta) && do_update) || cached_snaps == NULL) {
 		DBG_INFO("refreshing stored snaplist - current timedelta: %f "
-			 "permitted timedelta: %d\n", seconds, config->timedelta);
+			 "permitted timedelta: %d, dataset: %s\n",
+			 seconds, config->timedelta, ds->dataset_name);
 
 		get_smbzhandle(config->libzp, handle->conn, ds->dataset_name, &zfsp, false);
 		if (zfsp == NULL) {
@@ -1057,6 +1058,7 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 	ssize_t len, cpathlen, mplen, flen;
 	int rv;
 
+
 	SMB_VFS_HANDLE_GET_DATA(handle, config, struct shadow_copy_zfs_config,
 				return -1);
 
@@ -1376,7 +1378,8 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 	ret = conn_zfs_init(handle->conn->sconn,
 			    handle->conn->connectpath,
 			    &config->libzp,
-			    &config->ds_list);
+			    &config->ds_list,
+			    handle->conn->tcon != NULL);
 
 	if (ret != 0) {
 		DBG_ERR("Failed to initialize zfs: %s\n", strerror(errno));
