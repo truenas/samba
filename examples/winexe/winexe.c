@@ -220,8 +220,6 @@ static void parse_args(int argc, const char *argv[],
 		*port_str = '\0';
 	}
 
-	poptFreeContext(pc);
-
 	if (options->runas == NULL && options->runas_file != NULL) {
 		struct cli_credentials *runas_cred;
 		const char *user;
@@ -253,9 +251,19 @@ static void parse_args(int argc, const char *argv[],
 
 	options->credentials = samba_cmdline_get_creds();
 
-	options->hostname = argv_new[0] + 2;
+	options->hostname = talloc_strdup(mem_ctx, argv_new[0] + 2);
+	if (options->hostname == NULL) {
+		DBG_ERR("Out of memory\n");
+		exit(1);
+	}
 	options->port = port;
-	options->cmd = argv_new[1];
+	options->cmd = talloc_strdup(mem_ctx, argv_new[1]);
+	if (options->cmd == NULL) {
+		DBG_ERR("Out of memory\n");
+		exit(1);
+	}
+
+	poptFreeContext(pc);
 
 	options->flags = flag_interactive;
 	if (flag_reinstall) {
@@ -393,11 +401,16 @@ static NTSTATUS winexe_svc_install(
 	bool need_conf = false;
 	NTSTATUS status;
 	WERROR werr;
+	const char *remote_name = smbXcli_conn_remote_name(cli->conn);
+	const struct sockaddr_storage *remote_sockaddr =
+		smbXcli_conn_remote_sockaddr(cli->conn);
 
 	status = cli_rpc_pipe_open_noauth_transport(
 		cli,
 		NCACN_NP,
 		&ndr_table_svcctl,
+		remote_name,
+		remote_sockaddr,
 		&rpccli);
 	if (!NT_STATUS_IS_OK(status)) {
 		DBG_WARNING("cli_rpc_pipe_open_noauth_transport failed: %s\n",
@@ -408,7 +421,7 @@ static NTSTATUS winexe_svc_install(
 	status = dcerpc_svcctl_OpenSCManagerW(
 		rpccli->binding_handle,
 		frame,
-		smbXcli_conn_remote_name(cli->conn),
+		remote_name,
 		NULL,
 		SEC_FLAG_MAXIMUM_ALLOWED,
 		&scmanager_handle,
@@ -709,11 +722,16 @@ static NTSTATUS winexe_svc_uninstall(
 	struct SERVICE_STATUS service_status;
 	NTSTATUS status;
 	WERROR werr;
+	const char *remote_name = smbXcli_conn_remote_name(cli->conn);
+	const struct sockaddr_storage *remote_sockaddr =
+		smbXcli_conn_remote_sockaddr(cli->conn);
 
 	status = cli_rpc_pipe_open_noauth_transport(
 		cli,
 		NCACN_NP,
 		&ndr_table_svcctl,
+		remote_name,
+		remote_sockaddr,
 		&rpccli);
 	if (!NT_STATUS_IS_OK(status)) {
 		DBG_WARNING("cli_rpc_pipe_open_noauth_transport failed: %s\n",
@@ -724,7 +742,7 @@ static NTSTATUS winexe_svc_uninstall(
 	status = dcerpc_svcctl_OpenSCManagerW(
 		rpccli->binding_handle,
 		frame,
-		smbXcli_conn_remote_name(cli->conn),
+		remote_name,
 		NULL,
 		SEC_FLAG_MAXIMUM_ALLOWED,
 		&scmanager_handle,

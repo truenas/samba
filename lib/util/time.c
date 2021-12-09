@@ -178,7 +178,7 @@ check if it's a null NTTIME
 **/
 _PUBLIC_ bool null_nttime(NTTIME t)
 {
-	return t == 0 || t == (NTTIME)-1;
+	return t == 0;
 }
 
 /*******************************************************************
@@ -1128,10 +1128,10 @@ struct timespec nt_time_to_full_timespec(NTTIME nt)
 	if (nt == NTTIME_OMIT) {
 		return make_omit_timespec();
 	}
-	if (nt == NTTIME_FREEZE) {
+	if (nt == NTTIME_FREEZE || nt == NTTIME_THAW) {
 		/*
-		 * This should be returned as SAMBA_UTIME_FREEZE in the
-		 * future.
+		 * This should be returned as SAMBA_UTIME_FREEZE or
+		 * SAMBA_UTIME_THAW in the future.
 		 */
 		return make_omit_timespec();
 	}

@@ -25,6 +25,7 @@
 #include "cmdline_private.h"
 
 static bool _require_smbconf;
+static enum samba_cmdline_config_type _config_type;
 
 static bool _samba_cmdline_load_config_s4(void)
 {
@@ -41,6 +42,20 @@ static bool _samba_cmdline_load_config_s4(void)
 				set_dyn_CONFIGFILE(env);
 			}
 		}
+	}
+
+	switch (_config_type) {
+	case SAMBA_CMDLINE_CONFIG_SERVER: {
+		const struct samba_cmdline_daemon_cfg *cmdline_daemon_cfg =
+			samba_cmdline_get_daemon_cfg();
+
+		if (!cmdline_daemon_cfg->interactive) {
+			setup_logging(getprogname(), DEBUG_FILE);
+		}
+		break;
+	}
+	default:
+		break;
 	}
 
 	config_file = get_dyn_CONFIGFILE();
@@ -81,6 +96,7 @@ bool samba_cmdline_init(TALLOC_CTX *mem_ctx,
 		return false;
 	}
 	_require_smbconf = require_smbconf;
+	_config_type = config_type;
 
 	creds = cli_credentials_init(mem_ctx);
 	if (creds == NULL) {

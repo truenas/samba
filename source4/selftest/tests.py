@@ -553,6 +553,33 @@ else:
 
 plantestsuite("samba.blackbox.client_kerberos", "ad_dc", [os.path.join(bbdir, "test_client_kerberos.sh"), '$DOMAIN', '$REALM', '$USERNAME', '$PASSWORD', '$SERVER', '$PREFIX_ABS', '$SMB_CONF_PATH'])
 
+env="ad_member:local"
+plantestsuite("samba.blackbox.rpcclient_schannel",
+              env,
+              [os.path.join(bbdir, "test_rpcclient_schannel.sh"),
+               '$DOMAIN',
+               '$REALM',
+               '$DC_USERNAME',
+               '$DC_PASSWORD',
+               '$DC_SERVER',
+               '$PREFIX_ABS',
+               '$SMB_CONF_PATH',
+               env])
+env="ad_member_fips:local"
+plantestsuite("samba.blackbox.rpcclient_schannel",
+              env,
+              [os.path.join(bbdir, "test_rpcclient_schannel.sh"),
+               '$DOMAIN',
+               '$REALM',
+               '$DC_USERNAME',
+               '$DC_PASSWORD',
+               '$DC_SERVER',
+               '$PREFIX_ABS',
+               '$SMB_CONF_PATH',
+               env],
+              environ={'GNUTLS_FORCE_FIPS_MODE': '1',
+                       'OPENSSL_FORCE_FIPS_MODE': '1'})
+
 plantestsuite("samba4.blackbox.trust_ntlm", "fl2008r2dc:local", [os.path.join(bbdir, "test_trust_ntlm.sh"), '$SERVER_IP', '$USERNAME', '$PASSWORD', '$REALM', '$DOMAIN', '$TRUST_USERNAME', '$TRUST_PASSWORD', '$TRUST_REALM', '$TRUST_DOMAIN', 'forest', 'auto', 'NT_STATUS_LOGON_FAILURE'])
 plantestsuite("samba4.blackbox.trust_ntlm", "fl2003dc:local", [os.path.join(bbdir, "test_trust_ntlm.sh"), '$SERVER_IP', '$USERNAME', '$PASSWORD', '$REALM', '$DOMAIN', '$TRUST_USERNAME', '$TRUST_PASSWORD', '$TRUST_REALM', '$TRUST_DOMAIN', 'external', 'auto', 'NT_STATUS_LOGON_FAILURE'])
 plantestsuite("samba4.blackbox.trust_ntlm", "fl2000dc:local", [os.path.join(bbdir, "test_trust_ntlm.sh"), '$SERVER_IP', '$USERNAME', '$PASSWORD', '$REALM', '$DOMAIN', '$TRUST_USERNAME', '$TRUST_PASSWORD', '$TRUST_REALM', '$TRUST_DOMAIN', 'external', 'auto', 'NT_STATUS_LOGON_FAILURE'])
@@ -924,12 +951,28 @@ planoldpythontestsuite("ad_dc_smb1", "samba.tests.krb5.test_smb",
                            'TKT_SIG_SUPPORT': tkt_sig_support,
                            'EXPECT_PAC': expect_pac
                        })
-planoldpythontestsuite("ad_member_no_nss_wb:local",
+planoldpythontestsuite("ad_member_idmap_nss:local",
                        "samba.tests.krb5.test_min_domain_uid",
                        environ={
                            'ADMIN_USERNAME': '$DC_USERNAME',
                            'ADMIN_PASSWORD': '$DC_PASSWORD',
                            'STRICT_CHECKING': '0'
+                       })
+planoldpythontestsuite("ad_member_idmap_nss:local",
+                       "samba.tests.krb5.test_idmap_nss",
+                       environ={
+                           'ADMIN_USERNAME': '$DC_USERNAME',
+                           'ADMIN_PASSWORD': '$DC_PASSWORD',
+                           'MAPPED_USERNAME': 'bob',
+                           'MAPPED_PASSWORD': 'Secret007',
+                           'UNMAPPED_USERNAME': 'jane',
+                           'UNMAPPED_PASSWORD': 'Secret007',
+                           'INVALID_USERNAME': 'joe',
+                           'INVALID_PASSWORD': 'Secret007',
+                           'STRICT_CHECKING': '0',
+                           'FAST_SUPPORT': have_fast_support,
+                           'TKT_SIG_SUPPORT': tkt_sig_support,
+                           'EXPECT_PAC': expect_pac
                        })
 
 for env in ["ad_dc", smbv1_disabled_testenv]:

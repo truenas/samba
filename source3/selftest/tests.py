@@ -256,6 +256,21 @@ plantestsuite("samba3.smbtorture_s3.plain.%s" % "SMB2-LIST-DIR-ASYNC",
                 smbtorture3,
                 "",
                 "-l $LOCAL_PATH"])
+#
+# SMB2-DEL-ON-CLOSE-NONEMPTY needs to run against a special fileserver share veto_files_delete
+#
+plantestsuite("samba3.smbtorture_s3.plain.%s" % "SMB2-DEL-ON-CLOSE-NONEMPTY",
+                "fileserver",
+                [os.path.join(samba3srcdir,
+                              "script/tests/test_smbtorture_s3.sh"),
+                'SMB2-DEL-ON-CLOSE-NONEMPTY',
+                '//$SERVER_IP/veto_files_delete',
+                '$USERNAME',
+                '$PASSWORD',
+                smbtorture3,
+                "",
+                "-l $LOCAL_PATH"])
+
 
 
 shares = [
@@ -539,6 +554,12 @@ for env in ["fileserver"]:
     plantestsuite("samba3.blackbox.smbclient_iconv.CORE", env + "_smb1_done",
                   [os.path.join(samba3srcdir, "script/tests/test_smbclient_iconv.sh"),
                    '$SERVER', '$SERVER_IP', 'bad_iconv', '$USERNAME', '$PASSWORD', smbclient3, '-mCORE'])
+    plantestsuite("samba3.blackbox.test_veto_rmdir", env,
+                  [os.path.join(samba3srcdir, "script/tests/test_veto_rmdir.sh"),
+                  '$SERVER', '$SERVER_IP', '$USERNAME', '$PASSWORD', '$LOCAL_PATH/veto', smbclient3])
+    plantestsuite("samba3.blackbox.test_dangle_rmdir", env,
+                  [os.path.join(samba3srcdir, "script/tests/test_delete_veto_files_only_rmdir.sh"),
+                  '$SERVER', '$SERVER_IP', '$USERNAME', '$PASSWORD', '$LOCAL_PATH/veto', smbclient3])
 
     #
     # tar command tests
@@ -1172,6 +1193,13 @@ plantestsuite("samba3.blackbox.smbclient.encryption_off", "simpleserver",
                "$USERNAME", "$PASSWORD", "$SERVER",
                smbclient3])
 
+plantestsuite("samba3.blackbox.smbXsrv_client_dead_rec", "fileserver:local",
+              [os.path.join(samba3srcdir,
+                            "script/tests/test_smbXsrv_client_dead_rec.sh"),
+               configuration,
+               '$SERVER_IP',
+               "tmp"])
+
 for env in ['fileserver', 'simpleserver']:
     plantestsuite("samba3.blackbox.smbclient.encryption", env,
                   [os.path.join(samba3srcdir, "script/tests/test_smbclient_encryption.sh"),
@@ -1260,6 +1288,15 @@ plantestsuite(
      smbtorture3,
      "",
      "-b $PREFIX/clusteredmember/unclists/tmp.txt -N 5 -o 10"])
+
+plantestsuite(
+    "samba3.net_machine_account",
+    "clusteredmember",
+    [os.path.join(samba3srcdir,
+                  "script/tests/test_net_machine_account.sh"),
+     "bin/net",
+     "$SERVERCONFFILE",
+     "$SERVER_IP"])
 
 plantestsuite(
     "samba3.net_lookup_ldap",

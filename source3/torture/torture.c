@@ -51,6 +51,7 @@
 #include "lib/param/param.h"
 #include "auth/gensec/gensec.h"
 #include "lib/util/string_wrappers.h"
+#include "source3/lib/substitute.h"
 
 #include <gnutls/gnutls.h>
 #include <gnutls/crypto.h>
@@ -15248,6 +15249,10 @@ static struct {
 	{
 		.name  = "SMB2-LIST-DIR-ASYNC",
 		.fn    = run_list_dir_async_test,
+	},
+	{
+		.name  = "SMB2-DEL-ON-CLOSE-NONEMPTY",
+		.fn    = run_delete_on_close_non_empty,
 	},
 	{
 		.name  = "CLEANUP1",

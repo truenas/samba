@@ -1,4 +1,4 @@
-/* 
+/*
    Unix SMB/CIFS implementation.
    RPC pipe client
 
@@ -73,9 +73,9 @@ static char **completion_fn(const char *text, int start, int end)
 
 #if 0	/* JERRY */
 	/* FIXME!!!  -- what to do when completing argument? */
-	/* for words not at the start of the line fallback 
+	/* for words not at the start of the line fallback
 	   to filename completion */
-	if (start) 
+	if (start)
 		return NULL;
 #endif
 
@@ -103,7 +103,7 @@ static char **completion_fn(const char *text, int start, int end)
 		for (i=0; commands->cmd_set[i].name; i++) {
 			if ((strncmp(text, commands->cmd_set[i].name, strlen(text)) == 0) &&
 				(( commands->cmd_set[i].returntype == RPC_RTYPE_NTSTATUS &&
-                        commands->cmd_set[i].ntfn ) || 
+                        commands->cmd_set[i].ntfn ) ||
                       ( commands->cmd_set[i].returntype == RPC_RTYPE_WERROR &&
                         commands->cmd_set[i].wfn))) {
 				matches[count] = SMB_STRDUP(commands->cmd_set[i].name);
@@ -233,7 +233,7 @@ static NTSTATUS cmd_listcommands(struct rpc_pipe_client *cli, TALLOC_CTX *mem_ct
 
         /* Help on one command */
 
-	for (tmp = cmd_list; tmp; tmp = tmp->next) 
+	for (tmp = cmd_list; tmp; tmp = tmp->next)
 	{
 		tmp_set = tmp->cmd_set;
 
@@ -877,8 +877,44 @@ static NTSTATUS do_cmd(struct cli_state *cli,
 	enum dcerpc_transport_t transport;
 
 	TALLOC_CTX *mem_ctx = talloc_stackframe();
+	const char *remote_name = NULL;
+	const struct sockaddr_storage *remote_sockaddr = NULL;
+	struct sockaddr_storage remote_ss = {
+		.ss_family = AF_UNSPEC,
+	};
 
 	transport = dcerpc_binding_get_transport(binding);
+
+	if (cli != NULL) {
+		remote_name = smbXcli_conn_remote_name(cli->conn);
+		remote_sockaddr = smbXcli_conn_remote_sockaddr(cli->conn);
+	} else {
+		const char *remote_host =
+			dcerpc_binding_get_string_option(binding, "host");
+		remote_name = dcerpc_binding_get_string_option(
+				binding, "target_hostname");
+
+		if (remote_host != NULL) {
+			int af = AF_UNSPEC;
+
+			if (remote_name == NULL) {
+				remote_name = dcerpc_binding_get_string_option(
+						binding, "host");
+			}
+
+			if (is_ipaddress_v4(remote_host)) {
+				af = AF_INET;
+			} else if (is_ipaddress_v6(remote_host)) {
+				af = AF_INET6;
+			}
+			if (af != AF_UNSPEC) {
+				int ok = inet_pton(af, remote_host, &remote_ss);
+				if (ok) {
+					remote_sockaddr = &remote_ss;
+				}
+			}
+		}
+	}
 
 	/* Open pipe */
 
@@ -904,6 +940,8 @@ static NTSTATUS do_cmd(struct cli_state *cli,
 				ntresult = cli_rpc_pipe_open_noauth_transport(
 					cli, transport,
 					cmd_entry->table,
+					remote_name,
+					remote_sockaddr,
 					&cmd_entry->rpc_pipe);
 				break;
 			case DCERPC_AUTH_TYPE_SPNEGO:
@@ -918,7 +956,8 @@ static NTSTATUS do_cmd(struct cli_state *cli,
 					transport,
 					auth_type,
 					auth_level,
-					smbXcli_conn_remote_name(cli->conn),
+					remote_name,
+					remote_sockaddr,
 					creds,
 					&cmd_entry->rpc_pipe);
 				break;
@@ -929,6 +968,8 @@ static NTSTATUS do_cmd(struct cli_state *cli,
 					cmd_entry->table,
 					transport,
 					rpcclient_netlogon_domain,
+					remote_name,
+					remote_sockaddr,
 					&cmd_entry->rpc_pipe,
 					rpcclient_msg_ctx,
 					&rpcclient_netlogon_creds);

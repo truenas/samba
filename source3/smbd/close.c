@@ -965,8 +965,6 @@ static NTSTATUS rmdir_internals(TALLOC_CTX *ctx, struct files_struct *fsp)
 	struct smb_filename *smb_dname = fsp->fsp_name;
 	struct smb_filename *parent_fname = NULL;
 	struct smb_filename *at_fname = NULL;
-	const struct loadparm_substitution *lp_sub =
-		loadparm_s3_global_substitution();
 	SMB_STRUCT_STAT st;
 	const char *dname = NULL;
 	char *talloced = NULL;
@@ -1026,9 +1024,7 @@ static NTSTATUS rmdir_internals(TALLOC_CTX *ctx, struct files_struct *fsp)
 		return NT_STATUS_OK;
 	}
 
-	if (!((errno == ENOTEMPTY) || (errno == EEXIST)) ||
-	    !*lp_veto_files(talloc_tos(), lp_sub, SNUM(conn)))
-	{
+	if (!((errno == ENOTEMPTY) || (errno == EEXIST))) {
 		DEBUG(3,("rmdir_internals: couldn't remove directory %s : "
 			 "%s\n", smb_fname_str_dbg(smb_dname),
 			 strerror(errno)));
@@ -1037,10 +1033,20 @@ static NTSTATUS rmdir_internals(TALLOC_CTX *ctx, struct files_struct *fsp)
 	}
 
 	/*
+	 * Here we know the initial directory unlink failed with
+	 * ENOTEMPTY or EEXIST so we know there are objects within.
+	 * If we don't have permission to delete files non
+	 * visible to the client just fail the directory delete.
+	 */
+
+	if (!lp_delete_veto_files(SNUM(conn))) {
+		errno = ENOTEMPTY;
+		goto err;
+	}
+
+	/*
 	 * Check to see if the only thing in this directory are
-	 * vetoed files/directories. If so then delete them and
-	 * retry. If we fail to delete any of them (and we *don't*
-	 * do a recursive delete) then fail the rmdir.
+	 * files non-visible to the client. If not, fail the delete.
 	 */
 
 	dir_hnd = OpenDir(talloc_tos(), conn, smb_dname, NULL, 0);
@@ -1049,10 +1055,13 @@ static NTSTATUS rmdir_internals(TALLOC_CTX *ctx, struct files_struct *fsp)
 		goto err;
 	}
 
+	dirfsp = dir_hnd_fetch_fsp(dir_hnd);
+
 	while ((dname = ReadDirName(dir_hnd, &dirpos, &st, &talloced)) != NULL) {
 		struct smb_filename *smb_dname_full = NULL;
 		struct smb_filename *direntry_fname = NULL;
 		char *fullname = NULL;
+		int retval;
 
 		if (ISDOT(dname) || ISDOTDOT(dname)) {
 			TALLOC_FREE(talloced);
@@ -1087,8 +1096,8 @@ static NTSTATUS rmdir_internals(TALLOC_CTX *ctx, struct files_struct *fsp)
 			goto err;
 		}
 
-		ret = SMB_VFS_LSTAT(conn, smb_dname_full);
-		if (ret != 0) {
+		retval = SMB_VFS_LSTAT(conn, smb_dname_full);
+		if (retval != 0) {
 			int saved_errno = errno;
 			TALLOC_FREE(talloced);
 			TALLOC_FREE(fullname);
@@ -1097,15 +1106,61 @@ static NTSTATUS rmdir_internals(TALLOC_CTX *ctx, struct files_struct *fsp)
 			goto err;
 		}
 
-		/*
-		 * is_visible_fsp() always returns true
-		 * for the symlink/MSDFS case.
-		 */
 		if (S_ISLNK(smb_dname_full->st.st_ex_mode)) {
+			/* Could it be an msdfs link ? */
+			if (lp_host_msdfs() &&
+			    lp_msdfs_root(SNUM(conn))) {
+				struct smb_filename *smb_atname;
+				smb_atname = synthetic_smb_fname(talloc_tos(),
+							dname,
+							NULL,
+							&smb_dname_full->st,
+							fsp->fsp_name->twrp,
+							fsp->fsp_name->flags);
+				if (smb_atname == NULL) {
+					TALLOC_FREE(talloced);
+					TALLOC_FREE(fullname);
+					TALLOC_FREE(smb_dname_full);
+					errno = ENOMEM;
+					goto err;
+				}
+				if (is_msdfs_link(fsp, smb_atname)) {
+					TALLOC_FREE(talloced);
+					TALLOC_FREE(fullname);
+					TALLOC_FREE(smb_dname_full);
+					TALLOC_FREE(smb_atname);
+					DBG_DEBUG("got msdfs link name %s "
+						"- can't delete directory %s\n",
+						dname,
+						fsp_str_dbg(fsp));
+					errno = ENOTEMPTY;
+					goto err;
+				}
+				TALLOC_FREE(smb_atname);
+			}
+
+			/* Not a DFS link - could it be a dangling symlink ? */
+			retval = SMB_VFS_STAT(conn, smb_dname_full);
+			if (retval == -1 && (errno == ENOENT || errno == ELOOP)) {
+				/*
+				 * Dangling symlink.
+				 * Allow delete as "delete veto files = yes"
+				 */
+				TALLOC_FREE(talloced);
+				TALLOC_FREE(fullname);
+				TALLOC_FREE(smb_dname_full);
+				continue;
+			}
+
+			DBG_DEBUG("got symlink name %s - "
+				"can't delete directory %s\n",
+				dname,
+				fsp_str_dbg(fsp));
 			TALLOC_FREE(talloced);
 			TALLOC_FREE(fullname);
 			TALLOC_FREE(smb_dname_full);
-			continue;
+			errno = ENOTEMPTY;
+			goto err;
 		}
 
 		/* Not a symlink, get a pathref. */
@@ -1133,23 +1188,24 @@ static NTSTATUS rmdir_internals(TALLOC_CTX *ctx, struct files_struct *fsp)
 			continue;
 		}
 
+		/*
+		 * We found a client visible name.
+		 * We cannot delete this directory.
+		 */
+		DBG_DEBUG("got name %s - "
+			"can't delete directory %s\n",
+			dname,
+			fsp_str_dbg(fsp));
 		TALLOC_FREE(talloced);
 		TALLOC_FREE(fullname);
 		TALLOC_FREE(smb_dname_full);
 		TALLOC_FREE(direntry_fname);
-	}
-
-	/* We only have veto files/directories.
-	 * Are we allowed to delete them ? */
-
-	if (!lp_delete_veto_files(SNUM(conn))) {
 		errno = ENOTEMPTY;
 		goto err;
 	}
 
 	/* Do a recursive delete. */
 	RewindDir(dir_hnd,&dirpos);
-	dirfsp = dir_hnd_fetch_fsp(dir_hnd);
 
 	while ((dname = ReadDirName(dir_hnd, &dirpos, &st, &talloced)) != NULL) {
 		struct smb_filename *direntry_fname = NULL;
@@ -1188,8 +1244,8 @@ static NTSTATUS rmdir_internals(TALLOC_CTX *ctx, struct files_struct *fsp)
 		 * Todo: use SMB_VFS_STATX() once that's available.
 		 */
 
-		ret = SMB_VFS_LSTAT(conn, smb_dname_full);
-		if (ret != 0) {
+		retval = SMB_VFS_LSTAT(conn, smb_dname_full);
+		if (retval != 0) {
 			goto err_break;
 		}
 
@@ -1267,7 +1323,7 @@ static NTSTATUS rmdir_internals(TALLOC_CTX *ctx, struct files_struct *fsp)
 
 	/* Retry the rmdir */
 	ret = SMB_VFS_UNLINKAT(conn,
-			       dirfsp,
+			       parent_fname->fsp,
 			       at_fname,
 			       AT_REMOVEDIR);
 
