@@ -34,8 +34,9 @@ static bool test_null_time(struct torture_context *tctx)
 
 static bool test_null_nttime(struct torture_context *tctx)
 {
-	torture_assert(tctx, null_nttime(-1), "-1");
-	torture_assert(tctx, null_nttime(-1), "-1");
+	torture_assert(tctx, null_nttime(0), "0");
+	torture_assert(tctx, !null_nttime(NTTIME_FREEZE), "-1");
+	torture_assert(tctx, !null_nttime(NTTIME_THAW), "-2");
 	torture_assert(tctx, !null_nttime(42), "42");
 	return true;
 }

@@ -26,6 +26,7 @@
 #include "auth/credentials/credentials.h"
 #include "dynconfig/dynconfig.h"
 #include "cmdline_private.h"
+#include "source3/include/secrets.h"
 
 static bool _require_smbconf;
 static enum samba_cmdline_config_type _config_type;
@@ -55,7 +56,7 @@ static bool _samba_cmdline_load_config_s3(void)
 	case SAMBA_CMDLINE_CONFIG_CLIENT:
 		ok = lp_load_client(config_file);
 		break;
-        case SAMBA_CMDLINE_CONFIG_SERVER:
+	case SAMBA_CMDLINE_CONFIG_SERVER:
 	{
 		const struct samba_cmdline_daemon_cfg *cmdline_daemon_cfg =
 			samba_cmdline_get_daemon_cfg();
@@ -82,6 +83,31 @@ static bool _samba_cmdline_load_config_s3(void)
 	load_interfaces();
 
 	return true;
+}
+
+static NTSTATUS _samba_cmd_set_machine_account_s3(
+	struct cli_credentials *cred,
+	struct loadparm_context *lp_ctx)
+{
+	struct db_context *db_ctx = secrets_db_ctx();
+	NTSTATUS status;
+
+	if (db_ctx == NULL) {
+		DBG_WARNING("failed to open secrets.tdb to obtain our "
+			    "trust credentials for %s\n",
+			    lpcfg_workgroup(lp_ctx));;
+		return NT_STATUS_INTERNAL_ERROR;
+	}
+
+	status = cli_credentials_set_machine_account_db_ctx(
+		cred, lp_ctx, db_ctx);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_WARNING("cli_credentials_set_machine_account_db_ctx "
+			    "failed: %s\n",
+			    nt_errstr(status));
+	}
+
+	return status;
 }
 
 bool samba_cmdline_init(TALLOC_CTX *mem_ctx,
@@ -119,6 +145,8 @@ bool samba_cmdline_init(TALLOC_CTX *mem_ctx,
 	}
 
 	samba_cmdline_set_load_config_fn(_samba_cmdline_load_config_s3);
+	samba_cmdline_set_machine_account_fn(
+		_samba_cmd_set_machine_account_s3);
 
 	return true;
 }

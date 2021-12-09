@@ -1305,11 +1305,18 @@ static NTSTATUS libnet_join_joindomain_rpc_unsecure(TALLOC_CTX *mem_ctx,
 	TALLOC_FREE(creds);
 
 	if (netlogon_flags & NETLOGON_NEG_AUTHENTICATED_RPC) {
-		status = cli_rpc_pipe_open_schannel_with_creds(cli,
-							       &ndr_table_netlogon,
-							       NCACN_NP,
-							       netlogon_creds,
-							       &passwordset_pipe);
+		const char *remote_name = smbXcli_conn_remote_name(cli->conn);
+		const struct sockaddr_storage *remote_sockaddr =
+			smbXcli_conn_remote_sockaddr(cli->conn);
+
+		status = cli_rpc_pipe_open_schannel_with_creds(
+				cli,
+				&ndr_table_netlogon,
+				NCACN_NP,
+				netlogon_creds,
+				remote_name,
+				remote_sockaddr,
+				&passwordset_pipe);
 		if (!NT_STATUS_IS_OK(status)) {
 			TALLOC_FREE(frame);
 			return status;
@@ -1708,6 +1715,8 @@ NTSTATUS libnet_join_ok(struct messaging_context *msg_ctx,
 	uint32_t netlogon_flags = 0;
 	NTSTATUS status;
 	int flags = CLI_FULL_CONNECTION_IPC;
+	const char *remote_name = NULL;
+	const struct sockaddr_storage *remote_sockaddr = NULL;
 
 	if (!dc_name) {
 		TALLOC_FREE(frame);
@@ -1808,9 +1817,15 @@ NTSTATUS libnet_join_ok(struct messaging_context *msg_ctx,
 		return NT_STATUS_OK;
 	}
 
+	remote_name = smbXcli_conn_remote_name(cli->conn);
+	remote_sockaddr = smbXcli_conn_remote_sockaddr(cli->conn);
+
 	status = cli_rpc_pipe_open_schannel_with_creds(
 		cli, &ndr_table_netlogon, NCACN_NP,
-		netlogon_creds, &netlogon_pipe);
+		netlogon_creds,
+		remote_name,
+		remote_sockaddr,
+		&netlogon_pipe);
 
 	TALLOC_FREE(netlogon_pipe);
 
@@ -1818,7 +1833,7 @@ NTSTATUS libnet_join_ok(struct messaging_context *msg_ctx,
 		DEBUG(0,("libnet_join_ok: failed to open schannel session "
 			"on netlogon pipe to server %s for domain %s. "
 			"Error was %s\n",
-			smbXcli_conn_remote_name(cli->conn),
+			remote_name,
 			netbios_domain_name, nt_errstr(status)));
 		cli_shutdown(cli);
 		TALLOC_FREE(frame);
@@ -3053,7 +3068,7 @@ static WERROR libnet_DomainUnjoin(TALLOC_CTX *mem_ctx,
 		W_ERROR_HAVE_NO_MEMORY(r->in.domain_sid);
 	}
 
-	if (!(r->in.unjoin_flags & WKSSVC_JOIN_FLAGS_ACCOUNT_DELETE) && 
+	if (!(r->in.unjoin_flags & WKSSVC_JOIN_FLAGS_ACCOUNT_DELETE) &&
 	    !r->in.delete_machine_account) {
 		libnet_join_unjoindomain_remove_secrets(mem_ctx, r);
 		return WERR_OK;
@@ -3085,8 +3100,8 @@ static WERROR libnet_DomainUnjoin(TALLOC_CTX *mem_ctx,
 	}
 
 #ifdef HAVE_ADS
-	/* for net ads leave, try to delete the account.  If it works, 
-	   no sense in disabling.  If it fails, we can still try to 
+	/* for net ads leave, try to delete the account.  If it works,
+	   no sense in disabling.  If it fails, we can still try to
 	   disable it. jmcd */
 
 	if (r->in.delete_machine_account) {
@@ -3094,10 +3109,10 @@ static WERROR libnet_DomainUnjoin(TALLOC_CTX *mem_ctx,
 		ads_status = libnet_unjoin_connect_ads(mem_ctx, r);
 		if (ADS_ERR_OK(ads_status)) {
 			/* dirty hack */
-			r->out.dns_domain_name = 
+			r->out.dns_domain_name =
 				talloc_strdup(mem_ctx,
 					      r->in.ads->server.realm);
-			ads_status = 
+			ads_status =
 				libnet_unjoin_remove_machine_acct(mem_ctx, r);
 		}
 		if (!ADS_ERR_OK(ads_status)) {
@@ -3113,7 +3128,7 @@ static WERROR libnet_DomainUnjoin(TALLOC_CTX *mem_ctx,
 	}
 #endif /* HAVE_ADS */
 
-	/* The WKSSVC_JOIN_FLAGS_ACCOUNT_DELETE flag really means 
+	/* The WKSSVC_JOIN_FLAGS_ACCOUNT_DELETE flag really means
 	   "disable".  */
 	if (r->in.unjoin_flags & WKSSVC_JOIN_FLAGS_ACCOUNT_DELETE) {
 		status = libnet_join_unjoindomain_rpc(mem_ctx, r);
@@ -3132,7 +3147,7 @@ static WERROR libnet_DomainUnjoin(TALLOC_CTX *mem_ctx,
 		r->out.disabled_machine_account = true;
 	}
 
-	/* If disable succeeded or was not requested at all, we 
+	/* If disable succeeded or was not requested at all, we
 	   should be getting rid of our end of things */
 
 	libnet_join_unjoindomain_remove_secrets(mem_ctx, r);

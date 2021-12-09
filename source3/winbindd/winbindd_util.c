@@ -136,12 +136,7 @@ static NTSTATUS add_trusted_domain(const char *domain_name,
 		return NT_STATUS_INVALID_PARAMETER;
 	}
 
-	if (strequal(domain_name, "BUILTIN") &&
-	    sid_check_is_builtin(sid)) {
-		is_builtin = True;
-	}
-
-	if (!is_builtin && !is_allowed_domain(domain_name)) {
+	if (secure_channel_type == SEC_CHAN_NULL && !is_allowed_domain(domain_name)) {
 		return NT_STATUS_NO_SUCH_DOMAIN;
 	}
 
@@ -1790,6 +1785,9 @@ char *fill_domain_username_talloc(TALLOC_CTX *mem_ctx,
 	}
 
 	tmp_user = talloc_strdup(mem_ctx, user);
+	if (tmp_user == NULL) {
+		return NULL;
+	}
 	if (!strlower_m(tmp_user)) {
 		TALLOC_FREE(tmp_user);
 		return NULL;

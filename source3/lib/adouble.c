@@ -2591,10 +2591,6 @@ int ad_fset(struct vfs_handle_struct *handle,
 
 	DBG_DEBUG("Path [%s]\n", fsp_str_dbg(fsp));
 
-	if ((fsp == NULL) || (fsp->fh == NULL)) {
-		smb_panic("bad fsp");
-	}
-
 	ok = ad_pack(handle, ad, fsp);
 	if (!ok) {
 		return -1;

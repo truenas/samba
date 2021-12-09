@@ -27,6 +27,7 @@
 #include "system/filesys.h"
 #include "../librpc/gen_ndr/ndr_netlogon.h"
 #include "auth.h"
+#include "source3/lib/substitute.h"
 
 #define ALLOC_CHECK(ptr, label) do { if ((ptr) == NULL) { DEBUG(0, ("recycle.bin: out of memory!\n")); errno = ENOMEM; goto label; } } while(0)
 
@@ -571,9 +572,10 @@ static int recycle_unlink_internal(vfs_handle_struct *handle,
 	 */
 
 	/* extract filename and path */
-	if (!parent_dirname(handle, full_fname->base_name, &path_name, &base)) {
+	if (!parent_dirname(talloc_tos(), full_fname->base_name, &path_name, &base)) {
+		rc = -1;
 		errno = ENOMEM;
-		return -1;
+		goto done;
 	}
 
 	/* original filename with path */
