@@ -409,6 +409,13 @@ typedef union unid_t {
 	gid_t gid;
 } unid_t;
 
+enum acl_brand {
+        SMB_ACL_BRAND_POSIX,
+        SMB_ACL_BRAND_NFS40,
+        SMB_ACL_BRAND_NFS41,
+        SMB_ACL_BRAND_NONE,
+};
+
 struct fd_handle;
 
 struct fsp_lease {
@@ -680,6 +687,7 @@ typedef struct files_struct {
  *
  * In any other case use fsp_get_io_fd().
  */
+#define TCON_FLAG_STAT_FAILED		0x01
 
 #define FSP_POSIX_FLAGS_OPEN		0x01
 #define FSP_POSIX_FLAGS_RENAME		0x02
@@ -729,6 +737,12 @@ typedef struct connection_struct {
 	   sub second timestamps on files
 	   and directories when setting time ? */
 	enum timestamp_set_resolution ts_res;
+
+	/* iXsystems additions */
+	enum acl_brand aclbrand;
+	uint32_t internal_tcon_flags;
+	/* end iXsystems additions */
+
 	char *connectpath;
 	struct files_struct *cwd_fsp; /* Working directory. */
 	bool tcon_done;

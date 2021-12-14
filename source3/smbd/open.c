@@ -916,6 +916,11 @@ NTSTATUS fd_openat(const struct files_struct *dirfsp,
 	 * client should be doing this.
 	 */
 
+	if (fsp->conn->internal_tcon_flags & TCON_FLAG_STAT_FAILED) {
+		DBG_ERR("Tree connect initially failed access check. Denying access.\n");
+		return NT_STATUS_ACCESS_DENIED;
+	}
+
 	if ((fsp->posix_flags & FSP_POSIX_FLAGS_OPEN) || !lp_follow_symlinks(SNUM(conn))) {
 		how.flags |= O_NOFOLLOW;
 	}
