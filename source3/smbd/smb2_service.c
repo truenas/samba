@@ -720,6 +720,27 @@ NTSTATUS make_connection_snum(struct smbXsrv_connection *xconn,
 		}
 	}
 
+	smb_fname_cpath = synthetic_smb_fname(talloc_tos(),
+					conn->connectpath,
+					NULL,
+					NULL,
+					0,
+					0);
+	if (smb_fname_cpath == NULL) {
+		status = NT_STATUS_NO_MEMORY;
+		goto err_root_exit;
+	}
+
+	/*
+	 * Attempt to stat the share's connectpath as the current user
+	 * Windows allows tcon to succeed even if share access isn't allowed.
+	 * In this case though we'll set a flag to indicate that attempting
+	 * to stat() during TCON failed.
+	 */
+	if ((ret = SMB_VFS_STAT(conn, smb_fname_cpath)) != 0) {
+		conn->internal_tcon_flags |= TCON_FLAG_STAT_FAILED;
+	}
+
 #ifdef WITH_FAKE_KASERVER
 	if (lp_afs_share(snum)) {
 		afs_login(conn);
@@ -767,16 +788,6 @@ NTSTATUS make_connection_snum(struct smbXsrv_connection *xconn,
 			status = NT_STATUS_NO_MEMORY;
 			goto err_root_exit;
 		}
-	}
-	smb_fname_cpath = synthetic_smb_fname(talloc_tos(),
-					conn->connectpath,
-					NULL,
-					NULL,
-					0,
-					0);
-	if (smb_fname_cpath == NULL) {
-		status = NT_STATUS_NO_MEMORY;
-		goto err_root_exit;
 	}
 
 	/* win2000 does not check the permissions on the directory
