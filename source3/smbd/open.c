@@ -482,6 +482,11 @@ NTSTATUS fd_openat(const struct files_struct *dirfsp,
 
 	SMB_ASSERT(fsp_is_stream == smb_fname_is_stream);
 
+	if (fsp->conn->internal_tcon_flags & TCON_FLAG_STAT_FAILED) {
+		DBG_ERR("Tree connect initially failed access check. Denying access.\n");
+		return NT_STATUS_ACCESS_DENIED;
+	}
+
 	if (fsp_is_stream) {
 		fd = SMB_VFS_OPENAT(
 			conn,
