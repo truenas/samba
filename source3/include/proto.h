@@ -209,6 +209,7 @@ int sys_get_number_of_cores(void);
 #endif
 
 bool sys_have_proc_fds(void);
+uint64_t generate_file_id_from_stat(const struct stat *src);
 const char *sys_proc_fd_path(int fd, char *buf, size_t bufsize);
 
 struct stat;

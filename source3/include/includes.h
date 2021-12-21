@@ -204,6 +204,9 @@ struct stat_ex {
 	struct timespec st_ex_mtime;
 	struct timespec st_ex_ctime;
 	struct timespec st_ex_btime; /* birthtime */
+#ifdef FREEBSD
+	uint64_t	st_ex_gen;
+#endif
 	/*
 	 * Immutable original birth time aka instantiation time. Set when a file
 	 * is created, never changes thereafter. May not be set by the client.

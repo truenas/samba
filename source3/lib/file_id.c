@@ -89,7 +89,17 @@ uint64_t make_file_id_from_itime(const struct stat_ex *st)
 	uint64_t file_id;
 
 	if (st->st_ex_iflags & ST_EX_IFLAG_CALCULATED_ITIME) {
+#ifdef FREEBSD
+		struct stat tmp_st;
+		tmp_st = (struct stat) {
+			.st_ino = st->st_ex_ino,
+			.st_gen = st->st_ex_gen,
+			.st_dev = st->st_ex_dev,
+		};
+		return generate_file_id_from_stat(&tmp_st);
+#else
 		return ino;
+#endif
 	}
 
 	round_timespec_to_nttime(&itime);

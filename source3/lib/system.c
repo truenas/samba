@@ -272,6 +272,34 @@ void update_stat_ex_from_saved_stat(struct stat_ex *dst,
 	}
 }
 
+#ifdef FREEBSD
+struct fbsd_fileid {
+	ino_t ino;
+	uint64_t gen;
+	dev_t dev;
+};
+
+uint64_t generate_file_id_from_stat(const struct stat *src)
+{
+	struct fbsd_fileid st;
+	TDB_DATA key;
+	uint hash
+
+	st = (struct fbsd_fileid) {
+		.ino = src->st_ino,
+		.gen = src->st_gen,
+		.dev = src->st_dev,
+	}
+
+	key = (TDB_DATA) {
+		.dptr = discard_const_p(uint8_t, &st),
+		.dsize = sizeof(fbsd_fileid);
+	}
+
+	return tdb_jenksins_hash(&key);
+}
+#endif
+
 void init_stat_ex_from_stat (struct stat_ex *dst,
 			    const struct stat *src,
 			    bool fake_dir_create_times)
@@ -306,7 +334,13 @@ void init_stat_ex_from_stat (struct stat_ex *dst,
 #else
 	dst->st_ex_flags = 0;
 #endif
+
+#ifdef FREEBSD
+	dst->st_ex_gen = src->st_gen
+	dst->st_ex_file_id = generate_file_id_from_stat(src);
+#else
 	dst->st_ex_file_id = dst->st_ex_ino;
+#endif
 	dst->st_ex_iflags |= ST_EX_IFLAG_CALCULATED_FILE_ID;
 }
 
