@@ -213,6 +213,7 @@ access_denied:
 	if ((access_mask & FILE_WRITE_ATTRIBUTES) &&
 	    (rejected_mask & FILE_WRITE_ATTRIBUTES) &&
 	    !lp_store_dos_attributes(SNUM(conn)) &&
+	    !lp_kernel_dosmodes(SNUM(conn)) &&
 	    (lp_map_readonly(SNUM(conn)) ||
 	     lp_map_archive(SNUM(conn)) ||
 	     lp_map_hidden(SNUM(conn)) ||
@@ -3294,13 +3295,15 @@ static bool open_match_attributes(connection_struct *conn,
 		  (unsigned int)*returned_unx_mode ));
 
 	/* If we're mapping SYSTEM and HIDDEN ensure they match. */
-	if (lp_map_system(SNUM(conn)) || lp_store_dos_attributes(SNUM(conn))) {
+	if (lp_map_system(SNUM(conn)) || lp_store_dos_attributes(SNUM(conn)) ||
+	    lp_kernel_dosmodes(SNUM(conn))) {
 		if ((old_dos_attr & FILE_ATTRIBUTE_SYSTEM) &&
 		    !(new_dos_attr & FILE_ATTRIBUTE_SYSTEM)) {
 			return False;
 		}
 	}
-	if (lp_map_hidden(SNUM(conn)) || lp_store_dos_attributes(SNUM(conn))) {
+	if (lp_map_hidden(SNUM(conn)) || lp_store_dos_attributes(SNUM(conn)) ||
+	    lp_kernel_dosmodes(SNUM(conn))) {
 		if ((old_dos_attr & FILE_ATTRIBUTE_HIDDEN) &&
 		    !(new_dos_attr & FILE_ATTRIBUTE_HIDDEN)) {
 			return False;
@@ -3842,6 +3845,8 @@ static void possibly_set_archive(struct connection_struct *conn,
 	if ((info == FILE_WAS_OVERWRITTEN && lp_map_archive(SNUM(conn)))) {
 		set_archive = true;
 	} else if (lp_store_dos_attributes(SNUM(conn))) {
+		set_archive = true;
+	} else if (lp_kernel_dosmodes(SNUM(conn))) {
 		set_archive = true;
 	}
 	if (!set_archive) {
@@ -4742,7 +4747,8 @@ static NTSTATUS mkdir_internal(connection_struct *conn,
 		return NT_STATUS_NOT_A_DIRECTORY;
 	}
 
-	if (lp_store_dos_attributes(SNUM(conn))) {
+	if (lp_store_dos_attributes(SNUM(conn)) ||
+	    lp_kernel_dosmodes(SNUM(conn))) {
 		file_set_dosmode(conn,
 				 smb_dname,
 				 file_attributes | FILE_ATTRIBUTE_DIRECTORY,
