@@ -3123,6 +3123,10 @@ struct loadparm_context *loadparm_init(TALLOC_CTX *mem_ctx)
 				  "65536");
 
 	lpcfg_do_global_parameter(lp_ctx,
+				  "kernel dosmodes",
+				  "False");
+
+	lpcfg_do_global_parameter(lp_ctx,
 				  "acl flag inherited canonicalization",
 				  "yes");
 
