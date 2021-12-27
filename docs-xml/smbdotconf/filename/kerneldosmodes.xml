@@ -1,0 +1,13 @@
+<samba:parameter name="kernel dosmodes"
+                 context="S"
+                 type="boolean"
+                 xmlns:samba="http://www.samba.org/samba/DTD/samba-doc">
+<description>
+	<para>
+	This parameter is set to indicate that server supports kernel dosmodes.
+	In case they are enabled, normal dosmode storage in xattr / posix mode are bypassed
+	in favor of direct call to relevant SET/FSET_DOS_ATTRIBUTES vfs function.
+	</para>
+</description>
+<value type="default">no</value>
+</samba:parameter>
