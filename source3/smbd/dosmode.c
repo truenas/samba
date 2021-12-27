@@ -961,7 +961,8 @@ int file_set_dosmode(connection_struct *conn,
 	}
 
 	if (smb_fname->fsp->fsp_flags.posix_open &&
-	    !lp_store_dos_attributes(SNUM(conn)))
+	    !lp_store_dos_attributes(SNUM(conn)) &&
+	    !lp_kernel_dosmodes(SNUM(conn)))
 	{
 		return 0;
 	}
