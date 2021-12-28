@@ -209,6 +209,7 @@ access_denied:
 	if ((access_mask & FILE_WRITE_ATTRIBUTES) &&
 	    (rejected_mask & FILE_WRITE_ATTRIBUTES) &&
 	    !lp_store_dos_attributes(SNUM(conn)) &&
+	    !lp_kernel_dosmodes(SNUM(conn)) &&
 	    (lp_map_readonly(SNUM(conn)) ||
 	     lp_map_archive(SNUM(conn)) ||
 	     lp_map_hidden(SNUM(conn)) ||
@@ -3123,13 +3124,15 @@ static bool open_match_attributes(connection_struct *conn,
 		  (unsigned int)*returned_unx_mode ));
 
 	/* If we're mapping SYSTEM and HIDDEN ensure they match. */
-	if (lp_map_system(SNUM(conn)) || lp_store_dos_attributes(SNUM(conn))) {
+	if (lp_map_system(SNUM(conn)) || lp_store_dos_attributes(SNUM(conn)) ||
+	    lp_kernel_dosmodes(SNUM(conn))) {
 		if ((old_dos_attr & FILE_ATTRIBUTE_SYSTEM) &&
 		    !(new_dos_attr & FILE_ATTRIBUTE_SYSTEM)) {
 			return False;
 		}
 	}
-	if (lp_map_hidden(SNUM(conn)) || lp_store_dos_attributes(SNUM(conn))) {
+	if (lp_map_hidden(SNUM(conn)) || lp_store_dos_attributes(SNUM(conn)) ||
+	    lp_kernel_dosmodes(SNUM(conn))) {
 		if ((old_dos_attr & FILE_ATTRIBUTE_HIDDEN) &&
 		    !(new_dos_attr & FILE_ATTRIBUTE_HIDDEN)) {
 			return False;
@@ -4181,6 +4184,9 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 			file_id = make_file_id_from_itime(&smb_fname->st);
 			update_stat_ex_file_id(&smb_fname->st, file_id);
 		}
+		else if (lp_kernel_dosmodes(SNUM(conn))) {
+			/* TODO: derive fileid from getfh(2) output */
+		}
 	}
 
 	if (info != FILE_WAS_OPENED) {
@@ -4195,6 +4201,10 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 					unx_mode = smb_fname->st.st_ex_mode;
 				}
 			}
+		}
+		else if (lp_kernel_dosmodes(SNUM(conn)) && !posix_open) {
+			SMB_VFS_FSET_DOS_ATTRIBUTES(conn, smb_fname->fsp,
+					    new_dos_attributes | FILE_ATTRIBUTE_ARCHIVE);
 		}
 	}
 
@@ -4369,6 +4379,10 @@ static NTSTATUS mkdir_internal(connection_struct *conn,
 					 file_attributes | FILE_ATTRIBUTE_DIRECTORY,
 					 parent_dir_fname, true);
 		}
+	}
+	else if (lp_kernel_dosmodes(SNUM(conn)) && !posix_open) {
+		/* TODO: add file_id from getfh(2) on FreeBSD */
+		SMB_VFS_FSET_DOS_ATTRIBUTES(conn, fsp, file_attributes | FILE_ATTRIBUTE_DIRECTORY);
 	}
 
 	if (lp_inherit_permissions(SNUM(conn))) {
