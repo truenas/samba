@@ -1457,7 +1457,8 @@ def get_parm(key):
     if tn_config:
         return tn_config[key]
 
-    with open('/etc/wsdd.conf', 'r') as f:
+    path_prefix = '/usr/local' if platform.system() == 'FreeBSD' else ''
+    with open(f'{path_prefix}/etc/wsdd.conf', 'r') as f:
         contents = f.read()
 
     tn_config = json.loads(contents)
