@@ -253,7 +253,7 @@ static int zfs_core_set_quota(struct vfs_handle_struct *handle,
 		return -1;
 	}
 
-	zq.bytes = qt->hardlimit * 1024;
+	zq.bytes = qt->hardlimit * qt->bsize;
 	zq.obj = qt->ihardlimit;
 
 	switch (qtype) {
