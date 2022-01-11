@@ -969,24 +969,9 @@ static int ixnas_renameat(vfs_handle_struct *handle,
 	return result;
 }
 
-static bool is_robocopy_init(struct smb_file_time *ft)
+static int fsp_set_times(files_struct *fsp, struct timespec *times, bool set_btime)
 {
-	if (!null_timespec(ft->atime) ||
-	    !null_timespec(ft->create_time)) {
-		return false;
-	}
-	if (ft->mtime.tv_sec == 315619200) {
-		return true;
-	}
-	return false;
-}
-
-static int fsp_set_times(files_struct *fsp, struct timespec *times)
-{
-	if (!fsp->fsp_flags.is_pathref) {
-		return futimens(fsp_get_io_fd(fsp), times);
-        }
-
+	int flag = set_btime ? AT_UTIMENSAT_FULL : 0;
 	if (fsp->fsp_flags.have_proc_fds) {
 		int fd = fsp_get_pathref_fd(fsp);
 		const char *p = NULL;
@@ -994,14 +979,14 @@ static int fsp_set_times(files_struct *fsp, struct timespec *times)
 
 		p = sys_proc_fd_path(fd, buf, sizeof(buf));
 		if (p != NULL) {
-			return utimensat(AT_FDCWD, p, times, 0);
+			return utimensat(AT_FDCWD, p, times, flag);
                 }
 
 		return -1;
 	}
 
 	/* fallback to path-based call */
-	return utimensat(AT_FDCWD, fsp->fsp_name->base_name, times, 0);
+	return utimensat(AT_FDCWD, fsp->fsp_name->base_name, times, flag);
 }
 
 static int ixnas_ntimes(vfs_handle_struct *handle,
@@ -1010,7 +995,7 @@ static int ixnas_ntimes(vfs_handle_struct *handle,
 {
 	int result = -1;
 	struct ixnas_config_data *config = NULL;
-	struct timespec ts[2], *times = NULL;
+	struct timespec ts[3], *times = NULL;
 
 	if (is_named_stream(fsp->fsp_name)) {
 		errno = ENOENT;
@@ -1025,20 +1010,8 @@ static int ixnas_ntimes(vfs_handle_struct *handle,
 		return SMB_VFS_NEXT_FNTIMES(handle, fsp, ft);
 	}
 
-	/*
-	 * man utimensat(2)
-	 * If times is non-NULL, it is assumed to point to an array of two
-	 * timespec structures. The access time is set to the value of the
-	 * second element. For filesystems that support file birth (creation) times,
-	 * the birth time will be set to the value of the second element if the
-	 * second element is older than the currently set birthtime. To set both
-	 * a birth time and a modification tie, two calls are required. The first
-	 * to set the birth time and the second to set the (presumabley newer).
-	 */
 	if (ft != NULL) {
-		if (is_robocopy_init(ft)) {
-			return 0;
-		}
+		bool set_btime = !is_omit_timespec(&ft->create_time);
 		if (is_omit_timespec(&ft->atime)) {
 			ft->atime= fsp->fsp_name->st.st_ex_atime;
 		}
@@ -1049,23 +1022,15 @@ static int ixnas_ntimes(vfs_handle_struct *handle,
 		if ((timespec_compare(&ft->atime,
 				      &fsp->fsp_name->st.st_ex_atime) == 0) &&
 		    (timespec_compare(&ft->mtime,
-				      &fsp->fsp_name->st.st_ex_mtime) == 0)) {
+				      &fsp->fsp_name->st.st_ex_mtime) == 0) &&
+		    (timespec_compare(&ft->create_time,
+				      &fsp->fsp_name->st.st_ex_btime) == 0)) {
 			return 0;
 		}
-		/*
-		 * Perform two utimensat() calls if needed to set the specified
-		 * timestamps.
-		 */
-		if (is_omit_timespec(&ft->create_time)) {
-			ft->create_time = ft->mtime;
-		}
 		ts[0] = ft->atime;
-		ts[1] = ft->create_time;
-		result = fsp_set_times(fsp, ts);
-		if (timespec_compare(&ft->mtime, &ft->create_time) != 0) {
-			ts[1] = ft->mtime;
-			result = fsp_set_times(fsp, ts);
-		}
+		ts[1] = ft->mtime;
+		ts[2] = ft->create_time;
+		result = fsp_set_times(fsp, ts, set_btime);
 	}
 
 	if (result != 0) {
