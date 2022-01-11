@@ -971,7 +971,7 @@ static int ixnas_renameat(vfs_handle_struct *handle,
 
 static int fsp_set_times(files_struct *fsp, struct timespec *times, bool set_btime)
 {
-	int flag = set_btime ? AT_UTIMENSAT_FULL : 0;
+	int flag = set_btime ? AT_UTIMENSAT_BTIME : 0;
 	if (fsp->fsp_flags.have_proc_fds) {
 		int fd = fsp_get_pathref_fd(fsp);
 		const char *p = NULL;
