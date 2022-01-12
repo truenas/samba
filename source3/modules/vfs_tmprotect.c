@@ -31,6 +31,7 @@ static const char *null_string = NULL;
 static const char **empty_list = &null_string;
 static const char *default_aapl = "aapltm-*";
 static const char **default_prefix = &default_aapl;
+static const char *tm_plist_suffix = "SnapshotHistory.plist";
 
 enum autorollback {A_ALWAYS, A_POWERLOSS, A_DISABLED};
 
@@ -40,6 +41,7 @@ struct tmprotect_config_data {
 	const char **inclusions;
 	const char **exclusions;
 	enum autorollback autorollback;
+	struct smb_filename *history_file;
 	time_t last_snap;
 	time_t oldest_snap;
 };
@@ -72,6 +74,60 @@ static void tmprotect_free_data(void **pptr) {
 	}
 }
 
+static int tmprotect_openat(vfs_handle_struct *handle,
+                            const struct files_struct *dirfsp,
+                            const struct smb_filename *smb_fname,
+                            files_struct *fsp,
+                            int flags, mode_t mode)
+{
+	int fd, ret;
+	struct smb_filename *full_name = NULL;
+	struct tmprotect_config_data *config = NULL;
+	size_t flen, slen = strlen(tm_plist_suffix);
+
+	SMB_VFS_HANDLE_GET_DATA(handle,
+				config,
+				struct tmprotect_config_data,
+				NULL);
+
+	ret = SMB_VFS_NEXT_OPENAT(handle,
+				  dirfsp,
+				  smb_fname,
+				  fsp, flags, mode);
+
+	if ((ret == -1) || config->history_file != NULL) {
+		return ret;
+	}
+
+	flen = strlen(smb_fname->base_name);
+
+	if ((flen < slen) ||
+	    (strcmp(tm_plist_suffix, smb_fname->base_name + (flen - slen)) != 0)) {
+		return ret;
+	}
+
+	full_name = full_path_from_dirfsp_atname(talloc_tos(),
+						 dirfsp,
+						 smb_fname);
+	if (full_name == NULL) {
+		/* Since open succeeded, return the fd */
+		DBG_ERR("%s: full_path_from_dirfsp_atname() failed.\n",
+			smb_fname_str_dbg(smb_fname));
+		return ret;
+	}
+
+	config->history_file = full_name;
+#if 0
+	fd = dup(get_io_fd(fsp));
+	if (fd == -1) {
+		DBG_ERR("%s: dup() failed: %s\n",
+			smb_fname_str_dbg(full_name),
+			strerror(errno));
+		return -1;
+	}
+#endif
+	return ret;	
+}
 
 static void tmprotect_disconnect(vfs_handle_struct *handle)
 {
@@ -79,6 +135,7 @@ static void tmprotect_disconnect(vfs_handle_struct *handle)
 	time_t curtime;
 	struct tmprotect_config_data *config = NULL;
 	char *snapshot_name = NULL;
+
 	time(&curtime);
 	SMB_VFS_HANDLE_GET_DATA(handle,
 				config,
@@ -89,8 +146,9 @@ static void tmprotect_disconnect(vfs_handle_struct *handle)
 	 * Time machine will back up once every 15 minutes by default.
 	 * Refuse to take more frequent snapshots than that.
 	 */
-	if ((config->last_snap + 900) > curtime) {
-		DBG_INFO("Refusing to generate new snapshot on disconnect"
+	if ((config->history_file == NULL) ||
+	    (config->last_snap + 900 > curtime)) {
+		DBG_ERR("Refusing to generate new snapshot on disconnect"
 			 "last snapshot is less than 15 minutes old\n");
 		return;
 	}
@@ -104,6 +162,7 @@ static void tmprotect_disconnect(vfs_handle_struct *handle)
 			handle->conn->connectpath);
 	}
 }
+
 
 static int tmprotect_connect(struct vfs_handle_struct *handle,
 			     const char *service, const char *user)
@@ -277,7 +336,8 @@ static int tmprotect_connect(struct vfs_handle_struct *handle,
 
 static struct vfs_fn_pointers tmprotect_fns = {
 	.disconnect_fn = tmprotect_disconnect,
-	.connect_fn = tmprotect_connect
+	.connect_fn = tmprotect_connect,
+	.openat_fn = tmprotect_openat,
 };
 
 NTSTATUS vfs_tmprotect_init(TALLOC_CTX *);
