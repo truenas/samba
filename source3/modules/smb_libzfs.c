@@ -934,7 +934,7 @@ smb_zfs_add_snapshot(zfs_handle_t *snap, void *data)
 
 	/* ignore snapshots with zero bytes written */
 	used = zfs_prop_get_int(snap, ZFS_PROP_WRITTEN);
-	if (used == 0 && !state->iter_info->ignore_empty_snaps) {
+	if (used == 0 && state->iter_info->ignore_empty_snaps) {
 		goto done;
 	}
 
