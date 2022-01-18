@@ -193,6 +193,7 @@ typedef sig_atomic_t volatile SIG_ATOMIC_T;
 struct stat_ex {
 	dev_t		st_ex_dev;
 	ino_t		st_ex_ino;
+	uint64_t	st_ex_gen;
 	uint64_t	st_ex_file_id;
 	mode_t		st_ex_mode;
 	nlink_t		st_ex_nlink;

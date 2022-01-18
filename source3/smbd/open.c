@@ -4183,9 +4183,13 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 
 			file_id = make_file_id_from_itime(&smb_fname->st);
 			update_stat_ex_file_id(&smb_fname->st, file_id);
-		}
-		else if (lp_kernel_dosmodes(SNUM(conn))) {
-			/* TODO: derive fileid from getfh(2) output */
+		} else if (lp_kernel_dosmodes(SNUM(conn)) &&
+		    smb_fname->st.st_ex_iflags & ST_EX_IFLAG_CALCULATED_FILE_ID)
+		{
+			uint64_t file_id;
+
+			file_id = SMB_VFS_FS_FILE_ID(conn, &smb_fname->st);
+			update_stat_ex_file_id(&smb_fname->st, file_id);
 		}
 	}
 
@@ -4201,10 +4205,6 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 					unx_mode = smb_fname->st.st_ex_mode;
 				}
 			}
-		}
-		else if (lp_kernel_dosmodes(SNUM(conn)) && !posix_open) {
-			SMB_VFS_FSET_DOS_ATTRIBUTES(conn, smb_fname->fsp,
-					    new_dos_attributes | FILE_ATTRIBUTE_ARCHIVE);
 		}
 	}
 
@@ -4379,9 +4379,14 @@ static NTSTATUS mkdir_internal(connection_struct *conn,
 					 file_attributes | FILE_ATTRIBUTE_DIRECTORY,
 					 parent_dir_fname, true);
 		}
-	}
-	else if (lp_kernel_dosmodes(SNUM(conn)) && !posix_open) {
-		/* TODO: add file_id from getfh(2) on FreeBSD */
+	} else if (lp_kernel_dosmodes(SNUM(conn)) && !posix_open) {
+		if (smb_dname->st.st_ex_iflags & ST_EX_IFLAG_CALCULATED_FILE_ID)
+		{
+			uint64_t file_id;
+
+			file_id = SMB_VFS_FS_FILE_ID(conn, &smb_dname->st);
+			update_stat_ex_file_id(&smb_dname->st, file_id);
+		}
 		SMB_VFS_FSET_DOS_ATTRIBUTES(conn, fsp, file_attributes | FILE_ATTRIBUTE_DIRECTORY);
 	}
 
