@@ -560,6 +560,24 @@ for env in ["fileserver"]:
     plantestsuite("samba3.blackbox.test_dangle_rmdir", env,
                   [os.path.join(samba3srcdir, "script/tests/test_delete_veto_files_only_rmdir.sh"),
                   '$SERVER', '$SERVER_IP', '$USERNAME', '$PASSWORD', '$LOCAL_PATH/veto', smbclient3])
+    plantestsuite("samba3.blackbox.test_list_servers.NT1",
+                  env + "_smb1_done",
+                  [os.path.join(samba3srcdir, "script/tests/test_smbclient_list_servers.sh"),
+                  '$SERVER',
+                  '$SERVER_IP',
+                  '$USERNAME',
+                  '$PASSWORD',
+                  smbclient3,
+                  "-mSMB3"])
+    plantestsuite("samba3.blackbox.test_list_servers.SMB2",
+                  env,
+                  [os.path.join(samba3srcdir, "script/tests/test_smbclient_list_servers.sh"),
+                  '$SERVER',
+                  '$SERVER_IP',
+                  '$USERNAME',
+                  '$PASSWORD',
+                  smbclient3,
+                  "-mSMB3"])
 
     #
     # tar command tests
@@ -935,6 +953,8 @@ for t in tests:
         plansmbtorture4testsuite(t, "ad_dc", '//$SERVER/tmp -U$USERNAME%$PASSWORD')
     elif t == "smb2.fileid":
         plansmbtorture4testsuite(t, "nt4_dc", '//$SERVER_IP/vfs_fruit_xattr -U$USERNAME%$PASSWORD')
+    elif t == "smb2.fileid_unique":
+        plansmbtorture4testsuite(t, "fileserver", '//$SERVER_IP/tmp -U$USERNAME%$PASSWORD')
     elif t == "smb2.acls_non_canonical":
         plansmbtorture4testsuite(t, "nt4_dc", '//$SERVER_IP/acls_non_canonical -U$USERNAME%$PASSWORD')
     elif t == "rpc.wkssvc":
