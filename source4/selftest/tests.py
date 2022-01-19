@@ -369,6 +369,7 @@ smb2_s3only = [
     "smb2.durable-v2-delay",
     "smb2.aio_delay",
     "smb2.fileid",
+    "smb2.fileid_unique",
     "smb2.timestamps",
 ]
 smb2 = [x for x in smbtorture4_testsuites("smb2.") if x not in smb2_s3only]
@@ -406,6 +407,22 @@ for t in libsmbclient:
             libsmbclient_testargs +
             [ "--option=torture:clientprotocol=%s" % proto],
             "samba4.%s.%s" % (t, proto))
+
+url = "smb://baduser:invalidpw@$SERVER/tmpguest"
+t = "libsmbclient.noanon_list"
+libsmbclient_testargs = [
+    '//$SERVER/tmpguest',
+    '-U$USERNAME%$PASSWORD',
+    "--option=torture:smburl=" + url,
+    "--option=torture:replace_smbconf="
+    "%s/testdata/samba3/smb_new.conf" % srcdir()
+    ]
+for proto in protocols:
+    plansmbtorture4testsuite(t,
+        "maptoguest",
+        libsmbclient_testargs +
+        [ "--option=torture:clientprotocol=%s" % proto],
+        "samba4.%s.baduser.%s" % (t, proto))
 
 plansmbtorture4testsuite("raw.qfileinfo.ipc", "ad_dc_ntvfs", '//$SERVER/ipc\$ -U$USERNAME%$PASSWORD')
 
