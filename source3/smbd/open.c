@@ -4206,6 +4206,10 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 				}
 			}
 		}
+		else if (lp_kernel_dosmodes(SNUM(conn)) && !posix_open) {
+			SMB_VFS_FSET_DOS_ATTRIBUTES(conn, smb_fname->fsp,
+				new_dos_attributes | FILE_ATTRIBUTE_ARCHIVE);
+		}
 	}
 
 	/* Determine sparse flag. */
