@@ -1,0 +1,196 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE refentry PUBLIC "-//Samba-Team//DTD DocBook V4.2-Based Variant V1.0//EN" "http://www.samba.org/samba/DTD/samba-doc">
+<refentry id="convxattr.1">
+
+<refmeta>
+	<refentrytitle>convxattr</refentrytitle>
+	<manvolnum>1</manvolnum>
+	<refmiscinfo class="source">Samba</refmiscinfo>
+	<refmiscinfo class="manual">User Commands</refmiscinfo>
+	<refmiscinfo class="version">&doc.version;</refmiscinfo>
+</refmeta>
+
+
+<refnamediv>
+	<refname>convxattr</refname>
+	<refpurpose>Recursively convert extended attributes</refpurpose>
+</refnamediv>
+
+<refsynopsisdiv>
+	<cmdsynopsis>
+		<command>convattr</command>
+		<arg choice="req">-a STRING, --action=STRING</arg>
+		<arg choice="req">-p STRING, --stream-prefix=STRING</arg>
+		<arg choice="req">-n STRING, --new-prefix=STRING</arg>
+		<arg choice="opt">-z STRING, --suffix-op</arg>
+		<arg choice="opt">-e STRING, --encoding</arg>
+		<arg choice="opt">-l, --follow-symlinks</arg>
+		<arg choice="opt">-t, --test</arg>
+		<arg choice="opt">-v, --verbose</arg>
+		<arg choice="opt">-x, --no-xdev</arg>
+		<arg choice="opt">-c, --do-chdir</arg>
+		<arg choice="opt">-f, --force</arg>
+		<arg choice="opt">-s, --skip</arg>
+		<arg choice="req">PATH [PATH ...]</arg>
+	</cmdsynopsis>
+</refsynopsisdiv>
+
+<refsect1>
+	<title>DESCRIPTION</title>
+
+	<para>This tool is part of the <citerefentry><refentrytitle>samba</refentrytitle>
+	<manvolnum>1</manvolnum></citerefentry> suite.</para>
+
+	<para>convxattr is a utility to perform extended attribute migrations
+	between different configuration settings used in vfs_streams_xattr</para>
+
+	<para>Most of the possible actions are not possible to cleanly undo and so
+	it is recommended to run perform a test run first to determine whether
+	results are as desired. In the case of "mv" action this will print the
+	current name of xattr and what the resulting name will be. For "add" and
+        "rem" action, only file and xattr names will be printed</para>
+
+	<para>If samba is compiled with JSON support, then standard output will be
+	json-formatted. Errors are printed to standard error and not json-formatted.</para>
+
+	<para>By default all symlinks are ignored, use <option>-l</option> to
+	follow them.</para>
+</refsect1>
+
+<refsect1>
+	<title>OPTIONS</title>
+
+	<variablelist>
+	<varlistentry>
+		<term>-a STRING, --action=STRING</term>
+		<listitem>
+		<para> xattr-related operation to perform. One one action may be
+		specified at a time. Permitted actions are "add", "rem", and "mv".</para>
+
+		<para>add: append an extra zero byte to the end of an extended attribute
+		that was created via a non-samba application that needs to conform
+		with standard vfs_streams_xattr behavior regarding xattr data</para>
+
+		<para>rem: remove the last byte from an extended attribute. This is
+		to make xattrs made with default parameters in vfs_streams_xattr
+		consistent with xattrs as read from other applications</para>
+
+		<para>mv: bulk rename all supported stream xattrs that have the
+		the prefix specified by "stream-prefix" to "new-prefix". The
+		alternate datastream suffix ":$DATA" will be appended or removed
+		based on the mandatory configuratoin option "suffix-op"</para>
+
+		<para>Note: actions will only be applied to extended attributes
+		that begin with the string specified by the parameter "stream-prefix".</para>
+		</listitem>
+	</varlistentry>
+
+	<varlistentry>
+		<term>-p STRING, --stream-prefix=STRING</term>
+		<listitem><para>Extended attribute prefix for streams. Specified
+		actions will only be performed on xattrs that have names beginning with
+		this prefix.</para>
+
+		<para>Example: <command>convxattr -a add -p "user.DosStream." path</command></para>
+		</listitem>
+	</varlistentry>
+
+	<varlistentry>
+		<term>-n STRING, --new-prefix=STRING</term>
+		<listitem><para>New extended attribute prefix for streams. This parameter
+		is used only during "mv" actions. During the action, the prefix specified
+		by the parameter "stream-prefix" is replaced with the prefix specified
+		by this parameter.</para>
+
+		<para>Example: <command>convxattr -a mv -p "user." -n "user.DosStream."
+		-z append path</command></para>
+		<para>The above example will change xattr name prefix from user. to user.DosStream.
+		and append the alternate datastream suffix ":$DATA" if needed.</para>
+		</listitem>
+	</varlistentry>
+
+	<varlistentry>
+		<term>-z STRING, --suffix-op=STRING</term>
+		<listitem><para>Handling for the alternate datastream suffix ":$DATA".
+		If "append", then the suffix will be appended to stream names that lack it.
+		If "remove", then the suffix will be removed from streams that contain it.
+		If "ignore", then suffix of stream name will be unchanged.
+		This is a required parameter for "mv" actions. There is no default.
+		</para>
+
+		<para>Example: <command>convxattr -a mv -p "user." -n "user.DosStream."
+		-z ignore path</command></para>
+		</listitem>
+	</varlistentry>
+
+	<varlistentry>
+		<term>-e STRING, --encoding=STRING</term>
+		<listitem><para>Optional stream name encoding transformation to match
+		behavior of parameter "fruit:encoding" in the Samba VFS module vfs_fruit.
+		If "private", then body of xattr name (no suffix or prefix) will be converted
+		to match that of an xattr name written by vfs_fruit with the parameter
+		"fruit:encoding = private" set.
+		If "native", then body of xattr name will be converted to match that of an
+		xattr name written by vfs_fruit with the parameter "fruit:encoding = native"
+		set.
+		If "ignore", then encoding will be unchanged. Default is "ignore".</para>
+
+		<para>Example: <command>convxattr -a mv -p "user.DosStream." -n "user.DosStream."
+		-z append -e hidden path</command></para>
+		</listitem>
+	</varlistentry>
+
+	<varlistentry>
+		<term>-l, --follow-symlinks</term>
+		<listitem><para>Follow symlinks, the default is to ignore
+		them.</para></listitem>
+	</varlistentry>
+
+	<varlistentry>
+		<term>-v, --verbose</term>
+		<listitem><para>Print files as they are checked.</para></listitem>
+	</varlistentry>
+
+	<varlistentry>
+		<term>-x, --no-xdev</term>
+		<listitem><para>Do not cross device boundaries (mountpoints).
+		</para></listitem>
+	</varlistentry>
+
+	<varlistentry>
+		<term>-c, --do-chdir</term>
+		<listitem><para>chdir into current directory during traversal. This is
+		a performance optimization and can work around extremely long paths, but
+		will result in somewhat less than helpful verbose output.
+		</para></listitem>
+	</varlistentry>
+
+	<varlistentry>
+		<term>-s, --skip</term>
+		<listitem><para>Skip files that have already been converted.
+		</para></listitem>
+	</varlistentry>
+
+	<varlistentry>
+		<term>-f, --force</term>
+		<listitem><para>Force overwriting of destination xattr during "mv" action</para></listitem>
+	</varlistentry>
+	</variablelist>
+
+</refsect1>
+
+<refsect1>
+	<title>VERSION</title>
+
+	<para>This man page is part of version &doc.version; of the Samba suite.</para>
+</refsect1>
+
+<refsect1>
+	<title>AUTHOR</title>
+
+	<para>The original Samba software and related utilities were created by
+	Andrew Tridgell. Samba is now developed by the Samba Team as an Open
+	Source project similar to the way the Linux kernel is developed.</para>
+</refsect1>
+
+</refentry>
