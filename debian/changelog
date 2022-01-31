@@ -1,3 +1,32 @@
+samba (2:4.15.5+ix-0) unstable; urgency=medium
+
+  * Update to Samba 4.15.5
+
+ -- Andrew Walker <awalker@ixsystems.com>  Tue, 09 Nov 2021 17:00:00 +0000
+
+
+samba (2:4.15.3+ix-0) unstable; urgency=medium
+
+  * Update to Samba 4.15.3
+
+ -- Andrew Walker <awalker@ixsystems.com>  Tue, 09 Nov 2021 17:00:00 +0000
+
+
+samba (2:4.15.2+ix-1) unstable; urgency=medium
+
+  * Fix multiple issues in FSRVP. 
+
+ -- Andrew Walker <awalker@ixsystems.com>  Mon, 12 Dec 2021 17:00:00 +0000
+
+
+samba (2:4.15.2+ix-0) unstable; urgency=medium
+
+  * Update to Samba 4.15.2
+
+ -- Andrew Walker <awalker@ixsystems.com>  Tue, 09 Nov 2021 17:00:00 +0000
+
+
+>>>>>>> ffc1a15d054 (Update debian changelog)
 samba (2:4.15.1+ix-0) unstable; urgency=medium
 
   * Update to Samba 4.15.1
