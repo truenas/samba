@@ -633,7 +633,11 @@ int main(int argc, const char **argv)
 		exit(1);
 	}
 
+#if defined (FREEBSD)
 	ret = listen(listen_sock, -1);
+#else
+	ret = listen(listen_sock, 5);
+#endif
 	if (ret == -1) {
 		perror("listen() failed");
 		exit(1);
