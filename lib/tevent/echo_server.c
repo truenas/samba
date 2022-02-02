@@ -633,7 +633,7 @@ int main(int argc, const char **argv)
 		exit(1);
 	}
 
-	ret = listen(listen_sock, 5);
+	ret = listen(listen_sock, -1);
 	if (ret == -1) {
 		perror("listen() failed");
 		exit(1);
