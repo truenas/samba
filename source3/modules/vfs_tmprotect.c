@@ -29,10 +29,7 @@
 #define TMPROTECT_MODULE "tmprotect"
 #define TS_FORMAT "<date>%Y-%m-%dT%H:%M:%SZ</date>"
 
-static const char *null_string = NULL;
-static const char **empty_list = &null_string;
 static const char *default_aapl = "aapltm-*";
-static const char **default_prefix = &default_aapl;
 static const char *tm_plist_suffix = "SnapshotHistory.plist";
 static int vfs_tmprotect_debug_level = DBGC_VFS;
 
@@ -42,8 +39,8 @@ static int vfs_tmprotect_debug_level = DBGC_VFS;
 struct tmprotect_config_data {
 	struct smblibzfshandle *libzp;
 	struct smbzhandle *hdl;
-	const char **inclusions;
-	const char **exclusions;
+	char **inclusions;
+	char **exclusions;
 	int retention;
 	int min_snaps;
 	bool enabled;
@@ -431,8 +428,10 @@ static void tmprotect_disconnect(vfs_handle_struct *handle)
 static int tmprotect_connect(struct vfs_handle_struct *handle,
 			     const char *service, const char *user)
 {
-	int ret;
+	int ret, saved_errno;
 	struct tmprotect_config_data *config = NULL;
+	const char **inclusions = NULL;
+	const char **exclusions = NULL;
 
 	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
 	if (ret != 0) {
@@ -446,13 +445,29 @@ static int tmprotect_connect(struct vfs_handle_struct *handle,
 		return -1;
 	}
 
-	config->inclusions = lp_parm_string_list(SNUM(handle->conn),
-						 TMPROTECT_MODULE,
-						 "include", default_prefix);
+	inclusions = lp_parm_string_list(SNUM(handle->conn),
+					 TMPROTECT_MODULE,
+					 "include", &default_aapl);
+	if (inclusions != NULL) {
+		config->inclusions = str_list_copy(config, inclusions);
+		if (config->inclusions == NULL) {
+			DBG_ERR("%s: str_list_copy failed: %s\n",
+				service, strerror(errno));
+			goto disconnect_out;
+		}
+	}
 
-	config->exclusions = lp_parm_string_list(SNUM(handle->conn),
-						 TMPROTECT_MODULE,
-						 "exclude", empty_list);
+	exclusions = lp_parm_string_list(SNUM(handle->conn),
+					 TMPROTECT_MODULE,
+					 "exclude", NULL);
+	if (exclusions != NULL) {
+		config->exclusions = str_list_copy(config, exclusions);
+		if (config->exclusions == NULL) {
+			DBG_ERR("%s: str_list_copy failed: %s\n",
+				service, strerror(errno));
+			goto disconnect_out;
+		}
+	}
 
 	config->retention = lp_parm_int(SNUM(handle->conn),
 					TMPROTECT_MODULE,
@@ -467,6 +482,14 @@ static int tmprotect_connect(struct vfs_handle_struct *handle,
 				NULL, struct tmprotect_config_data,
 				return -1);
 	return 0;
+
+disconnect_out:
+
+	TALLOC_FREE(config);
+	saved_errno = errno;
+	SMB_VFS_NEXT_DISCONNECT(handle);
+	errno = saved_errno;
+	return -1;
 }
 
 static struct vfs_fn_pointers tmprotect_fns = {
