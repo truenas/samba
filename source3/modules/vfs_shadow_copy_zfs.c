@@ -47,8 +47,6 @@
  *    shadow_copy_zfs_get_shadow_copy_zfs_data()
  */
 
-static const char *null_string = NULL;
-static const char **empty_list = &null_string;
 static int vfs_shadow_copy_zfs_debug_level = DBGC_VFS;
 
 #undef DBGC_CLASS
@@ -64,8 +62,8 @@ struct shadow_copy_zfs_config {
 	int			timedelta;
 	/* Snapshot parameters */
 	bool 			ignore_empty_snaps;
-	const char 		**inclusions;
-	const char 		**exclusions;
+	char 			**inclusions;
+	char 			**exclusions;
 	struct snapshot_list 	*snapshots;
 
 	char			*shadow_connectpath;
@@ -1361,7 +1359,9 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 {
 	struct smblibzfshandle	*libzp = NULL;
 	struct shadow_copy_zfs_config *config = NULL;
-	int ret;
+	const char **exclusions = NULL;
+	const char **inclusions = NULL;
+	int ret, saved_errno;
 
 	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
 	if (ret < 0) {
@@ -1383,13 +1383,29 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 
 	if (ret != 0) {
 		DBG_ERR("Failed to initialize zfs: %s\n", strerror(errno));
-		return -1;
+		goto disconnect_out;
 	}
 
-	config->inclusions = lp_parm_string_list(SNUM(handle->conn), "shadow",
-						"include", empty_list);
-	config->exclusions = lp_parm_string_list(SNUM(handle->conn), "shadow",
-						 "exclude", empty_list);
+	inclusions = lp_parm_string_list(SNUM(handle->conn), "shadow",
+					 "include", NULL);
+	if (inclusions != NULL) {
+		config->inclusions = str_list_copy(config, inclusions);
+		if (config->inclusions == NULL) {
+			DBG_ERR("%s: str_list_copy failed: %s\n",
+				service, strerror(errno));
+			goto disconnect_out;
+		}
+	}
+	exclusions = lp_parm_string_list(SNUM(handle->conn), "shadow",
+					 "exclude", NULL);
+	if (exclusions != NULL) {
+		config->exclusions = str_list_copy(config, exclusions);
+		if (config->exclusions == NULL) {
+			DBG_ERR("%s: str_list_copy failed: %s\n",
+				service, strerror(errno));
+			goto disconnect_out;
+		}
+	}
 
 	config->cache_enabled = lp_parm_bool(SNUM(handle->conn), "shadow",
 						"cache_enabled", true);
@@ -1400,12 +1416,19 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 	config->timedelta = lp_parm_int(SNUM(handle->conn),
 					"shadow", "snap_timedelta", 300);
 
-
 	SMB_VFS_HANDLE_SET_DATA(handle, config,
 				NULL, struct shadow_copy_zfs_config,
 				return -1);
 
 	return 0;
+
+disconnect_out:
+
+	TALLOC_FREE(config);
+	saved_errno = errno;
+	SMB_VFS_NEXT_DISCONNECT(handle);
+	errno = saved_errno;
+	return -1;
 }
 
 static struct vfs_fn_pointers vfs_shadow_copy_zfs_fns = {
