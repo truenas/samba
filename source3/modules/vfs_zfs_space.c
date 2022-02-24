@@ -31,7 +31,7 @@ static int vfs_zfs_space_connect(struct vfs_handle_struct *handle,
                             const char *service, const char *user)
 {
 	lp_do_parameter(SNUM(handle->conn), "zfs_core:zfs_space_enabled", "true");
-	return 0;
+	return SMB_VFS_NEXT_CONNECT(handle, service, user);
 }
 
 static struct vfs_fn_pointers vfs_zfs_space_fns = {
