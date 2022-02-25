@@ -35,6 +35,7 @@ struct zfs_core_config_data {
 	bool zfs_space_enabled;
 	bool zfs_quota_enabled;
 	bool zfs_auto_create;
+	bool checked;
 	const char *dataset_auto_quota;
 	uint64_t base_user_quota;
 };
@@ -521,18 +522,13 @@ static int set_base_user_quota(vfs_handle_struct *handle,
 static int zfs_core_chdir(vfs_handle_struct *handle,
 			  const struct smb_filename *smb_fname)
 {
-	static bool checked = false;
 	struct zfs_core_config_data *config = NULL;
-
-	if (checked) {
-		return SMB_VFS_NEXT_CHDIR(handle, smb_fname);
-	}
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct zfs_core_config_data,
 				return -1);
 
-	if (config->created != NULL) {
+	if (!config->checked && config->created != NULL) {
 		bool ok;
 
 		become_root();
@@ -541,12 +537,12 @@ static int zfs_core_chdir(vfs_handle_struct *handle,
 				      config->created);
 		unbecome_root();
 		if (!ok) {
-			checked = true;
 			return -1;
 		}
 	}
 
-	checked = true;
+	config->checked = true;
+
 	return SMB_VFS_NEXT_CHDIR(handle, smb_fname);
 }
 
