@@ -29,7 +29,7 @@
 #define TMPROTECT_MODULE "tmprotect"
 #define TS_FORMAT "<date>%Y-%m-%dT%H:%M:%SZ</date>"
 
-static const char *default_aapl = "aapltm-*";
+static const char *default_aapl[2] = {"aapltm-*", NULL};
 static const char *tm_plist_suffix = "SnapshotHistory.plist";
 static int vfs_tmprotect_debug_level = DBGC_VFS;
 

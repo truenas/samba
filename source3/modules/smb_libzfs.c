@@ -872,34 +872,45 @@ struct zfs_dataset *smb_zfs_path_get_dataset(struct smblibzfshandle *smblibzfsp,
 	return dsout;
 }
 
+static bool check_pattern(const char **pattern, const char *snap_name)
+{
+	const char **to_check = NULL;
+	bool match = false;
+
+	SMB_ASSERT(pattern != NULL);
+
+	for (to_check = pattern; *to_check != NULL; to_check++) {
+		match = unix_wild_match(*to_check, snap_name);
+		if (match) {
+			break;
+		}
+	}
+
+	return match;
+}
+
 static bool
 shadow_copy_zfs_is_snapshot_included(struct iter_info *info,
     const char *snap_name)
 {
-	const char **pattern;
+	bool is_match;
 
-	pattern = info->inclusions;
-	while (*pattern) {
-		if (unix_wild_match(*pattern, snap_name)) {
-			break;
-		}
-		pattern++;
-	}
-
-	if (*info->inclusions && !*pattern) {
-		DBG_INFO("smb_zfs_add_snapshot: snapshot %s "
-			    "not in inclusion list\n", snap_name);
-		return false;
-	}
-
-	pattern = info->exclusions;
-	while (*pattern) {
-		if (unix_wild_match(*pattern, snap_name)) {
+	if (info->inclusions != NULL) {
+		is_match = check_pattern(info->inclusions, snap_name);
+		if (!is_match) {
 			DBG_INFO("smb_zfs_add_snapshot: snapshot %s "
-				    "in exclusion list\n", snap_name);
+				 "not in inclusion list\n", snap_name);
 			return false;
 		}
-		pattern++;
+	}
+
+	if (info->exclusions != NULL) {
+		is_match = check_pattern(info->exclusions, snap_name);
+		if (is_match) {
+			DBG_INFO("smb_zfs_add_snapshot: snapshot %s "
+				 "in exclusion list\n", snap_name);
+			return false;
+		}
 	}
 
 	return true;
@@ -1045,18 +1056,6 @@ snapshot_list *zhandle_list_snapshots(struct smbzhandle *zhandle_ext,
 	state->iter_info->ignore_empty_snaps = ignore_empty_snaps;
 	state->iter_info->start = start;
 	state->iter_info->end = end;
-
-	if (state->iter_info->inclusions == NULL) {
-		DBG_ERR("smb_zfs_list_snapshots: error getting "
-			"shadow:include parameter\n");
-		goto error;
-	}
-
-	if (state->iter_info->exclusions == NULL) {
-		DBG_ERR("smb_zfs_list_snapshots: error getting "
-			"shadow:exclude parameter\n");
-		goto error;
-	}
 
 	rc = zfs_iter_snapshots_sorted(zfs, smb_zfs_add_snapshot, state, 0, 0);
 	if (rc != 0) {
