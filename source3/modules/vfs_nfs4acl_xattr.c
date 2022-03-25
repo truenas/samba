@@ -232,6 +232,14 @@ static NTSTATUS nfs4acl_xattr_fget_nt_acl(struct vfs_handle_struct *handle,
 
 	status = smb_fget_nt_acl_nfs4(fsp, NULL, security_info, mem_ctx,
 				      sd, smb4acl);
+
+	if (NT_STATUS_IS_OK(status)) {
+		bool ok, is_trivial;
+		ok = smbacl4_get_trivial(smb4acl, &is_trivial);
+		if (ok) {
+			fsp->fsp_flags.acl_is_trivial = is_trivial;
+		}
+	}
 	TALLOC_FREE(frame);
 	return status;
 }
@@ -465,9 +473,11 @@ static int nfs4acl_connect(struct vfs_handle_struct *handle,
 	switch (nfs_version) {
 	case 40:
 		config->nfs_version = ACL4_XATTR_VERSION_40;
+		handle->conn->aclbrand = SMB_ACL_BRAND_NFS40;
 		break;
 	case 41:
 		config->nfs_version = ACL4_XATTR_VERSION_41;
+		handle->conn->aclbrand = SMB_ACL_BRAND_NFS41;
 		break;
 	default:
 		config->nfs_version = ACL4_XATTR_VERSION_DEFAULT;
@@ -516,11 +526,13 @@ static int nfs4acl_connect(struct vfs_handle_struct *handle,
 		   "'store dos attributes = yes' "
 		   "for service [%s]\n", service);
 
-	lp_do_parameter(SNUM(handle->conn), "inherit acls", "true");
+	if (handle->conn->aclbrand != SMB_ACL_BRAND_NFS41) {
+		lp_do_parameter(SNUM(handle->conn), "inherit acls", "true");
+		lp_do_parameter(SNUM(handle->conn), "create mask", "0666");
+		lp_do_parameter(SNUM(handle->conn), "directory mask", "0777");
+	}
 	lp_do_parameter(SNUM(handle->conn), "dos filemode", "true");
 	lp_do_parameter(SNUM(handle->conn), "force unknown acl user", "true");
-	lp_do_parameter(SNUM(handle->conn), "create mask", "0666");
-	lp_do_parameter(SNUM(handle->conn), "directory mask", "0777");
 	lp_do_parameter(SNUM(handle->conn), "store dos attributes", "yes");
 
 	return 0;

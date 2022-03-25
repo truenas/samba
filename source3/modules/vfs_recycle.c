@@ -436,13 +436,143 @@ static bool recycle_file_exist(vfs_handle_struct *handle,
 	return false;
 }
 
+#ifdef FREEBSD
+static bool acl_strip(files_struct *dirfsp,
+		      struct smb_filename *smb_fname,
+		      mode_t mode)
+{
+	bool ok;
+	int dirfd, fd, err;
+	acl_t old, new;
+
+	dirfd = fsp_get_pathref_fd(dirfsp);
+	SMB_ASSERT(dirfd != -1);
+
+	fd = openat(dirfd, smb_fname->base_name, O_DIRECTORY);
+	if (fd == -1) {
+		DBG_ERR("%s: failed to open directory: %s\n",
+			smb_fname->base_name, strerror(errno));
+		return false;
+	}
+
+	old = acl_get_fd_np(fd, ACL_TYPE_NFS4);
+	if (old == NULL) {
+		DBG_ERR("%s: acl_get_fd_np() failed: %s\n",
+			smb_fname->base_name, strerror(errno));
+		ok = false;
+		goto done;
+	}
+
+	new = acl_strip_np(old, 0);
+	if (new == NULL) {
+		DBG_ERR("%s: acl_get_strip_np() failed: %s\n",
+			smb_fname->base_name, strerror(errno));
+		acl_free(old);
+		goto done;
+	}
+	acl_free(old);
+
+	err = acl_set_fd_np(fd, new, ACL_TYPE_NFS4);
+	if (err) {
+		DBG_ERR("%s: acl_set_fd_np() failed: %s\n",
+			smb_fname->base_name, strerror(errno));
+		acl_free(new);
+		goto done;
+	}
+
+	acl_free(new);
+
+	err = fchmod(fd, mode);
+	if (err) {
+		DBG_ERR("%s: chmod() failed: %s\n",
+			smb_fname->base_name, strerror(errno));
+	}
+done:
+	close(fd);
+	return ok;
+}
+
+static bool acl_is_trivial(files_strut *dirfsp,
+			   bool *trivialp)
+{
+	int dirfd, fd, err;
+	acl_t theacl;
+	bool is_trivial;
+
+	dirfd = fsp_get_pathref_fd(dirfsp);
+	SMB_ASSERT(dirfd != -1);
+
+	fd = openat(dirfd, "", O_DIRECTORY, AT_EMPTY_PATH);
+	if (fd == -1) {
+		DBG_ERR("%s: failed to open directory: %s\n",
+			fsp_str_dbg(dirfsp), strerror(errno));
+		return false;
+	}
+	theacl = acl_get_fd_np(fd, ACL_TYPE_NFS4);
+	if (theacl == NULL) {
+		DBG_ERR("%s: acl_get_fd_np() failed: %s\n",
+			fsp_str_dbg(dirfsp), strerror(errno));
+		close(fd);
+		return false;
+	}
+
+	err = acl_is_trivial_np(theacl, &is_trivial);
+	if (err) {
+		DBG_ERR("%s: acl_is_trivial_np() failed: %s\n",
+			fsp_str_dbg(dirfsp), strerror(errno));
+	}
+	return err ? false : true;
+}
+
+#else
+static bool acl_strip(files_struct *dirfsp,
+		      struct smb_filename *smb_fname,
+		      mode_t mode)
+{
+	/*
+	 * Still need to implement functionality to strip ACL in Linux
+	 * Current plan is to do through rmxattr on the NFS ACL xattr.
+	 */
+
+	return false;
+}
+
+static bool acl_is_trivial(files_strut *dirfsp,
+			   bool *trivialp)
+{
+	NTSTATUS status;
+	struct security_descriptor *sd = NULL;
+
+	status = SMB_VFS_FGET_NT_ACL(dirfsp,
+				     (SECINFO_OWNER |
+				      SECINFO_GROUP |
+				      SECINFO_DACL),
+				     talloc_tos(),
+				     &sd);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("%s: failed to get NT ACL: %s\n",
+			fsp_str_dbg(dirfsp), nt_errstr(status));
+		return false;
+	}
+
+	TALLOC_FREE(sd);
+	*trivialp = dirfsp->fsp_flags.acl_is_trivial;
+	return true;
+}
+
+#endif
+
 /**
  * Create directory tree
  * @param conn connection
  * @param dname Directory tree to be created
+ * @param check_acl whether to check if ACL is trivial
  * @return Returns True for success
  **/
-static bool recycle_create_dir(vfs_handle_struct *handle, const files_struct *dirfsp, const char *dname)
+static bool recycle_create_dir(vfs_handle_struct *handle,
+			       const files_struct *dirfsp,
+			       const char *dname,
+			       bool check_acl)
 {
 	size_t len;
 	mode_t mode;
@@ -451,9 +581,18 @@ static bool recycle_create_dir(vfs_handle_struct *handle, const files_struct *di
 	char *token;
 	char *tok_str;
 	bool ret = False;
+	bool is_trivial = true;
 	char *saveptr;
+	int depth;
 
 	mode = recycle_directory_mode(handle);
+	if (check_acl && handle->conn->aclbrand == SMB_ACL_BRAND_NFS41) {
+		bool ok;
+		ok = acl_is_trivial(handle, dirfsp, &is_trivial);
+		if (!ok) {
+			return ok;
+		}
+	}
 
 	tmp_str = SMB_STRDUP(dname);
 	ALLOC_CHECK(tmp_str, done);
@@ -471,8 +610,8 @@ static bool recycle_create_dir(vfs_handle_struct *handle, const files_struct *di
 	}
 
 	/* Create directory tree if necessary */
-	for(token = strtok_r(tok_str, "/", &saveptr); token;
-	    token = strtok_r(NULL, "/", &saveptr)) {
+	for(token = strtok_r(tok_str, "/", &saveptr), depth = 0; token;
+	    token = strtok_r(NULL, "/", &saveptr), depth++) {
 		if (strlcat(new_dir, token, len+1) >= len+1) {
 			goto done;
 		}
@@ -490,7 +629,15 @@ static bool recycle_create_dir(vfs_handle_struct *handle, const files_struct *di
 					dirfsp,
 					&smb_fname,
 					mode);
-			if (retval != 0) {
+			if (retval != 0 && errno == EPERM && !is_trivial) {
+				ret = acl_strip(handle, dirfsp, &smb_fname, mode);
+				if (!ret) {
+					DBG_ERR("%s: failed to strip ACL: %s\n",
+						new_dir, strerror(errno));
+					goto done;
+				}
+			}
+			else if (retval != 0) {
 				DBG_WARNING("recycle: mkdirat failed "
 					"for %s with error: %s\n",
 					new_dir,

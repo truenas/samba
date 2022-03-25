@@ -49,6 +49,7 @@ struct SMB4ACL_T
 {
 	uint16_t controlflags;
 	uint32_t naces;
+	bool is_trivial;
 	struct SMB4ACE_T	*first;
 	struct SMB4ACE_T	*last;
 };
@@ -264,6 +265,25 @@ bool smbacl4_set_controlflags(struct SMB4ACL_T *acl, uint16_t controlflags)
 	acl->controlflags = controlflags;
 	return true;
 }
+
+bool smbacl4_get_trivial(const struct SMB4ACL_T *acl, bool *trivialp)
+{
+	if (acl == NULL) {
+		return false;
+	}
+	*trivialp = acl->is_trivial;
+	return true;
+}
+
+bool smbacl4_set_trivial(struct SMB4ACL_T *acl, bool trivial)
+{
+	if (acl == NULL) {
+		return false;
+	}
+	acl->is_trivial = trivial;
+	return true;
+}
+
 
 bool nfs_ace_is_inherit(SMB_ACE4PROP_T *ace)
 {
