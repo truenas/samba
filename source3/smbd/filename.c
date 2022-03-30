@@ -1393,7 +1393,8 @@ static NTSTATUS check_name(connection_struct *conn,
 		return status;
 	}
 
-	if (!lp_widelinks(SNUM(conn)) || !lp_follow_symlinks(SNUM(conn))) {
+	if (!(conn->internal_tcon_flags & TCON_FLAG_RESOLVE_BENEATH)
+	    && (!lp_widelinks(SNUM(conn)) || !lp_follow_symlinks(SNUM(conn)))) {
 		status = check_reduced_name(conn, NULL, smb_fname);
 		if (!NT_STATUS_IS_OK(status)) {
 			DEBUG(5,("check_name: name %s failed with %s\n",
