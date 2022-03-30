@@ -54,6 +54,48 @@ bool canonicalize_connect_path(connection_struct *conn)
  Ensure when setting connectpath it is a canonicalized (no ./ // or ../)
  absolute path stating in / and not ending in /.
 ****************************************************************************/
+static bool set_connectpath_fsp(connection_struct *conn,
+				const struct files_struct *cwd_fsp)
+{
+	NTSTATUS status;
+	files_struct *fsp = NULL;
+	struct smb_filename *tmp_fname = NULL;
+	mode_t unix_mode;
+	int fd;
+
+	if (conn->connectpath_fsp != NULL) {
+		fd_close(conn->connectpath_fsp);
+		file_free(NULL, conn->connectpath_fsp);
+		conn->connectpath_fsp = NULL;
+	}
+
+	tmp_fname = cp_smb_filename(conn, cwd_fsp->fsp_name);
+	if (tmp_fname == NULL) {
+		errno = ENOMEM;
+		return false;
+	}
+
+	status = create_internal_fsp(conn, tmp_fname, &fsp);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("%s: failed to open internal dirfsp: %s\n",
+			fsp_str_dbg(fsp), nt_errstr(status));
+		TALLOC_FREE(tmp_fname);
+		return false;
+	}
+
+	TALLOC_FREE(tmp_fname);
+
+	fd = open(conn->connectpath, O_DIRECTORY | O_PATH);
+	if (fd == -1) {
+		DBG_ERR("%s: failed to open: %s\n", fsp_str_dbg(fsp), strerror(errno));
+		return false;
+	}
+
+	fsp_set_fd(fsp, fd);
+	fsp->fsp_flags.is_directory = true;
+	conn->connectpath_fsp = fsp;
+	return true;
+}
 
 bool set_conn_connectpath(connection_struct *conn, const char *connectpath)
 {
@@ -873,6 +915,10 @@ static NTSTATUS make_connection_snum(struct smbXsrv_connection *xconn,
 			 conn->session_info->unix_info->unix_name );
 		dbgtext( "(uid=%d, gid=%d) ", (int)effuid, (int)effgid );
 		dbgtext( "(pid %d)\n", (int)getpid() );
+	}
+	if (!IS_IPC(conn) && !IS_PRINT(conn)) {
+		set_connectpath_fsp(conn, conn->cwd_fsp);
+		SMB_ASSERT(conn->connectpath_fsp != NULL);
 	}
 
 	conn->tcon_done = true;

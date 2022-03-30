@@ -702,6 +702,12 @@ static int vfswrap_openat(vfs_handle_struct *handle,
 
 	SMB_ASSERT(!is_named_stream(smb_fname));
 
+#ifdef O_RESOLVE_BENEATH
+	if (handle->conn->internal_tcon_flags & TCON_FLAG_RESOLVE_BENEATH) {
+		SMB_ASSERT(flags & (O_RESOLVE_BENEATH | O_EMPTY_PATH));
+	}
+#endif
+
 #ifdef O_PATH
 	have_opath = true;
 	if (fsp->fsp_flags.is_pathref) {

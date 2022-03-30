@@ -31,7 +31,7 @@ static int vfs_ixnas_debug_level = DBGC_VFS;
 
 struct ixnas_config_data {
 	struct smbacl4_vfs_params nfs4_params;
-	bool posix_rename;
+	bool use_resolve_beneath;
 	bool dosattrib_xattr;
 	bool zfs_acl_enabled;
 	bool zfs_acl_chmod_enabled;
@@ -1415,6 +1415,84 @@ static int ixnas_ntimes(vfs_handle_struct *handle,
 	}
 	return result;
 }
+
+static void generate_beneath_path(const char *connectpath,
+				  const struct files_struct *dirfsp,
+				  const struct smb_filename *at_name,
+				  char buf,
+				  size_t bufsz)
+{
+	if (at_name->base_name[0] == '/') {
+		if (strncmp(connectpath, at_name->base_name, strlen(connectpath)) != 0) {
+			smb_panic("absolute path not within connectpath");
+		}
+		strlcpy(buf, at_name->base_name + strlen(connectpath), sizeof(buf));
+	} else if (ISDOT(dirfsp->fsp_name->base_name)) {
+		strlcpy(buf, at_name->base_name, bufsz);
+	} else if (dirfsp->fsp_name->base_name[0] == '/') {
+		if (strncmp(connectpath, dirfsp->fsp_name->base_name, strlen(connectpath)) != 0) {
+			smb_panic("absolute path not within connectpath");
+		}
+		if (snprintf(buf, bufsz, "%s/%s",
+			     dirfsp->fsp_name->base_name + strlen(connectpath),
+			     at_name->base_name) >= bufsz) {
+			smb_panic("failed to generate beneath path");
+		}
+	} else {
+		if (snprintf(buf, sizeof(buf), "%s/%s",
+			     dirfsp->fsp_name->base_name,
+			     at_name->base_name) >= sizeof(buf)) {
+			smb_panic("failed to generate beneath path");
+		}
+	}
+}
+
+static int ixnas_openat(vfs_handle_struct *handle,
+			const struct files_struct *dirfsp,
+			const struct smb_filename *smb_fname_in,
+			files_struct *fsp,
+			int flags, mode_t mode)
+{
+	struct ixnas_config_data *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct ixnas_config_data,
+				smb_panic("ixnas_openat(): failed to get config"));
+
+	/*
+	 * O_EMPTY_PATH means that we're re-opening the dirfd using
+	 * and so we don't have to worry about symlinks.
+	 */
+	if (config->use_resolve_beneath &&
+	    (flags & O_EMPTY_PATH == 0)) {
+		char full_name[PATH_MAX] = { 0 };
+		struct smb_filename full_fname = {
+			.base_name = full_name,
+			.st = smb_fname_in->st,
+			.twrp = smb_fname_in->twrp,
+			.flags = smb_fname_in->flags
+		};
+
+		generate_beneath_path(handle->conn->connectpath,
+				      dirfsp,
+				      smb_fname_in,
+				      full_name,
+				      sizeof(full_name)- 1);
+
+		if (full_name[0] == '/') {
+			full_fname.base_name = &full_name[1];
+		}
+
+		handle->conn->internal_tcon_flags |= TCON_FLAG_RESOLVE_BENEATH;
+		return SMB_VFS_NEXT_OPENAT(handle, handle->conn->connectpath_fsp,
+					   full_fname, fsp, (flags | O_RESOLVE_BENEATH), mode);
+	}
+
+	return SMB_VFS_NEXT_OPENAT(handle,
+				   dirfsp,
+				   smb_fname_in,
+				   fsp, flags, mode);
+}
 #endif /* FREEBSD */
 
 static bool set_acl_parameters(struct vfs_handle_struct *handle,
@@ -1496,8 +1574,8 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 		return ret;
 	}
 
-	config->posix_rename = lp_parm_bool(SNUM(handle->conn),
-			"ixnas", "posix_rename", false);
+	config->use_resolve_beneath = lp_parm_bool(SNUM(handle->conn),
+			"ixnas", "use_resolve_beneath", false);
 
 	/*
 	 * Ensure other alternate methods of mapping dosmodes are disabled.
@@ -1550,6 +1628,7 @@ static struct vfs_fn_pointers ixnas_fns = {
 	/* zfs_acl_enabled = true */
 	.fchmod_fn = ixnas_fchmod,
 #if defined (FREEBSD)
+	.openat_fn = ixnas_openat,
 	.fntimes_fn = ixnas_ntimes,
 	.file_id_create_fn = ixnas_file_id_create,
 	.fs_file_id_fn = ixnas_fs_file_id,
