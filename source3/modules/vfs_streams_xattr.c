@@ -359,7 +359,9 @@ static int streams_xattr_openat(struct vfs_handle_struct *handle,
 		return vfs_fake_fd();
 	}
 #endif
-	SMB_ASSERT(fsp_get_pathref_fd(dirfsp) == AT_FDCWD);
+	if (!(handle->conn->internal_tcon_flags & TCON_FLAG_RESOLVE_BENEATH)) {
+		SMB_ASSERT(fsp_get_pathref_fd(dirfsp) == AT_FDCWD);
+	}
 	fsp->fsp_flags.have_proc_fds = fsp->conn->have_proc_fds;
 
 	status = streams_xattr_get_name(handle, talloc_tos(),

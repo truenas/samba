@@ -667,6 +667,7 @@ typedef struct files_struct {
  * In any other case use fsp_get_io_fd().
  */
 #define TCON_FLAG_STAT_FAILED		0x01
+#define TCON_FLAG_RESOLVE_BENEATH	0x02
 
 #define FSP_POSIX_FLAGS_OPEN		0x01
 #define FSP_POSIX_FLAGS_RENAME		0x02
@@ -719,6 +720,7 @@ typedef struct connection_struct {
 	/* iXsystems additions */
 	enum acl_brand aclbrand;
 	uint32_t internal_tcon_flags;
+	struct files_struct *connectpath_fsp;
 	/* end iXsystems additions */
 
 	char *connectpath;

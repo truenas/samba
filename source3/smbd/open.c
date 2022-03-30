@@ -674,7 +674,8 @@ static NTSTATUS non_widelink_open(const struct files_struct *dirfsp,
 	have_opath = true;
 #endif
 
-	if (dirfsp == conn->cwd_fsp) {
+	if ((!(conn->internal_tcon_flags & TCON_FLAG_RESOLVE_BENEATH) || is_named_stream(smb_fname))
+	     && dirfsp == conn->cwd_fsp) {
 		if (fsp->fsp_flags.is_directory) {
 			parent_dir_fname = cp_smb_filename(talloc_tos(), smb_fname);
 			if (parent_dir_fname == NULL) {

@@ -198,7 +198,8 @@ char *get_snapshot_path(TALLOC_CTX *mem_ctx,
 			char *mountpoint,
 			char *filename,
 			const char *mpoffset,
-			struct snapshot_entry *snap)
+			struct snapshot_entry *snap,
+			enum casesensitivity sens)
 {
 	DBG_DEBUG("connectpath: %s, mountpoint: %s, "
 		  "filename: %s, mpoffset: %s, snapshot: %s\n",
@@ -208,10 +209,25 @@ char *get_snapshot_path(TALLOC_CTX *mem_ctx,
 	char buf[PATH_MAX] = {0};
 	char *tmp_name = buf;
 	char *child_offset = NULL;
+	int (*strcmp_fn)(const char *s1, const char *s2);
+	int (*strncmp_fn)(const char *s1, const char *s2, size_t len);
+
+	switch(sens) {
+	case SMBZFS_SENSITIVE:
+		strcmp_fn = strcmp;
+		strncmp_fn = strncmp;
+		break;
+	case SMBZFS_INSENSITIVE:
+		strcmp_fn = strcasecmp_m;
+		strncmp_fn = strncasecmp_m;
+		break;
+	default:
+		smb_panic("Unsupported case sensitivity setting");
+	}
 
 	strlcpy(buf, filename, sizeof(buf));
 	if (mpoffset == NULL) {
-		SMB_ASSERT(strcmp(mountpoint, connectpath) >= 0);
+		SMB_ASSERT(strcmp_fn(mountpoint, connectpath) >= 0);
 		child_offset = mountpoint + strlen(connectpath);
 	}
 
@@ -220,7 +236,7 @@ char *get_snapshot_path(TALLOC_CTX *mem_ctx,
 		 * This is not the same dataset as the one underlying the connectpath.
 		 */
 		child_offset += 1;
-		if (strcmp(child_offset, tmp_name) == 0) {
+		if (strcmp_fn(child_offset, tmp_name) == 0) {
 			/* The path is a dataset mountpoint. Set last path component
 			 * to NULL so that we later exclude from our returned string.
 			 */
@@ -228,7 +244,7 @@ char *get_snapshot_path(TALLOC_CTX *mem_ctx,
 			DBG_DEBUG("file [%s] is a sub-dataset mountpoint\n",
 				  filename);
 		} else {
-			SMB_ASSERT(strncmp(tmp_name, child_offset, strlen(child_offset)) == 0);
+			SMB_ASSERT(strncmp_fn(tmp_name, child_offset, strlen(child_offset)) == 0);
 			tmp_name += strlen(child_offset) + 1;
 			DBG_DEBUG("file [%s] is within sub-dataset [%s] base_name rewritten to [%s]\n",
 				  filename, mountpoint, tmp_name);
@@ -642,7 +658,7 @@ static char *_do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 
 	ret = get_snapshot_path(talloc_tos(), handle->conn->connectpath,
 				snapshots.mountpoint, res_fname,
-				mpoffset, snapshots.snap);
+				mpoffset, snapshots.snap, config->singleton->properties->casesens);
 
 	if (out != NULL) {
 		size_t off = 0;
@@ -1156,7 +1172,8 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 		tmp_file = get_snapshot_path(handle->conn, handle->conn->connectpath,
 					     snapshots->mountpoint,
 					     fsp->fsp_name->base_name,
-					     mpoffset, entry);
+					     mpoffset, entry,
+					     config->singleton->properties->casesens);
 
 		DBG_INFO("snapshot[%d]: ts: %ld, gmt: %s, name: %s, "
 			 "createtxg: %ld, path: %s\n",
