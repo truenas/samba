@@ -140,9 +140,11 @@ static bool prune_snapshots(vfs_handle_struct *handle,
 			 "min snaps: %d\n", snapshots->num_entries,
 			 to_delete->num_entries, remaining_snaps, config->min_snaps);
 		to_delete->dataset_name = talloc_strdup(talloc_tos(), snapshots->dataset_name);
+		become_root();
 		ret = smb_zfs_delete_snapshots(config->libzp,
 					       talloc_tos(),
 					       to_delete);
+		unbecome_root();
 		if (ret != 0) {
 			DBG_ERR("failed to delete list of expired snapshots: %s\n",
 				strerror(errno));
