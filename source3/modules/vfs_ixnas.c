@@ -913,21 +913,24 @@ failure:
  * does not actually rename the file. Add new logic to rename(). If
  * a case_insensitive string comparison of the filenames returns 0, then
  * perform two renames so that the returned filename matches client
- * expectations. First rename appends a jenkins hash of the full path
- * to the file to its name. This makes the rename deterministic, but
- * minimizes risk of name collisions.
+ * expectations. First rename appends a unique id generated from
+ * inode and generation number to the file's name. This makes the
+ * rename deterministic, while minimizing risk of name collisions.
  */
+static uint64_t ixnas_fs_file_id(struct vfs_handle_struct *handle,
+				 const SMB_STRUCT_STAT *psbuf);
+
 static int ixnas_renameat(vfs_handle_struct *handle,
 			  files_struct *srcfsp,
 			  const struct smb_filename *smb_fname_src,
 			  files_struct *dstfsp,
 			  const struct smb_filename *smb_fname_dst)
 {
-	int result;
+	int result = 1;
 	struct ixnas_config_data *config = NULL;
 	char *tmp_base_name = NULL;
-	uint32_t nhash;
-	NTSTATUS status;
+	uint64_t srcid, dstid;
+
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct ixnas_config_data,
 				return -1);
@@ -939,8 +942,14 @@ static int ixnas_renameat(vfs_handle_struct *handle,
 					     dstfsp,
 					     smb_fname_dst);
 	}
-	result = strcasecmp_m(smb_fname_src->base_name,
-			      smb_fname_dst->base_name);
+
+	srcid = ixnas_fs_file_id(handle, &srcfsp->fsp_name->st);
+	dstid = ixnas_fs_file_id(handle, &dstfsp->fsp_name->st);
+
+	if (srcid == dstid) {
+		result = strcasecmp_m(smb_fname_src->base_name,
+				      smb_fname_dst->base_name);
+	}
 	if (result != 0) {
 		return SMB_VFS_NEXT_RENAMEAT(handle,
 					     srcfsp,
@@ -948,23 +957,28 @@ static int ixnas_renameat(vfs_handle_struct *handle,
 					     dstfsp,
 					     smb_fname_dst);
 	}
-	status = file_name_hash(handle->conn, smb_fname_src->base_name, &nhash);
-	if (NT_STATUS_EQUAL(status, NT_STATUS_NO_MEMORY)) {
-		DBG_ERR("failed to generate filename hash for %s\n",
-			smb_fname_src->base_name);
-		errno=ENOMEM;
+
+	dstid = ixnas_fs_file_id(handle, &smb_fname_src->st);
+	tmp_base_name = talloc_asprintf(talloc_tos(), "%s_%lu",
+					smb_fname_src->base_name, dstid);
+	if (tmp_base_name == NULL) {
+		errno = ENOMEM;
 		return -1;
 	}
-	tmp_base_name = talloc_asprintf(talloc_tos(), "%s_0x%08x",
-					smb_fname_src->base_name, nhash);
-	result = rename(smb_fname_src->base_name, tmp_base_name);
+	result = renameat(
+		fsp_get_pathref_fd(srcfsp), smb_fname_src->base_name,
+		fsp_get_pathref_fd(dstfsp), tmp_base_name
+        );
 	if (result != 0) {
 		DBG_ERR("Failed to rename %s to intermediate name %s\n",
 			smb_fname_src->base_name, tmp_base_name);
 		TALLOC_FREE(tmp_base_name);
 		return result;
 	}
-	result = rename(tmp_base_name, smb_fname_dst->base_name);
+	result = renameat(
+		fsp_get_pathref_fd(dstfsp), tmp_base_name,
+		fsp_get_pathref_fd(srcfsp), smb_fname_dst->base_name
+        );
 	TALLOC_FREE(tmp_base_name);
 	return result;
 }
