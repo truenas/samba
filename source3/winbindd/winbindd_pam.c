@@ -677,7 +677,6 @@ static NTSTATUS winbindd_raw_kerberos_login(TALLOC_CTX *mem_ctx,
 	fstring name_namespace, name_domain, name_user;
 	time_t ticket_lifetime = 0;
 	time_t renewal_until = 0;
-	ADS_STRUCT *ads;
 	time_t time_offset = 0;
 	const char *user_ccache_file;
 	struct PAC_LOGON_INFO *logon_info = NULL;
@@ -687,6 +686,8 @@ static NTSTATUS winbindd_raw_kerberos_login(TALLOC_CTX *mem_ctx,
 	const char *local_service;
 	uint32_t i;
 	struct netr_SamInfo6 *info6_copy = NULL;
+	char *canon_principal = NULL;
+	char *canon_realm = NULL;
 	bool ok;
 
 	*info6 = NULL;
@@ -714,9 +715,8 @@ static NTSTATUS winbindd_raw_kerberos_login(TALLOC_CTX *mem_ctx,
 	/* 2nd step:
 	 * get kerberos properties */
 
-	if (domain->private_data) {
-		ads = (ADS_STRUCT *)domain->private_data;
-		time_offset = ads->auth.time_offset;
+	if (domain->backend_data.ads_conn != NULL) {
+		time_offset = domain->backend_data.ads_conn->auth.time_offset;
 	}
 
 
@@ -789,6 +789,8 @@ static NTSTATUS winbindd_raw_kerberos_login(TALLOC_CTX *mem_ctx,
 				     WINBINDD_PAM_AUTH_KRB5_RENEW_TIME,
 				     NULL,
 				     local_service,
+				     &canon_principal,
+				     &canon_realm,
 				     &pac_data_ctr);
 	if (user_ccache_file != NULL) {
 		gain_root_privilege();
@@ -854,7 +856,9 @@ static NTSTATUS winbindd_raw_kerberos_login(TALLOC_CTX *mem_ctx,
 					    time(NULL),
 					    ticket_lifetime,
 					    renewal_until,
-					    false);
+					    false,
+					    canon_principal,
+					    canon_realm);
 
 		if (!NT_STATUS_IS_OK(result)) {
 			DEBUG(10,("winbindd_raw_kerberos_login: failed to add ccache to list: %s\n",
@@ -1231,7 +1235,9 @@ static NTSTATUS winbindd_dual_pam_auth_cached(struct winbindd_domain *domain,
 							    time(NULL),
 							    time(NULL) + lp_winbind_cache_time(),
 							    time(NULL) + WINBINDD_PAM_AUTH_KRB5_RENEW_TIME,
-							    true);
+							    true,
+							    principal_s,
+							    realm);
 
 				if (!NT_STATUS_IS_OK(result)) {
 					DEBUG(10,("winbindd_dual_pam_auth_cached: failed "
@@ -1421,9 +1427,6 @@ static NTSTATUS winbindd_dual_auth_passdb(TALLOC_CTX *mem_ctx,
 		TALLOC_FREE(frame);
 		return NT_STATUS_NO_MEMORY;
 	}
-
-	/* We don't want any more mapping of the username */
-	user_info->mapped_state = True;
 
 	/* We don't want to come back to winbindd or to do PAM account checks */
 	user_info->flags |= USER_INFO_INFO3_AND_NO_AUTHZ;

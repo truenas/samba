@@ -1234,6 +1234,18 @@ static struct tevent_req *cli_smb1_rename_send(TALLOC_CTX *mem_ctx,
 		return NULL;
 	}
 
+	/*
+	 * Strip a MSDFS path from fname_dst if we were given one.
+	 */
+	status = cli_dfs_target_check(state,
+				cli,
+				fname_src,
+				fname_dst,
+				&fname_dst);
+	if (!NT_STATUS_IS_OK(status)) {
+		goto fail;
+	}
+
 	if (!push_ucs2_talloc(talloc_tos(), &converted_str, fname_dst,
 			      &converted_size_bytes)) {
 		status = NT_STATUS_INVALID_PARAMETER;
@@ -1311,6 +1323,7 @@ static struct tevent_req *cli_cifs_rename_send(TALLOC_CTX *mem_ctx,
 	uint8_t additional_flags = 0;
 	uint16_t additional_flags2 = 0;
 	uint8_t *bytes = NULL;
+	NTSTATUS status;
 
 	req = tevent_req_create(mem_ctx, &state, struct cli_cifs_rename_state);
 	if (req == NULL) {
@@ -1322,6 +1335,18 @@ static struct tevent_req *cli_cifs_rename_send(TALLOC_CTX *mem_ctx,
 		 * CIFS doesn't support replace
 		 */
 		tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
+		return tevent_req_post(req, ev);
+	}
+
+	/*
+	 * Strip a MSDFS path from fname_dst if we were given one.
+	 */
+	status = cli_dfs_target_check(state,
+				cli,
+				fname_src,
+				fname_dst,
+				&fname_dst);
+	if (tevent_req_nterror(req, status)) {
 		return tevent_req_post(req, ev);
 	}
 
@@ -1489,6 +1514,7 @@ NTSTATUS cli_rename(struct cli_state *cli,
 	}
 
 	status = cli_rename_recv(req);
+	cli->raw_status = status; /* cli_smb2_rename_recv doesn't set this */
 
  fail:
 	TALLOC_FREE(frame);
@@ -1517,11 +1543,24 @@ static struct tevent_req *cli_ntrename_internal_send(TALLOC_CTX *mem_ctx,
 	uint8_t additional_flags = 0;
 	uint16_t additional_flags2 = 0;
 	uint8_t *bytes = NULL;
+	NTSTATUS status;
 
 	req = tevent_req_create(mem_ctx, &state,
 				struct cli_ntrename_internal_state);
 	if (req == NULL) {
 		return NULL;
+	}
+
+	/*
+	 * Strip a MSDFS path from fname_dst if we were given one.
+	 */
+	status = cli_dfs_target_check(state,
+				cli,
+				fname_src,
+				fname_dst,
+				&fname_dst);
+	if (tevent_req_nterror(req, status)) {
+		return tevent_req_post(req, ev);
 	}
 
 	SSVAL(state->vwv+0, 0 ,FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_DIRECTORY);
@@ -1681,12 +1720,26 @@ static struct tevent_req *cli_smb2_hardlink_send(
 {
 	struct tevent_req *req = NULL, *subreq = NULL;
 	struct cli_smb2_hardlink_state *state = NULL;
+	NTSTATUS status;
 
 	req = tevent_req_create(
 		mem_ctx, &state, struct cli_smb2_hardlink_state);
 	if (req == NULL) {
 		return NULL;
 	}
+
+	/*
+	 * Strip a MSDFS path from fname_dst if we were given one.
+	 */
+	status = cli_dfs_target_check(state,
+				cli,
+				fname_src,
+				fname_dst,
+				&fname_dst);
+	if (tevent_req_nterror(req, status)) {
+		return tevent_req_post(req, ev);
+	}
+
 	state->ev = ev;
 	state->cli = cli;
 	state->fname_dst = fname_dst;

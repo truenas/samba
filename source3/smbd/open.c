@@ -780,9 +780,8 @@ static NTSTATUS non_widelink_open(const struct files_struct *dirfsp,
 	fsp_set_fd(fsp, fd);
 
 	if (fd != -1) {
-		ret = SMB_VFS_FSTAT(fsp, &fsp->fsp_name->st);
-		if (ret != 0) {
-			status = map_nt_error_from_unix(errno);
+		status = vfs_stat_fsp(fsp);
+		if (!NT_STATUS_IS_OK(status)) {
 			goto out;
 		}
 		orig_fsp_name->st = fsp->fsp_name->st;
@@ -1537,12 +1536,11 @@ static NTSTATUS open_file(files_struct *fsp,
 			}
 
 			if (need_re_stat) {
-				ret = SMB_VFS_FSTAT(fsp, &smb_fname->st);
+				status = vfs_stat_fsp(fsp);
 				/*
 				 * If we have an fd, this stat should succeed.
 				 */
-				if (ret == -1) {
-					status = map_nt_error_from_unix(errno);
+				if (!NT_STATUS_IS_OK(status)) {
 					DBG_ERR("Error doing fstat on open "
 						"file %s (%s)\n",
 						 smb_fname_str_dbg(smb_fname),
@@ -4354,10 +4352,11 @@ static NTSTATUS mkdir_internal(connection_struct *conn,
 	/* Ensure we're checking for a symlink here.... */
 	/* We don't want to get caught by a symlink racer. */
 
-	if (SMB_VFS_FSTAT(fsp, &smb_dname->st) == -1) {
+	status = vfs_stat_fsp(fsp);
+	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(2, ("Could not stat directory '%s' just created: %s\n",
-			  smb_fname_str_dbg(smb_dname), strerror(errno)));
-		return map_nt_error_from_unix(errno);
+			  smb_fname_str_dbg(smb_dname), nt_errstr(status)));
+		return status;
 	}
 
 	if (!S_ISDIR(smb_dname->st.st_ex_mode)) {
@@ -4423,10 +4422,11 @@ static NTSTATUS mkdir_internal(connection_struct *conn,
 	}
 
 	if (need_re_stat) {
-		if (SMB_VFS_FSTAT(fsp, &smb_dname->st) == -1) {
+		status = vfs_stat_fsp(fsp);
+		if (!NT_STATUS_IS_OK(status)) {
 			DEBUG(2, ("Could not stat directory '%s' just created: %s\n",
-			  smb_fname_str_dbg(smb_dname), strerror(errno)));
-			return map_nt_error_from_unix(errno);
+			  smb_fname_str_dbg(smb_dname), nt_errstr(status)));
+			return status;
 		}
 	}
 
@@ -4890,16 +4890,36 @@ void msg_file_was_renamed(struct messaging_context *msg_ctx,
 	}
 
 	if (strcmp(fsp->conn->connectpath, msg->servicepath) == 0) {
+		SMB_STRUCT_STAT fsp_orig_sbuf;
 		NTSTATUS status;
 		DBG_DEBUG("renaming file %s from %s -> %s\n",
 			  fsp_fnum_dbg(fsp),
 			  fsp_str_dbg(fsp),
 			  smb_fname_str_dbg(smb_fname));
+
+		/*
+		 * The incoming smb_fname here has an
+		 * invalid stat struct from synthetic_smb_fname()
+		 * above.
+		 * Preserve the existing stat from the
+		 * open fsp after fsp_set_smb_fname()
+		 * overwrites with the invalid stat.
+		 *
+		 * (We could just copy this into
+		 * smb_fname->st, but keep this code
+		 * identical to the fix in rename_open_files()
+		 * for clarity.
+		 *
+		 * We will do an fstat before returning
+		 * any of this metadata to the client anyway.
+		 */
+		fsp_orig_sbuf = fsp->fsp_name->st;
 		status = fsp_set_smb_fname(fsp, smb_fname);
 		if (!NT_STATUS_IS_OK(status)) {
 			DBG_DEBUG("fsp_set_smb_fname failed: %s\n",
 				  nt_errstr(status));
 		}
+		fsp->fsp_name->st = fsp_orig_sbuf;
 	} else {
 		/* TODO. JRA. */
 		/*
@@ -5363,8 +5383,42 @@ static void lease_match_parser(
 
 		/* Everything should be the same. */
 		if (!file_id_equal(&state->id, &f->id)) {
-			/* This should catch all dynamic share cases. */
-			state->match_status = NT_STATUS_OPLOCK_NOT_GRANTED;
+			/*
+			 * The client asked for a lease on a
+			 * file that doesn't match the file_id
+			 * in the database.
+			 *
+			 * Maybe this is a dynamic share, i.e.
+			 * a share where the servicepath is
+			 * different for different users (e.g.
+			 * the [HOMES] share.
+			 *
+			 * If the servicepath is different, but the requested
+			 * file name + stream name is the same then this is
+			 * a dynamic share, the client is using the same share
+			 * name and doesn't know that the underlying servicepath
+			 * is different. It was expecting a lease on the
+			 * same file. Return NT_STATUS_OPLOCK_NOT_GRANTED
+			 * to break leases
+			 *
+			 * Otherwise the client has messed up, or is
+			 * testing our error codes, so return
+			 * NT_STATUS_INVALID_PARAMETER.
+			 */
+			if (!strequal(f->servicepath, state->servicepath) &&
+			    strequal(f->base_name, state->fname->base_name) &&
+			    strequal(f->stream_name, state->fname->stream_name))
+			{
+				/*
+				 * Name is the same but servicepath is
+				 * different, dynamic share. Break leases.
+				 */
+				state->match_status =
+					NT_STATUS_OPLOCK_NOT_GRANTED;
+			} else {
+				state->match_status =
+					NT_STATUS_INVALID_PARAMETER;
+			}
 			break;
 		}
 		if (!strequal(f->servicepath, state->servicepath)) {

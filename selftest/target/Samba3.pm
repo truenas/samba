@@ -188,7 +188,7 @@ sub getlog_env_app($$$)
 	close(LOG);
 
 	return "" if $out eq $title;
- 
+
 	return $out;
 }
 
@@ -1466,8 +1466,10 @@ sub setup_ad_member_idmap_nss
 	my $extra_member_options = "
 	# bob:x:65521:65531:localbob gecos:/:/bin/false
 	# jane:x:65520:65531:localjane gecos:/:/bin/false
+	# jackthemapper:x:65519:65531:localjackthemaper gecos:/:/bin/false
+	# jacknomapper:x:65518:65531:localjacknomaper gecos:/:/bin/false
 	idmap config $dcvars->{DOMAIN} : backend = nss
-	idmap config $dcvars->{DOMAIN} : range = 65520-65521
+	idmap config $dcvars->{DOMAIN} : range = 65518-65521
 
 	# Support SMB1 so that we can use posix_whoami().
 	client min protocol = CORE
@@ -1488,6 +1490,8 @@ sub setup_ad_member_idmap_nss
 
 	open(USERMAP, ">$prefix/lib/username.map") or die("Unable to open $prefix/lib/username.map");
 	print USERMAP "
+!jacknomapper = \@jackthemappergroup
+!root = jacknomappergroup
 root = $dcvars->{DOMAIN}/root
 bob = $dcvars->{DOMAIN}/bob
 ";
@@ -1539,31 +1543,11 @@ sub setup_simpleserver
 	aio_pthread:aio open = yes
 	smbd async dosmode = yes
 
-[vfs_aio_pthread_async_dosmode_force_sync1]
+[async_dosmode_shadow_copy2]
 	path = $prefix_abs/share
 	read only = no
-	vfs objects = aio_pthread
-	store dos attributes = yes
-	aio_pthread:aio open = yes
+	vfs objects = shadow_copy2 xattr_tdb
 	smbd async dosmode = yes
-	# This simulates non linux systems
-	smbd:force sync user path safe threadpool = yes
-	smbd:force sync user chdir safe threadpool = yes
-	smbd:force sync root path safe threadpool = yes
-	smbd:force sync root chdir safe threadpool = yes
-
-[vfs_aio_pthread_async_dosmode_force_sync2]
-	path = $prefix_abs/share
-	read only = no
-	vfs objects = aio_pthread xattr_tdb
-	store dos attributes = yes
-	aio_pthread:aio open = yes
-	smbd async dosmode = yes
-	# This simulates non linux systems
-	smbd:force sync user path safe threadpool = yes
-	smbd:force sync user chdir safe threadpool = yes
-	smbd:force sync root path safe threadpool = yes
-	smbd:force sync root chdir safe threadpool = yes
 
 [vfs_aio_fork]
 	path = $prefix_abs/share
@@ -1687,6 +1671,14 @@ sub setup_fileserver
 
 	my $veto_sharedir="$share_dir/veto";
 	push(@dirs,$veto_sharedir);
+
+	my $virusfilter_sharedir="$share_dir/virusfilter";
+	push(@dirs,$virusfilter_sharedir);
+
+	my $delete_unwrite_sharedir="$share_dir/delete_unwrite";
+	push(@dirs,$delete_unwrite_sharedir);
+	push(@dirs, "$delete_unwrite_sharedir/delete_veto_yes");
+	push(@dirs, "$delete_unwrite_sharedir/delete_veto_no");
 
 	my $ip4 = Samba::get_ipv4_addr("FILESERVER");
 	my $fileserver_options = "
@@ -1813,6 +1805,27 @@ sub setup_fileserver
 	path = $veto_sharedir
 	delete veto files = yes
 
+[delete_yes_unwrite]
+	read only = no
+	path = $delete_unwrite_sharedir
+	hide unwriteable files = yes
+	delete veto files = yes
+
+[delete_no_unwrite]
+	read only = no
+	path = $delete_unwrite_sharedir
+	hide unwriteable files = yes
+	delete veto files = no
+
+[virusfilter]
+	path = $virusfilter_sharedir
+	vfs objects = acl_xattr virusfilter
+	virusfilter:scanner = dummy
+	virusfilter:min file size = 0
+	virusfilter:infected files = *infected*
+	virusfilter:infected file action = rename
+	virusfilter:scan on close = yes
+
 [homes]
 	comment = Home directories
 	browseable = No
@@ -1890,6 +1903,14 @@ sub setup_fileserver
 	##
 	create_file_chmod("$bad_iconv_sharedir/\xED\x9F\xBF", 0644) or return undef;
 
+	##
+	## create unwritable files inside inside the delete unwrite veto share dirs.
+	##
+	unlink("$delete_unwrite_sharedir/delete_veto_yes/file_444");
+	create_file_chmod("$delete_unwrite_sharedir/delete_veto_yes/file_444", 0444) or return undef;
+	unlink("$delete_unwrite_sharedir/delete_veto_no/file_444");
+	create_file_chmod("$delete_unwrite_sharedir/delete_veto_no/file_444", 0444) or return undef;
+
 	return $vars;
 }
 
@@ -1927,32 +1948,6 @@ sub setup_fileserver_smb1
 	store dos attributes = yes
 	aio_pthread:aio open = yes
 	smbd async dosmode = yes
-
-[vfs_aio_pthread_async_dosmode_force_sync1]
-	path = $prefix_abs/share
-	read only = no
-	vfs objects = aio_pthread
-	store dos attributes = yes
-	aio_pthread:aio open = yes
-	smbd async dosmode = yes
-	# This simulates non linux systems
-	smbd:force sync user path safe threadpool = yes
-	smbd:force sync user chdir safe threadpool = yes
-	smbd:force sync root path safe threadpool = yes
-	smbd:force sync root chdir safe threadpool = yes
-
-[vfs_aio_pthread_async_dosmode_force_sync2]
-	path = $prefix_abs/share
-	read only = no
-	vfs objects = aio_pthread xattr_tdb
-	store dos attributes = yes
-	aio_pthread:aio open = yes
-	smbd async dosmode = yes
-	# This simulates non linux systems
-	smbd:force sync user path safe threadpool = yes
-	smbd:force sync user chdir safe threadpool = yes
-	smbd:force sync root path safe threadpool = yes
-	smbd:force sync root chdir safe threadpool = yes
 
 [vfs_aio_fork]
 	path = $prefix_abs/share
@@ -2153,7 +2148,7 @@ sub make_bin_cmd
 {
 	my ($self, $binary, $env_vars, $options, $valgrind, $dont_log_stdout) = @_;
 
-	my @optargs = ("-d0");
+	my @optargs = ();
 	if (defined($options)) {
 		@optargs = split(/ /, $options);
 	}
@@ -2426,7 +2421,7 @@ sub provision($$)
 	my $nmbdsockdir="$prefix_abs/nmbd";
 	unlink($nmbdsockdir);
 
-	## 
+	##
 	## create the test directory layout
 	##
 	die ("prefix_abs = ''") if $prefix_abs eq "";
@@ -2534,6 +2529,8 @@ sub provision($$)
 	my ($gid_nobody, $gid_nogroup, $gid_root, $gid_domusers, $gid_domadmins);
 	my ($gid_userdup, $gid_everyone);
 	my ($gid_force_user);
+	my ($gid_jackthemapper);
+	my ($gid_jacknomapper);
 	my ($uid_user1);
 	my ($uid_user2);
 	my ($uid_gooduser);
@@ -2541,6 +2538,8 @@ sub provision($$)
 	my ($uid_slashuser);
 	my ($uid_localbob);
 	my ($uid_localjane);
+	my ($uid_localjackthemapper);
+	my ($uid_localjacknomapper);
 
 	if ($unix_uid < 0xffff - 13) {
 		$max_uid = 0xffff;
@@ -2563,6 +2562,8 @@ sub provision($$)
 	$uid_slashuser = $max_uid - 13;
 	$uid_localbob = $max_uid - 14;
 	$uid_localjane = $max_uid - 15;
+	$uid_localjackthemapper = $max_uid - 16;
+	$uid_localjacknomapper = $max_uid - 17;
 
 	if ($unix_gids[0] < 0xffff - 8) {
 		$max_gid = 0xffff;
@@ -2578,6 +2579,8 @@ sub provision($$)
 	$gid_userdup = $max_gid - 6;
 	$gid_everyone = $max_gid - 7;
 	$gid_force_user = $max_gid - 8;
+	$gid_jackthemapper = $max_gid - 9;
+	$gid_jacknomapper = $max_gid - 10;
 
 	##
 	## create conffile
@@ -3135,6 +3138,7 @@ sub provision($$)
 	error_inject:pwrite = EBADF
 	shadow:mountpoint = $shadow_tstdir
 	shadow:fixinodes = yes
+	smbd async dosmode = yes
 
 [dfq]
 	path = $shrdir/dfree
@@ -3290,7 +3294,7 @@ sub provision($$)
 	unless (open(PASSWD, ">$nss_wrapper_passwd")) {
            warn("Unable to open $nss_wrapper_passwd");
            return undef;
-        } 
+        }
 	print PASSWD "nobody:x:$uid_nobody:$gid_nobody:nobody gecos:$prefix_abs:/bin/false
 $unix_name:x:$unix_uid:$unix_gids[0]:$unix_name gecos:$prefix_abs:/bin/false
 pdbtest:x:$uid_pdbtest:$gid_nogroup:pdbtest gecos:$prefix_abs:/bin/false
@@ -3306,6 +3310,8 @@ eviluser:x:$uid_eviluser:$gid_domusers:eviluser gecos::/bin/false
 slashuser:x:$uid_slashuser:$gid_domusers:slashuser gecos:/:/bin/false
 bob:x:$uid_localbob:$gid_domusers:localbob gecos:/:/bin/false
 jane:x:$uid_localjane:$gid_domusers:localjane gecos:/:/bin/false
+jackthemapper:x:$uid_localjackthemapper:$gid_domusers:localjackthemaper gecos:/:/bin/false
+jacknomapper:x:$uid_localjacknomapper:$gid_domusers:localjacknomaper gecos:/:/bin/false
 ";
 	if ($unix_uid != 0) {
 		print PASSWD "root:x:$uid_root:$gid_root:root gecos:$prefix_abs:/bin/false
@@ -3325,6 +3331,8 @@ domadmins:X:$gid_domadmins:
 userdup:x:$gid_userdup:$unix_name
 everyone:x:$gid_everyone:
 force_user:x:$gid_force_user:
+jackthemappergroup:x:$gid_jackthemapper:jackthemapper
+jacknomappergroup:x:$gid_jacknomapper:jacknomapper
 ";
 	if ($unix_gids[0] != 0) {
 		print GROUP "root:x:$gid_root:
@@ -3370,6 +3378,8 @@ force_user:x:$gid_force_user:
 	createuser($self, "gooduser", $password, $conffile, \%createuser_env) || die("Unable to create gooduser");
 	createuser($self, "eviluser", $password, $conffile, \%createuser_env) || die("Unable to create eviluser");
 	createuser($self, "slashuser", $password, $conffile, \%createuser_env) || die("Unable to create slashuser");
+	createuser($self, "jackthemapper", "mApsEcrEt", $conffile, \%createuser_env) || die("Unable to create jackthemapper");
+	createuser($self, "jacknomapper", "nOmApsEcrEt", $conffile, \%createuser_env) || die("Unable to create jacknomapper");
 
 	open(DNS_UPDATE_LIST, ">$prefix/dns_update_list") or die("Unable to open $$prefix/dns_update_list");
 	print DNS_UPDATE_LIST "A $server. $server_ip\n";

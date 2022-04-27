@@ -410,10 +410,11 @@ static NTSTATUS authsam_password_check_and_record(struct auth4_context *auth_con
 			return NT_STATUS_WRONG_PASSWORD;
 		}
 
-		if (user_info->password_state != AUTH_PASSWORD_RESPONSE) {
+		if (user_info->flags & USER_INFO_INTERACTIVE_LOGON) {
 			/*
 			 * The authentication was OK against the previous password,
-			 * but it's not a NTLM network authentication.
+			 * but it's not a NTLM network authentication,
+			 * LDAP simple bind or something similar.
 			 *
 			 * We just return the original wrong password.
 			 * This skips the update of the bad pwd count,
@@ -657,7 +658,7 @@ static NTSTATUS authsam_check_password_internals(struct auth_method_context *ctx
 	 * really, really want to get back to exactly the same account
 	 * we got the DN for.
 	 */
-	if (user_info->mapped_state == false) {
+	if (!user_info->cracknames_called) {
 		p = strchr_m(account_name, '@');
 	} else {
 		/*
@@ -866,17 +867,17 @@ static NTSTATUS authsam_want_check(struct auth_method_context *ctx,
 		return NT_STATUS_OK;
 	}
 
-	if (user_info->mapped_state) {
+	if (user_info->cracknames_called) {
 		/*
 		 * The caller already did a cracknames call.
 		 */
-		DBG_DEBUG("%s is not one domain name (DC)\n",
+		DBG_DEBUG("%s is not own domain name (DC)\n",
 			  effective_domain);
 		return NT_STATUS_NOT_IMPLEMENTED;
 	}
 
 	if (!strequal(effective_domain, "")) {
-		DBG_DEBUG("%s is not one domain name (DC)\n",
+		DBG_DEBUG("%s is not own domain name (DC)\n",
 			  effective_domain);
 		return NT_STATUS_NOT_IMPLEMENTED;
 	}
