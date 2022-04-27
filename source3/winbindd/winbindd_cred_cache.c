@@ -209,7 +209,7 @@ rekinit:
 	set_effective_uid(entry->uid);
 
 	ret = smb_krb5_renew_ticket(entry->ccname,
-				    entry->principal_name,
+				    entry->canon_principal,
 				    entry->service,
 				    &new_start);
 #if defined(DEBUG_KRB5_TKT_RENEWAL)
@@ -501,7 +501,9 @@ NTSTATUS add_ccache_to_list(const char *princ_name,
 			    time_t create_time,
 			    time_t ticket_end,
 			    time_t renew_until,
-			    bool postponed_request)
+			    bool postponed_request,
+			    const char *canon_principal,
+			    const char *canon_realm)
 {
 	struct WINBINDD_CCACHE_ENTRY *entry = NULL;
 	struct timeval t;
@@ -614,6 +616,18 @@ NTSTATUS add_ccache_to_list(const char *princ_name,
 	if (service) {
 		entry->service = talloc_strdup(entry, service);
 		if (!entry->service) {
+			goto no_mem;
+		}
+	}
+	if (canon_principal != NULL) {
+		entry->canon_principal = talloc_strdup(entry, canon_principal);
+		if (entry->canon_principal == NULL) {
+			goto no_mem;
+		}
+	}
+	if (canon_realm != NULL) {
+		entry->canon_realm = talloc_strdup(entry, canon_realm);
+		if (entry->canon_realm == NULL) {
 			goto no_mem;
 		}
 	}
