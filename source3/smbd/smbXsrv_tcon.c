@@ -914,7 +914,6 @@ NTSTATUS smbXsrv_tcon_disconnect(struct smbXsrv_tcon *tcon, uint64_t vuid)
 				  tcon->global->share_name,
 				  nt_errstr(status)));
 
-			close_cnum(tcon->compat, vuid);
 			tcon->compat = NULL;
 			return status;
 		}
