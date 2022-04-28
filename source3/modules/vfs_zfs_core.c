@@ -393,6 +393,7 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 		}
 
 		fd_close(pathref);
+		file_free(NULL, pathref);
 		pathref = c_fsp;
 	}
 	error = chdir(handle->conn->connectpath);
