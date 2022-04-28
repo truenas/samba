@@ -157,6 +157,7 @@ static NTSTATUS winmsa_inherit_acl(vfs_handle_struct *handle,
 	}
 
 	status = fd_close(tmp_fsp);
+	file_free(NULL, tmp_fsp);
 	return status;
 }
 
