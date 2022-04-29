@@ -328,8 +328,8 @@ static bool smbace2bsdentry(acl_t bsdacl, SMB_ACE4PROP_T *aceprop)
 	acl_entry_t new_entry;
 	acl_perm_t permset = 0;
 	acl_entry_type_t type = 0;
-	acl_flag_t flags;
-	uid_t id;
+	acl_flag_t flags = 0;
+	uid_t id = ACL_UNDEFINED_ID;
 	acl_tag_t tag;
 	int i;
 
@@ -373,7 +373,9 @@ static bool smbace2bsdentry(acl_t bsdacl, SMB_ACE4PROP_T *aceprop)
 			smb_panic("Unsupported special id.");
 		}
 	} else {
-		tag = ACL_GROUP ? aceprop->aceFlags & SMB_ACE4_IDENTIFIER_GROUP : ACL_USER;
+		tag = aceprop->aceFlags & SMB_ACE4_IDENTIFIER_GROUP ?
+		     ACL_GROUP : ACL_USER;
+		id = aceprop->who.id;
 	}
 
 	new_entry->ae_perm = permset;
@@ -553,6 +555,7 @@ static bool ixnas_process_smbacl(vfs_handle_struct *handle,
 
 		hidden_entry->ae_perm = 0;
 		hidden_entry->ae_entry_type = ACL_ENTRY_TYPE_ALLOW;
+		hidden_entry->ae_flags = ACL_ENTRY_FILE_INHERIT | ACL_ENTRY_DIRECTORY_INHERIT;
 		hidden_entry->ae_tag = ACL_EVERYONE;
 		hidden_entry->ae_id = ACL_UNDEFINED_ID;
 	}
