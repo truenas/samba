@@ -326,6 +326,7 @@ static bool get_synthetic_fsp(vfs_handle_struct *handle,
 		DBG_ERR("Failed to open %s, mode: 0o%o: %s\n",
 			smb_fname_str_dbg(tmp_fname), unix_mode,
 			strerror(errno));
+		file_free(NULL, tmp_fsp);
 		return false;
 	}
 	tmp_fsp->fsp_flags.is_directory = true;
@@ -373,6 +374,8 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 
 		ok = get_synthetic_fsp(handle, ds->mountpoint + root_len, &c_fsp);
 		if (!ok) {
+			fd_close(pathref);
+			file_free(NULL, pathref);
 			return false;
 		}
 
@@ -380,6 +383,9 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 		if (error) {
 			DBG_ERR("%s: stat() failed: %s\n", fsp_str_dbg(c_fsp), strerror(errno));
 			fd_close(c_fsp);
+			file_free(NULL, c_fsp);
+			fd_close(pathref);
+			file_free(NULL, pathref);
 			return false;
 		}
 
