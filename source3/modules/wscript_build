@@ -284,7 +284,7 @@ bld.SAMBA3_MODULE('vfs_shadow_copy_zfs',
 bld.SAMBA3_MODULE('vfs_zfsacl',
                  subsystem='vfs',
                  source='vfs_zfsacl.c',
-                 deps='NFS4_ACLS sunacl',
+                 deps='NFS4_ACLS zfsacl sunacl',
                  init_function='',
                  internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_zfsacl'),
                  enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_zfsacl'))
