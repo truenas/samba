@@ -4,11 +4,17 @@
 #define __ZFSACL_H__
 
 
+/*
+ * BRAND_ACCESS and BRAND_DEFAULT
+ * values chosen so can convert easily
+ * to FreeBSD brand POSIX with
+ * zfsacl_brand_t & ACL_BRAND_POSIX 
+ */
 typedef enum {
 	ZFSACL_BRAND_UNKNOWN	= 0,
-	ZFSACL_BRAND_ACCESS	= 1,
-	ZFSACL_BRAND_DEFAULT	= 2,
-	ZFSACL_BRAND_NFSV4	= 3,
+	ZFSACL_BRAND_NFSV4	= 2,
+	ZFSACL_BRAND_ACCESS	= 3,
+	ZFSACL_BRAND_DEFAULT	= 5,
 } zfsacl_brand_t;
 
 typedef enum {
@@ -38,6 +44,7 @@ struct native_acl {
 typedef void *zfsacl_entry_t;
 struct zfsacl;
 typedef struct zfsacl *zfsacl_t;
+
 typedef unsigned int zfsace_flagset_t;
 typedef unsigned int zfsace_permset_t;
 typedef uid_t zfsace_id_t;

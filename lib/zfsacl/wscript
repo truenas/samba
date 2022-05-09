@@ -39,7 +39,7 @@ def configure(conf):
 def build(bld):
     bld.RECURSE('lib/replace')
 
-    SRC = 'zfsacl_impl_linux.c'
+    SRC = 'zfsacl_impl_freebsd.c'
     bld.SAMBA_LIBRARY('zfsacl',
                       SRC,
                       enabled= True,

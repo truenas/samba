@@ -42,17 +42,18 @@ def build(bld):
     LINUX_SRC = [
         'libsunacl.c'
     ]
-    bld.SAMBA_LIBRARY('sunacl',
-                      ' '.join(LINUX_SRC),
-                      enabled= True,
-                      includes='.',
-                      deps='zfsacl',
-                      abi_directory='ABI',
-                      abi_match='sunacl_*',
-                      vnum=VERSION,
-                      public_headers=(''),
-                      public_headers_install=False,
-                      private_library=True)
+    if not bld.CHECK_HEADERS('sunacl.h'):
+        bld.SAMBA_LIBRARY('sunacl',
+                          ' '.join(LINUX_SRC),
+                          enabled= True,
+                          includes='.',
+                          deps='zfsacl',
+                          abi_directory='ABI',
+                          abi_match='sunacl_*',
+                          vnum=VERSION,
+                          public_headers=(''),
+                          public_headers_install=False,
+                          private_library=True)
 
 def dist():
     '''makes a tarball for distribution'''
