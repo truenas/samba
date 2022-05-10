@@ -133,6 +133,7 @@ static int smblibzfs_handle_destructor(struct smblibzfs_int *slibzp)
 		return 0;
 	}
 	libzfs_fini(slibzp->libzfsp);
+	slibzp->libzfsp = NULL;
 	return 0;
 }
 
@@ -144,6 +145,7 @@ static int smbzhandle_destructor(struct smbzhandle_int *szhp)
 		return 0;
 	}
 	zfs_close(szhp->zhandle);
+	szhp->zhandle = NULL;
 	return 0;
 }
 
