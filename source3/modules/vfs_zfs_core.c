@@ -595,7 +595,7 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 			    &lz,
 			    &config->dl,
 			    handle->conn->tcon != NULL);
-	if (ret != 0) {
+	if ((ret != 0) || (config->dl == NULL)) {
 		DBG_ERR("Failed to initialize ZFS data: %s\n",
 			strerror(errno));
 		return ret;
