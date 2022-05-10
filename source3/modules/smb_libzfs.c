@@ -1418,6 +1418,10 @@ int conn_zfs_init(TALLOC_CTX *mem_ctx,
 	if ((conn_zfsp == NULL) && (strlen(connectpath) > 15)) {
 		DBG_ERR("Failed to obtain zhandle on connectpath: %s\n",
 			strerror(errno));
+		if (errno == EAGAIN) {
+			DBG_ERR("IO has been suspended on ZPOOL.\n");
+			return -1;
+		}
 		tmp_name = strstr(connectpath, "/.zfs/snapshot/");
 		if (tmp_name != NULL) {
 			DBG_INFO("Connectpath is zfs snapshot. Opening zhandle "
