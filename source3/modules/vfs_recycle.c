@@ -899,8 +899,7 @@ static int recycle_chdir(vfs_handle_struct *handle,
 	ok = make_new_bin(handle, config, tmp_dirfsp, handle->conn->connectpath);
 	if (!ok) {
 		DBG_ERR("%s: add to pathrefs failed\n", handle->conn->connectpath);
-		TALLOC_FREE(tmp_dirfsp);
-		return -1;
+		ret = -1;
 	}
 
 	fd_close(tmp_dirfsp);
