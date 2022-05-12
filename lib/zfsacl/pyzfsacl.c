@@ -1092,14 +1092,14 @@ static PyObject *py_acl_set(PyObject *obj, PyObject *args, PyObject *kwargs)
 	if (fd != -1) {
 		ok = zfsacl_set_fd(fd, self->theacl);
 		if (!ok) {
-			set_exc_from_errno("zfsacl_get_fd()");
+			set_exc_from_errno("zfsacl_set_fd()");
 			return NULL;
 		}
 	}
 	else if (path != NULL) {
 		ok = zfsacl_set_file(path, self->theacl);
 		if (!ok) {
-			set_exc_from_errno("zfsacl_get_file()");
+			set_exc_from_errno("zfsacl_set_file()");
 			return NULL;
 		}
 	} else {
@@ -1312,6 +1312,7 @@ PyObject* module_init(void)
 	return m;
 }
 
+PyMODINIT_FUNC PyInit_zfsacl(void);
 PyMODINIT_FUNC PyInit_zfsacl(void)
 {
 	return module_init();

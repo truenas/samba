@@ -3,22 +3,6 @@
 #include "replace.h"
 #include "zfsacl.h"
 
-#if 0
-struct zfsacl {
-	struct acl		ats_acl;
-	int			ats_cur_entry;
-	/*
-	 * ats_brand is for libc internal bookkeeping only.
-	 * Applications should use acl_get_brand_np(3).
-	 * Kernel code should use the "type" argument passed
-	 * to VOP_SETACL, VOP_GETACL or VOP_ACLCHECK calls;
-	 * ACL_TYPE_ACCESS or ACL_TYPE_DEFAULT mean POSIX.1e
-	 * ACL, ACL_TYPE_NFS4 means NFSv4 ACL.
-	 */
-	int			ats_brand;
-};
-#endif
-
 #define BSDACE(zfsace) ((acl_entry_t)zfsace)
 #define BSDACL(zfsacl) ((acl_t)zfsacl)
 #define ZFSACL(bsdacl) ((zfsacl_t)bsdacl)
@@ -64,6 +48,28 @@ static inline void BSD_BRAND(acl_t _acl)
 	_acl->ats_brand = CONV_BRAND(_acl->ats_brand);
 }
 
+static inline acl_type_t brand_to_type(zfsacl_brand_t _brand)
+{
+	acl_type_t out = 0;
+
+	switch(_brand) {
+	case ZFSACL_BRAND_NFSV4:
+		out = ACL_TYPE_NFS4;
+		break;
+	case ZFSACL_BRAND_ACCESS:
+		out = ACL_TYPE_ACCESS;
+		break;
+	case ZFSACL_BRAND_DEFAULT:
+		out = ACL_TYPE_DEFAULT;
+		break;
+	default:
+		fprintf(stderr, "0x%08x: invalid ACL brand\n", _brand);
+		break;
+	};
+
+	return out;
+}
+
 zfsacl_t zfsacl_init(int _acecnt, zfsacl_brand_t _brand)
 {
 	acl_t out = NULL;
@@ -85,7 +91,10 @@ zfsacl_t zfsacl_get_fd(int _fd, zfsacl_brand_t _brand)
 {
 	acl_t out = NULL;
 
-	out = acl_get_fd_np(_fd, CONV_BRAND(_brand));
+	out = acl_get_fd_np(_fd, brand_to_type(_brand));
+	if (out == NULL) {
+		return NULL;
+	}
 	out->ats_brand = _brand;
 	return ZFSACL(out);
 }
@@ -94,7 +103,10 @@ zfsacl_t zfsacl_get_file(const char *_path_p, zfsacl_brand_t _brand)
 {
 	acl_t out = NULL;
 
-	out = acl_get_file(_path_p, CONV_BRAND(_brand));
+	out = acl_get_file(_path_p, brand_to_type(_brand));
+	if (out == NULL) {
+		return NULL;
+	}
 	out->ats_brand = _brand;
 	return ZFSACL(out);
 }
@@ -103,7 +115,10 @@ zfsacl_t zfsacl_get_link(const char *_path_p, zfsacl_brand_t _brand)
 {
 	acl_t out = NULL;
 
-	out = acl_get_link_np(_path_p, CONV_BRAND(_brand));
+	out = acl_get_link_np(_path_p, brand_to_type(_brand));
+	if (out == NULL) {
+		return NULL;
+	}
 	out->ats_brand = _brand;
 	return ZFSACL(out);
 }
@@ -128,7 +143,7 @@ bool zfsacl_set_file(const char *_path_p, zfsacl_t _acl)
 	int err;
 
 	BSD_BRAND(acl);
-	err = acl_set_file(_path_p, acl->ats_brand, acl);
+	err = acl_set_file(_path_p, brand_to_type(saved), acl);
 	acl->ats_brand = saved;
 
 	return err ? false : true;
@@ -141,7 +156,7 @@ bool zfsacl_set_link(const char *_path_p, zfsacl_t _acl)
 	int err;
 
 	BSD_BRAND(acl);
-	err = acl_set_link_np(_path_p, acl->ats_brand, acl);
+	err = acl_set_link_np(_path_p, brand_to_type(saved), acl);
 	acl->ats_brand = saved;
 
 	return err ? false : true;
@@ -166,6 +181,7 @@ bool zfsacl_get_aclflags(zfsacl_t _acl, zfsacl_aclflags_t *pflags)
 	unsigned int cnt;
 	zfsace_flagset_t flags_out = 0;
 	acl_flag_t flags;
+
 	for (cnt = 0; cnt < acl->ats_acl.acl_cnt; cnt++) {
 		flags = acl->ats_acl.acl_entry[cnt].ae_flags;
 		if ((flags & ACL_ENTRY_INHERITED) == 0)
@@ -196,6 +212,24 @@ bool zfsacl_get_acecnt(zfsacl_t _acl, uint *_acecnt)
 	return true;
 }
 
+static bool validate_entry_idx(zfsacl_t _acl, int _idx)
+{
+	uint acecnt;
+	bool ok;
+
+	ok = zfsacl_get_acecnt(_acl, &acecnt);
+	if (!ok) {
+		return false;
+	}
+
+	if ((_idx + 1) > acecnt) {
+		errno = E2BIG;
+		return false;
+	}
+
+	return true;
+}
+
 bool zfsacl_create_aclentry(zfsacl_t _acl, int _idx, zfsacl_entry_t *_pentry)
 {
 	acl_t acl = BSDACL(_acl);
@@ -223,19 +257,13 @@ bool zfsacl_create_aclentry(zfsacl_t _acl, int _idx, zfsacl_entry_t *_pentry)
 bool zfsacl_get_aclentry(zfsacl_t _acl, int _idx, zfsacl_entry_t *_pentry)
 {
 	acl_t acl = BSDACL(_acl);
-        int err;
-        zfsacl_brand_t saved = acl->ats_brand;
-        acl_entry_t entry = NULL;
+	acl_entry_t entry = NULL;
 
-	BSD_BRAND(acl);
-
-	err = acl_get_entry(acl, _idx, &entry);
-	acl->ats_brand = saved;
-
-	if (err) {
+	if (!validate_entry_idx(_acl, _idx)) {
 		return false;
 	}
 
+	entry = &acl->ats_acl.acl_entry[_idx];
 	*_pentry = entry;
 	return true;
 }
@@ -243,8 +271,8 @@ bool zfsacl_get_aclentry(zfsacl_t _acl, int _idx, zfsacl_entry_t *_pentry)
 bool zfsacl_delete_aclentry(zfsacl_t _acl, int _idx)
 {
 	acl_t acl = BSDACL(_acl);
-        int err;
-        zfsacl_brand_t saved = acl->ats_brand;
+	int err;
+	zfsacl_brand_t saved = acl->ats_brand;
 
 	BSD_BRAND(acl);
 
@@ -462,4 +490,10 @@ bool zfsace_set_entry_type(zfsacl_entry_t _entry, zfsace_entry_type_t _tp)
 	err = acl_set_entry_type_np(entry, etype);
 
 	return err ? false : true;
+}
+
+bool zfsacl_to_native(zfsacl_t _acl, struct native_acl *pnative)
+{
+	errno = EOPNOTSUPP;
+	return false;
 }
