@@ -4827,13 +4827,6 @@ static NTSTATUS smb_set_file_basic_info(connection_struct *conn,
 		return status;
 	}
 
-	/* Set the attributes */
-	dosmode = IVAL(pdata,32);
-	status = smb_set_file_dosmode(conn, fsp, dosmode);
-	if (!NT_STATUS_IS_OK(status)) {
-		return status;
-	}
-
 	/* create time */
 	ft.create_time = pull_long_date_full_timespec(pdata);
 
@@ -4850,6 +4843,18 @@ static NTSTATUS smb_set_file_basic_info(connection_struct *conn,
 		   smb_fname_str_dbg(smb_fname)));
 
 	status = smb_set_file_time(conn, fsp, smb_fname, &ft, true);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+
+	/* Set the attributes */
+	/*
+	 * This should happen _after_ timestamp changes
+	 * otherwise we will undo ARCHIVE bit when updating
+	 * timestamps
+	 */
+	dosmode = IVAL(pdata,32);
+	status = smb_set_file_dosmode(conn, fsp, dosmode);
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
