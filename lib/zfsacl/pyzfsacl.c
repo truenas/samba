@@ -97,6 +97,7 @@ static PyObject *aclflag_to_pylist(zfsacl_aclflags_t flags)
 		}
 
 		err = PyList_Append(out, val);
+		Py_XDECREF(val);
 		if (err == -1) {
 			Py_XDECREF(out);
 			return NULL;
@@ -293,6 +294,8 @@ static PyObject *ace_get_permset(PyObject *obj, void *closure)
 			"parsed", permlist,
 			"basic", basic
 		);
+		Py_XDECREF(permlist);
+		Py_XDECREF(basic);
 	} else {
 		out = Py_BuildValue("I", perms);
 	}
@@ -398,6 +401,8 @@ static PyObject *ace_get_flagset(PyObject *obj, void *closure)
 			"parsed", flaglist,
 			"basic", basic
 		);
+		Py_XDECREF(flaglist);
+		Py_XDECREF(basic);
 	} else {
 		out = Py_BuildValue("I", flags);
 	}
@@ -488,6 +493,9 @@ static PyObject *verbose_who(zfsace_who_t whotype, zfsace_id_t whoid)
 		"{s:O,s:O}",
 		"who_type", verbose_whotype,
 		"who_id", pywhoid);
+
+	Py_XDECREF(verbose_whotype);
+	Py_XDECREF(pywhoid);
 	return out;
 }
 
