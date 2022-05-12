@@ -1314,5 +1314,5 @@ PyObject* module_init(void)
 
 PyMODINIT_FUNC PyInit_zfsacl(void)
 {
-	module_init();
+	return module_init();
 }
