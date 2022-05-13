@@ -39,12 +39,9 @@ def configure(conf):
 def build(bld):
     bld.RECURSE('lib/replace')
 
-    LINUX_SRC = [
-        'libsunacl.c'
-    ]
     if not bld.CHECK_HEADERS('sunacl.h'):
         bld.SAMBA_LIBRARY('sunacl',
-                          ' '.join(LINUX_SRC),
+                          'libsunacl.c',
                           enabled= True,
                           includes='.',
                           deps='zfsacl',
