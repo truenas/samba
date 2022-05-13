@@ -23,13 +23,6 @@
 #include "system/filesys.h"
 #include "nfs4_acls.h"
 #include "zfsacl.h"
-#if 0
-#include <sys/acl.h>
-#endif
-
-#if HAVE_LIBZFS
-#include "modules/smb_libzfs.h"
-#endif
 
 static int vfs_ixnas_debug_level = DBGC_VFS;
 
@@ -38,14 +31,21 @@ static int vfs_ixnas_debug_level = DBGC_VFS;
 
 struct ixnas_config_data {
 	struct smbacl4_vfs_params nfs4_params;
-	struct smblibzfshandle *libzp;
-	struct dataset_list *dsl;
 	bool posix_rename;
 	bool dosattrib_xattr;
 	bool zfs_acl_enabled;
 	bool zfs_acl_chmod_enabled;
-	struct zfs_dataset_prop *props;
 };
+
+#ifndef FREEBSD
+#define	UF_READONLY		0x0000000100000000ull
+#define	UF_HIDDEN		0x0000000200000000ull
+#define	UF_SYSTEM		0x0000000400000000ull
+#define	UF_ARCHIVE		0x0000000800000000ull
+#define	UF_REPARSE		0x0000080000000000ull
+#define	UF_OFFLINE		0x0000100000000000ull
+#define	UF_SPARSE		0x0000200000000000ull
+#endif /* FREEBSD */
 
 static const struct {
 	uint32_t dosmode;
@@ -60,12 +60,45 @@ static const struct {
 	{ FILE_ATTRIBUTE_REPARSE_POINT, UF_REPARSE },
 };
 
+#define KERN_DOSMODES (UF_READONLY | UF_ARCHIVE | UF_SYSTEM | \
+	UF_HIDDEN | UF_SPARSE | UF_OFFLINE | UF_REPARSE)
+
+static bool ixnas_get_native_dosmode(struct files_struct *fsp, uint32_t *_dosmode)
+{
+	bool rv = true;
+#if defined (FREEBSD)
+	*_dosmode = fsp->fsp_name->st.st_ex_flags & KERN_DOSMODES;
+#else
+
+#endif /* FREEBSD */
+	return rv;
+}
+
+static bool ixnas_set_native_dosmode(struct files_struct *fsp, uint32_t dosmode)
+{
+#if defined (FREEBSD)
+	int err;
+	err = SMB_VFS_FCHFLAGS(fsp, dosmode);
+	if (err) {
+		DBG_WARNING("Setting dosmode failed for %s: %s\n",
+			    fsp_str_dbg(fsp), strerror(errno));
+
+		return false;
+	}
+#else
+
+#endif /* FREEBSD */
+	return true;
+}
+
 static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
-                                            struct files_struct *fsp,
-                                            uint32_t *dosmode)
+					  struct files_struct *fsp,
+				          uint32_t *dosmode)
 {
 	struct ixnas_config_data *config = NULL;
 	int i;
+	bool ok;
+	uint32_t kern_dosmodes;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct ixnas_config_data,
@@ -77,8 +110,30 @@ static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
 							dosmode);
 	}
 
+#ifndef FREEBSD
+	/*
+	 * update timestamps and dosmode from xattr before
+	 * applying the FS dos mode.
+	 *
+	 * This can be removed once we have OS / FS method
+	 * to change file birth time on Linux like on FreeBSD.e
+	 */
+	NTSTATUS status;
+	status = SMB_VFS_NEXT_FGET_DOS_ATTRIBUTES(handle,
+						  fsp,
+						  dosmode);
+
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+#endif /* FREEBSD */
+
+	ok = ixnas_get_native_dosmode(fsp, &kern_dosmodes);
+	if (!ok) {
+		return map_nt_error_from_unix(errno);
+	}
 	for (i = 0; i < ARRAY_SIZE(dosmode2flag); i++) {
-		if (fsp->fsp_name->st.st_ex_flags & dosmode2flag[i].flag) {
+		if (kern_dosmodes & dosmode2flag[i].flag) {
 			*dosmode |= dosmode2flag[i].dosmode;
 		}
 	}
@@ -106,6 +161,7 @@ static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
 	uint32_t flags = 0;
 	int ret, i;
 	bool set_dosmode_ok = false;
+	bool ok;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct ixnas_config_data,
@@ -133,15 +189,8 @@ static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
 		}
 	}
 
-	ret = SMB_VFS_FCHFLAGS(fsp, flags);
-	if ((ret == -1) && (errno != EPERM)) {
-		DBG_WARNING("Setting dosmode failed for %s: %s\n",
-			    fsp_str_dbg(fsp), strerror(errno));
-
-		return map_nt_error_from_unix(errno);
-	}
-
-	if (ret == 0) {
+	ok = ixnas_set_native_dosmode(fsp, flags);
+	if (ok) {
 		return NT_STATUS_OK;
 	}
 
@@ -162,16 +211,28 @@ static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
 	/* becomeroot() because non-owners need to write flags */
 
 	become_root();
-	ret = SMB_VFS_FCHFLAGS(fsp, flags);
+	ok = ixnas_set_native_dosmode(fsp, flags);
 	unbecome_root();
 
-	if (ret == -1) {
+	if (!ok) {
 		DBG_WARNING("Setting dosmode failed for %s: %s\n",
 			    fsp_str_dbg(fsp), strerror(errno));
 		return map_nt_error_from_unix(errno);
 	}
 
+
+#if defined (FREEBSD)
 	return NT_STATUS_OK;
+#else
+	/*
+	 * On Linux need to pass through
+	 * so that we can set synthetic timestamps
+	 * and file id.
+	 */
+	return SMB_VFS_NEXT_FSET_DOS_ATTRIBUTES(handle,
+						fsp,
+						dosmode);
+#endif /* FREEBSD */
 }
 
 static zfsacl_t fsp_get_zfsacl(files_struct *fsp)
@@ -407,7 +468,7 @@ static NTSTATUS ixnas_get_nt_acl_nfs4_common(struct connection_struct *conn,
 	ok = zfsacl_get_acecnt(zfsacl, &cnt);
 	if (!ok) {
 		DBG_ERR("zfsacl_get_acecnt() failed: %s\n", strerror(errno));
-		return NT_STATUS_NO_MEMORY;
+		return map_nt_error_from_unix(errno);
 	}
 
 	for (i=0; i < cnt; i++) {
@@ -420,13 +481,13 @@ static NTSTATUS ixnas_get_nt_acl_nfs4_common(struct connection_struct *conn,
 		if (!ok) {
 			DBG_ERR("zfsacl_get_aclentry() failed: %s\n", strerror(errno));
 			TALLOC_FREE(pacl);
-			return NT_STATUS_NO_MEMORY;
+			return map_nt_error_from_unix(errno);
 		}
 
 		ok = zfsentry2smbace(ae, &aceprop);
 		if (!ok) {
 			TALLOC_FREE(pacl);
-			return NT_STATUS_NO_MEMORY;
+			return map_nt_error_from_unix(errno);
 		}
 
 		if ((aceprop.aceMask == 0) &&
@@ -1071,83 +1132,6 @@ failure:
 	return -1;
 }
 
-/*
- * Windows clients return NT_STATUS_OBJECT_NAME_COLLISION in case of
- * rename in case of rename in case insensitive dataset. MacOS does
- * attempts the rename. rename() in FreeBSD in this returns success, but
- * does not actually rename the file. Add new logic to rename(). If
- * a case_insensitive string comparison of the filenames returns 0, then
- * perform two renames so that the returned filename matches client
- * expectations. First rename appends a unique id generated from
- * inode and generation number to the file's name. This makes the
- * rename deterministic, while minimizing risk of name collisions.
- */
-static uint64_t ixnas_fs_file_id(struct vfs_handle_struct *handle,
-				 const SMB_STRUCT_STAT *psbuf);
-
-static int ixnas_renameat(vfs_handle_struct *handle,
-			  files_struct *srcfsp,
-			  const struct smb_filename *smb_fname_src,
-			  files_struct *dstfsp,
-			  const struct smb_filename *smb_fname_dst)
-{
-	int result = 1;
-	struct ixnas_config_data *config = NULL;
-	char *tmp_base_name = NULL;
-	uint64_t srcid, dstid;
-
-	SMB_VFS_HANDLE_GET_DATA(handle, config,
-				struct ixnas_config_data,
-				return -1);
-
-	if (config->props->casesens != SMBZFS_INSENSITIVE) {
-		return SMB_VFS_NEXT_RENAMEAT(handle,
-					     srcfsp,
-					     smb_fname_src,
-					     dstfsp,
-					     smb_fname_dst);
-	}
-
-	srcid = ixnas_fs_file_id(handle, &srcfsp->fsp_name->st);
-	dstid = ixnas_fs_file_id(handle, &dstfsp->fsp_name->st);
-
-	if (srcid == dstid) {
-		result = strcasecmp_m(smb_fname_src->base_name,
-				      smb_fname_dst->base_name);
-	}
-	if (result != 0) {
-		return SMB_VFS_NEXT_RENAMEAT(handle,
-					     srcfsp,
-					     smb_fname_src,
-					     dstfsp,
-					     smb_fname_dst);
-	}
-
-	dstid = ixnas_fs_file_id(handle, &smb_fname_src->st);
-	tmp_base_name = talloc_asprintf(talloc_tos(), "%s_%lu",
-					smb_fname_src->base_name, dstid);
-	if (tmp_base_name == NULL) {
-		errno = ENOMEM;
-		return -1;
-	}
-	result = renameat(
-		fsp_get_pathref_fd(srcfsp), smb_fname_src->base_name,
-		fsp_get_pathref_fd(dstfsp), tmp_base_name
-        );
-	if (result != 0) {
-		DBG_ERR("Failed to rename %s to intermediate name %s\n",
-			smb_fname_src->base_name, tmp_base_name);
-		TALLOC_FREE(tmp_base_name);
-		return result;
-	}
-	result = renameat(
-		fsp_get_pathref_fd(dstfsp), tmp_base_name,
-		fsp_get_pathref_fd(srcfsp), smb_fname_dst->base_name
-        );
-	TALLOC_FREE(tmp_base_name);
-	return result;
-}
-
 static struct file_id ixnas_file_id_create(struct vfs_handle_struct *handle,
 					   const SMB_STRUCT_STAT *sbuf)
 {
@@ -1248,34 +1232,6 @@ static int ixnas_ntimes(vfs_handle_struct *handle,
 	return result;
 }
 
-static bool set_zfs_parameters(struct vfs_handle_struct *handle,
-			       const char *service, const char *user,
-			       struct ixnas_config_data *config)
-{
-	const char *base_quota_str = NULL;
-	if (config->dsl == NULL) {
-		config->props = talloc_zero(handle->conn, struct zfs_dataset_prop);
-		if (config->props == NULL) {
-			errno = ENOMEM;
-			return false;
-		}
-		DBG_INFO("Share connectpath is not ZFS dataset. "
-			 "Skipping configuration.\n");
-		config->props->casesens = SMBZFS_SENSITIVE;
-		return true;
-	}
-	config->props = config->dsl->root->properties;
-
-	if (config->props->casesens == SMBZFS_INSENSITIVE) {
-		DBG_INFO("ixnas: case insensitive dataset detected, "
-			 "automatically adjusting case sensitivity settings.\n");
-		lp_do_parameter(SNUM(handle->conn),
-				"case sensitive", "yes");
-		handle->conn->case_sensitive = True;
-	}
-	return true;
-}
-
 static bool set_acl_parameters(struct vfs_handle_struct *handle,
 			       struct ixnas_config_data *config)
 {
@@ -1356,24 +1312,6 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 	}
 
 
-#if HAVE_LIBZFS
-	ret = conn_zfs_init(handle->conn->sconn,
-			    handle->conn->connectpath,
-			    &config->libzp,
-			    &config->dsl, handle->conn->tcon != NULL);
-
-	if (ret != 0) {
-		TALLOC_FREE(config);
-		return ret;
-	}
-
-	ok = set_zfs_parameters(handle, service, user, config);
-	if (!ok) {
-		TALLOC_FREE(config);
-		return -1;
-	}
-#endif
-
 	/* OS-X Compatibility */
 	config->posix_rename = lp_parm_bool(SNUM(handle->conn),
 			"ixnas", "posix_rename", false);
@@ -1429,7 +1367,6 @@ static struct vfs_fn_pointers ixnas_fns = {
 	/* zfs_acl_enabled = true */
 	.fchmod_fn = ixnas_fchmod,
 	.fntimes_fn = ixnas_ntimes,
-	.renameat_fn = ixnas_renameat,
 	.file_id_create_fn = ixnas_file_id_create,
 	.fs_file_id_fn = ixnas_fs_file_id,
 	.fget_nt_acl_fn = ixnas_fget_nt_acl,
