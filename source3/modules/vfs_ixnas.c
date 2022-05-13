@@ -45,11 +45,19 @@ struct ixnas_config_data {
 #define	UF_REPARSE		0x0000080000000000ull
 #define	UF_OFFLINE		0x0000100000000000ull
 #define	UF_SPARSE		0x0000200000000000ull
+
+#define ACL_BRAND_UNKNOWN	0
+#define ACL_BRAND_POSIX		1
+#define ACL_BRAND_NFS4		2
+
+
+#define ACL4_XATTR "system.nfs4_acl_xdr"
+#define ACL_XATTR "system.posix_acl_access"
 #endif /* FREEBSD */
 
 static const struct {
 	uint32_t dosmode;
-	uint32_t flag;
+	uint64_t flag;
 } dosmode2flag[] = {
 	{ FILE_ATTRIBUTE_READONLY, UF_READONLY },
 	{ FILE_ATTRIBUTE_ARCHIVE, UF_ARCHIVE },
@@ -280,9 +288,10 @@ static bool fsp_set_zfsacl(files_struct *fsp, zfsacl_t zfsacl)
 
 static int fsp_get_acl_brand(files_struct *fsp)
 {
-	long ret;
+#if defined (FREEBSD)
 	int saved_errno;
 	saved_errno = errno;
+	long ret;
 
 	ret = fpathconf(fsp_get_pathref_fd(fsp), _PC_ACL_NFS4);
 	if (ret == -1) {
@@ -294,6 +303,73 @@ static int fsp_get_acl_brand(files_struct *fsp)
 		errno = saved_errno;
 		return ACL_BRAND_UNKNOWN;
 	}
+#elseif
+	ssize_t rv;
+	rv = SMB_VFS_FGETXATTR(fsp->conn, fsp, ACL_XATTR, NULL, 0);
+	if (rv == -1) {
+		if (errno == ENODATA) {
+			return ACL_BRAND_POSIX;
+		}
+		DBG_ERR("%s: fgetxattr() for %s failed: %s\n",
+			path, ACL_XATTR, strerror(errno));
+		return ACL_BRAND_UNKNOWN;
+	}
+
+	rv = SMB_VFS_FGETXATTR(fsp->conn, fsp, ACL4_XATTR, NULL, 0);
+	if (rv == -1) {
+		if (errno == ENODATA) {
+			/* probably need to add disabled */
+			return ACL_BRAND_UNKNOWN;
+		}
+		DBG_ERR("%s: fgetxattr() for %s failed: %s\n",
+			path, ACL4_XATTR, strerror(errno));
+		return ACL_BRAND_UNKNOWN;
+	}
+#endif /* FREEBSD */
+
+	return ACL_BRAND_NFS4;
+}
+
+static int path_get_aclbrand(const char *path)
+{
+#if defined (FREEBSD)
+	int saved_errno;
+	saved_errno = errno;
+	long ret;
+
+	ret = pathconf(path, _PC_ACL_NFS4);
+	if (ret == -1) {
+		if (saved_errno == errno) {
+			return ACL_BRAND_POSIX;
+		}
+		DBG_ERR("%s: pathconf failed: %s\n",
+			path, strerror(errno));
+		errno = saved_errno;
+		return ACL_BRAND_UNKNOWN;
+	}
+#elseif /* LINUX */
+	ssize_t rv;
+	rv = getxattr(path, ACL_XATTR, NULL, 0);
+	if (rv == -1) {
+		if (errno == ENODATA) {
+			return ACL_BRAND_POSIX;
+		}
+		DBG_ERR("%s: getxattr() for %s failed: %s\n",
+			path, ACL_XATTR, strerror(errno));
+		return ACL_BRAND_UNKNOWN;
+	}
+
+	rv = getxattr(path, ACL4_XATTR, NULL, 0);
+	if (rv == -1) {
+		if (errno == ENODATA) {
+			/* probably need to add disabled */
+			return ACL_BRAND_UNKNOWN;
+		}
+		DBG_ERR("%s: getxattr() for %s failed: %s\n",
+			path, ACL4_XATTR, strerror(errno));
+		return ACL_BRAND_UNKNOWN;
+	}
+#endif /* FREEBSD */
 
 	return ACL_BRAND_NFS4;
 }
@@ -385,9 +461,9 @@ static bool smbace2zfsentry(zfsacl_t zfsacl, SMB_ACE4PROP_T *aceprop)
 	}
 
 	if (aceprop->aceType == SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE) {
-		type = ACL_ENTRY_TYPE_ALLOW;
+		type = ZFSACL_ENTRY_TYPE_ALLOW;
 	} else if (aceprop->aceType == SMB_ACE4_ACCESS_DENIED_ACE_TYPE) {
-		type = ACL_ENTRY_TYPE_DENY;
+		type = ZFSACL_ENTRY_TYPE_DENY;
 	} else {
 		smb_panic("Unsupported ace type.");
 	}
@@ -1132,6 +1208,7 @@ failure:
 	return -1;
 }
 
+#if defined (FREEBSD)
 static struct file_id ixnas_file_id_create(struct vfs_handle_struct *handle,
 					   const SMB_STRUCT_STAT *sbuf)
 {
@@ -1231,6 +1308,7 @@ static int ixnas_ntimes(vfs_handle_struct *handle,
 	}
 	return result;
 }
+#endif /* FREEBSD */
 
 static bool set_acl_parameters(struct vfs_handle_struct *handle,
 			       struct ixnas_config_data *config)
@@ -1272,7 +1350,7 @@ static bool set_acl_parameters(struct vfs_handle_struct *handle,
 	 * middleware will probably not let the user get this far, but it's better to
 	 * be somewhat safer.
 	 */
-	if (pathconf(chkpath, _PC_ACL_NFS4) < 0) {
+	if (path_get_aclbrand(handle->conn->connectpath) != ACL_BRAND_NFS4) {
 		DBG_ERR("Connectpath does not support NFSv4 ACLs. Disabling ZFS ACL handling.\n");
 		config->zfs_acl_enabled = false;
 	}
@@ -1366,9 +1444,11 @@ static struct vfs_fn_pointers ixnas_fns = {
 	.fset_dos_attributes_fn = ixnas_fset_dos_attributes,
 	/* zfs_acl_enabled = true */
 	.fchmod_fn = ixnas_fchmod,
+#if defined (FREEBSD)
 	.fntimes_fn = ixnas_ntimes,
 	.file_id_create_fn = ixnas_file_id_create,
 	.fs_file_id_fn = ixnas_fs_file_id,
+#endif /* FREEBSD */
 	.fget_nt_acl_fn = ixnas_fget_nt_acl,
 	.fset_nt_acl_fn = ixnas_fset_nt_acl,
 	.sys_acl_get_fd_fn = ixnas_fail__sys_acl_get_fd,
