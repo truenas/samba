@@ -2712,6 +2712,9 @@ static int openpam_convert_error_code(struct pwb_context *ctx,
 		    r == PAM_CRED_ERR) {
 			return r;
 		}
+		else if (r == PAM_AUTHINFO_UNAVAIL) {
+			return PAM_CRED_UNAVAIL;
+		}
 		break;
 	case PAM_WINBIND_ACCT_MGMT:
 		if (r == PAM_USER_UNKNOWN ||
