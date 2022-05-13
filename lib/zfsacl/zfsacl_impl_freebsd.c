@@ -84,7 +84,9 @@ zfsacl_t zfsacl_init(int _acecnt, zfsacl_brand_t _brand)
 
 void zfsacl_free(zfsacl_t *_acl)
 {
-	acl_free((acl_t *)_acl);
+	acl_t acl = BSDACL(*_acl);
+	acl_free(acl);
+	*_acl = NULL;
 }
 
 zfsacl_t zfsacl_get_fd(int _fd, zfsacl_brand_t _brand)
@@ -496,4 +498,18 @@ bool zfsacl_to_native(zfsacl_t _acl, struct native_acl *pnative)
 {
 	errno = EOPNOTSUPP;
 	return false;
+}
+
+bool zfsacl_is_trivial(zfsacl_t _acl, bool *_trivialp)
+{
+	acl_t acl = BSDACL(_acl);
+	int err, triv;
+
+	err = acl_is_trivial_np(acl, &triv);
+	if (err) {
+		return false;
+	}
+
+	*_trivialp = (triv == 1) ? true : false;
+	return true;
 }

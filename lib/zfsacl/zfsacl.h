@@ -62,6 +62,8 @@ zfsacl_t zfsacl_get_fd(int fd, zfsacl_brand_t _brand);
 zfsacl_t zfsacl_get_file(const char *_path_p, zfsacl_brand_t _brand);
 zfsacl_t zfsacl_get_link(const char *_path_p, zfsacl_brand_t _brand);
 
+bool zfsacl_is_trivial(zfsacl_t _acl, bool *trivialp);
+
 /**
  * @brief initialize a new ZFS ACL (for setting on file)
  *        allocates memory that must be freed
@@ -253,16 +255,6 @@ bool zfsace_set_entry_type(zfsacl_entry_t _entry, zfsace_entry_type_t _tp);
     (who != ZFSACL_USER_OBJ) && (who != ZFSACL_USER) && \
     (who != ZFSACL_GROUP_OBJ) && (who != ZFSACL_GROUP) && \
     (who != ZFSACL_EVERYONE))
-
-#if 0
-#define ACL4_ENTRY_INVALID(entry) ( \
-    ACE4_TYPE_INVALID(entry.ae_entry_type) || \
-    ACE4_FLAG_INVALID(entry.ae_flags) || \
-    ACE4_SPECIAL_WHO_INVALID(entry.ae_special_who) || \
-    ACCESS_MASK_INVALID(entry.ae_perm) || \
-    (entry.ae_special_who != 0 && entry.id != ACL_UNDEFINED_ID) || \
-    (entry.ae_special_who == 0 && entry.id == ACL_UNDEFINED_ID))
-#endif
 
 const struct {
 	zfsacl_aclflags_t flag;
