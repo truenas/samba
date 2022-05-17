@@ -44,7 +44,7 @@ struct tmprotect_config_data {
 	int retention;
 	int min_snaps;
 	bool enabled;
-	struct smb_filename *history_file;
+	FILE *history_file;
 	time_t last_snap;
 	time_t oldest_snap;
 	time_t last_success;
@@ -203,14 +203,17 @@ static bool parse_history(FILE *history, size_t *cntp, time_t *timestamp)
 		struct tm ts;
 		time_t tm_int;
 
+		DBG_DEBUG("Evaluating history line: %s\n", line);
 		begin = strstr(line, "<date>");
 		if (begin == NULL || begin == line) {
+			DBG_DEBUG("skipping line: %s\n", line);
 			continue;
 		}
 
 		end = strptime(begin, TS_FORMAT, &ts);
 		if (end == NULL) {
-			DBG_ERR("strptime() failed: %s\n", strerror(errno));
+			DBG_ERR("%s: strptime() failed: %s\n",
+				begin, strerror(errno));
 			free(line);
 			return false;
 		}
@@ -219,6 +222,8 @@ static bool parse_history(FILE *history, size_t *cntp, time_t *timestamp)
 
 		tm_int = mktime(&ts);
 		if (*timestamp >= tm_int) {
+			DBG_DEBUG("timestamp %ld is more recent than %ld\n",
+				  *timestamp, tm_int);
 			continue;
 		}
 
@@ -227,6 +232,35 @@ static bool parse_history(FILE *history, size_t *cntp, time_t *timestamp)
 
 	*cntp = cnt;
 	free(line);
+	rewind(history);
+	return true;
+}
+
+static bool open_history(int _fd, struct tmprotect_config_data *config)
+{
+	FILE *history = NULL;
+	const char *p = NULL;
+	char buf[PATH_MAX];
+	int fd;
+
+	p = sys_proc_fd_path(_fd, buf, sizeof(buf));
+	SMB_ASSERT(p != NULL);
+
+	fd = open(p, O_RDONLY);
+	if (fd == -1) {
+		DBG_ERR("open() failed: %s\n", strerror(errno));
+		return false;
+	}
+
+	history = fdopen(fd, "r");
+	if (history == NULL) {
+		DBG_ERR("fdopen() failed: %s\n",
+			strerror(errno));
+		close(fd);
+		return false;
+	}
+
+	config->history_file = history;
 	return true;
 }
 
@@ -236,11 +270,9 @@ static int tmprotect_openat(vfs_handle_struct *handle,
                             files_struct *fsp,
                             int flags, mode_t mode)
 {
-	int fd, ret;
-	struct smb_filename *resolved_fname = NULL;
+	int ret;
 	struct tmprotect_config_data *config = NULL;
 	size_t cnt, flen, slen = strlen(tm_plist_suffix);
-	FILE *history = NULL;
 	time_t last_success = 0;
 	bool ok;
 
@@ -266,46 +298,22 @@ static int tmprotect_openat(vfs_handle_struct *handle,
 		return ret;
 	}
 
-	resolved_fname = SMB_VFS_REALPATH(handle->conn, handle->conn, fsp->fsp_name);
-	if (resolved_fname == NULL) {
-		DBG_ERR("%s: realpath() failed: %s\n",
-			fsp_str_dbg(fsp), strerror(errno));
+	ok = open_history(ret, config);
+	if (!ok) {
+		DBG_ERR("%s at %s: failed to open history file\n",
+			smb_fname_str_dbg(smb_fname), fsp_str_dbg(dirfsp));
 		return ret;
 	}
 
-	fd = dup(ret);
-	if (fd == -1) {
-		DBG_ERR("%s: dup() failed: %s\n",
-			smb_fname_str_dbg(resolved_fname),
-			strerror(errno));
-		goto err;
-	}
-
-	history = fdopen(fd, "r");
-	if (history == NULL) {
-		DBG_ERR("%s: fdopen() failed: %s\n",
-			smb_fname_str_dbg(resolved_fname),
-			strerror(errno));
-		close(fd);
-		goto err;
-	}
-
-	ok = parse_history(history, &cnt, &last_success);
+	ok = parse_history(config->history_file, &cnt, &last_success);
 	if (ok && cnt) {
 		config->last_success = last_success;
 	}
-
-	fclose(history);
-	config->history_file = resolved_fname;
 
 	ok = prune_snapshots(handle, config);
 	if (!ok) {
 		DBG_ERR("Failed to prune snapshots\n");
 	}
-	return ret;
-
-err:
-	TALLOC_FREE(resolved_fname);
 	return ret;
 }
 
@@ -314,44 +322,10 @@ static bool history_changed(vfs_handle_struct *handle,
 			    const struct tmprotect_config_data *config)
 {
 	bool ok, rv = false;
-	NTSTATUS status;
-	int fd;
-	struct files_struct *tmp_fsp = NULL;
-	FILE *history = NULL;
 	time_t timestamp = 0;
 	size_t cnt = 0;
 
-	status = create_internal_fsp(handle->conn, config->history_file, &tmp_fsp);
-	if (!NT_STATUS_IS_OK(status)) {
-		DBG_ERR("Failed to create internal FSP for %s: %s\n",
-			smb_fname_str_dbg(config->history_file), nt_errstr(status));
-		return false;
-	}
-
-	fd = SMB_VFS_NEXT_OPENAT(handle,
-				 handle->conn->cwd_fsp,
-				 config->history_file,
-				 tmp_fsp,
-				 O_RDONLY, 0);
-	if (fd == -1) {
-		DBG_ERR("%s: openat failed for history file: %s\n",
-			smb_fname_str_dbg(config->history_file),
-			strerror(errno));
-		TALLOC_FREE(tmp_fsp);
-		return false;
-	}
-
-	history = fdopen(fd, "r");
-	if (history == NULL) {
-		DBG_ERR("%s: fdopen() failed: %s\n",
-			smb_fname_str_dbg(config->history_file),
-			strerror(errno));
-		close(fd);
-		TALLOC_FREE(tmp_fsp);
-		return false;
-	}
-
-	ok = parse_history(history, &cnt, &timestamp);
+	ok = parse_history(config->history_file, &cnt, &timestamp);
 	if (ok && cnt && timestamp > config->last_success) {
 		DBG_INFO("Initial last backup timestamp of tree "
 			 "connection [%ld] is older than current "
@@ -364,9 +338,9 @@ static bool history_changed(vfs_handle_struct *handle,
 
 	DBG_INFO("Backup history file: %zu backups, last: %ld\n",
 		 cnt, timestamp);
-	TALLOC_FREE(tmp_fsp);
-	fclose(history);
 
+out:
+	fclose(config->history_file);
 	return rv;
 }
 
