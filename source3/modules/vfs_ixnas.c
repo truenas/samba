@@ -53,6 +53,9 @@ struct ixnas_config_data {
 
 #define ACL4_XATTR "system.nfs4_acl_xdr"
 #define ACL_XATTR "system.posix_acl_access"
+
+#define ZFS_IOC_GETDOSFLAGS     _IOR(0x83, 1, uint64_t)
+#define ZFS_IOC_SETDOSFLAGS     _IOW(0x83, 2, uint64_t)
 #endif /* FREEBSD */
 
 static const struct {
@@ -71,21 +74,26 @@ static const struct {
 #define KERN_DOSMODES (UF_READONLY | UF_ARCHIVE | UF_SYSTEM | \
 	UF_HIDDEN | UF_SPARSE | UF_OFFLINE | UF_REPARSE)
 
-static bool ixnas_get_native_dosmode(struct files_struct *fsp, uint32_t *_dosmode)
+static bool ixnas_get_native_dosmode(struct files_struct *fsp, uint64_t *_dosmode)
 {
-	bool rv = true;
 #if defined (FREEBSD)
 	*_dosmode = fsp->fsp_name->st.st_ex_flags & KERN_DOSMODES;
 #else
-
+	int err;
+	err = ioctl(fsp_get_pathref_fd(fsp), ZFS_IOC_GETDOSFLAGS, _dosmode);
+	if (err) {
+		DBG_ERR("%s: ioctl() to get dos flags failed: %s\n",
+			fsp_str_dbg(fsp), strerror(errno));
+		return false;
+	}
 #endif /* FREEBSD */
-	return rv;
+	return true;
 }
 
-static bool ixnas_set_native_dosmode(struct files_struct *fsp, uint32_t dosmode)
+static bool ixnas_set_native_dosmode(struct files_struct *fsp, uint64_t dosmode)
 {
-#if defined (FREEBSD)
 	int err;
+#if defined (FREEBSD)
 	err = SMB_VFS_FCHFLAGS(fsp, dosmode);
 	if (err) {
 		DBG_WARNING("Setting dosmode failed for %s: %s\n",
@@ -94,7 +102,37 @@ static bool ixnas_set_native_dosmode(struct files_struct *fsp, uint32_t dosmode)
 		return false;
 	}
 #else
+	if (!fsp->fsp_flags.is_pathref) {
+		err = ioctl(fsp_get_io_fd(fsp), ZFS_IOC_SETDOSFLAGS, &dosmode);
+	} else {
+		int fd;
+		const char *p = NULL;
+		char buf[PATH_MAX];
 
+		p = sys_proc_fd_path(fsp_get_pathref_fd(fsp), buf, sizeof(buf));
+		if (p == NULL) {
+			errno = EBADF;
+			return false;
+		}
+		if (S_ISDIR(fsp->fsp_name->st.st_ex_mode)) {
+			fd = open(p, O_DIRECTORY);
+		} else {
+			fd = open(p, O_RDWR);
+		}
+		if (fd == -1) {
+			DBG_WARNING("%s: open() failed: %s\n",
+				    fsp_str_dbg(fsp), strerror(errno));
+			return false;
+		}
+		err = ioctl(fd, ZFS_IOC_SETDOSFLAGS, &dosmode);
+		close(fd);
+	}
+
+	if (err) {
+		DBG_WARNING("%s: ioctl to set dosmode failed: %s\n",
+			    fsp_str_dbg(fsp), strerror(errno));
+		return false;
+	}
 #endif /* FREEBSD */
 	return true;
 }
@@ -106,7 +144,7 @@ static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
 	struct ixnas_config_data *config = NULL;
 	int i;
 	bool ok;
-	uint32_t kern_dosmodes;
+	uint64_t kern_dosmodes;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct ixnas_config_data,
@@ -166,7 +204,7 @@ static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
 {
 	NTSTATUS status;
 	struct ixnas_config_data *config = NULL;
-	uint32_t flags = 0;
+	uint64_t flags = 0;
 	int ret, i;
 	bool set_dosmode_ok = false;
 	bool ok;
