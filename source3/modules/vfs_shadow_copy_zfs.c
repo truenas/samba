@@ -53,24 +53,22 @@ static int vfs_shadow_copy_zfs_debug_level = DBGC_VFS;
 #define DBGC_CLASS vfs_shadow_copy_zfs_debug_level
 
 struct shadow_copy_zfs_config {
-	struct smblibzfshandle	*libzp;
-	struct dataset_list	*ds_list;
+	struct zfs_dataset	*ds;
+	struct zfs_dataset	*singleton;
+	struct memcache		*zcache;
 
 	/* Cache parameters */
 	bool 			cache_enabled;
 
 	int			timedelta;
 	/* Snapshot parameters */
-	bool 			ignore_empty_snaps;
-	char 			**inclusions;
-	char 			**exclusions;
+	struct snap_filter	*filter;
 	struct snapshot_list 	*snapshots;
-
 	char			*shadow_connectpath;
 };
 
 struct snapshot_data {
-	char *mountpoint;
+	char mountpoint[PATH_MAX];
 	char *shadow_cp;
 	struct snapshot_entry *snap;
 };
@@ -82,38 +80,37 @@ struct shadow_copy_fsp_ext {
 	vfs_handle_struct *handle;
 };
 
-static struct zfs_dataset *shadow_path_to_dataset(struct dataset_list *dl,
-						  const char *path)
+static struct zfs_dataset *shadow_path_to_dataset(
+    struct shadow_copy_zfs_config *config,
+    const char *path)
 {
 	int ret;
 	struct stat st;
-	struct zfs_dataset *child = NULL;
-	if (!dl->children) {
-		return dl->root;
-	}
+	struct zfs_dataset *resolved = NULL;
 	ret = stat(path, &st);
 	if (ret < 0) {
 		DBG_ERR("Stat of %s failed with error: %s\n",
 			path, strerror(errno));
 	}
-	if (st.st_dev == dl->root->devid) {
-		return dl->root;
+	if (st.st_dev == config->ds->devid) {
+		return config->ds;
 	}
-	for (child=dl->children; child; child=child->next) {
-		if (child->devid == st.st_dev) {
-			return child;
-		}
+
+	if (config->singleton &&
+	    (config->singleton->devid == st.st_dev)) {
+		return config->singleton;
 	}
+
 	/*
 	 * Our current cache of datasets does not contain the path in
 	 * question. Use libzfs to try to get it. Allocate under
 	 * memory context of our dataset list.
 	 */
-	child = smb_zfs_path_get_dataset(dl->root->zhandle->lz, dl,
-					 path, true, true, true);
-	if (child != NULL) {
-		DLIST_ADD(dl->children, child);
-		return child;
+	resolved = smb_zfs_path_get_dataset(config, path, true, true, true);
+	if (resolved != NULL) {
+		TALLOC_FREE(config->singleton);
+		config->singleton = resolved;
+		return resolved;
 	}
 
 	DBG_ERR("No dataset found for %s with device id: %lu\n",
@@ -122,11 +119,41 @@ static struct zfs_dataset *shadow_path_to_dataset(struct dataset_list *dl,
 	return NULL;
 }
 
+static struct zfs_dataset *shadow_fsp_to_dataset(
+    struct shadow_copy_zfs_config *config,
+    files_struct *fsp)
+{
+	int ret;
+	struct zfs_dataset *resolved = NULL;
+
+	if (VALID_STAT(fsp->fsp_name->st)) {
+		if (fsp->fsp_name->st.st_ex_dev == config->ds->devid) {
+			return config->ds;
+		}
+
+		if ((config->singleton != NULL) &&
+		    (fsp->fsp_name->st.st_ex_dev == config->singleton->devid)) {
+			return config->singleton;
+		}
+	}
+
+	resolved = smb_zfs_fd_get_dataset(config, fsp_get_pathref_fd(fsp), true, true);
+	if (resolved == NULL) {
+		TALLOC_FREE(config->singleton);
+		config->singleton = resolved;
+		return resolved;
+	}
+
+	DBG_ERR("%s: no dataset found\n", fsp_str_dbg(fsp));
+	errno = ENOENT;
+	return NULL;
+}
+
 static struct snapshot_list *get_cached_snapshot(TDB_DATA ds,
 			   struct shadow_copy_zfs_config *config)
 {
 	return (struct snapshot_list *)memcache_lookup_talloc(
-				config->libzp->zcache,
+				config->zcache,
 				ZFS_CACHE,
 				data_blob_const(ds.dptr, ds.dsize));
 }
@@ -135,7 +162,7 @@ static bool put_cached_snapshot(TDB_DATA key,
 				struct snapshot_list *snaps,
 				struct shadow_copy_zfs_config *config)
 {
-	memcache_add_talloc(config->libzp->zcache,
+	memcache_add_talloc(config->zcache,
 				ZFS_CACHE,
 				data_blob_const(key.dptr, key.dsize),
 				&snaps);
@@ -242,6 +269,7 @@ char *get_snapshot_path(TALLOC_CTX *mem_ctx,
 static bool shadow_copy_zfs_update_snaplist(struct vfs_handle_struct *handle,
 					    TALLOC_CTX *mem_ctx,
 					    const char *path,
+					    files_struct *fsp,
 					    bool do_update,
 					    struct snapshot_list **snapp)
 {
@@ -260,7 +288,11 @@ static bool shadow_copy_zfs_update_snaplist(struct vfs_handle_struct *handle,
 	time(&snap_time);
 	SMB_VFS_HANDLE_GET_DATA(handle, config, struct shadow_copy_zfs_config,
 				return NULL);
-	ds = shadow_path_to_dataset(config->ds_list, path);
+	if (fsp == NULL) {
+		ds = shadow_path_to_dataset(config, path);
+	} else {
+		ds = shadow_fsp_to_dataset(config, fsp);
+	}
 	if (!ds) {
 		return NULL;
 	}
@@ -276,17 +308,9 @@ static bool shadow_copy_zfs_update_snaplist(struct vfs_handle_struct *handle,
 			 "permitted timedelta: %d, dataset: %s\n",
 			 seconds, config->timedelta, ds->dataset_name);
 
-		get_smbzhandle(config->libzp, handle->conn, ds->dataset_name, &zfsp, false);
-		if (zfsp == NULL) {
-			return false;
-		}
-		snapshots = zhandle_list_snapshots(zfsp,
+		snapshots = zhandle_list_snapshots(ds->zhandle,
 						   mem_ctx,
-						   config->ignore_empty_snaps,
-						   config->inclusions,
-						   config->exclusions, 0, 0);
-
-		close_smbzhandle(zfsp);
+						   config->filter);
 		if (snapshots != NULL) {
 			snaplist_updated = put_cached_snapshot(key, snapshots,
 							       config);
@@ -413,7 +437,7 @@ static char *snapcache_get(TALLOC_CTX *tmp_ctx,
 			   TDB_DATA key)
 {
 	return (char *)memcache_lookup_talloc(
-				config->libzp->zcache,
+				config->zcache,
 				ZFS_CACHE,
 				data_blob_const(key.dptr, key.dsize));
 }
@@ -423,7 +447,7 @@ static void snapcache_set(TALLOC_CTX *tmp_ctx,
 			  TDB_DATA key,
 			  char *resolved_path)
 {
-	memcache_add_talloc(config->libzp->zcache,
+	memcache_add_talloc(config->zcache,
 				ZFS_CACHE,
 				data_blob_const(key.dptr, key.dsize),
 				&resolved_path);
@@ -458,7 +482,7 @@ static char *do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 	SMB_VFS_HANDLE_GET_DATA(handle, config, struct shadow_copy_zfs_config,
 	    return NULL);
 
-	if (config->ds_list == NULL) {
+	if (config->ds == NULL) {
 		DBG_ERR("Refusing to convert to shadow copy due to "
 			"path not supporting snapshots\n");
 		errno = EINVAL;
@@ -499,7 +523,7 @@ static char *do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 		return NULL;
 	}
 
-	shadow_copy_zfs_update_snaplist(handle, handle->conn, normalized_fname, false, &snapshots);
+	shadow_copy_zfs_update_snaplist(handle, handle->conn, normalized_fname, NULL, false, &snapshots);
 	if (snapshots == NULL) {
 		DBG_ERR("Failed to get snapshot list for %s\n",
 			normalized_fname);
@@ -595,9 +619,9 @@ static char *do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 		}
 		out->snap->nt_time = entry->nt_time;
 		out->snap->cr_time = entry->cr_time;
-		out->snap->name = talloc_strdup(out, entry->name);
-		out->mountpoint = talloc_strdup(out, snapshots->mountpoint);
-		snprintf(out->snap->label, GMT_NAME_LEN, "%s", entry->label);
+		strlcpy(out->snap->name, entry->name, sizeof(out->snap->name));
+		strlcpy(out->mountpoint, snapshots->mountpoint, sizeof(out->mountpoint));
+		strlcpy(out->snap->label, entry->label, sizeof(out->snap->label));
 	}
 
 	if (config->cache_enabled && !ISDOT(fname)) {
@@ -1048,8 +1072,6 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 	SMB_STRUCT_STAT sbuf, cur_st, prev_st;
 	const SMB_STRUCT_STAT *psbuf = NULL;
 	uint idx = 0;
-	char tmpbuf[PATH_MAX];
-	char *fullpath, *to_free;
 	char *tmp_file = NULL;
 	char *file_name = NULL;
 	char *mpoffset = NULL;
@@ -1060,21 +1082,13 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 	SMB_VFS_HANDLE_GET_DATA(handle, config, struct shadow_copy_zfs_config,
 				return -1);
 
-	if (config->ds_list == NULL) {
-		DBG_ERR("No dataset list present for share at path: %s\n",
+	if (config->ds == NULL) {
+		DBG_ERR("No dataset present for share at path: %s\n",
 			handle->conn->connectpath);
 		return 0;
 	}
 
 	cpathlen = strlen(handle->conn->connectpath);
-
-	len = full_path_tos(handle->conn->connectpath, fsp->fsp_name->base_name, tmpbuf,
-			    sizeof(tmpbuf), &fullpath, &to_free);
-
-	if (len == -1) {
-		errno = ENOMEM;
-		return -1;
-	}
 
 	tmp_ctx = talloc_new(config);
 
@@ -1095,13 +1109,13 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 
 	shadow_copy_zfs_update_snaplist(handle,
 					handle->conn,
-					fullpath,
+					NULL,
+					fsp,
 					true,
 					&snapshots);
 	if (snapshots == NULL) {
-		DBG_INFO("failed to retrieve snapshots for %s\n", fullpath);
+		DBG_INFO("failed to retrieve snapshots for %s\n", fsp_str_dbg(fsp));
 		TALLOC_FREE(tmp_ctx);
-		TALLOC_FREE(to_free);
 		return -1;
 	}
 	shadow_copy_zfs_data->labels = NULL;
@@ -1117,7 +1131,6 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 		if (shadow_copy_zfs_data->labels == NULL) {
 			DBG_ERR("shadow_copy_zfs: out of memory\n");
 			TALLOC_FREE(tmp_ctx);
-			TALLOC_FREE(to_free);
 			return -1;
 		}
 	}
@@ -1143,17 +1156,18 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 					     flen, mpoffset, entry);
 
 		rv = sys_stat(tmp_file, &cur_st, false);
-		TALLOC_FREE(tmp_file);
 		if (rv != 0) {
-			DBG_INFO("stat() failed for [%s] in mp [%s] snap [%s]: %s\n",
-				 fsp_str_dbg(fsp), snapshots->mountpoint, entry->name,
+			DBG_INFO("%s: stat() failed for [%s] in mp [%s] snap [%s]: %s\n",
+				 tmp_file, fsp_str_dbg(fsp), snapshots->mountpoint, entry->name,
 				 strerror(errno));
+			TALLOC_FREE(tmp_file);
 			continue;
 		}
-		if (config->ignore_empty_snaps && !S_ISDIR(cur_st.st_ex_mode) &&
+		TALLOC_FREE(tmp_file);
+		if (config->filter->ignore_empty_snaps && !S_ISDIR(cur_st.st_ex_mode) &&
 		    (timespec_compare(&cur_st.st_ex_mtime, &prev_st.st_ex_mtime) == 0)) {
 			continue;
-			}
+		}
 		if (labels) {
 			strlcpy(shadow_copy_zfs_data->labels[idx],
 				entry->label, sizeof(entry->label));
@@ -1163,7 +1177,6 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 	}
 
 	shadow_copy_zfs_data->num_volumes = idx;
-	TALLOC_FREE(to_free);
 	TALLOC_FREE(tmp_ctx);
 	return 0;
 }
@@ -1357,11 +1370,11 @@ static int shadow_copy_zfs_get_quota(vfs_handle_struct *handle, const struct smb
 static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 				const char *service, const char *user)
 {
-	struct smblibzfshandle	*libzp = NULL;
 	struct shadow_copy_zfs_config *config = NULL;
 	const char **exclusions = NULL;
 	const char **inclusions = NULL;
 	int ret, saved_errno;
+	int memcache_sz;
 
 	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
 	if (ret < 0) {
@@ -1375,10 +1388,15 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 		return -1;
 	}
 
+	config->filter = talloc_zero(config, struct snap_filter);
+	if (config->filter == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+
 	ret = conn_zfs_init(handle->conn->sconn,
 			    handle->conn->connectpath,
-			    &config->libzp,
-			    &config->ds_list,
+			    &config->ds,
 			    handle->conn->tcon != NULL);
 
 	if (ret != 0) {
@@ -1389,8 +1407,8 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 	inclusions = lp_parm_string_list(SNUM(handle->conn), "shadow",
 					 "include", NULL);
 	if (inclusions != NULL) {
-		config->inclusions = str_list_copy(config, inclusions);
-		if (config->inclusions == NULL) {
+		config->filter->inclusions = str_list_copy(config, inclusions);
+		if (config->filter->inclusions == NULL) {
 			DBG_ERR("%s: str_list_copy failed: %s\n",
 				service, strerror(errno));
 			goto disconnect_out;
@@ -1399,8 +1417,8 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 	exclusions = lp_parm_string_list(SNUM(handle->conn), "shadow",
 					 "exclude", NULL);
 	if (exclusions != NULL) {
-		config->exclusions = str_list_copy(config, exclusions);
-		if (config->exclusions == NULL) {
+		config->filter->exclusions = str_list_copy(config, exclusions);
+		if (config->filter->exclusions == NULL) {
 			DBG_ERR("%s: str_list_copy failed: %s\n",
 				service, strerror(errno));
 			goto disconnect_out;
@@ -1410,11 +1428,16 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 	config->cache_enabled = lp_parm_bool(SNUM(handle->conn), "shadow",
 						"cache_enabled", true);
 
-	config->ignore_empty_snaps = lp_parm_bool(SNUM(handle->conn), "shadow",
+	config->filter->ignore_empty_snaps = lp_parm_bool(SNUM(handle->conn), "shadow",
 						"ignore_empty_snaps", true);
 
 	config->timedelta = lp_parm_int(SNUM(handle->conn),
 					"shadow", "snap_timedelta", 300);
+
+	memcache_sz = lp_parm_int(SNUM(handle->conn),
+				  "shadow", "cache_size", 512);
+
+	config->zcache = memcache_init(handle->conn, (memcache_sz * 1024));
 
 	SMB_VFS_HANDLE_SET_DATA(handle, config,
 				NULL, struct shadow_copy_zfs_config,
