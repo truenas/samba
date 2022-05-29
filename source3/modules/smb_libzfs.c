@@ -54,7 +54,6 @@ struct mntent
 #include "lib/util/dlinklist.h"
 #include "lib/util/fault.h"
 #include "lib/util/memcache.h"
-#include "lib/util/memory.h"
 #include "lib/util/unix_match.h"
 #include "smb_macros.h"
 #include "modules/smb_libzfs.h"
@@ -200,7 +199,7 @@ static dataset_t *zcache_lookup_dataset(dev_t dev_id)
 	char key[20] = {0};
 	dataset_t *out = NULL;
 
-	snprintf(key, sizeof(key), "DS_0x%16lx", dev_id);
+	snprintf(key, sizeof(key), "DS_0x%lx", dev_id);
 
 	DS_LOCK();
 	out = memcache_lookup_talloc(global_zcache,
@@ -214,7 +213,7 @@ static void zcache_add_dataset(dataset_t *ds)
 {
 	char key[20] = {0};
 
-	snprintf(key, sizeof(key), "DS_0x%16lx", ds->ds->devid);
+	snprintf(key, sizeof(key), "DS_0x%lx", ds->ds->devid);
 
 	DS_LOCK();
 	ds->ds->zhandle->zone = ZHANDLE_ROOT;
@@ -229,7 +228,7 @@ static void zcache_remove_dataset(dev_t dev_id)
 {
 	char key[20] = {0};
 
-	snprintf(key, sizeof(key), "DS_0x%16lx", dev_id);
+	snprintf(key, sizeof(key), "DS_0x%lx", dev_id);
 
 	DS_LOCK();
 	memcache_delete(global_zcache,
@@ -1082,8 +1081,8 @@ bool resolve_legacy(struct zfs_dataset *ds)
 
 	strlcpy(buf, zfs_get_name(zfsp), sizeof(buf));
 	while ((slashp = strrchr(buf, '/'))) {
-		ZERO_STRUCT(parent);
-		ZERO_STRUCT(mp);
+		*parent = '\0';
+		*mp = '\0';
 		*slashp = '\0';
 		ret = zfs_parent_name(p, parent, sizeof(parent));
 		if (ret != 0) {
