@@ -199,10 +199,10 @@ static void global_handle_incref()
 
 static dataset_t *zcache_lookup_dataset(dev_t dev_id)
 {
-	char key[20] = {0};
+	char key[22] = {0};
 	dataset_t *out = NULL;
 
-	snprintf(key, sizeof(key), "DS_0x%lx", dev_id);
+	snprintf(key, sizeof(key), "DS_0x%16lx", dev_id);
 
 	DS_LOCK();
 	out = memcache_lookup_talloc(global_zcache,
@@ -214,9 +214,9 @@ static dataset_t *zcache_lookup_dataset(dev_t dev_id)
 
 static void zcache_add_dataset(dataset_t *ds)
 {
-	char key[20] = {0};
+	char key[22] = {0};
 
-	snprintf(key, sizeof(key), "DS_0x%lx", ds->ds->devid);
+	snprintf(key, sizeof(key), "DS_0x%16lx", ds->ds->devid);
 
 	DS_LOCK();
 	ds->ds->zhandle->zone = ZHANDLE_ROOT;
@@ -229,9 +229,9 @@ static void zcache_add_dataset(dataset_t *ds)
 
 static void zcache_remove_dataset(dev_t dev_id)
 {
-	char key[20] = {0};
+	char key[22] = {0};
 
-	snprintf(key, sizeof(key), "DS_0x%lx", dev_id);
+	snprintf(key, sizeof(key), "DS_0x%16lx", dev_id);
 
 	DS_LOCK();
 	memcache_delete(global_zcache,
@@ -538,6 +538,7 @@ static struct zfs_dataset *copy_to_external(TALLOC_CTX *mem_ctx,
 	}
 	if (open_zhandle) {
 		out->zhandle = smbzhandle_dup(out, ds_in->ds->zhandle);
+		out->zhandle->zone = ZHANDLE_ROOT;
 	}
 	DS_UNLOCK();
 	return out;
