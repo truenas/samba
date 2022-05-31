@@ -61,6 +61,9 @@ struct mntent
 #define SHADOW_COPY_ZFS_GMT_FORMAT "@GMT-%Y.%m.%d-%H.%M.%S"
 #define ZFS_PROP_SAMBA_PREFIX "org.samba"
 
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a)/sizeof(a[0]))
+#endif
 
 typedef struct dataset_entry_internal {
 	struct zfs_dataset *ds;
