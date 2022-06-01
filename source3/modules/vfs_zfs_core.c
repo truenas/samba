@@ -29,9 +29,12 @@ static int vfs_zfs_core_debug_level = DBGC_VFS;
 #undef DBGC_CLASS
 #define DBGC_CLASS vfs_zfs_core_debug_level
 
+
 struct zfs_core_config_data {
-	struct dataset_list *dl;
-	struct dataset_list *created;
+	struct zfs_dataset *ds;
+	struct zfs_dataset *singleton;
+	struct zfs_dataset **created;
+	size_t ncreated;
 	bool zfs_space_enabled;
 	bool zfs_quota_enabled;
 	bool zfs_auto_create;
@@ -41,13 +44,13 @@ struct zfs_core_config_data {
 };
 
 static struct zfs_dataset *smbfname_to_ds(const struct connection_struct *conn,
-					  struct dataset_list *dl,
+					  struct zfs_core_config_data *config,
 					  const struct smb_filename *smb_fname)
 {
 	int ret;
 	SMB_STRUCT_STAT sbuf;
 	const SMB_STRUCT_STAT *psbuf = NULL;
-	struct zfs_dataset *child = NULL;
+	struct zfs_dataset *resolved = NULL;
 	char *full_path = NULL;
 	char *to_free = NULL;
 	char path[PATH_MAX + 1];
@@ -67,20 +70,15 @@ static struct zfs_dataset *smbfname_to_ds(const struct connection_struct *conn,
 		psbuf = &sbuf;
 	}
 
-	if (psbuf->st_ex_dev == dl->root->devid) {
-		return dl->root;
-	}
-	for (child=dl->children; child; child=child->next) {
-		if (child->devid == psbuf->st_ex_dev) {
-			return child;
-		}
+	if (psbuf->st_ex_dev == config->ds->devid) {
+		return config->ds;
 	}
 
-	/*
-	 * Our current cache of datasets does not contain the path in
-	 * question. Use libzfs to try to get it. Allocate under
-	 * memory context of our dataset list.
-	 */
+	if (config->singleton &&
+	    (config->singleton->devid == psbuf->st_ex_dev)) {
+		return config->singleton;
+	}
+
 	len = full_path_tos(discard_const(conn->cwd_fsp->fsp_name->base_name),
 			    smb_fname->base_name,
 			    path, sizeof(path),
@@ -90,16 +88,22 @@ static struct zfs_dataset *smbfname_to_ds(const struct connection_struct *conn,
 		return NULL;
 	}
 
-	child = smb_zfs_path_get_dataset(dl->root->zhandle->lz,
-					 dl, path, true, true, true);
-	TALLOC_FREE(to_free);
-	if (child != NULL) {
-		DLIST_ADD(dl->children, child);
-		return child;
+	/*
+	 * Our current cache of datasets does not contain the path in
+	 * question. Use libzfs to try to get it. Allocate under
+	 * memory context of our dataset list.
+	 */
+	resolved = smb_zfs_path_get_dataset(config, path, true, true, true);
+	if (resolved != NULL) {
+		TALLOC_FREE(config->singleton);
+		TALLOC_FREE(to_free);
+		config->singleton = resolved;
+		return resolved;
 	}
 
 	DBG_ERR("No dataset found for %s with device id: %lu\n",
 		path, psbuf->st_ex_dev);
+	TALLOC_FREE(to_free);
 	errno = ENOENT;
 	return NULL;
 }
@@ -139,7 +143,7 @@ static uint64_t zfs_core_disk_free(vfs_handle_struct *handle,
 		return SMB_VFS_NEXT_DISK_FREE(handle, smb_fname, bsize, dfree, dsize);
 	}
 
-	ds = smbfname_to_ds(handle->conn, config->dl, smb_fname);
+	ds = smbfname_to_ds(handle->conn, config, smb_fname);
 	if (ds == NULL) {
 		DBG_ERR("Failed to retrive ZFS dataset handle on %s: %s\n",
 			smb_fname_str_dbg(smb_fname), strerror(errno));
@@ -176,7 +180,7 @@ static int zfs_core_get_quota(struct vfs_handle_struct *handle,
 		return -1;
 	}
 
-	ds = smbfname_to_ds(handle->conn, config->dl, smb_fname);
+	ds = smbfname_to_ds(handle->conn, config, smb_fname);
 	if (ds == NULL) {
 		DBG_ERR("Failed to retrive ZFS dataset handle on %s: %s\n",
 			smb_fname_str_dbg(smb_fname), strerror(errno));
@@ -267,7 +271,7 @@ static int zfs_core_set_quota(struct vfs_handle_struct *handle,
 		xid = id.uid == -1?(uint64_t)geteuid():(uint64_t)id.uid;
 		zq.quota_type = SMBZFS_USER_QUOTA;
 		become_root();
-		ret = smb_zfs_set_quota(config->dl->root->zhandle, xid, zq);
+		ret = smb_zfs_set_quota(config->ds->zhandle, xid, zq);
 		unbecome_root();
 		break;
 	case SMB_GROUP_QUOTA_TYPE:
@@ -278,7 +282,7 @@ static int zfs_core_set_quota(struct vfs_handle_struct *handle,
 		xid = id.gid == -1?(uint64_t)getegid():(uint64_t)id.gid;
 		zq.quota_type = SMBZFS_GROUP_QUOTA;
 		become_root();
-		ret = smb_zfs_set_quota(config->dl->root->zhandle, xid, zq);
+		ret = smb_zfs_set_quota(config->ds->zhandle, xid, zq);
 		unbecome_root();
 		break;
 	default:
@@ -329,6 +333,7 @@ static bool get_synthetic_fsp(vfs_handle_struct *handle,
 		file_free(NULL, tmp_fsp);
 		return false;
 	}
+
 	tmp_fsp->fsp_flags.is_directory = true;
 
 	fsp_set_fd(tmp_fsp, fd);
@@ -338,8 +343,7 @@ static bool get_synthetic_fsp(vfs_handle_struct *handle,
 }
 
 static bool zfs_inherit_acls(vfs_handle_struct *handle,
-			     const char *root,
-			     struct dataset_list *ds_list)
+			     struct zfs_core_config_data *config)
 {
 	struct zfs_dataset *ds = NULL;
 	size_t root_len;
@@ -347,28 +351,34 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 	int error;
 	struct files_struct *pathref = NULL;
 	bool ok;
+	size_t idx = config->ncreated -1;
 
-	root_len = strlen(ds_list->root->mountpoint) + 1;
+	root_len = strlen(config->created[idx]->mountpoint) + 1;
 
 	error = stat(handle->conn->connectpath, &st);
 	if (error) {
-		DBG_ERR("%s: stat() failed: %s\n", root, strerror(errno));
+		DBG_ERR("%s: stat() failed: %s\n",
+			handle->conn->connectpath,
+			strerror(errno));
 		return false;
 	}
 
-	error = chdir(ds_list->root->mountpoint);
+	error = chdir(config->created[idx]->mountpoint);
 	if (error != 0) {
 		DBG_ERR("failed to chdir into [%s]: %s\n",
-			ds_list->root->mountpoint, strerror(errno));
+			config->created[idx], strerror(errno));
 		return false;
 	}
 
 	ok = get_synthetic_fsp(handle, ".", &pathref);
 	if (!ok) {
+		DBG_ERR("get_syntehntic_fsp() failed: %s\n", strerror(errno));
 		return false;
 	}
+	idx--;
 
-	for (ds = ds_list->children; ds; ds = ds->next) {
+	for (; idx != 0; idx--) {
+		ds = config->created[idx];
 		struct files_struct *c_fsp = NULL;
 		NTSTATUS status;
 
@@ -402,6 +412,7 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 		file_free(NULL, pathref);
 		pathref = c_fsp;
 	}
+
 	error = chdir(handle->conn->connectpath);
 	if (error != 0) {
 		DBG_ERR("failed to chdir into [%s]: %s\n",
@@ -416,7 +427,7 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 	if (error) {
 		DBG_ERR("%s: failed to restore ownership after "
 			"forced ACL inheritance: %s\n",
-			root, strerror(errno));
+			handle->conn->connectpath, strerror(errno));
 	}
 
 	return true;
@@ -428,9 +439,6 @@ static int create_zfs_connectpath(vfs_handle_struct *handle,
 {
 	bool do_chown;
 	int rv;
-	NTSTATUS status;
-	struct smblibzfshandle *libzp = NULL;
-	struct dataset_list *ds_list = NULL;
 
 	if (access(handle->conn->connectpath, F_OK) == 0) {
 		DBG_INFO("Connectpath for %s already exists. "
@@ -439,17 +447,12 @@ static int create_zfs_connectpath(vfs_handle_struct *handle,
 		return 0;
 	}
 
-	rv = get_smblibzfs_handle(handle->conn, &libzp);
-	if (rv != 0) {
-		DBG_ERR("Failed to obtain libzfshandle on connectpath: %s\n",
-			strerror(errno));
-		return -1;
-	}
-
-	rv = smb_zfs_create_dataset(handle->conn, libzp,
+	DBG_ERR("preparing to create: %s\n", handle->conn->connectpath);
+	rv = smb_zfs_create_dataset(handle->conn,
 				    handle->conn->connectpath,
 				    config->dataset_auto_quota,
-				    &config->created, true);
+				    &config->created,
+				    &config->ncreated, true);
 	if (rv !=0) {
 		return -1;
 	}
@@ -472,7 +475,6 @@ static int create_zfs_connectpath(vfs_handle_struct *handle,
 		}
 		TALLOC_FREE(current_user);
 	}
-	TALLOC_FREE(libzp);
 	return rv;
 }
 
@@ -499,7 +501,7 @@ static int set_base_user_quota(vfs_handle_struct *handle,
 		return -1;
 	}
 
-	ret = smb_zfs_get_quota(config->dl->root->zhandle,
+	ret = smb_zfs_get_quota(config->ds->zhandle,
 					  current_user,
 					  SMBZFS_USER_QUOTA,
 					  &zq);
@@ -515,7 +517,7 @@ static int set_base_user_quota(vfs_handle_struct *handle,
 	if (zq.bytes == 0) {
 		zq.bytes = config->base_user_quota;
 		zq.obj = 0;
-		ret = smb_zfs_set_quota(config->dl->root->zhandle,
+		ret = smb_zfs_set_quota(config->ds->zhandle,
 				        current_user, zq);
 		if (ret != 0) {
 			DBG_ERR("Failed to set base quota uid: (%u), "
@@ -535,14 +537,58 @@ static int zfs_core_chdir(vfs_handle_struct *handle,
 				struct zfs_core_config_data,
 				return -1);
 
-	if (!config->checked && config->created != NULL) {
+	if (!config->checked && (config->created != NULL)) {
+		DBG_ERR("preparing to inherit\n");
 		bool ok;
+		int inherit_owner;
+		bool force_acl_user;
+		const char *owner = NULL;
 
+		inherit_owner = lp_inherit_owner(SNUM(handle->conn));
+		force_acl_user = lp_force_unknown_acl_user(SNUM(handle->conn));
+
+		lp_do_parameter(
+			SNUM(handle->conn),
+			"inherit owner", "window and unix"
+		);
+
+		lp_do_parameter(
+			SNUM(handle->conn),
+			"force unknown acl user", "true"
+		);
 		become_root();
-		ok = zfs_inherit_acls(handle,
-				      config->created->root->mountpoint,
-				      config->created);
+		ok = zfs_inherit_acls(handle, config);
 		unbecome_root();
+
+		switch (inherit_owner) {
+		case INHERIT_OWNER_NO:
+			lp_do_parameter(
+				SNUM(handle->conn),
+				"inherit owner", "no"
+			);
+			break;
+		case INHERIT_OWNER_WINDOWS_AND_UNIX:
+			lp_do_parameter(
+				SNUM(handle->conn),
+				"inherit owner", "window and unix"
+			);
+			break;
+		case INHERIT_OWNER_UNIX_ONLY:
+			lp_do_parameter(
+				SNUM(handle->conn),
+				"inherit owner", "unix only"
+			);
+			break;
+		default:
+			smb_panic("unexpected value for inherit acls");
+		}
+
+		lp_do_parameter(
+			SNUM(handle->conn),
+			"force unknown acl user",
+			force_acl_user ? "true" : "false"
+		);
+
 		if (!ok) {
 			return -1;
 		}
@@ -553,6 +599,82 @@ static int zfs_core_chdir(vfs_handle_struct *handle,
 	return SMB_VFS_NEXT_CHDIR(handle, smb_fname);
 }
 
+#if 0 /*pending rework of case insensitve renames */
+/*
+ * Windows clients return NT_STATUS_OBJECT_NAME_COLLISION in case of
+ * rename in case of rename in case insensitive dataset. MacOS does
+ * attempts the rename. rename() in FreeBSD in this returns success, but
+ * does not actually rename the file. Add new logic to rename(). If
+ * a case_insensitive string comparison of the filenames returns 0, then
+ * perform two renames so that the returned filename matches client
+ * expectations. First rename appends a unique id generated from
+ * inode and generation number to the file's name. This makes the
+ * rename deterministic, while minimizing risk of name collisions.
+ */
+static int zfs_core_renameat(vfs_handle_struct *handle,
+			     files_struct *srcfsp,
+			     const struct smb_filename *smb_fname_src,
+			     files_struct *dstfsp,
+			     const struct smb_filename *smb_fname_dst)
+{
+	int result = 1;
+	struct zfs_core_config_data *config = NULL;
+	char *tmp_base_name = NULL;
+	uint64_t srcid, dstid;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct zfs_core_config_data,
+				return -1);
+
+	if (config->ds->properties->casesens != SMBZFS_INSENSITIVE) {
+		return SMB_VFS_NEXT_RENAMEAT(handle,
+					     srcfsp,
+					     smb_fname_src,
+					     dstfsp,
+					     smb_fname_dst);
+	}
+
+	srcid = SMB_VFS_FS_FILE_ID(handle->conn, &srcfsp->fsp_name->st);
+	dstid = SMB_VFS_FS_FILE_ID(handle->conn, &dstfsp->fsp_name->st);
+
+	if (srcid == dstid) {
+		result = strcasecmp_m(smb_fname_src->base_name,
+				      smb_fname_dst->base_name);
+	}
+	if (result != 0) {
+		return SMB_VFS_NEXT_RENAMEAT(handle,
+					     srcfsp,
+					     smb_fname_src,
+					     dstfsp,
+					     smb_fname_dst);
+	}
+
+	dstid = SMB_VFS_FS_FILE_ID(handle->conn, &smb_fname_src->st);
+	tmp_base_name = talloc_asprintf(talloc_tos(), "%s_%lu",
+					smb_fname_src->base_name, dstid);
+	if (tmp_base_name == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	result = renameat(
+		fsp_get_pathref_fd(srcfsp), smb_fname_src->base_name,
+		fsp_get_pathref_fd(dstfsp), tmp_base_name
+        );
+	if (result != 0) {
+		DBG_ERR("Failed to rename %s to intermediate name %s\n",
+			smb_fname_src->base_name, tmp_base_name);
+		TALLOC_FREE(tmp_base_name);
+		return result;
+	}
+	result = renameat(
+		fsp_get_pathref_fd(dstfsp), tmp_base_name,
+		fsp_get_pathref_fd(srcfsp), smb_fname_dst->base_name
+        );
+	TALLOC_FREE(tmp_base_name);
+	return result;
+}
+#endif
+
 static int zfs_core_connect(struct vfs_handle_struct *handle,
 			    const char *service, const char *user)
 {
@@ -560,7 +682,6 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 	int ret;
 	const char *dataset_auto_quota = NULL;
 	const char *base_quota_str = NULL;
-	struct smblibzfshandle *lz = NULL;
 
 	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
 	if (ret < 0) {
@@ -580,6 +701,7 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 	 */
 	config->zfs_auto_create = lp_parm_bool(SNUM(handle->conn),
 			"zfs_core", "zfs_auto_create", false);
+
 	config->dataset_auto_quota = lp_parm_const_string(SNUM(handle->conn),
 			"zfs_core", "dataset_auto_quota", NULL);
 
@@ -592,10 +714,9 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 
 	ret = conn_zfs_init(handle->conn->sconn,
 			    handle->conn->connectpath,
-			    &lz,
-			    &config->dl,
+			    &config->ds,
 			    handle->conn->tcon != NULL);
-	if ((ret != 0) || (config->dl == NULL)) {
+	if (ret != 0 || (config->ds == NULL)) {
 		DBG_ERR("Failed to initialize ZFS data: %s\n",
 			strerror(errno));
 		return ret;
@@ -609,7 +730,7 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 		set_base_user_quota(handle, config, user);
         }
 
-	if (config->dl->root->properties->casesens == SMBZFS_INSENSITIVE) {
+	if (config->ds->properties->casesens == SMBZFS_INSENSITIVE) {
 		DBG_INFO("zfs_core: case insensitive dataset detected, "
 			 "automatically adjusting case sensitivity settings.\n");
 		lp_do_parameter(SNUM(handle->conn),

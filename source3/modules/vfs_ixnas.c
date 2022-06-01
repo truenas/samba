@@ -35,13 +35,10 @@ static int vfs_ixnas_debug_level = DBGC_VFS;
 
 struct ixnas_config_data {
 	struct smbacl4_vfs_params nfs4_params;
-	struct smblibzfshandle *libzp;
-	struct dataset_list *dsl;
 	bool posix_rename;
 	bool dosattrib_xattr;
 	bool zfs_acl_enabled;
 	bool zfs_acl_chmod_enabled;
-	struct zfs_dataset_prop *props;
 };
 
 static const struct {
@@ -1056,35 +1053,6 @@ static int ixnas_ntimes(vfs_handle_struct *handle,
 	return result;
 }
 
-
-static bool set_zfs_parameters(struct vfs_handle_struct *handle,
-			       const char *service, const char *user,
-			       struct ixnas_config_data *config)
-{
-	const char *base_quota_str = NULL;
-	if (config->dsl == NULL) {
-		config->props = talloc_zero(handle->conn, struct zfs_dataset_prop);
-		if (config->props == NULL) {
-			errno = ENOMEM;
-			return false;
-		}
-		DBG_INFO("Share connectpath is not ZFS dataset. "
-			 "Skipping configuration.\n");
-		config->props->casesens = SMBZFS_SENSITIVE;
-		return true;
-	}
-	config->props = config->dsl->root->properties;
-
-	if (config->props->casesens == SMBZFS_INSENSITIVE) {
-		DBG_INFO("ixnas: case insensitive dataset detected, "
-			 "automatically adjusting case sensitivity settings.\n");
-		lp_do_parameter(SNUM(handle->conn),
-				"case sensitive", "yes");
-		handle->conn->case_sensitive = True;
-	}
-	return true;
-}
-
 static bool set_acl_parameters(struct vfs_handle_struct *handle,
 			       struct ixnas_config_data *config)
 {
@@ -1164,26 +1132,6 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 		return ret;
 	}
 
-
-#if HAVE_LIBZFS
-	ret = conn_zfs_init(handle->conn->sconn,
-			    handle->conn->connectpath,
-			    &config->libzp,
-			    &config->dsl, handle->conn->tcon != NULL);
-
-	if (ret != 0) {
-		TALLOC_FREE(config);
-		return ret;
-	}
-
-	ok = set_zfs_parameters(handle, service, user, config);
-	if (!ok) {
-		TALLOC_FREE(config);
-		return -1;
-	}
-#endif
-
-	/* OS-X Compatibility */
 	config->posix_rename = lp_parm_bool(SNUM(handle->conn),
 			"ixnas", "posix_rename", false);
 

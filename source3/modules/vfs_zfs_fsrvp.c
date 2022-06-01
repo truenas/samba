@@ -161,14 +161,16 @@ static NTSTATUS zfs_fsrvp_snap_delete(struct vfs_handle_struct *handle,
 	to_delete = talloc_zero(tmp_ctx, struct snapshot_list);
 	del_entry = talloc_zero(tmp_ctx, struct snapshot_entry);
 
-	to_delete->dataset_name = talloc_strdup(tmp_ctx, base_path);
+	strlcpy(to_delete->dataset_name, base_path,
+		sizeof(to_delete->dataset_name));
+
 	to_delete->num_entries = 1;
-	del_entry->name = talloc_strdup(tmp_ctx, base);
+
+	strlcpy(del_entry->name, base, sizeof(del_entry->name));
+
 	DLIST_ADD(to_delete->entries, del_entry);
 	become_root();
-	ret = smb_zfs_delete_snapshots(config->ds->zhandle->lz,
-				       tmp_ctx,
-				       to_delete);
+	ret = smb_zfs_delete_snapshots(to_delete);
 	unbecome_root();
 	if (ret != 0) {
 		TALLOC_FREE(tmp_ctx);
@@ -185,17 +187,16 @@ static int zfs_fsrvp_connect(struct vfs_handle_struct *handle,
 {
 	int ret;
 	struct zfs_fsrvp_config_data *config = NULL;
-	struct smblibzfshandle *libzp = NULL;
-	struct dataset_list *ds_list = NULL;
+	struct zfs_dataset *ds = NULL;
 	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
 	if (ret != 0) {
 		return ret;
 	}
 	ret = conn_zfs_init(handle->conn->sconn,
 			    handle->conn->connectpath,
-			    &libzp, &ds_list, handle->conn->tcon != NULL);
+			    &ds, handle->conn->tcon != NULL);
 
-	if (ds_list == NULL) {
+	if (ds == NULL) {
 		DBG_ERR("Failed to obtain dataset list for connect path. "
 			"Path may not be a ZFS filesystem: %s\n",
 			handle->conn->connectpath);
@@ -209,14 +210,14 @@ static int zfs_fsrvp_connect(struct vfs_handle_struct *handle,
 		return -1;
 	}
 
-	config->ds = ds_list->root;
+	config->ds = ds;
 
-	if ((strcmp(ds_list->root->mountpoint, handle->conn->connectpath) != 0) &&
+	if ((strcmp(ds->mountpoint, handle->conn->connectpath) != 0) &&
 	    (strlen(handle->conn->connectpath) > 15) &&
 	    (strnstr(handle->conn->connectpath, "/.zfs/snapshot/", PATH_MAX) == NULL)) {
 		DBG_ERR("Sharing a subdirectory inside a ZFS dataset "
 			"is not permitted.: Connectpath: %s, Mountpoint: %s\n",
-			handle->conn->connectpath, ds_list->root->mountpoint);
+			handle->conn->connectpath, ds->mountpoint);
 		errno = EPERM;
 		return -1;
 	}
