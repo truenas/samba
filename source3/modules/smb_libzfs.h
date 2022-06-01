@@ -1,5 +1,5 @@
 /*-
- * Copyright 2018 iXsystems, Inc.
+ * Copyright 2022 iXsystems, Inc.
  * All rights reserved
  *
  * Redistribution and use in source and binary forms, with or without
@@ -30,37 +30,43 @@
 #include <pwd.h>
 #include <talloc.h>
 
-struct smblibzfs_int;
-struct smbzhandle_int;
+struct smbzhandle;
+typedef struct smbzhandle *smbzhandle_t;
 
-struct smblibzfshandle {
-	struct memcache *zcache;
-	struct db_context *db;
-	struct smblibzfs_int *sli;
-};
-
-struct smbzhandle {
-	struct smblibzfshandle *lz;
-	struct smbzhandle_int *zhp;
-	bool is_open;
-};
-
+#define SMBGMT_NAMELEN 25
+#define ZFSDS_NAMELEN 256
+/*
+ * Maximum length dataset name is 256 characters
+ */
 struct snapshot_entry
 {
-	char label[25];		/* @GMT-prefixed label for snapshot */
-	char *name;		/* name of snapshot */
-	time_t cr_time;		/* creation time of snapshot */
-	NTTIME nt_time;		/* creation time as nt_time */
+	uint64_t createtxg;
+	char label[SMBGMT_NAMELEN];	/* @GMT-prefixed label for snapshot */
+	char name[ZFSDS_NAMELEN];	/* name of snapshot */
+	time_t cr_time;			/* creation time of snapshot */
+	NTTIME nt_time;			/* creation time as nt_time */
 	struct snapshot_entry *prev, *next;
 };
 
 struct snapshot_list
 {
-	time_t timestamp;	/* when list generated */
-	char *mountpoint;	/* mountpoint of ZFS dataset where list taken */
-	char *dataset_name;	/* ZFS dataset name that the list is for */
-	size_t num_entries;	/* number of entries in snapshot list */
+	time_t timestamp;			/* when list generated */
+	char mountpoint[PATH_MAX];		/* mountpoint of underlying ds */
+	char dataset_name[ZFSDS_NAMELEN];	/* ZFS dataset name */
+	size_t num_entries;			/* number of entries in snapshot list */
 	struct snapshot_entry *entries;
+	struct snapshot_entry *last;
+};
+
+struct snap_filter
+{
+	bool ignore_empty_snaps;
+	const char **inclusions;
+	const char **exclusions;
+	time_t start;
+	time_t end;
+	uint64_t start_txg;
+	uint64_t end_txg;
 };
 
 enum casesensitivity {SMBZFS_SENSITIVE, SMBZFS_INSENSITIVE, SMBZFS_MIXED};
@@ -82,7 +88,8 @@ struct zfs_quota {
 struct zfs_dataset_prop
 {
 	enum casesensitivity casesens;
-	int readonly;
+	bool readonly;
+	bool snapdir_visible;
 #if 0 /* Properties we may wish to expose in the future */
 	int atime;
 	int exec;
@@ -92,41 +99,19 @@ struct zfs_dataset_prop
 
 struct zfs_dataset
 {
-	const char *dataset_name;
-	char *mountpoint;
-	struct smbzhandle *zhandle;
+	char dataset_name[ZFSDS_NAMELEN];
+	char mountpoint[PATH_MAX];
+	smbzhandle_t zhandle;
 	dev_t devid;
 	struct zfs_dataset_prop *properties;
-	struct zfs_dataset *prev, *next;
 };
 
-struct dataset_list
-{
-	time_t timestamp;	/* when list generated */
-	struct zfs_dataset *root;
-	struct zfs_dataset *children;
-	size_t nentries;
-};
-
-/*
- * Get an smblibzfshandle. This is to allow reuse of the same libzfs handle,
- * which provides performance and efficiency benefits. The libzfs handle will
- * be automatically closed in the destructor function for the smblibzfshandle.
- *
- * @param[in]	mem_ctx			talloc memory context
- * @param[out]	smblibzfsp		smblibzfs handle struct
- *
- * @return	0 on success -1 on failure
- */
-
-int get_smblibzfs_handle(TALLOC_CTX *mem_ctx,struct smblibzfshandle **smblibzfsp);
-
-struct smblibzfshandle *get_global_smblibzfs_handle(TALLOC_CTX *mem_ctx);
-
-int get_smbzhandle(struct smblibzfshandle *smblibzfsp,
-		   TALLOC_CTX *mem_ctx, const char *path,
+int get_smbzhandle(TALLOC_CTX *mem_ctx, const char *path,
 		   struct smbzhandle **smbzhandle,
 		   bool resolve);
+
+int fget_smbzhandle(TALLOC_CTX *mem_ctx, int fd,
+                    smbzhandle_t *smbzhandle);
 
 /*
  * Get userspace quotas for a given path, ID, and quota type.
@@ -174,16 +159,18 @@ uint64_t smb_zfs_disk_free(struct smbzhandle *hdl,
  * @param[in]	smblibzfsp		smblibzfs handle struct
  * @para[in]	path			path to be created.
  * @para[in]	quota			quota to set on final dataset.
- * @para[out]	created			dataset_list with new dataset(s).
+ * @para[out]	_array_out		pointer to array of datasets.
+ * @para[out]	_nentries		number of datasets.
  * @para[in]	create_ancestors	create intermediate datasets.
  *
  * @return	0 on success -1 on failure.
  */
 int smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
-			   struct smblibzfshandle *smblibzfsp,
 			   const char *path, const char *quota,
-			   struct dataset_list **created,
+			   struct zfs_dataset ***_array_out,
+			   size_t *_nentries,
 			   bool create_ancestors);
+
 
 /*
  * Retrieve the value of a user-defined ZFS dataset property
@@ -197,7 +184,7 @@ int smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
  *
  * @return	0 on success -1 on failure
  */
-int smb_zfs_get_user_prop(struct smbzhandle *hdl,
+int smb_zfs_get_user_prop(smbzhandle_t hdl,
 			  TALLOC_CTX *mem_ctx,
 			  const char *prop,
 			  char **value);
@@ -213,7 +200,7 @@ int smb_zfs_get_user_prop(struct smbzhandle *hdl,
  *
  * @return	0 on success -1 on failure
  */
-int smb_zfs_set_user_prop(struct smbzhandle *hdl,
+int smb_zfs_set_user_prop(smbzhandle_t hdl,
 			  const char *prop,
 			  const char *value);
 
@@ -222,20 +209,22 @@ int smb_zfs_set_user_prop(struct smbzhandle *hdl,
  * If get_props is set to True, then ZFS dataset properties are included
  * in the returned zfs_dataset struct.
  */
-struct zfs_dataset *smb_zfs_path_get_dataset(struct smblibzfshandle *smblibzfsp,
-					     TALLOC_CTX *mem_ctx,
+struct zfs_dataset *smb_zfs_path_get_dataset(TALLOC_CTX *mem_ctx,
 					     const char *path,
 					     bool get_props,
 					     bool open_zhandle,
 					     bool resolve_path);
 
-int smb_get_dataset_name(struct smbzhandle *zhandle_ext, const char **dataset_name_out);
+struct zfs_dataset *smb_zfs_fd_get_dataset(TALLOC_CTX *mem_ctx,
+					   int fd,
+					   bool get_props,
+					   bool open_zhandle);
+
 /*
  * This function returns a list of ZFS snapshots matching the specified
  * filters, allocated under a user-provided talloc memory context. Returns
  * NULL on error. It is a wrapper around zhandle_list_snapshots.
  *
- * @param[in]	smblibzfsp		smblibzfs handle struct
  * @param[in]	mem_ctx			talloc memory context
  * @param[in]	ignore_empty_snaps	ignore snapshots with zero space used
  * @param[in]	inclusions		list of filters to determine whether to
@@ -249,14 +238,9 @@ int smb_get_dataset_name(struct smbzhandle *zhandle_ext, const char **dataset_na
  *
  * @return	struct snapshot_list
  */
-struct snapshot_list *smb_zfs_list_snapshots(struct smblibzfshandle *smblibzfsp,
-					     TALLOC_CTX *mem_ctx,
+struct snapshot_list *smb_zfs_list_snapshots(TALLOC_CTX *mem_ctx,
 					     const char *fs,
-					     bool ignore_empty_snaps,
-					     const char **inclusions,
-					     const char **exclusions,
-					     time_t start,
-					     time_t end);
+					     struct snap_filter *filter);
 
 /*
  * This function returns a list of ZFS snapshots matching the specified
@@ -277,28 +261,24 @@ struct snapshot_list *smb_zfs_list_snapshots(struct smblibzfshandle *smblibzfsp,
  *
  * @return	struct snapshot_list
  */
-struct snapshot_list *zhandle_list_snapshots(struct smbzhandle *zhandle_ext,
+struct snapshot_list *zhandle_list_snapshots(smbzhandle_t hdl,
 					     TALLOC_CTX *mem_ctx,
-					     bool ignore_empty_snaps,
-					     const char **inclusions,
-					     const char **exclusions,
-					     time_t start,
-					     time_t end);
+					     struct snap_filter *filter);
+
+bool update_snapshot_list(smbzhandle_t hdl,
+			  struct snapshot_list *snaps,
+			  struct snap_filter *filter);
 
 /*
  * Delete a list of ZFS snapshots. List is converted into an nvlist
  * and deletion performed in single ZFS ioctl. Required parts of
  * snapshot list are snaps->dataset_name, and entry->name for entries.
  *
- * @param[in]	smblibzfsp		smblibzfs handle struct
- * @param[in]	mem_ctx			talloc memory context
  * @param[in]	snaps			list of snapshots to delete
  *
  * @return	0 on success -1 on failure
  */
-int smb_zfs_delete_snapshots(struct smblibzfshandle *smblibzfsp,
-			     TALLOC_CTX *mem_ctx,
-			     struct snapshot_list *snaps);
+int smb_zfs_delete_snapshots(struct snapshot_list *snaps);
 
 /*
  * Take a named snapshot of a given path.
@@ -308,7 +288,7 @@ int smb_zfs_delete_snapshots(struct smblibzfshandle *smblibzfsp,
  *
  * @return	0 on success -1 on failure
  */
-int smb_zfs_snapshot(struct smbzhandle *hdl,
+int smb_zfs_snapshot(smbzhandle_t hdl,
 		     const char *snapshot_name,
 		     bool recursive);
 
@@ -327,7 +307,7 @@ int smb_zfs_snapshot(struct smbzhandle *hdl,
  *
  * @return	0 on success -1 on failure
  */
-int smb_zfs_rollback(struct smbzhandle *smbzhandle,
+int smb_zfs_rollback(smbzhandle_t hdl,
 		     const char *snapshot_name,
 		     bool force);
 
@@ -338,23 +318,7 @@ int smb_zfs_rollback(struct smbzhandle *smbzhandle,
  * @param[in]	hdl			target ZFS dataset handle
  * @return	0 on success -1 on failure
  */
-int smb_zfs_rollback_last(struct smbzhandle *hdl);
-
-void close_smbzhandle(struct smbzhandle *zfsp_ext);
-
-/*
- * Get a list of child datasets of a given dataset using zfs_iter_filesystems.
- *
- * @param[in]	mem_ctx			talloc memory context on which to hang results.
- * @param[in]	smbzhandle_ext		smb zfs dataset handle
- * @param[in]	open_handles		specifies whether to leave zhandles on child
- *					datasets open
- * @return	dataset_list		dataset->root->zhandle is a pointer to the
- *					same zhandle used to generate the dataset list.
- */
-struct dataset_list *zhandle_list_children(TALLOC_CTX *mem_ctx,
-					   struct smbzhandle *zhandle_ext,
-					   bool open_zhandles);
+int smb_zfs_rollback_last(smbzhandle_t hdl);
 
 /*
  * Initialize global libzfs handle if necessary and populate
@@ -362,14 +326,13 @@ struct dataset_list *zhandle_list_children(TALLOC_CTX *mem_ctx,
  *
  * @param[in]	mem_ctx			talloc memory context on which to hang results.
  * @param[in]	connectpath		connectpath to share.
- * @param[out]	ppdsl			returned dataset list for connectpath.
+ * @param[out]	ppdsl			dataset for connectpath.
  * @param[in]	has_tcon		indicates whether talloc ctx is short-lived
  * @return	0 on success -1 on failure
  */
 int conn_zfs_init(TALLOC_CTX *mem_ctx,
 		  const char *connectpath,
-		  struct smblibzfshandle **plibzfs,
-		  struct dataset_list **ppdsl,
+		  struct zfs_dataset **ppds,
 		  bool has_tcon);
 
 #endif	/* !__SMB_LIBZFS_H */
