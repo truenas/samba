@@ -37,10 +37,8 @@ static int vfs_tmprotect_debug_level = DBGC_VFS;
 #define DBGC_CLASS vfs_tmprotect_debug_level
 
 struct tmprotect_config_data {
-	struct smblibzfshandle *libzp;
 	struct smbzhandle *hdl;
-	char **inclusions;
-	char **exclusions;
+	struct snap_filter *filter;
 	int retention;
 	int min_snaps;
 	bool enabled;
@@ -55,32 +53,23 @@ static bool init_zfs(vfs_handle_struct *handle,
 {
 	int ret;
 	struct smblibzfshandle *libzp = NULL;
-	struct dataset_list *ds_list = NULL;
+	struct zfs_dataset *ds = NULL;
 
 	ret = conn_zfs_init(handle->conn->sconn,
 			    handle->conn->connectpath,
-			    &config->libzp,
-			    &ds_list,
+			    &ds,
 			    handle->conn->tcon != NULL);
 	if (ret != 0) {
 		DBG_ERR("Failed to initialize libzfs: %s\n", strerror(errno));
 		return false;
 	}
-	if (ds_list == NULL) {
+	if (ds == NULL) {
 		DBG_ERR("Path [%s] is not a ZFS filesystem\n",
 			handle->conn->connectpath);
 		errno = EINVAL;
 		return false;
 	}
-	config->hdl = ds_list->root->zhandle;
-
-	if (ds_list->nentries) {
-		DBG_ERR("SMB share contains child datasets. "
-			"This is an unsupported configuration. "
-			"Disabling snapshot managment\n");
-		return false;
-	}
-
+	config->hdl = ds->zhandle;
 	return true;
 }
 
@@ -105,10 +94,7 @@ static bool prune_snapshots(vfs_handle_struct *handle,
 	}
 	snapshots = zhandle_list_snapshots(config->hdl,
 					   talloc_tos(),
-					   false,
-					   config->inclusions,
-					   config->exclusions,
-					   0, 0);
+					   config->filter);
 	SMB_ASSERT(snapshots != NULL);
 	time(&curtime);
 	for (entry = snapshots->entries; entry; entry = entry->next) {
@@ -128,7 +114,8 @@ static bool prune_snapshots(vfs_handle_struct *handle,
 			DBG_INFO("Appending [%s] to list of snapshots "
 				 "to be deleted.\n", entry->name);
 			del_entry = talloc_zero(talloc_tos(), struct snapshot_entry);
-			del_entry->name = talloc_strdup(talloc_tos(), entry->name);
+			strlcpy(del_entry->name, entry->name,
+				sizeof(del_entry->name));
 			DLIST_ADD(to_delete->entries, del_entry);
 			to_delete->num_entries++;
 		}
@@ -139,11 +126,10 @@ static bool prune_snapshots(vfs_handle_struct *handle,
 		DBG_INFO("num_snaps: %zu, num_delete: %zu, remaining_snaps: %zu, "
 			 "min snaps: %d\n", snapshots->num_entries,
 			 to_delete->num_entries, remaining_snaps, config->min_snaps);
-		to_delete->dataset_name = talloc_strdup(talloc_tos(), snapshots->dataset_name);
+		strlcpy(to_delete->dataset_name, snapshots->dataset_name,
+			sizeof(to_delete->dataset_name));
 		become_root();
-		ret = smb_zfs_delete_snapshots(config->libzp,
-					       talloc_tos(),
-					       to_delete);
+		ret = smb_zfs_delete_snapshots(to_delete);
 		unbecome_root();
 		if (ret != 0) {
 			DBG_ERR("failed to delete list of expired snapshots: %s\n",
@@ -171,10 +157,7 @@ static bool last_snap_ts(vfs_handle_struct *handle,
 
 	snapshots = zhandle_list_snapshots(config->hdl,
 					   talloc_tos(),
-					   false,
-					   config->inclusions,
-					   config->exclusions,
-					   0, 0);
+					   config->filter);
 	if (snapshots == NULL) {
 		DBG_ERR("Failed to list snapshots: %s\n", strerror(errno));
 		return false;
@@ -421,12 +404,19 @@ static int tmprotect_connect(struct vfs_handle_struct *handle,
 		return -1;
 	}
 
+	config->filter = talloc_zero(config, struct snap_filter);
+	if (config->filter == NULL) {
+		DBG_ERR("talloc_zero() failed\n");
+		errno = ENOMEM;
+		return -1;
+	}
+
 	inclusions = lp_parm_string_list(SNUM(handle->conn),
 					 TMPROTECT_MODULE,
 					 "include", &default_aapl);
 	if (inclusions != NULL) {
-		config->inclusions = str_list_copy(config, inclusions);
-		if (config->inclusions == NULL) {
+		config->filter->inclusions = str_list_copy(config, inclusions);
+		if (config->filter->inclusions == NULL) {
 			DBG_ERR("%s: str_list_copy failed: %s\n",
 				service, strerror(errno));
 			goto disconnect_out;
@@ -437,8 +427,8 @@ static int tmprotect_connect(struct vfs_handle_struct *handle,
 					 TMPROTECT_MODULE,
 					 "exclude", NULL);
 	if (exclusions != NULL) {
-		config->exclusions = str_list_copy(config, exclusions);
-		if (config->exclusions == NULL) {
+		config->filter->exclusions = str_list_copy(config, exclusions);
+		if (config->filter->exclusions == NULL) {
 			DBG_ERR("%s: str_list_copy failed: %s\n",
 				service, strerror(errno));
 			goto disconnect_out;
