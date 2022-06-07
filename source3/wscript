@@ -1952,8 +1952,10 @@ int main(void) {
         default_static_modules.extend(['pdb_samba_dsdb', 'auth_samba4', 'vfs_dfs_samba4'])
         default_shared_modules.extend(['vfs_posix_eadb'])
 
+    default_shared_modules.extend(['vfs_zfsacl', 'vfs_zfs_space', 'vfs_winmsa', 'vfs_ixnas'])
+
     if conf.CONFIG_SET('HAVE_FREEBSD_SUNACL_H'):
-        default_shared_modules.extend(['vfs_zfsacl', 'vfs_zfs_space', 'vfs_ixnas', 'vfs_winmsa', 'vfs_noacl'])
+        default_shared_modules.extend(['vfs_noacl'])
 
     if conf.CONFIG_SET('HAVE_DIRFD_DECL'):
         default_shared_modules.extend(['vfs_syncops', 'vfs_dirsort'])
