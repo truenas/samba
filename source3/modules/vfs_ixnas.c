@@ -22,11 +22,7 @@
 #include "smbd/smbd.h"
 #include "system/filesys.h"
 #include "nfs4_acls.h"
-#include <sys/acl.h>
-
-#if HAVE_LIBZFS
-#include "modules/smb_libzfs.h"
-#endif
+#include "zfsacl.h"
 
 static int vfs_ixnas_debug_level = DBGC_VFS;
 
@@ -41,9 +37,30 @@ struct ixnas_config_data {
 	bool zfs_acl_chmod_enabled;
 };
 
+#ifndef FREEBSD
+#define	UF_READONLY		0x0000000100000000ull
+#define	UF_HIDDEN		0x0000000200000000ull
+#define	UF_SYSTEM		0x0000000400000000ull
+#define	UF_ARCHIVE		0x0000000800000000ull
+#define	UF_REPARSE		0x0000080000000000ull
+#define	UF_OFFLINE		0x0000100000000000ull
+#define	UF_SPARSE		0x0000200000000000ull
+
+#define ACL_BRAND_UNKNOWN	0
+#define ACL_BRAND_POSIX		1
+#define ACL_BRAND_NFS4		2
+
+
+#define ACL4_XATTR "system.nfs4_acl_xdr"
+#define ACL_XATTR "system.posix_acl_access"
+
+#define ZFS_IOC_GETDOSFLAGS     _IOR(0x83, 1, uint64_t)
+#define ZFS_IOC_SETDOSFLAGS     _IOW(0x83, 2, uint64_t)
+#endif /* FREEBSD */
+
 static const struct {
 	uint32_t dosmode;
-	uint32_t flag;
+	uint64_t flag;
 } dosmode2flag[] = {
 	{ FILE_ATTRIBUTE_READONLY, UF_READONLY },
 	{ FILE_ATTRIBUTE_ARCHIVE, UF_ARCHIVE },
@@ -54,61 +71,139 @@ static const struct {
 	{ FILE_ATTRIBUTE_REPARSE_POINT, UF_REPARSE },
 };
 
-/*
- * ACL_ENTRY_SUCCESSFUL_ACCESS and
- * ACL_ENTRY_FAILED_ACCESS are omitted because
- * they are not currently implemented in FreeBSD and Samba
- */
-static const struct {
-	acl_flag_t bsdflag;
-	uint32_t nfs4flag;
-} bsdflag2nfs4flag[] = {
-	{ ACL_ENTRY_FILE_INHERIT, SMB_ACE4_FILE_INHERIT_ACE },
-	{ ACL_ENTRY_DIRECTORY_INHERIT, SMB_ACE4_DIRECTORY_INHERIT_ACE },
-	{ ACL_ENTRY_NO_PROPAGATE_INHERIT, SMB_ACE4_NO_PROPAGATE_INHERIT_ACE },
-	{ ACL_ENTRY_INHERIT_ONLY, SMB_ACE4_INHERIT_ONLY_ACE },
-	{ ACL_ENTRY_INHERITED, SMB_ACE4_INHERITED_ACE },
-};
+#define KERN_DOSMODES (UF_READONLY | UF_ARCHIVE | UF_SYSTEM | \
+	UF_HIDDEN | UF_SPARSE | UF_OFFLINE | UF_REPARSE)
 
-static const struct {
-	acl_perm_t bsdperm;
-	uint32_t nfs4perm;
-} bsdperm2nfs4perm[] = {
-	{ ACL_READ_DATA, SMB_ACE4_READ_DATA },
-	{ ACL_WRITE_DATA, SMB_ACE4_WRITE_DATA },
-	{ ACL_APPEND_DATA, SMB_ACE4_APPEND_DATA },
-	{ ACL_READ_NAMED_ATTRS, SMB_ACE4_READ_NAMED_ATTRS },
-	{ ACL_WRITE_NAMED_ATTRS, SMB_ACE4_WRITE_NAMED_ATTRS },
-	{ ACL_EXECUTE, SMB_ACE4_EXECUTE },
-	{ ACL_DELETE_CHILD, SMB_ACE4_DELETE_CHILD },
-	{ ACL_READ_ATTRIBUTES, SMB_ACE4_READ_ATTRIBUTES },
-	{ ACL_WRITE_ATTRIBUTES, SMB_ACE4_WRITE_ATTRIBUTES },
-	{ ACL_DELETE, SMB_ACE4_DELETE },
-	{ ACL_READ_ACL, SMB_ACE4_READ_ACL },
-	{ ACL_WRITE_ACL, SMB_ACE4_WRITE_ACL },
-	{ ACL_WRITE_OWNER, SMB_ACE4_WRITE_OWNER },
-	{ ACL_SYNCHRONIZE, SMB_ACE4_SYNCHRONIZE },
-};
+
+#ifndef FREEBSD
+static int ixnas_pathref_reopen(const files_struct *fsp, int flags)
+{
+	int fd_out = -1;
+	const char *p = NULL;
+	char buf[PATH_MAX];
+
+	p = sys_proc_fd_path(fsp_get_pathref_fd(fsp), buf, sizeof(buf));
+	if (p == NULL) {
+		errno = EBADF;
+		return fd_out;
+	}
+	if (S_ISDIR(fsp->fsp_name->st.st_ex_mode)) {
+		fd_out = open(p, O_DIRECTORY);
+	} else {
+		fd_out = open(p, flags);
+	}
+	return fd_out;
+}
+#endif
+
+static bool ixnas_get_native_dosmode(struct files_struct *fsp, uint64_t *_dosmode)
+{
+#if defined (FREEBSD)
+	*_dosmode = fsp->fsp_name->st.st_ex_flags & KERN_DOSMODES;
+#else
+	int err;
+	if (!fsp->fsp_flags.is_pathref) {
+		err = ioctl(fsp_get_io_fd(fsp), ZFS_IOC_GETDOSFLAGS, _dosmode);
+	} else {
+		int fd;
+		fd = ixnas_pathref_reopen(fsp, O_RDONLY);
+		if (fd == -1) {
+			DBG_WARNING("%s: open() failed: %s\n",
+				    fsp_str_dbg(fsp), strerror(errno));
+			return false;
+		}
+		err = ioctl(fd, ZFS_IOC_GETDOSFLAGS, _dosmode);
+		close(fd);
+	}
+	if (err) {
+		DBG_ERR("%s: ioctl() to get dos flags failed: %s\n",
+			fsp_str_dbg(fsp), strerror(errno));
+		return false;
+	}
+#endif /* FREEBSD */
+	return true;
+}
+
+static bool ixnas_set_native_dosmode(struct files_struct *fsp, uint64_t dosmode)
+{
+	int err;
+#if defined (FREEBSD)
+	err = SMB_VFS_FCHFLAGS(fsp, dosmode);
+	if (err) {
+		DBG_WARNING("Setting dosmode failed for %s: %s\n",
+			    fsp_str_dbg(fsp), strerror(errno));
+
+		return false;
+	}
+#else
+	if (!fsp->fsp_flags.is_pathref) {
+		err = ioctl(fsp_get_io_fd(fsp), ZFS_IOC_SETDOSFLAGS, &dosmode);
+	} else {
+		int fd;
+		fd = ixnas_pathref_reopen(fsp, O_RDWR);
+		if (fd == -1) {
+			DBG_WARNING("%s: open() failed: %s\n",
+				    fsp_str_dbg(fsp), strerror(errno));
+			return false;
+		}
+		err = ioctl(fd, ZFS_IOC_SETDOSFLAGS, &dosmode);
+		close(fd);
+	}
+
+	if (err) {
+		DBG_WARNING("%s: ioctl to set dosmode failed: %s\n",
+			    fsp_str_dbg(fsp), strerror(errno));
+		return false;
+	}
+#endif /* FREEBSD */
+	return true;
+}
 
 static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
-                                            struct files_struct *fsp,
-                                            uint32_t *dosmode)
+					  struct files_struct *fsp,
+				          uint32_t *dosmode)
 {
 	struct ixnas_config_data *config = NULL;
 	int i;
-
+	bool ok;
+	uint64_t kern_dosmodes = 0;
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct ixnas_config_data,
 				return NT_STATUS_INTERNAL_ERROR);
 
+#if defined (FREEBSD)
 	if (config->dosattrib_xattr) {
 		return SMB_VFS_NEXT_FGET_DOS_ATTRIBUTES(handle,
 							fsp,
 							dosmode);
 	}
+#else
+	/*
+	 * update timestamps and dosmode from xattr before
+	 * applying the FS dos mode.
+	 *
+	 * This can be removed once we have OS / FS method
+	 * to change file birth time on Linux like on FreeBSD.e
+	 */
+	NTSTATUS status;
+	if (config->dosattrib_xattr) {
+		status = SMB_VFS_NEXT_FGET_DOS_ATTRIBUTES(handle,
+							  fsp,
+							  dosmode);
+
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
+	}
+#endif /* FREEBSD */
+
+	ok = ixnas_get_native_dosmode(fsp, &kern_dosmodes);
+	if (!ok) {
+		return map_nt_error_from_unix(errno);
+	}
 
 	for (i = 0; i < ARRAY_SIZE(dosmode2flag); i++) {
-		if (fsp->fsp_name->st.st_ex_flags & dosmode2flag[i].flag) {
+		if (kern_dosmodes & dosmode2flag[i].flag) {
 			*dosmode |= dosmode2flag[i].dosmode;
 		}
 	}
@@ -133,9 +228,10 @@ static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
 {
 	NTSTATUS status;
 	struct ixnas_config_data *config = NULL;
-	uint32_t flags = 0;
+	uint64_t flags = 0;
 	int ret, i;
 	bool set_dosmode_ok = false;
+	bool ok;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct ixnas_config_data,
@@ -153,6 +249,9 @@ static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
 	* Optimization. This is most likely set by file owner. First try without
 	* performing additional permissions checks and using become_root().
 	*/
+	if (!CAN_WRITE(handle->conn)) {
+		return NT_STATUS_ACCESS_DENIED;
+	}
 
 	for (i = 0; i < ARRAY_SIZE(dosmode2flag); i++) {
 		if (dosmode & dosmode2flag[i].dosmode) {
@@ -160,16 +259,9 @@ static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
 		}
 	}
 
-	ret = SMB_VFS_FCHFLAGS(fsp, flags);
-	if ((ret == -1) && (errno != EPERM)) {
-		DBG_WARNING("Setting dosmode failed for %s: %s\n",
-			    fsp_str_dbg(fsp), strerror(errno));
-
-		return map_nt_error_from_unix(errno);
-	}
-
-	if (!CAN_WRITE(handle->conn)) {
-		return NT_STATUS_ACCESS_DENIED;
+	ok = ixnas_set_native_dosmode(fsp, flags);
+	if (ok && errno != EPERM) {
+		return NT_STATUS_OK;
 	}
 
 	status = smbd_check_access_rights_fsp(handle->conn->cwd_fsp, fsp,
@@ -189,26 +281,38 @@ static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
 	/* becomeroot() because non-owners need to write flags */
 
 	become_root();
-	ret = SMB_VFS_FCHFLAGS(fsp, flags);
+	ok = ixnas_set_native_dosmode(fsp, flags);
 	unbecome_root();
 
-	if (ret == -1) {
+	if (!ok) {
 		DBG_WARNING("Setting dosmode failed for %s: %s\n",
 			    fsp_str_dbg(fsp), strerror(errno));
 		return map_nt_error_from_unix(errno);
 	}
 
+
+#if defined (FREEBSD)
 	return NT_STATUS_OK;
+#else
+	/*
+	 * On Linux need to pass through
+	 * so that we can set synthetic timestamps
+	 * and file id.
+	 */
+	return SMB_VFS_NEXT_FSET_DOS_ATTRIBUTES(handle,
+						fsp,
+						dosmode);
+#endif /* FREEBSD */
 }
 
-static acl_t fsp_get_bsdacl(files_struct *fsp)
+static zfsacl_t fsp_get_zfsacl(files_struct *fsp)
 {
 	int fd;
 	const char *proc_fd_path = NULL;
 	char buf[PATH_MAX];
 
 	if (!fsp->fsp_flags.is_pathref) {
-		return acl_get_fd_np(fsp_get_io_fd(fsp), ACL_TYPE_NFS4);
+		return zfsacl_get_fd(fsp_get_io_fd(fsp), ZFSACL_BRAND_NFSV4);
 	}
 
 	SMB_ASSERT(fsp->fsp_flags.have_proc_fds);
@@ -219,17 +323,17 @@ static acl_t fsp_get_bsdacl(files_struct *fsp)
 		return NULL;
 	}
 
-	return acl_get_file(proc_fd_path, ACL_TYPE_NFS4);
+	return zfsacl_get_file(proc_fd_path, ZFSACL_BRAND_NFSV4);
 }
 
-static int fsp_set_bsdacl(files_struct *fsp, acl_t bsdacl)
+static bool fsp_set_zfsacl(files_struct *fsp, zfsacl_t zfsacl)
 {
 	int fd;
 	const char *proc_fd_path = NULL;
 	char buf[PATH_MAX];
 
 	if (!fsp->fsp_flags.is_pathref) {
-		return acl_set_fd_np(fsp_get_io_fd(fsp), bsdacl, ACL_TYPE_NFS4);
+		return zfsacl_set_fd(fsp_get_io_fd(fsp), zfsacl);
 	}
 
 	SMB_ASSERT(fsp->fsp_flags.have_proc_fds);
@@ -241,14 +345,15 @@ static int fsp_set_bsdacl(files_struct *fsp, acl_t bsdacl)
 		return -1;
 	}
 
-	return acl_set_file(proc_fd_path, ACL_TYPE_NFS4, bsdacl);
+	return zfsacl_set_file(proc_fd_path, zfsacl);
 }
 
 static int fsp_get_acl_brand(files_struct *fsp)
 {
-	long ret;
+#if defined (FREEBSD)
 	int saved_errno;
 	saved_errno = errno;
+	long ret;
 
 	ret = fpathconf(fsp_get_pathref_fd(fsp), _PC_ACL_NFS4);
 	if (ret == -1) {
@@ -260,97 +365,167 @@ static int fsp_get_acl_brand(files_struct *fsp)
 		errno = saved_errno;
 		return ACL_BRAND_UNKNOWN;
 	}
+#elseif
+	ssize_t rv;
+	rv = SMB_VFS_FGETXATTR(fsp->conn, fsp, ACL_XATTR, NULL, 0);
+	if (rv == -1) {
+		if (errno == ENODATA) {
+			return ACL_BRAND_POSIX;
+		}
+		DBG_ERR("%s: fgetxattr() for %s failed: %s\n",
+			path, ACL_XATTR, strerror(errno));
+		return ACL_BRAND_UNKNOWN;
+	}
+
+	rv = SMB_VFS_FGETXATTR(fsp->conn, fsp, ACL4_XATTR, NULL, 0);
+	if (rv == -1) {
+		if (errno == ENODATA) {
+			/* probably need to add disabled */
+			return ACL_BRAND_UNKNOWN;
+		}
+		DBG_ERR("%s: fgetxattr() for %s failed: %s\n",
+			path, ACL4_XATTR, strerror(errno));
+		return ACL_BRAND_UNKNOWN;
+	}
+#endif /* FREEBSD */
 
 	return ACL_BRAND_NFS4;
 }
 
-static void bsdentry2smbace(acl_entry_t ae, SMB_ACE4PROP_T *aceprop)
+static int path_get_aclbrand(const char *path)
+{
+#if defined (FREEBSD)
+	int saved_errno;
+	saved_errno = errno;
+	long ret;
+
+	ret = pathconf(path, _PC_ACL_NFS4);
+	if (ret == -1) {
+		if (saved_errno == errno) {
+			return ACL_BRAND_POSIX;
+		}
+		DBG_ERR("%s: pathconf failed: %s\n",
+			path, strerror(errno));
+		errno = saved_errno;
+		return ACL_BRAND_UNKNOWN;
+	}
+#elseif /* LINUX */
+	ssize_t rv;
+	rv = getxattr(path, ACL_XATTR, NULL, 0);
+	if (rv == -1) {
+		if (errno == ENODATA) {
+			return ACL_BRAND_POSIX;
+		}
+		DBG_ERR("%s: getxattr() for %s failed: %s\n",
+			path, ACL_XATTR, strerror(errno));
+		return ACL_BRAND_UNKNOWN;
+	}
+
+	rv = getxattr(path, ACL4_XATTR, NULL, 0);
+	if (rv == -1) {
+		if (errno == ENODATA) {
+			/* probably need to add disabled */
+			return ACL_BRAND_UNKNOWN;
+		}
+		DBG_ERR("%s: getxattr() for %s failed: %s\n",
+			path, ACL4_XATTR, strerror(errno));
+		return ACL_BRAND_UNKNOWN;
+	}
+#endif /* FREEBSD */
+
+	return ACL_BRAND_NFS4;
+}
+
+static bool zfsentry2smbace(zfsacl_entry_t ae, SMB_ACE4PROP_T *aceprop)
 {
 	int i;
+	zfsace_permset_t perms = 0;
+	zfsace_flagset_t flags = 0;
+	zfsace_entry_type_t entry_type = 0;
+	zfsace_id_t who_id = ZFSACL_UNDEFINED_ID;
+	zfsace_who_t who_type = ZFSACL_UNDEFINED_TAG;
+	bool ok;
 
-	for (i = 0; i < ARRAY_SIZE(bsdperm2nfs4perm); i++) {
-		if (ae->ae_perm & bsdperm2nfs4perm[i].bsdperm) {
-			aceprop->aceMask |= bsdperm2nfs4perm[i].nfs4perm;
-		}
+	ok = zfsace_get_permset(ae, &perms);
+	if (!ok) {
+		DBG_ERR("zfsace_get_permset() failed: %s\n", strerror(errno));
+		return false;
 	}
 
-	for (i = 0; i < ARRAY_SIZE(bsdflag2nfs4flag); i++) {
-		if (ae->ae_flags & bsdflag2nfs4flag[i].bsdflag) {
-			aceprop->aceFlags |= bsdflag2nfs4flag[i].nfs4flag;
-		}
+	ok = zfsace_get_flagset(ae, &flags);
+	if (!ok) {
+		DBG_ERR("zfsace_get_flagset() failed: %s\n", strerror(errno));
+		return false;
 	}
 
-	if (ae->ae_entry_type == ACL_ENTRY_TYPE_ALLOW) {
-		aceprop->aceType = SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE;
-		aceprop->aceMask |= SMB_ACE4_SYNCHRONIZE;
-	} else if (ae->ae_entry_type == ACL_ENTRY_TYPE_DENY) {
-		aceprop->aceType = SMB_ACE4_ACCESS_DENIED_ACE_TYPE;
-	} else {
-		smb_panic("Unsupported ace type.");
+	ok = zfsace_get_who(ae, &who_type, &who_id);
+	if (!ok) {
+		DBG_ERR("zfsace_get_who() failed: %s\n", strerror(errno));
+		return false;
 	}
 
-	switch(ae->ae_tag) {
-	case ACL_USER_OBJ:
+	ok = zfsace_get_entry_type(ae, &entry_type);
+	if (!ok) {
+		DBG_ERR("zfsace_get_entry_type() failed: %s\n", strerror(errno));
+		return false;
+	}
+
+	aceprop->aceMask = perms;
+	aceprop->aceFlags = flags;
+	aceprop->aceType = entry_type;
+
+	switch(who_type) {
+	case ZFSACL_USER_OBJ:
 		aceprop->flags = SMB_ACE4_ID_SPECIAL;
 		aceprop->who.special_id = SMB_ACE4_WHO_OWNER;
 		break;
-	case ACL_GROUP_OBJ:
+	case ZFSACL_GROUP_OBJ:
 		aceprop->flags = SMB_ACE4_ID_SPECIAL;
 		aceprop->who.special_id = SMB_ACE4_WHO_GROUP;
 		break;
-	case ACL_EVERYONE:
+	case ZFSACL_EVERYONE:
 		aceprop->flags = SMB_ACE4_ID_SPECIAL;
 		aceprop->who.special_id = SMB_ACE4_WHO_EVERYONE;
 		break;
-	case ACL_GROUP:
+	case ZFSACL_GROUP:
 		aceprop->aceFlags |= SMB_ACE4_IDENTIFIER_GROUP;
-	case ACL_USER:
-		aceprop->who.id = ae->ae_id;
+	case ZFSACL_USER:
+		aceprop->who.id = who_id;
 		aceprop->flags = 0;
 		break;
 	default:
 		smb_panic("Unsupported ace tag");
 	}
 
-	if ((aceprop->aceType == SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE) &&
-	    (aceprop->flags) && (aceprop->aceMask & SMB_ACE4_WRITE_DATA)) {
+	if ((aceprop->flags & SMB_ACE4_ID_SPECIAL) &&
+	    (aceprop->aceType == SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE) &&
+	    ((aceprop->flags & (SMB_ACE4_DIRECTORY_INHERIT_ACE | SMB_ACE4_FILE_INHERIT_ACE)) == 0) &&
+	    (aceprop->aceMask & SMB_ACE4_WRITE_DATA)) {
 		aceprop->aceMask |= (SMB_ACE4_WRITE_NAMED_ATTRS | \
 				     SMB_ACE4_WRITE_ATTRIBUTES | \
 				     SMB_ACE4_DELETE);
 	}
+	return true;
 }
 
-static bool smbace2bsdentry(acl_t bsdacl, SMB_ACE4PROP_T *aceprop)
+static bool smbace2zfsentry(zfsacl_t zfsacl, SMB_ACE4PROP_T *aceprop)
 {
-	acl_entry_t new_entry;
-	acl_perm_t permset = 0;
-	acl_entry_type_t type = 0;
-	acl_flag_t flags = 0;
-	uid_t id = ACL_UNDEFINED_ID;
-	acl_tag_t tag;
-	int i;
+	bool ok;
+	zfsacl_entry_t new_entry = NULL;
+	zfsace_who_t who_type;
+	zfsace_id_t who_id = ZFSACL_UNDEFINED_ID;
+	zfsace_entry_type_t type;
 
-	for (i = 0; i < ARRAY_SIZE(bsdperm2nfs4perm); i++) {
-		if (aceprop->aceMask & bsdperm2nfs4perm[i].nfs4perm) {
-			permset |= bsdperm2nfs4perm[i].bsdperm;
-		}
-	}
-
-	for (i = 0; i < ARRAY_SIZE(bsdflag2nfs4flag); i++) {
-		if (aceprop->aceFlags & bsdflag2nfs4flag[i].nfs4flag) {
-			flags |= bsdflag2nfs4flag[i].bsdflag;
-		}
-	}
-
-	if (acl_create_entry(&bsdacl, &new_entry) < 0) {
+	ok = zfsacl_create_aclentry(zfsacl, ZFSACL_APPEND_ENTRY, &new_entry);
+	if (!ok) {
 		DBG_ERR("Failed to create new ACL entry: %s\n", strerror(errno));
 		return false;
 	}
 
 	if (aceprop->aceType == SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE) {
-		type = ACL_ENTRY_TYPE_ALLOW;
+		type = ZFSACL_ENTRY_TYPE_ALLOW;
 	} else if (aceprop->aceType == SMB_ACE4_ACCESS_DENIED_ACE_TYPE) {
-		type = ACL_ENTRY_TYPE_DENY;
+		type = ZFSACL_ENTRY_TYPE_DENY;
 	} else {
 		smb_panic("Unsupported ace type.");
 	}
@@ -358,28 +533,52 @@ static bool smbace2bsdentry(acl_t bsdacl, SMB_ACE4PROP_T *aceprop)
 	if (aceprop->flags & SMB_ACE4_ID_SPECIAL) {
 		switch(aceprop->who.special_id) {
 		case SMB_ACE4_WHO_EVERYONE:
-			tag = ACL_EVERYONE;
+			who_type = ZFSACL_EVERYONE;
 			break;
 		case SMB_ACE4_WHO_OWNER:
-			tag = ACL_USER_OBJ;
+			who_type = ZFSACL_USER_OBJ;
 			break;
 		case SMB_ACE4_WHO_GROUP:
-			tag = ACL_GROUP_OBJ;
+			who_type = ZFSACL_GROUP_OBJ;
 			break;
 		default:
 			smb_panic("Unsupported special id.");
 		}
 	} else {
-		tag = aceprop->aceFlags & SMB_ACE4_IDENTIFIER_GROUP ?
-		     ACL_GROUP : ACL_USER;
-		id = aceprop->who.id;
+		who_type = aceprop->aceFlags & SMB_ACE4_IDENTIFIER_GROUP ?
+		     ZFSACL_GROUP : ZFSACL_USER;
+		who_id = aceprop->who.id;
 	}
 
-	new_entry->ae_perm = permset;
-	new_entry->ae_flags = flags;
-	new_entry->ae_entry_type = type;
-	new_entry->ae_tag = tag;
-	new_entry->ae_id = id;
+	ok = zfsace_set_permset(new_entry, (zfsace_permset_t)aceprop->aceMask);
+	if (!ok) {
+		DBG_ERR("zfsace_set_permset() failed: %s\n", strerror(errno));
+		return false;
+	}
+
+	ok = zfsace_set_flagset(new_entry, (zfsace_flagset_t)aceprop->aceFlags);
+	if (!ok) {
+		DBG_ERR("zfsace_set_flagset() failed: %s\n", strerror(errno));
+		return false;
+	}
+
+	ok = zfsace_set_who(new_entry, who_type, who_id);
+	if (!ok) {
+		DBG_ERR("zfsace_set_who() failed: %s\n", strerror(errno));
+		return false;
+	}
+
+	ok = zfsace_set_who(new_entry, who_type, who_id);
+	if (!ok) {
+		DBG_ERR("zfsace_set_who() failed: %s\n", strerror(errno));
+		return false;
+	}
+
+	ok = zfsace_set_entry_type(new_entry, type);
+	if (!ok) {
+		DBG_ERR("zfsace_set_type() failed: %s\n", strerror(errno));
+		return false;
+	}
 
 	return true;
 }
@@ -387,14 +586,14 @@ static bool smbace2bsdentry(acl_t bsdacl, SMB_ACE4PROP_T *aceprop)
 static NTSTATUS ixnas_get_nt_acl_nfs4_common(struct connection_struct *conn,
 					     TALLOC_CTX *mem_ctx,
 					     files_struct *fsp,
-					     acl_t bsdacl,
+					     zfsacl_t zfsacl,
 					     struct SMB4ACL_T **ppacl,
 					     struct ixnas_config_data *config)
 {
-	int cnt, ret;
+	uint cnt, i;
 	struct SMB4ACL_T *pacl = NULL;
 	bool inherited_is_present = false;
-	bool is_dir;
+	bool ok;
 
 	mem_ctx = talloc_tos();
 
@@ -404,11 +603,30 @@ static NTSTATUS ixnas_get_nt_acl_nfs4_common(struct connection_struct *conn,
 		return NT_STATUS_NO_MEMORY;
 	}
 
-	for (cnt=0; cnt<bsdacl->ats_acl.acl_cnt; cnt++) {
+	ok = zfsacl_get_acecnt(zfsacl, &cnt);
+	if (!ok) {
+		DBG_ERR("zfsacl_get_acecnt() failed: %s\n", strerror(errno));
+		return map_nt_error_from_unix(errno);
+	}
+
+	for (i=0; i < cnt; i++) {
 		SMB_ACE4PROP_T aceprop;
 		ZERO_STRUCT(aceprop);
+		zfsacl_entry_t ae = NULL;
+		bool ok;
 
-		bsdentry2smbace(&bsdacl->ats_acl.acl_entry[cnt], &aceprop);
+		ok = zfsacl_get_aclentry(zfsacl, i, &ae);
+		if (!ok) {
+			DBG_ERR("zfsacl_get_aclentry() failed: %s\n", strerror(errno));
+			TALLOC_FREE(pacl);
+			return map_nt_error_from_unix(errno);
+		}
+
+		ok = zfsentry2smbace(ae, &aceprop);
+		if (!ok) {
+			TALLOC_FREE(pacl);
+			return map_nt_error_from_unix(errno);
+		}
 
 		if ((aceprop.aceMask == 0) &&
 		    (aceprop.flags == SMB_ACE4_ID_SPECIAL) &&
@@ -421,6 +639,7 @@ static NTSTATUS ixnas_get_nt_acl_nfs4_common(struct connection_struct *conn,
 		}
 
 		if (smb_add_ace4(pacl, &aceprop) == NULL) {
+			TALLOC_FREE(pacl);
 			return NT_STATUS_NO_MEMORY;
 		}
 	}
@@ -449,7 +668,7 @@ static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 	TALLOC_CTX *frame = NULL;
 	struct files_struct *to_check = NULL;
 	NTSTATUS status;
-	acl_t bsdacl;
+	zfsacl_t zfsacl;
 	struct ixnas_config_data *config = NULL;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
@@ -461,8 +680,8 @@ static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 	}
 
 	to_check = fsp->base_fsp ? fsp->base_fsp : fsp;
-	bsdacl = fsp_get_bsdacl(to_check);
-	if (bsdacl == NULL) {
+	zfsacl = fsp_get_zfsacl(to_check);
+	if (zfsacl == NULL) {
 		if ((errno == EINVAL) &&
 		    (fsp_get_acl_brand(fsp) == ACL_BRAND_POSIX)) {
 			status = SMB_VFS_NEXT_FGET_NT_ACL(handle, fsp, security_info, mem_ctx, ppdesc);
@@ -479,10 +698,10 @@ static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 	status = ixnas_get_nt_acl_nfs4_common(handle->conn,
 					      frame,
 					      fsp,
-					      bsdacl,
+					      zfsacl,
 					      &pacl,
 					      config);
-	acl_free(bsdacl);
+	zfsacl_free(&zfsacl);
 
 	if (!NT_STATUS_IS_OK(status)) {
 		TALLOC_FREE(frame);
@@ -495,21 +714,76 @@ static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 	return status;
 }
 
+static bool ixnas_add_hidden_entry(zfsacl_t zfsacl,
+				   bool has_inheritable,
+				   files_struct *fsp)
+{
+	bool ok;
+	uint acecnt;
+	zfsacl_entry_t hidden_entry = NULL;
+
+
+	if (!has_inheritable) {
+		ok = zfsacl_get_acecnt(zfsacl, &acecnt);
+		if (!ok) {
+			DBG_ERR("Failed to get ACE count: %s\n",
+				strerror(errno));
+			return false;
+		}
+		if (acecnt != 0) {
+			/*
+			 * We don't want locking entry. Otherwise
+			 * no aces will be inherited.
+			 */
+			return true;
+		}
+	}
+
+	ok = zfsacl_create_aclentry(zfsacl, ZFSACL_APPEND_ENTRY, &hidden_entry);
+	if (!ok) {
+		DBG_ERR("zfsacl_create_aclentry() failed: %s\n", strerror(errno));
+		return false;
+	}
+
+	ok = zfsace_set_permset(hidden_entry, 0);
+	if (!ok) {
+		DBG_ERR("zfsacl_set_permset() failed: %s\n", strerror(errno));
+		return false;
+	}
+	ok = zfsace_set_who(hidden_entry, ZFSACL_EVERYONE, ZFSACL_UNDEFINED_ID);
+	if (!ok) {
+		DBG_ERR("zfsacl_set_who() failed: %s\n", strerror(errno));
+		return false;
+	}
+
+	if (S_ISDIR(fsp->fsp_name->st.st_ex_mode)) {
+		ok = zfsace_set_flagset(hidden_entry,
+					ZFSACE_FILE_INHERIT | ZFSACE_DIRECTORY_INHERIT);
+		if (!ok) {
+			DBG_ERR("zfsacl_set_flagset() failed: %s\n", strerror(errno));
+			return false;
+		}
+	}
+
+	return true;
+}
+
 static bool ixnas_process_smbacl(vfs_handle_struct *handle,
 				 files_struct *fsp,
 				 struct SMB4ACL_T *smbacl)
 {
-	acl_t bsdacl;
+	zfsacl_t zfsacl;
 	struct SMB4ACE_T *smbace = NULL;
 	bool has_inheritable = false;
+	bool ok;
 	struct ixnas_config_data *config = NULL;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct ixnas_config_data,
 				return False);
 
-	bsdacl = acl_init(ACL_MAX_ENTRIES);
-	if (bsdacl == NULL) {
+	zfsacl = zfsacl_init(ZFSACL_MAX_ENTRIES, ZFSACL_BRAND_NFSV4);
+	if (zfsacl == NULL) {
 		DBG_ERR("%s: acl_init failed: %s\n",
 			fsp_str_dbg(fsp), strerror(errno));
 		return false;
@@ -521,11 +795,11 @@ static bool ixnas_process_smbacl(vfs_handle_struct *handle,
 		bool ok;
 		SMB_ACE4PROP_T *aceprop = smb_get_ace4(smbace);
 
-		ok = smbace2bsdentry(bsdacl, aceprop);
+		ok = smbace2zfsentry(zfsacl, aceprop);
                 if (!ok) {
 			DBG_ERR("%s: failed to convert ACL entry\n",
 				fsp_str_dbg(fsp));
-			acl_free(bsdacl);
+			zfsacl_free(&zfsacl);
 			return false;
 		}
 
@@ -534,38 +808,21 @@ static bool ixnas_process_smbacl(vfs_handle_struct *handle,
 		}
 	}
 
-	if (bsdacl->ats_acl.acl_cnt == 0 || has_inheritable) {
-		int rv;
-		acl_entry_t hidden_entry;
-
-		rv = acl_create_entry(&bsdacl, &hidden_entry);
-		if (rv == -1) {
-			DBG_ERR("%s: acl_create_entry() failed: %s\n",
-				fsp_str_dbg(fsp), strerror(errno));
-			acl_free(bsdacl);
-			return false;
-		}
-
-		if (S_ISDIR(fsp->fsp_name->st.st_ex_mode)) {
-			hidden_entry->ae_flags = ACL_ENTRY_DIRECTORY_INHERIT|ACL_ENTRY_FILE_INHERIT;
-		}
-
-		hidden_entry->ae_perm = 0;
-		hidden_entry->ae_entry_type = ACL_ENTRY_TYPE_ALLOW;
-		hidden_entry->ae_flags = ACL_ENTRY_FILE_INHERIT | ACL_ENTRY_DIRECTORY_INHERIT;
-		hidden_entry->ae_tag = ACL_EVERYONE;
-		hidden_entry->ae_id = ACL_UNDEFINED_ID;
-	}
-
-	if (fsp_set_bsdacl(fsp, bsdacl)) {
-		DBG_ERR("%s: failed to set acl: %s\n",
-			fsp_str_dbg(fsp), strerror(errno));
-		acl_free(bsdacl);
+	if (!ixnas_add_hidden_entry(zfsacl, has_inheritable, fsp)) {
+		DBG_ERR("%s: failed to add locking ACL entry\n", fsp_str_dbg(fsp));
+		zfsacl_free(&zfsacl);
 		return false;
 	}
 
-	acl_free(bsdacl);
-	return True;
+	if (fsp_set_zfsacl(fsp, zfsacl)) {
+		DBG_ERR("%s: failed to set acl: %s\n",
+			fsp_str_dbg(fsp), strerror(errno));
+		zfsacl_free(&zfsacl);
+		return false;
+	}
+
+	zfsacl_free(&zfsacl);
+	return true;
 }
 
 static NTSTATUS ixnas_fset_nt_acl(vfs_handle_struct *handle,
@@ -623,138 +880,187 @@ static int ixnas_fail__sys_acl_blob_get_fd(vfs_handle_struct *handle,
  (WRITE_ATTRIBUTES, DELETE, etc.). If DELETE is stripped, then
  users will no longer be able to rename files.
 ********************************************************************/
-static int mode_to_acl(acl_t *new_acl, mode_t mode)
+static int mode_to_acl(zfsacl_t *new_acl, mode_t mode)
 {
 	int res = 0;
+	bool ok;
 	mode_t shifted_mode, other_mode, deny_mode;
-	acl_entry_t o_allow_entry = NULL;
-	acl_entry_t g_allow_entry = NULL;
-	acl_entry_t e_allow_entry = NULL;
-	acl_entry_t o_deny_entry = NULL;
-	acl_entry_t g_deny_entry = NULL;
-	acl_permset_t permset;
-	acl_flagset_t flagset;
+	zfsacl_entry_t o_allow_entry = NULL;
+	zfsacl_entry_t g_allow_entry = NULL;
+	zfsacl_entry_t e_allow_entry = NULL;
+	zfsacl_entry_t o_deny_entry = NULL;
+	zfsacl_entry_t g_deny_entry = NULL;
+	zfsace_permset_t permset;
 	/*
 	 * convert posix mode bits to ACLs
 	 */
 	if (((mode & S_IRWXU) >> 6) < (mode & S_IRWXO)) {
+		permset = 0;
 		shifted_mode = (mode &= S_IRWXU) >> 6;
 		other_mode &= S_IRWXO;
 		deny_mode = (shifted_mode ^ other_mode) << 6;
-		res = acl_create_entry(new_acl, &o_deny_entry);
-		if (res != 0) {
+
+		ok = zfsacl_create_aclentry(*new_acl, ZFSACL_APPEND_ENTRY, &o_deny_entry);
+		if (!ok) {
 			return -1;
 		}
-		acl_get_permset(o_deny_entry, &permset);
 		if (deny_mode & S_IRUSR) {
-			*permset = ACL_READ_DATA;
+			permset = ZFSACE_READ_DATA;
 		}
 		if (deny_mode & S_IWUSR) {
-			*permset |= ACL_WRITE_DATA;
+			permset |= ZFSACE_WRITE_DATA;
 		}
 		if (deny_mode & S_IXUSR) {
-			*permset |= ACL_EXECUTE;
+			permset |= ZFSACE_EXECUTE;
 		}
-		acl_get_flagset_np(o_deny_entry, &flagset);
-		*flagset = 0;
-		acl_set_entry_type_np(o_deny_entry, ACL_ENTRY_TYPE_DENY);
-		acl_set_tag_type(o_deny_entry, ACL_USER_OBJ);
+		if (!zfsace_set_permset(o_deny_entry, permset))
+			return -1;
+
+		if (!zfsace_set_flagset(o_deny_entry, 0))
+			return -1;
+
+		if (!zfsace_set_entry_type(o_deny_entry, ZFSACL_ENTRY_TYPE_DENY))
+			return -1;
+
+		if (!zfsace_set_who(o_deny_entry, ZFSACL_USER_OBJ, ZFSACL_UNDEFINED_ID))
+			return -1;
 	}
 	if (((mode & S_IRWXG) >> 3) < (mode & S_IRWXO)) {
+		permset = 0;
 		shifted_mode = (mode &= S_IRWXG) >> 3;
 		other_mode &= S_IRWXG;
 		deny_mode = (shifted_mode ^ other_mode) << 3;
 
-		res = acl_create_entry(new_acl, &g_deny_entry);
-		if (res != 0) {
+		ok = zfsacl_create_aclentry(*new_acl, ZFSACL_APPEND_ENTRY, &g_deny_entry);
+		if (!ok) {
 			return -1;
 		}
-		acl_get_permset(g_deny_entry, &permset);
+
 		if (deny_mode & S_IRGRP) {
-			*permset = ACL_READ_DATA;
+			permset = ZFSACE_READ_DATA;
 		}
 		if (deny_mode & S_IWGRP) {
-			*permset |= ACL_WRITE_DATA;
+			permset |= ZFSACE_WRITE_DATA;
 		}
 		if (deny_mode & S_IXGRP) {
-			*permset |= ACL_EXECUTE;
+			permset |= ZFSACE_EXECUTE;
 		}
-		acl_get_flagset_np(g_deny_entry, &flagset);
-		*flagset = 0;
-		acl_set_entry_type_np(g_deny_entry, ACL_ENTRY_TYPE_DENY);
-		acl_set_tag_type(g_deny_entry, ACL_GROUP_OBJ);
+
+		if (!zfsace_set_permset(g_deny_entry, permset))
+			return -1;
+
+		if (!zfsace_set_flagset(g_deny_entry, 0))
+			return -1;
+
+		if (!zfsace_set_entry_type(g_deny_entry, ZFSACL_ENTRY_TYPE_DENY))
+			return -1;
+
+		if (!zfsace_set_who(o_deny_entry, ZFSACL_GROUP_OBJ, ZFSACL_UNDEFINED_ID))
+			return -1;
+
 	}
 	if (mode & S_IRWXU) {
-		res = acl_create_entry(new_acl, &o_allow_entry);
-		if (res != 0) {
+		permset = 0;
+
+		ok = zfsacl_create_aclentry(*new_acl, ZFSACL_APPEND_ENTRY, &o_allow_entry);
+		if (!ok) {
 			return -1;
 		}
-		acl_get_permset(o_allow_entry, &permset);
+
 		if (mode & S_IRUSR) {
-			*permset = ACL_READ_SET;
+			permset = ZFSACE_READ_SET;
 		}
 		if (mode & S_IWUSR) {
-			*permset |= ACL_WRITE_SET;
-			*permset |= ACL_DELETE;
+			permset |= ZFSACE_WRITE_SET;
+			permset |= ZFSACE_DELETE;
 		}
 		if (mode & S_IXUSR) {
-			*permset |= ACL_EXECUTE;
+			permset |= ZFSACE_EXECUTE;
 		}
-		acl_get_flagset_np(o_allow_entry, &flagset);
-		*flagset = 0;
-		acl_set_entry_type_np(o_allow_entry, ACL_ENTRY_TYPE_ALLOW);
-		acl_set_tag_type(o_allow_entry, ACL_USER_OBJ);
+
+		if (!zfsace_set_permset(o_allow_entry, permset))
+			return -1;
+
+		if (!zfsace_set_flagset(o_allow_entry, 0))
+			return -1;
+
+		if (!zfsace_set_entry_type(o_allow_entry, ZFSACL_ENTRY_TYPE_ALLOW))
+			return -1;
+
+		if (!zfsace_set_who(o_allow_entry, ZFSACL_USER_OBJ, ZFSACL_UNDEFINED_ID))
+			return -1;
 	}
 	if (mode & S_IRWXG) {
-		res = acl_create_entry(new_acl, &g_allow_entry);
-		if (res != 0) {
+		permset = 0;
+
+		ok = zfsacl_create_aclentry(*new_acl, ZFSACL_APPEND_ENTRY, &g_allow_entry);
+		if (!ok) {
 			return -1;
 		}
-		acl_get_permset(g_allow_entry, &permset);
+
 		if (mode & S_IRGRP) {
-			*permset = ACL_READ_SET;
+			permset = ZFSACE_READ_SET;
 		}
 		if (mode & S_IWGRP) {
-			*permset |= ACL_WRITE_SET;
-			*permset |= ACL_DELETE;
+			permset |= ZFSACE_WRITE_SET;
+			permset |= ZFSACE_DELETE;
 		}
 		if (mode & S_IXGRP) {
-			*permset |= ACL_EXECUTE;
+			permset |= ZFSACE_EXECUTE;
 		}
-		acl_get_flagset_np(g_allow_entry, &flagset);
-		*flagset = 0;
-		acl_set_entry_type_np(g_allow_entry, ACL_ENTRY_TYPE_ALLOW);
-		acl_set_tag_type(g_allow_entry, ACL_GROUP_OBJ);
+
+		if (!zfsace_set_permset(g_allow_entry, permset))
+			return -1;
+
+		if (!zfsace_set_flagset(g_allow_entry, 0))
+			return -1;
+
+		if (!zfsace_set_entry_type(g_allow_entry, ZFSACL_ENTRY_TYPE_ALLOW))
+			return -1;
+
+		if (!zfsace_set_who(g_allow_entry, ZFSACL_GROUP_OBJ, ZFSACL_UNDEFINED_ID))
+			return -1;
 	}
 	if (mode & S_IRWXO) {
-		res = acl_create_entry(new_acl, &e_allow_entry);
-		if (res != 0) {
+		permset = 0;
+
+		ok = zfsacl_create_aclentry(*new_acl, ZFSACL_APPEND_ENTRY, &e_allow_entry);
+		if (!ok) {
 			return -1;
 		}
-		acl_get_permset(e_allow_entry, &permset);
+
 		if (mode & S_IROTH) {
-			*permset = ACL_READ_SET;
+			permset = ZFSACE_READ_SET;
 		}
 		if (mode & S_IWOTH) {
-			*permset |= ACL_WRITE_SET;
-			*permset |= ACL_DELETE;
+			permset |= ZFSACE_WRITE_SET;
+			permset |= ZFSACE_DELETE;
 		}
 		if (mode & S_IXOTH) {
-			*permset |= ACL_EXECUTE;
+			permset |= ZFSACE_EXECUTE;
 		}
-		acl_get_flagset_np(e_allow_entry, &flagset);
-		*flagset = 0;
-		acl_set_entry_type_np(e_allow_entry, ACL_ENTRY_TYPE_ALLOW);
-		acl_set_tag_type(e_allow_entry, ACL_EVERYONE);
+
+		if (!zfsace_set_permset(e_allow_entry, permset))
+			return -1;
+
+		if (!zfsace_set_flagset(e_allow_entry, 0))
+			return -1;
+
+		if (!zfsace_set_entry_type(e_allow_entry, ZFSACL_ENTRY_TYPE_ALLOW))
+			return -1;
+
+		if (!zfsace_set_who(e_allow_entry, ZFSACL_EVERYONE, ZFSACL_UNDEFINED_ID))
+			return -1;
 	}
+
 	return 0;
 }
 
-static int recalculate_flagset(acl_flagset_t flagset)
+static int recalculate_flagset(zfsace_flagset_t *flagset)
 {
 	/* Simply replace non-inheriting entries */
-	if ((*flagset & (ACL_ENTRY_DIRECTORY_INHERIT \
-		        | ACL_ENTRY_FILE_INHERIT)) == 0){
+	if ((*flagset & (ZFSACE_DIRECTORY_INHERIT \
+		        | ZFSACE_FILE_INHERIT)) == 0){
 		return -1;
 	}
 	/*
@@ -766,94 +1072,153 @@ static int recalculate_flagset(acl_flagset_t flagset)
 	 * as-is and end up with wonky mode so as not to
 	 * break expectations regarding inheritance.
 	 */
-	if (((*flagset & ACL_ENTRY_INHERIT_ONLY) == 0) &&
-	     (*flagset & ACL_ENTRY_NO_PROPAGATE_INHERIT)) {
+	if (((*flagset & ZFSACE_INHERIT_ONLY) == 0) &&
+	     (*flagset & ZFSACE_NO_PROPAGATE_INHERIT)) {
 		return 0;
 	}
-	*flagset |= ACL_ENTRY_INHERIT_ONLY;
+
+	*flagset |= ZFSACE_INHERIT_ONLY;
 	return 0;
 }
 
-static acl_t calculate_chmod_acl(acl_t source_acl,
-				 mode_t mode)
+static zfsacl_t calculate_chmod_acl(zfsacl_t source_acl,
+				    mode_t mode)
 {
-	int res = 0;
-	acl_t new_acl, tmp_acl;
-	int entry_id = ACL_FIRST_ENTRY;
-	acl_entry_t entry, new_entry;
-	acl_tag_t tag = 0;
-	acl_flagset_t flagset;
+	int err, i;
+	bool ok;
+	uint acecnt;
+	zfsacl_t new_acl = NULL;
 
-	new_acl = acl_init(ACL_MAX_ENTRIES);
-	tmp_acl = acl_dup(source_acl);
-	res = mode_to_acl(&new_acl, mode);
-	if (res != 0) {
-		DBG_ERR("Failed to convert mode to ACL\n");
+	/* create new ACL that we will return */
+	new_acl = zfsacl_init(ZFSACL_MAX_ENTRIES, ZFSACL_BRAND_NFSV4);
+	if (new_acl == NULL) {
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	/*
+	 * start by putting in entries for new mode
+	 * since these are non-inheriting entries Windows clients
+	 * want them at the top of the ACL
+	 */
+	err = mode_to_acl(&new_acl, mode);
+	if (err) {
+		DBG_ERR("Failed to convert mode to ACL: %s\n", strerror(errno));
+		goto failure;
+	}
+
+	ok = zfsacl_get_acecnt(source_acl, &acecnt);
+	if (!ok) {
+		DBG_ERR("zfsacl_get_acecnt() failed: %s\n", strerror(errno));
 		goto failure;
 	}
 	/*
 	 * Iterate through ACL, remove non-inheriting special entries.
 	 * Append INHERIT_ONLY to inheritng special entries
 	 */
-	while (acl_get_entry(tmp_acl, entry_id, &entry) == 1) {
-		entry_id = ACL_NEXT_ENTRY;
-		res = acl_get_tag_type(entry, &tag);
-		if (res != 0) {
-			DBG_ERR("acl_get_permset() failed.\n");
-			return NULL;
+	for (i = 0; i < acecnt; i++) {
+		zfsacl_entry_t src_entry = NULL, dst_entry = NULL;
+		zfsace_permset_t perms = 0;
+		zfsace_flagset_t flags = 0;
+		zfsace_entry_type_t type;
+		zfsace_who_t who_type = ZFSACL_UNDEFINED_TAG;
+		zfsace_id_t who_id = ZFSACL_UNDEFINED_ID;
+
+		ok = zfsacl_get_aclentry(source_acl, i, &src_entry);
+		if (!ok) {
+			DBG_ERR("zfsacl_get_aclentry() failed: %s\n",
+				strerror(errno));
+			goto failure;
 		}
-		switch (tag) {
-                        case ACL_USER_OBJ:
-                        case ACL_GROUP_OBJ:
-                        case ACL_EVERYONE:
-				res = acl_get_flagset_np(entry, &flagset);
-				if (res != 0) {
-					DBG_ERR("acl_get_flagset failed\n");
-					return NULL;
-				}
-				res = recalculate_flagset(flagset);
-				if (res != 0) {
-					continue;
-				}
-				res = acl_create_entry(&new_acl, &new_entry);
-				if (res != 0) {
-					DBG_ERR("acl_create_entry failed\n");
-					goto failure;
-				}
-				res = acl_copy_entry(new_entry, entry);
-				if (res != 0) {
-					DBG_ERR("acl_copy_entry failed\n");
-					goto failure;
-				}
-                                break;
-                        default:
-				res = acl_create_entry(&new_acl, &new_entry);
-				if (res != 0) {
-					DBG_ERR("acl_create_entry failed\n");
-					goto failure;
-				}
-				res = acl_copy_entry(new_entry, entry);
-				if (res != 0) {
-					DBG_ERR("acl_copy_entry failed\n");
-					goto failure;
-				}
-                                break;
+
+		ok = zfsace_get_permset(src_entry, &perms);
+		if (!ok) {
+			DBG_ERR("zfsace_get_permset() failed: %s\n",
+				strerror(errno));
+			goto failure;
+		}
+
+		ok = zfsace_get_flagset(src_entry, &flags);
+		if (!ok) {
+			DBG_ERR("zfsace_get_permset() failed: %s\n",
+				strerror(errno));
+			goto failure;
+		}
+
+		ok = zfsace_get_who(src_entry, &who_type, &who_id);
+		if (!ok) {
+			DBG_ERR("zfsace_get_who() failed: %s\n",
+				strerror(errno));
+			goto failure;
+		}
+
+		ok = zfsace_get_entry_type(src_entry, &type);
+		if (!ok) {
+			DBG_ERR("zfsace_get_entry_type() failed: %s\n",
+				strerror(errno));
+			goto failure;
+		}
+
+		switch(who_type) {
+		case ZFSACL_USER_OBJ:
+		case ZFSACL_GROUP_OBJ:
+		case ZFSACL_EVERYONE:
+			err = recalculate_flagset(&flags);
+			if (err) {
+				continue;
+			}
+			break;
+		default:
+			break;
+		};
+
+		ok = zfsacl_create_aclentry(new_acl, ZFSACL_APPEND_ENTRY, &dst_entry);
+		if (!ok) {
+			DBG_ERR("zfsacl_create_aclentry() failed: %s\n",
+				strerror(errno));
+			goto failure;
+		}
+
+		ok = zfsace_set_permset(dst_entry, perms);
+		if (!ok) {
+			DBG_ERR("zfsace_set_permset() failed: %s\n",
+				strerror(errno));
+			goto failure;
+		}
+
+		ok = zfsace_set_flagset(dst_entry, flags);
+		if (!ok) {
+			DBG_ERR("zfsace_set_flagset() failed: %s\n",
+				strerror(errno));
+			goto failure;
+		}
+
+		ok = zfsace_set_entry_type(dst_entry, type);
+		if (!ok) {
+			DBG_ERR("zfsace_set_entry_type() failed: %s\n",
+				strerror(errno));
+			goto failure;
+		}
+
+		ok = zfsace_set_who(dst_entry, who_type, who_id);
+		if (!ok) {
+			DBG_ERR("zfsace_set_who() failed: %s\n",
+				strerror(errno));
+			goto failure;
 		}
 	}
-	acl_free(tmp_acl);
+
 	return new_acl;
 failure:
-	acl_free(tmp_acl);
-	acl_free(new_acl);
+	zfsacl_free(&new_acl);
 	return NULL;
 }
 
 static int ixnas_fchmod(vfs_handle_struct *handle,
 			files_struct *fsp, mode_t mode)
 {
-	int result;
-	acl_t zacl, new_acl;
-	int trivial = 0;
+	zfsacl_t zacl, new_acl;
+	bool trivial, ok;
 	struct ixnas_config_data *config = NULL;
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct ixnas_config_data,
@@ -862,15 +1227,15 @@ static int ixnas_fchmod(vfs_handle_struct *handle,
 	if (!config->zfs_acl_chmod_enabled) {
 		return SMB_VFS_NEXT_FCHMOD(handle, fsp, mode);
 	}
-	zacl = fsp_get_bsdacl(fsp);
+	zacl = fsp_get_zfsacl(fsp);
 	if (zacl == NULL) {
 		DBG_ERR("ixnas: acl_get_fd() failed for %s: %s\n",
 			fsp_str_dbg(fsp), strerror(errno));
 		return -1;
 	}
-	result = acl_is_trivial_np(zacl, &trivial);
-	if (result !=0) {
-		DBG_ERR("acl_is_trivial_np() failed\n");
+	ok = zfsacl_is_trivial(zacl, &trivial);
+	if (!ok) {
+		DBG_ERR("zfsacl_is_trivial() failed: %s\n", strerror(errno));
 		goto failure;
 	}
 	/*
@@ -883,9 +1248,8 @@ static int ixnas_fchmod(vfs_handle_struct *handle,
 		DBG_INFO("Trivial ACL detected on file %s, "
 			 "passing to next CHMOD function\n",
 			 fsp_str_dbg(fsp));
-		acl_free(zacl);
-		result = SMB_VFS_NEXT_FCHMOD(handle, fsp, mode);
-		return result;
+		zfsacl_free(&zacl);
+		return SMB_VFS_NEXT_FCHMOD(handle, fsp, mode);
 	}
 	new_acl = calculate_chmod_acl(zacl, mode);
 	if (new_acl == NULL) {
@@ -893,30 +1257,40 @@ static int ixnas_fchmod(vfs_handle_struct *handle,
 			fsp_str_dbg(fsp));
 		goto failure;
 	}
-	result = fsp_set_bsdacl(fsp, new_acl);
-	if (result != 0) {
+	ok = fsp_set_zfsacl(fsp, new_acl);
+	if (!ok) {
 		DBG_ERR("Failed to set new ACL on %s: %s\n",
 			fsp_str_dbg(fsp), strerror(errno));
 	}
-	acl_free(zacl);
-	acl_free(new_acl);
-	return result;
+	zfsacl_free(&zacl);
+	zfsacl_free(&new_acl);
+	return 0;
 failure:
-	acl_free(zacl);
+	zfsacl_free(&zacl);
 	return -1;
 }
 
-/*
- * Windows clients return NT_STATUS_OBJECT_NAME_COLLISION in case of
- * rename in case of rename in case insensitive dataset. MacOS does
- * attempts the rename. rename() in FreeBSD in this returns success, but
- * does not actually rename the file. Add new logic to rename(). If
- * a case_insensitive string comparison of the filenames returns 0, then
- * perform two renames so that the returned filename matches client
- * expectations. First rename appends a unique id generated from
- * inode and generation number to the file's name. This makes the
- * rename deterministic, while minimizing risk of name collisions.
- */
+#if 0 /*pending work on FILE IDs from FreeBSD */
+#if defined (FREEBSD)
+static struct file_id ixnas_file_id_create(struct vfs_handle_struct *handle,
+					   const SMB_STRUCT_STAT *sbuf)
+{
+	struct file_id key = (struct file_id) {
+		.devid = sbuf->st_ex_dev,
+		.inode = sbuf->st_ex_ino,
+		.extid = sbuf->st_ex_gen,
+	};
+
+	return key;
+}
+
+static inline uint64_t gen_id_comp(uint64_t p) {
+	uint64_t out = (p & UINT32_MAX) ^ (p >> 32);
+	return out;
+};
+
+#endif
+
 static uint64_t ixnas_fs_file_id(struct vfs_handle_struct *handle,
 				 const SMB_STRUCT_STAT *psbuf);
 
@@ -1052,6 +1426,7 @@ static int ixnas_ntimes(vfs_handle_struct *handle,
 	}
 	return result;
 }
+#endif /* FREEBSD */
 
 static bool set_acl_parameters(struct vfs_handle_struct *handle,
 			       struct ixnas_config_data *config)
@@ -1093,7 +1468,7 @@ static bool set_acl_parameters(struct vfs_handle_struct *handle,
 	 * middleware will probably not let the user get this far, but it's better to
 	 * be somewhat safer.
 	 */
-	if (pathconf(chkpath, _PC_ACL_NFS4) < 0) {
+	if (path_get_aclbrand(handle->conn->connectpath) != ACL_BRAND_NFS4) {
 		DBG_ERR("Connectpath does not support NFSv4 ACLs. Disabling ZFS ACL handling.\n");
 		config->zfs_acl_enabled = false;
 	}
@@ -1185,8 +1560,13 @@ static struct vfs_fn_pointers ixnas_fns = {
 	.fset_dos_attributes_fn = ixnas_fset_dos_attributes,
 	/* zfs_acl_enabled = true */
 	.fchmod_fn = ixnas_fchmod,
+#if defined (FREEBSD)
 	.fntimes_fn = ixnas_ntimes,
-	.renameat_fn = ixnas_renameat,
+#if 0 /* pending FILEID work */
+	.file_id_create_fn = ixnas_file_id_create,
+	.fs_file_id_fn = ixnas_fs_file_id,
+#endif
+#endif
 	.fget_nt_acl_fn = ixnas_fget_nt_acl,
 	.fset_nt_acl_fn = ixnas_fset_nt_acl,
 	.sys_acl_get_fd_fn = ixnas_fail__sys_acl_get_fd,
