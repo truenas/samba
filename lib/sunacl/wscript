@@ -1,0 +1,61 @@
+#!/usr/bin/env python
+
+APPNAME = 'sunacl'
+VERSION = '0.1.0'
+
+import sys, os
+
+# find the buildtools directory
+top = '.'
+while not os.path.exists(top+'/buildtools') and len(top.split('/')) < 5:
+    top = top + '/..'
+sys.path.insert(0, top + '/buildtools/wafsamba')
+
+out = 'bin'
+
+import wafsamba
+from wafsamba import samba_dist, samba_utils
+from waflib import Options, Logs, Context, Errors
+
+samba_dist.DIST_DIRS('lib/tdb:. lib/replace:lib/replace buildtools:buildtools third_party/waf:third_party/waf')
+
+def options(opt):
+    opt.BUILTIN_DEFAULT('replace')
+    opt.RECURSE('lib/replace')
+
+
+def configure(conf):
+    conf.RECURSE('lib/replace')
+    #conf.RECURSE('lib/talloc')
+
+    conf.SAMBA_CHECK_PYTHON()
+    conf.SAMBA_CHECK_PYTHON_HEADERS()
+
+    conf.SAMBA_CONFIG_H()
+
+    conf.SAMBA_CHECK_UNDEFINED_SYMBOL_FLAGS()
+
+
+def build(bld):
+    bld.RECURSE('lib/replace')
+
+    if not bld.CHECK_HEADERS('sunacl.h'):
+        bld.SAMBA_LIBRARY('sunacl',
+                          'libsunacl.c',
+                          enabled= True,
+                          includes='.',
+                          deps='zfsacl',
+                          abi_directory='ABI',
+                          abi_match='sunacl_*',
+                          vnum=VERSION,
+                          public_headers=(''),
+                          public_headers_install=False,
+                          private_library=True)
+
+def dist():
+    '''makes a tarball for distribution'''
+    samba_dist.dist()
+
+def reconfigure(ctx):
+    '''reconfigure if config scripts have changed'''
+    samba_utils.reconfigure(ctx)
