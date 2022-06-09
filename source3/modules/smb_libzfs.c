@@ -153,6 +153,7 @@ struct smbzhandle {
 	zfs_handle_t *zhandle;
 	int zhandle_ref;
 	enum zhandle_zone zone;
+	const char *location;
 };
 
 struct snap_cb
@@ -417,9 +418,9 @@ static bool zfs_get_smbzhandle(TALLOC_CTX *mem_ctx,
 	return true;
 }
 
-int get_smbzhandle(TALLOC_CTX *mem_ctx, const char *path,
+int _get_smbzhandle(TALLOC_CTX *mem_ctx, const char *path,
 		   smbzhandle_t *smbzhandle,
-		   bool resolve)
+		   bool resolve, const char *location)
 {
 	zfs_handle_t *zfsp = NULL;
 	smbzhandle_t zh = NULL;
@@ -443,12 +444,13 @@ int get_smbzhandle(TALLOC_CTX *mem_ctx, const char *path,
 		return -1;
 	}
 
+	zh->location = location;
 	*smbzhandle = zh;
 	return 0;
 }
 
-int fget_smbzhandle(TALLOC_CTX *mem_ctx, int fd,
-		    smbzhandle_t *smbzhandle)
+int _fget_smbzhandle(TALLOC_CTX *mem_ctx, int fd,
+		    smbzhandle_t *smbzhandle, const char *location)
 {
 	zfs_handle_t *zfsp = NULL;
 	smbzhandle_t zh = NULL;
@@ -470,6 +472,7 @@ int fget_smbzhandle(TALLOC_CTX *mem_ctx, int fd,
 		return -1;
 	}
 
+	zh->location = location;
 	*smbzhandle = zh;
 	return 0;
 }
@@ -539,6 +542,7 @@ static struct zfs_dataset *copy_to_external(TALLOC_CTX *mem_ctx,
 	if (open_zhandle) {
 		out->zhandle = smbzhandle_dup(out, ds_in->ds->zhandle);
 		out->zhandle->zone = ZHANDLE_ROOT;
+		out->zhandle->location = ds_in->ds->zhandle->location;
 	}
 	DS_UNLOCK();
 	return out;
@@ -1154,14 +1158,13 @@ struct zfs_dataset *zhandle_get_dataset(TALLOC_CTX *mem_ctx,
 	struct stat ds_st;
 
 	SMB_ASSERT(zfsp_ext->dev_id != 0);
-	zfsp = get_zhandle_from_smbzhandle(zfsp_ext);
-
 	dsentry = lookup_dataset_by_devid(zfsp_ext->dev_id);
 	if (dsentry != NULL) {
 		return copy_to_external(mem_ctx, dsentry,
 					get_props, open_zhandle);
 	}
 
+	zfsp = get_zhandle_from_smbzhandle(zfsp_ext);
 	DS_LOCK();
 	dsentry = talloc_zero(global_zcache, dataset_t);
 	if (dsentry == NULL) {
@@ -1178,6 +1181,7 @@ struct zfs_dataset *zhandle_get_dataset(TALLOC_CTX *mem_ctx,
 	dsentry->ds = ds;
 
 	ds->zhandle = smbzhandle_dup(ds, zfsp_ext);
+	ds->zhandle->location = zfsp_ext->location;
 
 	strlcpy(ds->dataset_name, zfs_get_name(zfsp),
 		sizeof(ds->dataset_name));
@@ -1226,6 +1230,11 @@ struct zfs_dataset *zhandle_get_dataset(TALLOC_CTX *mem_ctx,
 	}
 
 	add_to_global_datasets(dsentry);
+	/*
+	 * Change zone to ROOT to prevent destructor from closing
+	 * ZFS dataset handle that is now in our cache
+	 */
+	zfsp_ext->zone = ZHANDLE_ROOT;
 	DS_UNLOCK();
 	return copy_to_external(mem_ctx, dsentry,
 				get_props, open_zhandle);
@@ -1235,39 +1244,18 @@ fail:
 	return NULL;
 }
 
-struct zfs_dataset *smb_zfs_path_get_dataset(TALLOC_CTX *mem_ctx,
-					     const char *path,
-					     bool get_props,
-					     bool open_zhandle,
-					     bool resolve_path)
+struct zfs_dataset *_smb_zfs_path_get_dataset(TALLOC_CTX *mem_ctx,
+					      const char *path,
+					      bool get_props,
+					      bool open_zhandle,
+					      bool resolve_path,
+					      const char *location)
 {
 	int ret;
 	struct zfs_dataset *dsout = NULL;
 	struct smbzhandle *zfs_ext = NULL;
 
-	ret = get_smbzhandle(mem_ctx, path, &zfs_ext, resolve_path);
-	if (ret != 0) {
-		DBG_ERR("Failed to get zhandle\n");
-		return NULL;
-	}
-	dsout = zhandle_get_dataset(mem_ctx, zfs_ext, get_props, open_zhandle);
-
-	if (dsout == NULL) {
-		return dsout;
-	}
-	return dsout;
-}
-
-struct zfs_dataset *smb_zfs_fd_get_dataset(TALLOC_CTX *mem_ctx,
-					   int fd,
-					   bool get_props,
-					   bool open_zhandle)
-{
-	int ret;
-	struct zfs_dataset *dsout = NULL;
-	struct smbzhandle *zfs_ext = NULL;
-
-	ret = fget_smbzhandle(mem_ctx, fd, &zfs_ext);
+	ret = _get_smbzhandle(mem_ctx, path, &zfs_ext, resolve_path, location);
 	if (ret != 0) {
 		DBG_ERR("Failed to get zhandle\n");
 		return NULL;
@@ -1277,7 +1265,29 @@ struct zfs_dataset *smb_zfs_fd_get_dataset(TALLOC_CTX *mem_ctx,
 	if (dsout == NULL) {
 		return dsout;
 	}
+	return dsout;
+}
 
+struct zfs_dataset *_smb_zfs_fd_get_dataset(TALLOC_CTX *mem_ctx,
+					    int fd,
+					    bool get_props,
+					    bool open_zhandle,
+					    const char *location)
+{
+	int ret;
+	struct zfs_dataset *dsout = NULL;
+	struct smbzhandle *zfs_ext = NULL;
+
+	ret = _fget_smbzhandle(mem_ctx, fd, &zfs_ext, location);
+	if (ret != 0) {
+		DBG_ERR("Failed to get zhandle\n");
+		return NULL;
+	}
+	dsout = zhandle_get_dataset(mem_ctx, zfs_ext, get_props, open_zhandle);
+	TALLOC_FREE(zfs_ext);
+	if (dsout == NULL) {
+		return dsout;
+	}
 	return dsout;
 }
 
@@ -1334,6 +1344,7 @@ smb_zfs_add_snapshot(zfs_handle_t *snap, void *data)
 	time_t cr_time;
 	struct tm timestamp;
 	int rc, used;
+	uint64_t createtxg;
 	size_t req_mem, name_len;
 	bool included;
 
@@ -1351,6 +1362,11 @@ smb_zfs_add_snapshot(zfs_handle_t *snap, void *data)
 	included = shadow_copy_zfs_is_snapshot_included(state->iter_info,
 							snap_name);
 	if (!included) {
+		goto done;
+	}
+
+	createtxg = zfs_prop_get_int(snap, ZFS_PROP_CREATETXG);
+	if (state->iter_info->start_txg == createtxg) {
 		goto done;
 	}
 
@@ -1382,7 +1398,7 @@ smb_zfs_add_snapshot(zfs_handle_t *snap, void *data)
 	entry->cr_time = cr_time;
 	unix_to_nt_time(&entry->nt_time, cr_time);
 	strlcpy(entry->name, snap_name, sizeof(entry->name));
-	entry->createtxg = zfs_prop_get_int(snap, ZFS_PROP_CREATETXG);
+	entry->createtxg = createtxg;
 
 	DLIST_ADD(state->snapshots->entries, entry);
 	state->snapshots->num_entries++;
@@ -1494,6 +1510,7 @@ bool update_snapshot_list(smbzhandle_t zh,
 
 	state->iter_info = iter_info;
 	state->snapshots = snaps;
+	state->iter_info->start_txg = snaps->last->createtxg;
 
 	ZFS_LOCK();
 	rc = zfs_iter_snapshots_sorted(zfs, smb_zfs_add_snapshot,
@@ -1513,7 +1530,7 @@ snapshot_list *smb_zfs_list_snapshots(TALLOC_CTX *mem_ctx,
 	int ret;
 	smbzhandle_t hdl = NULL;
 	struct snapshot_list *out = NULL;
-	ret = get_smbzhandle(mem_ctx, path, &hdl, false);
+	ret = _get_smbzhandle(mem_ctx, path, &hdl, false, __location__);
 	if (ret != 0) {
 		DBG_ERR("Failed to get zhandle\n");
 		return NULL;
@@ -1744,7 +1761,7 @@ int conn_zfs_init(TALLOC_CTX *mem_ctx,
 		}
 	}
 
-	get_smbzhandle(mem_ctx, connectpath, &conn_zfsp, true);
+	_get_smbzhandle(mem_ctx, connectpath, &conn_zfsp, true, __location__);
 	/*
 	 * Attempt to get zfs dataset handle will fail if the dataset is a
 	 * snapshot. This may occur if the share is one dynamically created
@@ -1765,8 +1782,8 @@ int conn_zfs_init(TALLOC_CTX *mem_ctx,
 		ptr = strstr(connectpath, "/.zfs/snapshot/");
 		if (ptr != NULL) {
 			*ptr = '\0';
-			get_smbzhandle(mem_ctx, tmp_name,
-				       &conn_zfsp, true);
+			_get_smbzhandle(mem_ctx, tmp_name,
+				        &conn_zfsp, true, __location__);
 		}
 		TALLOC_FREE(tmp_name);
 	}
