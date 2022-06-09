@@ -106,12 +106,22 @@ struct zfs_dataset
 	struct zfs_dataset_prop *properties;
 };
 
+#ifdef DOXYGEN
 int get_smbzhandle(TALLOC_CTX *mem_ctx, const char *path,
 		   struct smbzhandle **smbzhandle,
 		   bool resolve);
+#else
+#define	get_smbzhandle(mem_ctx, path, smbzhandle, resolve) \
+	_get_smbzhandle(mem_ctx, path, smbzhandle, resolve, __location__)
+#endif
 
+#ifdef DOXYGEN
 int fget_smbzhandle(TALLOC_CTX *mem_ctx, int fd,
                     smbzhandle_t *smbzhandle);
+#else
+#define	fget_smbzhandle(mem_ctx, fd, smbzhandle) \
+	_fget_smbzhandle(mem_ctx, path, smbzhandle, __location__)
+#endif
 
 /*
  * Get userspace quotas for a given path, ID, and quota type.
@@ -209,16 +219,41 @@ int smb_zfs_set_user_prop(smbzhandle_t hdl,
  * If get_props is set to True, then ZFS dataset properties are included
  * in the returned zfs_dataset struct.
  */
+#ifdef DOXYGEN
 struct zfs_dataset *smb_zfs_path_get_dataset(TALLOC_CTX *mem_ctx,
 					     const char *path,
 					     bool get_props,
 					     bool open_zhandle,
 					     bool resolve_path);
+#else
+#define	smb_zfs_path_get_dataset(mem_ctx, path, get_props, open, resolve)\
+	(struct zfs_dataset *)_smb_zfs_path_get_dataset(\
+		mem_ctx, path, get_props, open, resolve, __location__)
 
+struct zfs_dataset *_smb_zfs_path_get_dataset(TALLOC_CTX *mem_ctx,
+					      const char *path,
+					      bool get_props,
+					      bool open_zhandle,
+					      bool resolve_path,
+					      const char *location);
+#endif
+
+#ifdef DOXYGEN
 struct zfs_dataset *smb_zfs_fd_get_dataset(TALLOC_CTX *mem_ctx,
 					   int fd,
 					   bool get_props,
 					   bool open_zhandle);
+#else
+#define	smb_zfs_fd_get_dataset(mem_ctx, fd, get_props, open_zhandle)\
+	(struct zfs_dataset *)_smb_zfs_fd_get_dataset(\
+		mem_ctx, fd, get_props, open_zhandle, __location__)
+
+struct zfs_dataset *_smb_zfs_fd_get_dataset(TALLOC_CTX *mem_ctx,
+					    int fd,
+					    bool get_props,
+					    bool open_zhandle,
+					    const char *location);
+#endif
 
 /*
  * This function returns a list of ZFS snapshots matching the specified
