@@ -366,7 +366,7 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 	error = chdir(config->created[idx]->mountpoint);
 	if (error != 0) {
 		DBG_ERR("failed to chdir into [%s]: %s\n",
-			config->created[idx], strerror(errno));
+			config->created[idx]->mountpoint, strerror(errno));
 		return false;
 	}
 
