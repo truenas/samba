@@ -365,7 +365,7 @@ static int fsp_get_acl_brand(files_struct *fsp)
 		errno = saved_errno;
 		return ACL_BRAND_UNKNOWN;
 	}
-#elseif
+#else
 	ssize_t rv;
 	rv = SMB_VFS_FGETXATTR(fsp->conn, fsp, ACL_XATTR, NULL, 0);
 	if (rv == -1) {
@@ -409,7 +409,7 @@ static int path_get_aclbrand(const char *path)
 		errno = saved_errno;
 		return ACL_BRAND_UNKNOWN;
 	}
-#elseif /* LINUX */
+#else /* LINUX */
 	ssize_t rv;
 	rv = getxattr(path, ACL_XATTR, NULL, 0);
 	if (rv == -1) {
