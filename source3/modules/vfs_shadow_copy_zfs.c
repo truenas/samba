@@ -534,7 +534,7 @@ static bool zfs_lookup_snapshot_list(vfs_handle_struct *handle,
 
 	if (entry == NULL) {
 		DBG_ERR("%s: no snapshot found\n", smb_fname_str_dbg(fname_in));
-		errno = ENODATA;
+		errno = ENOENT;
 		return false;
 	}
 
@@ -590,7 +590,7 @@ static char *do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 	}
 
 	found = zfs_lookup_snapshot_list(handle, fname_in, buf, &snapshots);
-	if (!found && errno != ENODATA) {
+	if (!found && errno != ENOENT) {
 		return NULL;
 	}
 
