@@ -499,7 +499,7 @@ static bool zfsentry2smbace(zfsacl_entry_t ae, SMB_ACE4PROP_T *aceprop)
 
 	if ((aceprop->flags & SMB_ACE4_ID_SPECIAL) &&
 	    (aceprop->aceType == SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE) &&
-	    ((aceprop->flags & (SMB_ACE4_DIRECTORY_INHERIT_ACE | SMB_ACE4_FILE_INHERIT_ACE)) == 0) &&
+	    ((aceprop->aceFlags & (SMB_ACE4_DIRECTORY_INHERIT_ACE | SMB_ACE4_FILE_INHERIT_ACE)) == 0) &&
 	    (aceprop->aceMask & SMB_ACE4_WRITE_DATA)) {
 		aceprop->aceMask |= (SMB_ACE4_WRITE_NAMED_ATTRS | \
 				     SMB_ACE4_WRITE_ATTRIBUTES | \
