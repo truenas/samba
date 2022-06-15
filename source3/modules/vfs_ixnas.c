@@ -367,24 +367,24 @@ static int fsp_get_acl_brand(files_struct *fsp)
 	}
 #else
 	ssize_t rv;
-	rv = SMB_VFS_FGETXATTR(fsp->conn, fsp, ACL_XATTR, NULL, 0);
+	rv = SMB_VFS_FGETXATTR(fsp, ACL_XATTR, NULL, 0);
 	if (rv == -1) {
 		if (errno == ENODATA) {
 			return ACL_BRAND_POSIX;
 		}
 		DBG_ERR("%s: fgetxattr() for %s failed: %s\n",
-			path, ACL_XATTR, strerror(errno));
+			fsp_str_dbg(fsp), ACL_XATTR, strerror(errno));
 		return ACL_BRAND_UNKNOWN;
 	}
 
-	rv = SMB_VFS_FGETXATTR(fsp->conn, fsp, ACL4_XATTR, NULL, 0);
+	rv = SMB_VFS_FGETXATTR(fsp, ACL4_XATTR, NULL, 0);
 	if (rv == -1) {
 		if (errno == ENODATA) {
 			/* probably need to add disabled */
 			return ACL_BRAND_UNKNOWN;
 		}
 		DBG_ERR("%s: fgetxattr() for %s failed: %s\n",
-			path, ACL4_XATTR, strerror(errno));
+			fsp_str_dbg(fsp), ACL4_XATTR, strerror(errno));
 		return ACL_BRAND_UNKNOWN;
 	}
 #endif /* FREEBSD */
