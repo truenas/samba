@@ -685,7 +685,11 @@ static int recycle_unlink_internal(vfs_handle_struct *handle,
 	recycle_bin *the_bin = NULL;
 
 	if (!VALID_STAT(smb_fname->st)) {
-		SMB_ASSERT(SMB_VFS_STAT(handle->conn, smb_fname) == 0);
+		int err = SMB_VFS_STAT(handle->conn, smb_fname);
+		if (err && (errno == ENOENT)) {
+			return err;
+		}
+		SMB_ASSERT(err == 0);
 	}
 
 	the_bin = get_recycle_bin(handle, smb_fname);
