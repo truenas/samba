@@ -2311,6 +2311,7 @@ static py_ctdb_db_entry *entry_from_tdb_data(py_ctdb_db_ctx *db_ctx,
 	}
 
 	if (data != NULL) {
+		Py_DECREF(entry->val);
 		entry->val = pytdb_copy(data);
 	}
 
@@ -2325,24 +2326,20 @@ static PyObject *py_ctdb_db_entry_fetch(PyObject *self, PyObject *args_unused)
 	py_ctdb_db_entry *entry = (py_ctdb_db_entry *)self;
 	bool ok;
 	TDB_DATA key, data;
-	TALLOC_CTX *tmp_ctx = NULL;
 	struct ctdb_record_handle *hdl = NULL;
 	PyObject *pydata = NULL;
 	py_ctdb_db_entry *out = NULL;
 
-	tmp_ctx = talloc_new(entry->ctx->client->mem_ctx);
-	if (tmp_ctx == NULL) {
-		PyErr_NoMemory();
-		return NULL;
-	}
-
 	key = PyBytes_AsTDB_DATA(entry->key);
-	ok = ctdb_db_fetch(tmp_ctx, entry->ctx, key, &data, &hdl);
+	ok = ctdb_db_fetch(entry->ctx->client->mem_ctx, entry->ctx, key, &data, &hdl);
 	if (!ok) {
 		goto finished;
 	}
 
 	pydata = PyBytes_FromTDB_DATA(data);
+	if (data.dptr) {
+		TALLOC_FREE(data.dptr);
+	}
 	out = entry_from_tdb_data(entry->ctx, entry->key, pydata);
 	if (out == NULL) {
 		goto finished;
@@ -2353,7 +2350,6 @@ static PyObject *py_ctdb_db_entry_fetch(PyObject *self, PyObject *args_unused)
 	}
 
 finished:
-	TALLOC_FREE(tmp_ctx);
 	Py_XDECREF(pydata);
 	if (out == NULL) {
 		return NULL;
@@ -2639,18 +2635,11 @@ static PyObject *py_ctdb_detach(PyObject *self, PyObject *args_unused)
 static PyObject *py_ctdb_db_fetch(PyObject *self, PyObject *args)
 {
 	py_ctdb_db_ctx *ctx = (py_ctdb_db_ctx *)self;
-	TALLOC_CTX *tmp_ctx = NULL;
-	PyObject *pykey = NULL;
+	PyObject *pykey = NULL, *pydata = NULL;
 	py_ctdb_db_entry *out = NULL;
 	TDB_DATA key, data;
 	struct ctdb_record_handle *hdl = NULL;
 	bool ok;
-
-	tmp_ctx = talloc_new(ctx->client->mem_ctx);
-	if (tmp_ctx == NULL) {
-		PyErr_NoMemory();
-		return NULL;
-	}
 
 	if (!PyArg_ParseTuple(args, "O", &pykey)) {
 		goto finished;
@@ -2665,7 +2654,7 @@ static PyObject *py_ctdb_db_fetch(PyObject *self, PyObject *args)
 	}
 
 	key = PyBytes_AsTDB_DATA(pykey);
-	ok = ctdb_db_fetch(tmp_ctx, ctx, key, &data, &hdl);
+	ok = ctdb_db_fetch(ctx->client->mem_ctx, ctx, key, &data, &hdl);
 	if (!ok) {
 		goto finished;
 	}
@@ -2675,9 +2664,14 @@ static PyObject *py_ctdb_db_fetch(PyObject *self, PyObject *args)
 	 * memory for TDB_DATA data is allocated under temporary
 	 * TALLOC context and freed in TALLOC_FREE()
 	 */
-	out = entry_from_tdb_data(ctx,
-				  PyBytes_FromTDB_DATA(key),
-				  PyBytes_FromTDB_DATA(data));
+	pydata = PyBytes_FromTDB_DATA(data);
+	out = entry_from_tdb_data(ctx, pykey, pydata);
+
+	Py_XDECREF(pydata);
+	if (data.dptr) {
+		TALLOC_FREE(data.dptr);
+	}
+
 	if (out == NULL) {
 		goto finished;
 	}
@@ -2687,8 +2681,6 @@ static PyObject *py_ctdb_db_fetch(PyObject *self, PyObject *args)
 	}
 
 finished:
-	Py_XDECREF(pykey);
-	TALLOC_FREE(tmp_ctx);
 	if (out == NULL) {
 		return NULL;
 	}
