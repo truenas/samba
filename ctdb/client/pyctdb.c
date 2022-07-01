@@ -450,6 +450,7 @@ static PyTypeObject PyCtdbDBEntry = {
 
 /* CTDB node getsetter functions */
 static PyObject *py_ctdb_node_is_current(PyObject *self, void *closure);
+static PyObject *py_ctdb_node_pnn(PyObject *self, void *closure);
 static PyObject *py_ctdb_node_flags(PyObject *self, void *closure);
 static PyObject *py_ctdb_node_addr(PyObject *self, void *closure);
 
@@ -475,7 +476,7 @@ static void py_ctdb_node_dealloc(py_ctdb_node *self);
 static PyGetSetDef ctdb_db_node_getsetters[] = {
 	{
 		.name = discard_const_p(char, "pnn"),
-		.get = (getter)py_ctdb_get_pnn,
+		.get = (getter)py_ctdb_node_pnn,
 	},
 	{
 		.name = discard_const_p(char, "current_node"),
@@ -1682,7 +1683,7 @@ static PyObject *ipinfo_to_py(struct ctdb_public_ip_info *ipinfo)
 		bool active, available;
 
 		active = (ipinfo->active_idx == i) ? true : false;
-		available = (iface->link_state == 0) ? true : false;
+		available = (iface->link_state == 0) ? false : true;
 
 		entry = Py_BuildValue(
 			"{s:s,s:O,s:O}",
@@ -1721,6 +1722,7 @@ static PyObject *ips_to_py(TALLOC_CTX *mem_ctx,
 	for (i = 0; i < ips->num; i++) {
 		PyObject *entry = NULL;
 		PyObject *py_ifaces = NULL;
+		PyObject *alias = NULL;
 		char *a = NULL;
 
 		a = ctdb_sock_addr_to_string(mem_ctx, &ips->ip[i].addr, false);
@@ -1731,13 +1733,20 @@ static PyObject *ips_to_py(TALLOC_CTX *mem_ctx,
 			return NULL;
 		}
 
+		alias = py_ctdb_sock_addr(&ips->ip->addr, false);
+		if (alias == NULL) {
+			return NULL;
+		}
+
 		entry = Py_BuildValue(
-			"{s:s,s:I,s:O}",
+			"{s:s,s:O,s:I,s:O}",
 			"public_ip", a,
+			"alias", alias,
 			"pnn", ips->ip[i].pnn,
 			"interfaces", py_ifaces
 		);
 
+		Py_XDECREF(alias);
 		Py_XDECREF(py_ifaces);
 
 		if (entry == NULL) {
@@ -2479,7 +2488,6 @@ static bool attach_db(py_ctdb_db_ctx *ctx)
 static PyObject *py_ctdb_attach(PyObject *self, PyObject *args)
 {
 	py_ctdb_db_ctx *ctx = (py_ctdb_db_ctx *)self;
-	py_ctdb_client_ctx *cl_ctx = ctx->client;
 	int err;
 	long flag = 0;
 
@@ -3396,28 +3404,28 @@ static void py_ctdb_db_dealloc(py_ctdb_db_ctx *self)
 	if (self->db != NULL) {
 		TALLOC_FREE(self->db);
 	}
-	if (self->client != NULL) {
-		Py_DECREF(self->client);
-	}
+	Py_CLEAR(self->client);
 	Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
 static PyObject *py_ctdb_db_exists(PyObject *self, void *closure)
 {
 	py_ctdb_db_ctx *ctx = (py_ctdb_db_ctx *)self;
-	return ctx->db_exists ? Py_True : Py_False;
+
+	if (ctx->db_exists) {
+		Py_RETURN_TRUE;
+	}
+	Py_RETURN_FALSE;
 }
 
 static PyObject *py_ctdb_db_opened(PyObject *self, void *closure)
 {
 	py_ctdb_db_ctx *ctx = (py_ctdb_db_ctx *)self;
-	return (ctx->db == NULL) ? Py_False : Py_True;
-}
 
-static PyObject *py_ctdb_db_has_txh(PyObject *self, void *closure)
-{
-	py_ctdb_db_ctx *ctx = (py_ctdb_db_ctx *)self;
-	return (ctx->txh == NULL) ? Py_False : Py_True;
+	if (ctx->db == NULL) {
+		Py_RETURN_FALSE;
+	}
+	Py_RETURN_TRUE;
 }
 
 static PyObject *py_ctdb_db_flags(PyObject *self, void *closure)
@@ -3435,6 +3443,7 @@ static PyObject *py_ctdb_db_dbid(PyObject *self, void *closure)
 static PyObject *py_ctdb_db_txh(PyObject *self, void *closure)
 {
 	py_ctdb_db_ctx *ctx = (py_ctdb_db_ctx *)self;
+
 	if (ctx->txh == NULL) {
 		Py_RETURN_FALSE;
 	}
@@ -3769,6 +3778,12 @@ static PyObject *py_ctdb_node_is_current(PyObject *self, void *closure)
 	Py_RETURN_FALSE;
 }
 
+static PyObject *py_ctdb_node_pnn(PyObject *self, void *closure)
+{
+	py_ctdb_node *node = (py_ctdb_node *)self;
+	return Py_BuildValue("I", node->pnn);
+}
+
 static PyObject *py_ctdb_node_flags(PyObject *self, void *closure)
 {
 	py_ctdb_node *node = (py_ctdb_node *)self;
@@ -3913,7 +3928,7 @@ PyObject* module_init(void)
 
 	m = PyModule_Create(&moduledef);
 	if (m == NULL) {
-		fprintf(stderr, "fucking module didn't init\n");
+		fprintf(stderr, "Failed to initialize module\n");
 		return NULL;
 	}
 
