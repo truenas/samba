@@ -360,7 +360,7 @@ else:
 
 bld.SAMBA3_LIBRARY('smb_libzfs',
                    source='smb_libzfs.c',
-                   cflags='-DNEED_SOLARIS_BOOLEAN',
+                   cflags_end='-DNEED_SOLARIS_BOOLEAN',
                    deps='samba-util',
                    includes=bld.CONFIG_GET('CPPPATH_ZFS'),
                    ldflags='-luutil -lzfs_core -lzfs -lnvpair',
