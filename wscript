@@ -129,6 +129,10 @@ def options(opt):
                    action='store_false', dest='with_json',
                    help=("Build without JSON support."))
 
+    opt.add_option('--with-libzfs',
+                   help='enable libZFS support',
+                   action='store_true', dest='with_libzfs', default=False)
+
 def configure(conf):
     version = samba_version.load_version(env=conf.env)
 

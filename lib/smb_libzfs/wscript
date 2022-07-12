@@ -1,0 +1,96 @@
+#!/usr/bin/env python
+
+APPNAME = 'smb_libzfsl'
+VERSION = '0.1.0'
+
+import sys, os
+
+# find the buildtools directory
+top = '.'
+while not os.path.exists(top+'/buildtools') and len(top.split('/')) < 5:
+    top = top + '/..'
+sys.path.insert(0, top + '/buildtools/wafsamba')
+
+out = 'bin'
+
+import wafsamba
+from wafsamba import samba_dist, samba_utils
+from waflib import Options, Logs, Context, Errors
+
+samba_dist.DIST_DIRS('lib/tdb:. lib/replace:lib/replace buildtools:buildtools third_party/waf:third_party/waf')
+
+def options(opt):
+    opt.BUILTIN_DEFAULT('replace')
+    opt.RECURSE('lib/replace')
+
+
+def configure(conf):
+    conf.RECURSE('lib/replace')
+
+    conf.SAMBA_CHECK_PYTHON()
+    conf.SAMBA_CHECK_PYTHON_HEADERS()
+
+    conf.SAMBA_CONFIG_H()
+
+    conf.SAMBA_CHECK_UNDEFINED_SYMBOL_FLAGS()
+
+
+def build(bld):
+    enabled = bool(bld.options.with_libzfs)
+
+    bld.RECURSE('lib/replace')
+    conf.DEFINE('HAVE_LIBZFS', '1')
+    if os.path.exists('/usr/include/libzfs/libzfs.h'):
+        CPPPATH_ZFS = [
+            '/usr/include/libspl',
+            '/usr/include/libzfs',
+            '/usr/include/libzfs/sys',
+            '/usr/include/libzfs/sys/fs',
+            ]
+        elif os.path.exists('/usr/local/include/libzfs/libzfs.h'):
+            CPPPATH_ZFS = [
+                '/usr/local/include/libspl',
+                '/usr/local/include/libzfs',
+                '/usr/local/include/libzfs/sys',
+                '/usr/local/include/libzfs/sys/fs',
+            ]
+
+    else:
+        src_base = conf.CONFIG_GET("SRC_BASE")
+        if src_base is None:
+            src_base = "/usr/src"
+
+        CPPPATH_ZFS = [
+            f'{src_base}/cddl/contrib/opensolaris/lib/libzpool/common',
+            f'{src_base}/cddl/compat/opensolaris/include',
+            f'{src_base}/cddl/compat/opensolaris/lib/libumem',
+            f'{src_base}/sys/cddl/compat/opensolaris',
+            f'{src_base}/cddl/contrib/opensolaris/head',
+            f'{src_base}/cddl/contrib/opensolaris/lib/libuutil/common',
+            f'{src_base}/cddl/contrib/opensolaris/lib/libzfs/common',
+            f'{src_base}/cddl/contrib/opensolaris/lib/libzfs_core/common',
+            f'{src_base}/cddl/contrib/opensolaris/lib/libumem/common',
+            f'{src_base}/cddl/contrib/opensolaris/lib/libnvpair',
+            f'{src_base}/sys/cddl/contrib/opensolaris/uts/common',
+            f'{src_base}/sys/cddl/contrib/opensolaris/uts/common/fs/zfs',
+            f'{src_base}/sys/cddl/contrib/opensolaris/uts/common/sys',
+            f'{src_base}/sys/cddl/contrib/opensolaris/common/zfs',
+        ]
+
+    bld.SAMBA3_LIBRARY('smb_libzfs',
+                       source='smb_libzfs.c',
+                       cflags_end='-DNEED_SOLARIS_BOOLEAN',
+                       deps='samba-util',
+                       includes=CPPPATH_ZFS,
+                       ldflags='-luutil -lzfs_core -lzfs -lnvpair',
+                       enabled=enabled,
+                       private_library=True)
+
+
+def dist():
+    '''makes a tarball for distribution'''
+    samba_dist.dist()
+
+def reconfigure(ctx):
+    '''reconfigure if config scripts have changed'''
+    samba_utils.reconfigure(ctx)
