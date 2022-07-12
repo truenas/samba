@@ -358,9 +358,13 @@ if bld.CONFIG_SET("HAVE_RPC_XDR_H"):
 else:
     bld.SET_TARGET_TYPE('VFS_NFS4_XDR', 'EMPTY')
 
+libzfs_cflags = '-DNEED_SOLARIS_BOOLEAN'
+if bld.CONFIG_SET('FREEBSD'):
+    libzfs_cflags += ' -DFREEBSD'
+
 bld.SAMBA3_LIBRARY('smb_libzfs',
                    source='smb_libzfs.c',
-                   cflags_end='-DNEED_SOLARIS_BOOLEAN',
+                   cflags_end=libzfs_cflags,
                    deps='samba-util',
                    includes=bld.CONFIG_GET('CPPPATH_ZFS'),
                    ldflags='-luutil -lzfs_core -lzfs -lnvpair',
