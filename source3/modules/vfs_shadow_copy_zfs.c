@@ -6,7 +6,7 @@
  * Copyright (C) Christian Ambach  2011
  * Copyright (C) Michael Adam      2013
  * Copyright (C) XStor Systems Inc 2011
- * Copyright (C) iXsystems Inc     2021
+ * Copyright (C) iXsystems Inc     2022
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -194,27 +194,32 @@ static bool put_cached_snapshot(TDB_DATA key,
 }
 
 char *get_snapshot_path(TALLOC_CTX *mem_ctx,
-			char *connectpath, size_t clen,
-			char *mountpoint, size_t mplen,
-			char *filename, size_t flen,
+			char *connectpath,
+			char *mountpoint,
+			char *filename,
 			const char *mpoffset,
 			struct snapshot_entry *snap)
 {
-	DBG_DEBUG("connectpath: %s, clen: %zu, mountpoint: %s, mplen %zu "
-		  "filename: %s, flen %zu, mpoffset: %s, snapshot: %s\n",
-		  connectpath, clen, mountpoint, mplen, filename, flen,
+	DBG_DEBUG("connectpath: %s, mountpoint: %s,"
+		  "filename: %s, mpoffset: %s, snapshot: %s\n",
+		  connectpath, mountpoint, filename,
 		  mpoffset, snap->name);
 	char *ret = NULL;
-	char buf[PATH_MAX];
-	char *tmp_name = &buf;
+	char buf[PATH_MAX] = {0};
+	char *tmp_name = buf;
 	bool is_child = false;
+	size_t clen, mplen;
+
 	strlcpy(buf, filename, sizeof(buf));
+	mplen = strlen(mountpoint);
+	clen = strlen(connectpath);
+
 	if (mplen > clen) {
 		/*
 		 * This is not the same dataset as the one underlying the connectpath.
 		 */
 		is_child = true;
-		if (!(flen > (mplen - clen -1)) && (strcmp(mountpoint + clen + 1, tmp_name) == 0)) {
+		if (!(strlen(filename) > (mplen - clen -1)) && (strcmp(mountpoint + clen + 1, tmp_name) == 0)) {
 			/* The path is a dataset mountpoint. Set last path component
 			 * to NULL so that we later exclude from our returned string.
 			 */
@@ -223,7 +228,7 @@ char *get_snapshot_path(TALLOC_CTX *mem_ctx,
 				  filename);
 		}
 		else {
-			SMB_ASSERT(flen >= (mplen - clen - 1));
+			SMB_ASSERT(strlen(filename) >= (mplen - clen - 1));
 			tmp_name += (mplen - clen);
 			DBG_DEBUG("file [%s] is within sub-dataset [%s] base_name rewritten to [%s]\n",
 				  filename, mountpoint + clen, tmp_name);
@@ -237,7 +242,7 @@ char *get_snapshot_path(TALLOC_CTX *mem_ctx,
 	 * the dataset underlying the share's connectpath (at least on TrueNAS).
 	 */
 	if (mpoffset && !is_child) {
-		if (flen) {
+		if (*filename != '\0') {
 			ret = talloc_asprintf(mem_ctx, "%s/.zfs/snapshot/%s/%s/%s",
 					      mountpoint, snap->name, mpoffset, tmp_name);
 		}
@@ -250,7 +255,7 @@ char *get_snapshot_path(TALLOC_CTX *mem_ctx,
 	 * Path is a dataset mountpoint for child dataset or
 	 * the share's connectpath.
 	 */
-	else if ((*tmp_name == '\0') || (flen == 0)) {
+	else if ((*tmp_name == '\0') || (*filename == '\0')) {
 		ret = talloc_asprintf(mem_ctx, "%s/.zfs/snapshot/%s",
 				      mountpoint, snap->name);
 	}
@@ -559,14 +564,14 @@ static char *do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 {
 	struct shadow_copy_zfs_config *config = NULL;
 	struct snapshot_entry snap;
-	struct snapshot_data snapshots= (struct snapshot_data) {
+	struct snapshot_data snapshots = (struct snapshot_data) {
 		.snap = &snap,
 	};
 	const char *mpoffset = NULL;
 	size_t mplen, flen, clen;
 	char *ret = NULL;
-	char buf[PATH_MAX];
-	char *res_fname = &buf;
+	char buf[PATH_MAX] = {0};
+	char *res_fname = buf;
 	bool already_converted = false;
 	bool found;
 
@@ -643,9 +648,9 @@ static char *do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 		return NULL;
 	}
 
-	ret = get_snapshot_path(talloc_tos(), handle->conn->connectpath, clen,
-				snapshots.mountpoint, mplen,
-				res_fname, flen, mpoffset, snapshots.snap);
+	ret = get_snapshot_path(talloc_tos(), handle->conn->connectpath,
+				snapshots.mountpoint, res_fname,
+				mpoffset, snapshots.snap);
 
 	if (out != NULL) {
 		size_t off = 0;
@@ -957,7 +962,6 @@ static int shadow_copy_zfs_chdir(vfs_handle_struct *handle,
 	int ret;
 	char *conv = NULL;
 	struct snapshot_data *data = NULL;
-	char *shadow_cp = NULL;
 	struct smb_filename *conv_smb_fname = NULL;
 
 	if (!shadow_copy_zfs_match_name(handle, smb_fname)) {
@@ -1088,7 +1092,7 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 	struct shadow_copy_zfs_config *config = NULL;
 	struct snapshot_list *snapshots = NULL;
 	struct snapshot_entry *entry = NULL;
-	SMB_STRUCT_STAT sbuf, cur_st, prev_st;
+	SMB_STRUCT_STAT sbuf, prev_st;
 	const SMB_STRUCT_STAT *psbuf = NULL;
 	uint idx = 0;
 	const char *mpoffset = NULL;
@@ -1165,11 +1169,12 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 		 * Directories should always be added if they exist in the
 		 * snapshot. Files only be added if mtime differs.
 		 */
+		SMB_STRUCT_STAT cur_st;
 		char *tmp_file = NULL;
 		tmp_file = get_snapshot_path(handle->conn, handle->conn->connectpath,
-					     cpathlen, snapshots->mountpoint,
-					     mplen, fsp->fsp_name->base_name,
-					     flen, mpoffset, entry);
+					     snapshots->mountpoint,
+					     fsp->fsp_name->base_name,
+					     mpoffset, entry);
 
 		DBG_INFO("snapshot[%d]: ts: %ld, gmt: %s, name: %s, "
 			 "createtxg: %ld, path: %s\n",
@@ -1301,7 +1306,7 @@ static const char *shadow_copy_zfs_connectpath(struct vfs_handle_struct *handle,
 			return handle->conn->connectpath;
 		}
 		TALLOC_FREE(conv);
-		if (data->shadow_cp == NULL) {
+		if (data->shadow_cp[0] == '\0') {
 			TALLOC_FREE(data);
 			return SMB_VFS_NEXT_CONNECTPATH(handle, smb_fname);
 		}
