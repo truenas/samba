@@ -167,6 +167,7 @@ static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
 	int i;
 	bool ok;
 	uint64_t kern_dosmodes = 0;
+
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct ixnas_config_data,
 				return NT_STATUS_INTERNAL_ERROR);
@@ -197,7 +198,13 @@ static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
 	}
 #endif /* FREEBSD */
 
-	ok = ixnas_get_native_dosmode(fsp, &kern_dosmodes);
+	if (is_named_stream(fsp->fsp_name)) {
+		// Streams don't have separate dos attribute metadata
+		ok = ixnas_get_native_dosmode(fsp->base_fsp, &kern_dosmodes);
+	} else {
+		ok = ixnas_get_native_dosmode(fsp, &kern_dosmodes);
+	}
+
 	if (!ok) {
 		return map_nt_error_from_unix(errno);
 	}
@@ -232,6 +239,11 @@ static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
 	int ret, i;
 	bool set_dosmode_ok = false;
 	bool ok;
+
+	if (is_named_stream(fsp->fsp_name)) {
+		// Streams don't have separate dos attribute metadata
+		return NT_STATUS_OK;
+	}
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct ixnas_config_data,
@@ -505,6 +517,11 @@ static bool zfsentry2smbace(zfsacl_entry_t ae, SMB_ACE4PROP_T *aceprop)
 				     SMB_ACE4_WRITE_ATTRIBUTES | \
 				     SMB_ACE4_DELETE);
 	}
+
+	if (aceprop->aceType == SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE) {
+		aceprop->aceMask |= SMB_ACE4_SYNCHRONIZE;
+	}
+
 	return true;
 }
 
