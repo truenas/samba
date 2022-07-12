@@ -20,7 +20,7 @@
 #include "includes.h"
 #include "system/filesys.h"
 #include "smbd/globals.h"
-#include "modules/smb_libzfs.h"
+#include "smb_libzfs.h"
 #include "../libcli/security/security.h"
 #include "../libcli/security/dom_sid.h"
 

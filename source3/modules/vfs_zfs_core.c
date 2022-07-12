@@ -22,7 +22,7 @@
 #include "system/filesys.h"
 
 #include "lib/util/tevent_ntstatus.h"
-#include "modules/smb_libzfs.h"
+#include "smb_libzfs.h"
 
 static int vfs_zfs_core_debug_level = DBGC_VFS;
 

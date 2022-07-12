@@ -28,7 +28,7 @@
 #include "smbd/globals.h"
 #include "system/filesys.h"
 #include "include/ntioctl.h"
-#include "modules/smb_libzfs.h"
+#include "smb_libzfs.h"
 #include "../lib/util/memcache.h"
 #include "../lib/util/time.h"
 

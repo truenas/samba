@@ -23,7 +23,7 @@
 #include "system/filesys.h"
 #include "lib/util/tevent_ntstatus.h"
 #include "libcli/security/security.h"
-#include "modules/smb_libzfs.h"
+#include "smb_libzfs.h"
 
 #define TMPROTECT_PREFIX "aapltm"
 #define TMPROTECT_MODULE "tmprotect"

@@ -37,6 +37,8 @@ def configure(conf):
 
 def build(bld):
     enabled = bool(bld.options.with_libzfs)
+    if enabled:
+        conf.DEFINE('HAVE_LIBZFS', '1')
 
     bld.RECURSE('lib/replace')
     conf.DEFINE('HAVE_LIBZFS', '1')
@@ -46,15 +48,14 @@ def build(bld):
             '/usr/include/libzfs',
             '/usr/include/libzfs/sys',
             '/usr/include/libzfs/sys/fs',
-            ]
-        elif os.path.exists('/usr/local/include/libzfs/libzfs.h'):
-            CPPPATH_ZFS = [
-                '/usr/local/include/libspl',
-                '/usr/local/include/libzfs',
-                '/usr/local/include/libzfs/sys',
-                '/usr/local/include/libzfs/sys/fs',
-            ]
-
+        ]
+    elif os.path.exists('/usr/local/include/libzfs/libzfs.h'):
+        CPPPATH_ZFS = [
+            '/usr/local/include/libspl',
+            '/usr/local/include/libzfs',
+            '/usr/local/include/libzfs/sys',
+            '/usr/local/include/libzfs/sys/fs',
+        ]
     else:
         src_base = conf.CONFIG_GET("SRC_BASE")
         if src_base is None:
