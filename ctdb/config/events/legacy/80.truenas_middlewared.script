@@ -30,12 +30,9 @@ def main():
 
     with CtdbEvent(logger=logger) as c:
         try:
-            if args:
-                getattr(c, event)(args)
-            else:
-                getattr(c, event)()
+            getattr(c, event)(*args)
         except Exception:
-            logger.warning("%s: event failed.", event, exc_info=True)
+            logger.warning("%s: event failed. Args: %s", event, args, exc_info=True)
             sys.exit(1)
 
     sys.exit(0)
