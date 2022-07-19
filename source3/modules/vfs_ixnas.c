@@ -531,7 +531,7 @@ static bool smbace2zfsentry(zfsacl_t zfsacl, SMB_ACE4PROP_T *aceprop)
 	zfsacl_entry_t new_entry = NULL;
 	zfsace_who_t who_type;
 	zfsace_id_t who_id = ZFSACL_UNDEFINED_ID;
-	zfsace_entry_type_t type;
+	zfsace_entry_type_t entry_type;
 
 	ok = zfsacl_create_aclentry(zfsacl, ZFSACL_APPEND_ENTRY, &new_entry);
 	if (!ok) {
@@ -540,9 +540,9 @@ static bool smbace2zfsentry(zfsacl_t zfsacl, SMB_ACE4PROP_T *aceprop)
 	}
 
 	if (aceprop->aceType == SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE) {
-		type = ZFSACL_ENTRY_TYPE_ALLOW;
+		entry_type = ZFSACL_ENTRY_TYPE_ALLOW;
 	} else if (aceprop->aceType == SMB_ACE4_ACCESS_DENIED_ACE_TYPE) {
-		type = ZFSACL_ENTRY_TYPE_DENY;
+		entry_type = ZFSACL_ENTRY_TYPE_DENY;
 	} else {
 		smb_panic("Unsupported ace type.");
 	}
@@ -585,13 +585,7 @@ static bool smbace2zfsentry(zfsacl_t zfsacl, SMB_ACE4PROP_T *aceprop)
 		return false;
 	}
 
-	ok = zfsace_set_who(new_entry, who_type, who_id);
-	if (!ok) {
-		DBG_ERR("zfsace_set_who() failed: %s\n", strerror(errno));
-		return false;
-	}
-
-	ok = zfsace_set_entry_type(new_entry, type);
+	ok = zfsace_set_entry_type(new_entry, entry_type);
 	if (!ok) {
 		DBG_ERR("zfsace_set_type() failed: %s\n", strerror(errno));
 		return false;
@@ -776,10 +770,20 @@ static bool ixnas_add_hidden_entry(zfsacl_t zfsacl,
 	if (S_ISDIR(fsp->fsp_name->st.st_ex_mode)) {
 		ok = zfsace_set_flagset(hidden_entry,
 					ZFSACE_FILE_INHERIT | ZFSACE_DIRECTORY_INHERIT);
-		if (!ok) {
-			DBG_ERR("zfsacl_set_flagset() failed: %s\n", strerror(errno));
-			return false;
-		}
+	}
+	else {
+		ok = zfsace_set_flagset(hidden_entry, 0);
+	}
+
+	if (!ok) {
+		DBG_ERR("zfsacl_set_flagset() failed: %s\n", strerror(errno));
+		return false;
+	}
+
+	ok = zfsace_set_entry_type(hidden_entry, ZFSACL_ENTRY_TYPE_ALLOW);
+	if (!ok) {
+		DBG_ERR("zfsace_set_entry_type() failed: %s\n", strerror(errno));
+		return false;
 	}
 
 	return true;
@@ -831,7 +835,7 @@ static bool ixnas_process_smbacl(vfs_handle_struct *handle,
 		return false;
 	}
 
-	if (fsp_set_zfsacl(fsp, zfsacl)) {
+	if (!fsp_set_zfsacl(fsp, zfsacl)) {
 		DBG_ERR("%s: failed to set acl: %s\n",
 			fsp_str_dbg(fsp), strerror(errno));
 		zfsacl_free(&zfsacl);
