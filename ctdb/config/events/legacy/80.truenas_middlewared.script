@@ -1,28 +1,37 @@
 #!/usr/bin/python3
 
 import logging
+import os
 import sys
 
+from contextlib import suppress
 from middlewared.scripts.ctdb_events import CtdbEvent
 from middlewared.plugins.cluster_linux.ctdb_event import CtdbEventType
 
-LOGFILE = '/var/log/ctdb/middleware_event_handler.log'
+LOGDIR = '/var/log/ctdb'
+LOGFILE = os.path.join(LOGDIR, 'middleware_event_handler.log')
 LOGLEVEL = logging.INFO
 LOGFMT = ('[%(asctime)s] (%(levelname)s): %(message)s')
-
-logging.basicConfig(
-    filename=LOGFILE,
-    level=LOGLEVEL,
-    format=LOGFMT
-)
-
-logger = logging.getLogger('middleware_ctdb_event')
 KNOWN_EVENTS = [event.name.lower() for event in CtdbEventType]
+
+
+def setup_logging():
+    with suppress(FileExistsError):
+        os.mkdir(LOGDIR, mode=0o700)
+
+    logging.basicConfig(
+        filename=LOGFILE,
+        level=LOGLEVEL,
+        format=LOGFMT
+    )
+    return logging.getLogger('middleware_ctdb_event')
 
 
 def main():
     event = sys.argv[1]
     args = sys.argv[2:]
+
+    logger = setup_logging()
 
     if event not in KNOWN_EVENTS:
         logger.error("%s: unknown event type", event)
