@@ -344,7 +344,7 @@ size_t srvstr_get_path_req(TALLOC_CTX *mem_ctx, struct smb_request *req,
 {
 	ssize_t bufrem = smbreq_bufrem(req, src);
 
-	if (bufrem < 0) {
+	if (bufrem == 0) {
 		*err = NT_STATUS_INVALID_PARAMETER;
 		return 0;
 	}
@@ -382,7 +382,7 @@ size_t srvstr_pull_req_talloc(TALLOC_CTX *ctx, struct smb_request *req,
 {
 	ssize_t bufrem = smbreq_bufrem(req, src);
 
-	if (bufrem < 0) {
+	if (bufrem == 0) {
 		return 0;
 	}
 
@@ -3853,7 +3853,7 @@ static void reply_lockread_locked(struct tevent_req *subreq)
 	/*
 	 * However the requested READ size IS affected by max_send. Insanity.... JRA.
 	 */
-	maxtoread = req->xconn->smb1.sessions.max_send - (smb_size + 5*2 + 3);
+	maxtoread = req->xconn->smb1.sessions.max_send - (MIN_SMB_SIZE + 5*2 + 3);
 
 	if (numtoread > maxtoread) {
 		DBG_WARNING("requested read size (%zu) is greater than "
@@ -3949,7 +3949,7 @@ void reply_read(struct smb_request *req)
 	/*
 	 * The requested read size cannot be greater than max_send. JRA.
 	 */
-	maxtoread = xconn->smb1.sessions.max_send - (smb_size + 5*2 + 3);
+	maxtoread = xconn->smb1.sessions.max_send - (MIN_SMB_SIZE + 5*2 + 3);
 
 	if (numtoread > maxtoread) {
 		DEBUG(0,("reply_read: requested read size (%u) is greater than maximum allowed (%u/%u). \
