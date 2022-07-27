@@ -40,7 +40,6 @@ samba (2:4.15.2+ix-0) unstable; urgency=medium
  -- Andrew Walker <awalker@ixsystems.com>  Tue, 09 Nov 2021 17:00:00 +0000
 
 
->>>>>>> ffc1a15d054 (Update debian changelog)
 samba (2:4.15.1+ix-0) unstable; urgency=medium
 
   * Update to Samba 4.15.1
@@ -104,7 +103,6 @@ samba (2:4.14.2+ix-2) unstable; urgency=medium
  -- Andrew Walker <awalker@ixsystems.com>  Thu, 10 June 2021 17:00:00 +0000
 
 
->>>>>>> 172f1a532c5 (Update changelog)
 samba (2:4.14.2+ix-1) unstable; urgency=medium
 
   * Update to Samba 4.14.4.
