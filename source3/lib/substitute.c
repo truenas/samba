@@ -315,6 +315,10 @@ char *talloc_sub_basic(TALLOC_CTX *mem_ctx,
 
 		switch (*(p+1)) {
 		case 'U' : 
+			if (smb_name != NULL && smb_name[0] == '\0') {
+				DBG_ERR("empty smb_name string with U\n");
+				goto error;
+			}
 			r = strlower_talloc(tmp_ctx, smb_name);
 			if (r == NULL) {
 				goto error;
@@ -335,6 +339,10 @@ char *talloc_sub_basic(TALLOC_CTX *mem_ctx,
 						    *sep,
 						    smb_name);
 				is_domain_name = true;
+			} else if (smb_name != NULL && smb_name[0] == '\0') {
+				DBG_ERR("empty smb_name string and "
+					"domain_name string  with G\n");
+				goto error;
 			} else {
 				r = talloc_strdup(tmp_ctx, smb_name);
 			}
@@ -362,6 +370,10 @@ char *talloc_sub_basic(TALLOC_CTX *mem_ctx,
 			break;
 		}
 		case 'D' :
+			if (domain_name != NULL && domain_name[0] == '\0') {
+				DBG_ERR("empty domain_name string with D\n");
+				goto error;
+			}
 			r = strupper_talloc(tmp_ctx, domain_name);
 			if (r == NULL) {
 				goto error;
@@ -652,6 +664,10 @@ char *talloc_sub_full(TALLOC_CTX *ctx,
 			const char *str)
 {
 	char *a_string, *ret_string;
+
+	if (str == NULL) {
+		return NULL;
+	}
 
 	a_string = talloc_sub_advanced(ctx, servicename, user, connectpath,
 				       gid, str);
