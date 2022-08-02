@@ -518,7 +518,8 @@ static bool zfsentry2smbace(zfsacl_entry_t ae, SMB_ACE4PROP_T *aceprop)
 				     SMB_ACE4_DELETE);
 	}
 
-	if (aceprop->aceType == SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE) {
+	if ((aceprop->aceType == SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE) &&
+	    (aceprop->aceMask != 0)) {
 		aceprop->aceMask |= SMB_ACE4_SYNCHRONIZE;
 	}
 
