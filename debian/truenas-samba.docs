@@ -2,6 +2,5 @@ ctdb/README
 ctdb/README.eventscripts
 ctdb/README.notification
 ctdb/doc/*.txt
-#XXX: samba-common.docs
 README.md
 WHATSNEW.txt

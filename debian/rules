@@ -17,7 +17,8 @@ DEB_HOST_ARCH_CPU ?= $(shell dpkg-architecture -qDEB_HOST_ARCH_CPU)
 export PYSHORT=python3
 export PYTHON=$(shell which $(PYSHORT))
 export PYTHON_CONFIG="$(PYTHON)-config"
-WAF := $(PYTHON) ./buildtools/bin/waf -v
+#WAF := $(PYTHON) ./buildtools/bin/waf -v
+WAF = make
 WAF_NO_PARALLEL := $(WAF) -j 1
 
 ifneq (,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
@@ -57,7 +58,6 @@ conf_args = \
 		--disable-avahi \
 		--disable-rpath \
 		--disable-rpath-install \
-		--builtin-libraries=ccan,samba-cluster-support \
 		--minimum-library-version="$(shell ./debian/autodeps.py --minimum-library-version)" \
 		--with-cluster-support \
 		--with-socketpath=/run/ctdb/ctdbd.socket \
@@ -82,7 +82,7 @@ endif
 	dh $* --with python3
 
 override_dh_auto_configure:
-	$(WAF_NO_PARALLEL) configure $(conf_args)
+	./configure $(conf_args)
 
 override_dh_auto_build:
 	DESTDIR="$(DESTDIR)" $(WAF)
@@ -95,28 +95,14 @@ override_dh_auto_install:
 	DESTDIR="$(DESTDIR)" $(WAF) install
 	# get list of files in build log
 	find ${DESTDIR}
-	# Included in python-tevent
-	rm $(DESTDIR)/usr/lib/python*/*-packages/_tevent.*
-	rm $(DESTDIR)/usr/lib/python*/*-packages/tevent.py
 	# pam stuff
 	mkdir -p $(DESTDIR)/usr/share/pam-configs
 	mkdir -p $(DESTDIR)/var/db/system/samba4/private
 	install -m 0644 debian/winbind.pam-config $(DESTDIR)/usr/share/pam-configs/winbind
 	mv $(DESTDIR)/usr/lib/$(DEB_HOST_MULTIARCH)/libnss_* $(DESTDIR)/lib/$(DEB_HOST_MULTIARCH)/
-	# we don't ship the symlinks
-	rm $(DESTDIR)/lib/$(DEB_HOST_MULTIARCH)/libnss_*.so
-	#Remove unused vfstest manpage vfstest is no longer installed
-	rm $(DESTDIR)/usr/share/man/man1/vfstest.1
 	# Debian goodies
 	mkdir -p $(DESTDIR)/usr/share/samba/
 	cp debian/smb.conf* $(DESTDIR)/usr/share/samba/
-	install -m755 debian/update-apparmor-samba-profile $(DESTDIR)/usr/share/samba/update-apparmor-samba-profile
-	mkdir -p $(DESTDIR)/etc/dhcp/dhclient-enter-hooks.d
-	install -m755 debian/samba-common.dhcp $(DESTDIR)/etc/dhcp/dhclient-enter-hooks.d/samba
-	mkdir -p $(DESTDIR)/etc/ufw/applications.d
-	install -m644 debian/truenas-samba.ufw.profile $(DESTDIR)/etc/ufw/applications.d/samba
-	mkdir -p $(DESTDIR)/usr/share/apport/package-hooks
-	install -D -m 644 debian/source_samba.py $(DESTDIR)/usr/share/apport/package-hooks/source_samba.py
 	# Install other stuff not installed by "make install"
 	# This moves the dckeytab module to the samba package in order to avoid
 	# a circular dependency between python3-samba, samba and samba-common-bin
@@ -129,7 +115,6 @@ override_dh_auto_install:
 ifeq ($(DEB_HOST_ARCH_OS), linux)
 	# Install systemd configs
 	mkdir -p $(DESTDIR)/lib/systemd/system/
-	install -m 0644 ctdb/config/ctdb.service $(DESTDIR)/lib/systemd/system/
 	# Services fixups
 	mv $(DESTDIR)/lib/systemd/system/nmb.service $(DESTDIR)/lib/systemd/system/nmbd.service
 	mv $(DESTDIR)/lib/systemd/system/smb.service $(DESTDIR)/lib/systemd/system/smbd.service
@@ -141,11 +126,6 @@ ifeq ($(DEB_HOST_ARCH_OS), linux)
 	  $(DESTDIR)/lib/systemd/system/smbd.service \
 	  $(DESTDIR)/lib/systemd/system/winbind.service
 endif
-	# Harmless on systems without systemd-tmpfiles, and other consumers exist
-	# such as OpenRC's opentmpfiles
-	mkdir -p $(DESTDIR)/usr/lib/tmpfiles.d
-	echo "d /run/samba 0755 root root -" > $(DESTDIR)/usr/lib/tmpfiles.d/samba.conf
-	echo "d /run/ctdb 0755 root root -" > $(DESTDIR)/usr/lib/tmpfiles.d/ctdb.conf
 
 override_dh_installdocs-arch:
 	cp ctdb/config/events/README ctdb/README.eventscripts

@@ -3,6 +3,7 @@
 
 import errno
 import os, sys, re, fnmatch, shlex, inspect
+import traceback
 from optparse import SUPPRESS_HELP
 from waflib import Build, Options, Utils, Task, Logs, Configure, Errors, Context
 from waflib import Scripting
@@ -126,7 +127,8 @@ def install_rpath(target):
     ret = set()
     if bld.env.RPATH_ON_INSTALL:
         ret.add(bld.EXPAND_VARIABLES(bld.env.LIBDIR))
-    if bld.env.RPATH_ON_INSTALL_PRIVATE and needs_private_lib(bld, target):
+    #if bld.env.RPATH_ON_INSTALL_PRIVATE and needs_private_lib(bld, target):
+    if bld.env.RPATH_ON_INSTALL_PRIVATE:
         ret.add(bld.EXPAND_VARIABLES(bld.env.PRIVATELIBDIR))
     return list(ret)
 
