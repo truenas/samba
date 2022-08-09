@@ -1,6 +1,6 @@
 # Samba automatic dependency handling and project rules
 
-import os, sys, re
+import os, sys, traceback, re
 
 from waflib import Build, Options, Logs, Utils, Errors, Task
 from waflib.Logs import debug
