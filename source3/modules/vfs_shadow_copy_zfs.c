@@ -837,7 +837,7 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 				const struct files_struct *dirfsp,
 				const struct smb_filename *smb_fname_in,
 				files_struct *fsp,
-				int flags, mode_t mode)
+				const struct vfs_open_how *how)
 {
 	int ret;
 	char *tmp = NULL;
@@ -845,6 +845,7 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 	struct smb_filename *smb_fname = NULL;
 	struct snapshot_data *data = NULL;
 	struct shadow_copy_fsp_ext *fsp_ext = NULL;
+	struct vfs_open_how tmp_how = { .flags = how->flags, .mode = how->mode};
 
 	smb_fname = full_path_from_dirfsp_atname(talloc_tos(),
 						 dirfsp,
@@ -855,7 +856,7 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 		return SMB_VFS_NEXT_OPENAT(handle,
 					   dirfsp,
 					   smb_fname_in,
-					   fsp, flags, mode);
+					   fsp, how);
 	}
 
 	/*
@@ -890,10 +891,10 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 	}
 	TALLOC_FREE(smb_fname);
 
-	flags &= ~(O_WRONLY | O_RDWR | O_CREAT);
+	tmp_how.flags &= ~(O_WRONLY | O_RDWR | O_CREAT);
 
 	ret = SMB_VFS_NEXT_OPENAT(handle, dirfsp, conv_smb_fname,
-				  fsp, flags, mode);
+				  fsp, &tmp_how);
 
 	TALLOC_FREE(conv_smb_fname);
 
@@ -1243,11 +1244,13 @@ static int shadow_copy_zfs_fsetxattr(struct vfs_handle_struct *handle,
 	return SMB_VFS_NEXT_FSETXATTR(handle, fsp, aname, value, size, flags);
 }
 
-static int shadow_copy_zfs_get_real_filename(struct vfs_handle_struct *handle,
-					  const struct smb_filename *path,
-					  const char *name,
-					  TALLOC_CTX *mem_ctx,
-					  char **found_name)
+#if 0 /* XXX: MUST BE FIXED BEFORE RELEASE */
+static NTSTATUS shadow_copy2_get_real_filename_at(
+        struct vfs_handle_struct *handle,
+        struct files_struct *dirfsp,
+        const char *path,
+        TALLOC_CTX *mem_ctx,
+        char **found_name)
 {
 	ssize_t ret;
 	char *conv = NULL;
@@ -1268,14 +1271,15 @@ static int shadow_copy_zfs_get_real_filename(struct vfs_handle_struct *handle,
 		if (conv_smb_fname == NULL) {
 			return -1;
 		}
-		ret = SMB_VFS_NEXT_GET_REAL_FILENAME(handle, conv_smb_fname, name,
-						     mem_ctx, found_name);
+		ret = SMB_VFS_NEXT_GET_REAL_FILENAME_AT(handle, conv_smb_fname, name,
+							mem_ctx, found_name);
 		TALLOC_FREE(conv_smb_fname);
 		return ret;
 	}
 	return SMB_VFS_NEXT_GET_REAL_FILENAME(handle, path, name,
 					      mem_ctx, found_name);
 }
+#endif
 
 static const char *shadow_copy_zfs_connectpath(struct vfs_handle_struct *handle,
 					    const struct smb_filename *smb_fname)
@@ -1494,7 +1498,9 @@ static struct vfs_fn_pointers vfs_shadow_copy_zfs_fns = {
 	.mkdirat_fn = shadow_copy_zfs_mkdirat,
 	.fsetxattr_fn = shadow_copy_zfs_fsetxattr,
 	.fchflags_fn = shadow_copy_zfs_fchflags,
+#if 0 /* XXX: to fix */
 	.get_real_filename_fn = shadow_copy_zfs_get_real_filename,
+#endif
 	.connectpath_fn = shadow_copy_zfs_connectpath,
 };
 

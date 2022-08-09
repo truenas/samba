@@ -42,6 +42,7 @@
 #include "common/path.h"
 #include "protocol/protocol.h"
 #include "protocol/protocol_api.h"
+#include "protocol/protocol_basic.h"
 #include "protocol/protocol_util.h"
 #include "common/system_socket.h"
 #include "client/client.h"
@@ -71,6 +72,7 @@ typedef struct {
 	const char *ctdb_socket;
 	uint32_t pnn;
 	uint32_t target_pnn;
+	uint32_t leader_pnn;
 	uint64_t srvid;
 	int timeout;
 } py_ctdb_client_ctx;
@@ -188,7 +190,13 @@ static PyMethodDef ctdb_client_methods[] = {
 		.ml_name = "recmaster",
 		.ml_meth = py_ctdb_recmaster,
 		.ml_flags = METH_NOARGS,
-		.ml_doc = "Get CTDB cluster recovery master"
+		.ml_doc = "Get CTDB cluster recovery master (deprecated)"
+	},
+	{
+		.ml_name = "leader",
+		.ml_meth = py_ctdb_recmaster,
+		.ml_flags = METH_NOARGS,
+		.ml_doc = "Get CTDB cluster leader"
 	},
 	{
 		.ml_name = "runstate",
@@ -539,6 +547,25 @@ static PyTypeObject PyCtdbNode = {
 	.tp_flags = Py_TPFLAGS_DEFAULT|Py_TPFLAGS_BASETYPE,
 };
 
+static void leader_handler(uint64_t srvid,
+			   TDB_DATA data,
+			   void *private_data)
+{
+	py_ctdb_client_ctx *ctdb = NULL;
+	ctdb = (py_ctdb_client_ctx *)private_data;
+	uint32_t leader_pnn;
+	size_t np;
+	int ret;
+
+	ret = ctdb_uint32_pull(data.dptr, data.dsize, &leader_pnn, &np);
+	if (ret != 0) {
+		/* Ignore packet */
+		return;
+	}
+
+	ctdb->leader_pnn = leader_pnn;
+}
+
 static PyObject *py_ctdb_client_new(PyTypeObject *obj,
 				    PyObject *args_unused,
 				    PyObject *kwargs_unused)
@@ -587,6 +614,21 @@ static PyObject *py_ctdb_client_new(PyTypeObject *obj,
 	srvid_offset = getpid() & 0xFFFF;
 	self->srvid = SRVID_PY_CTDB | (srvid_offset << 16);
 	self->timeout = DEFAULT_TIMEOUT;
+	self->leader_pnn = CTDB_UNKNOWN_PNN;
+	err = ctdb_client_set_message_handler(self->ev,
+					      self->client,
+					      CTDB_SRVID_LEADER,
+					      leader_handler,
+					      self);
+	if (err) {
+		TALLOC_FREE(self->mem_ctx);
+		PyErr_Format(
+			PyExc_RuntimeError,
+			"ctdb_client_set_message_handler() failed: %s\n",
+			strerror(abs(err))
+		);
+		return NULL;
+	}
 
 	return (PyObject *)self;
 
@@ -780,6 +822,37 @@ static struct ctdb_node_map *read_nodes_file(TALLOC_CTX *mem_ctx, uint32_t pnn)
 
 	return nodemap;
 }
+
+static bool get_leader_done(void *private_data)
+{
+	py_ctdb_client_ctx *ctdb = NULL;
+	ctdb = (py_ctdb_client_ctx *)private_data;
+	return ctdb->leader_pnn != CTDB_UNKNOWN_PNN;
+} 
+
+static PyObject *get_leader(py_ctdb_client_ctx *ctdb)
+{
+	int err;
+
+	err = ctdb_client_wait_func_timeout(ctdb->ev,
+					    get_leader_done,
+					    ctdb,
+					    TIMEOUT(ctdb));
+
+	if (err == ETIMEDOUT) {
+		ctdb->leader_pnn = CTDB_UNKNOWN_PNN;
+	} else if (err != 0) {
+		PyErr_Format(
+			PyExc_RuntimeError,
+			"Failed to cluster leader : %s\n",
+			strerror(abs(err))
+		);
+		return NULL;
+	}
+
+	return Py_BuildValue("I", ctdb->leader_pnn);
+}
+
 
 /*
  * Get consistent nodemap information.
@@ -1196,6 +1269,7 @@ static PyObject *py_ctdb_status(PyObject *self, PyObject *args_unused)
 	PyObject *pynodes = NULL;
 	PyObject *pyvnn = NULL;
 	PyObject *out = NULL;
+	PyObject *leader = NULL;
 	int recmode;
 	uint32_t recmaster;
 	char *recmode_str;
@@ -1244,28 +1318,23 @@ static PyObject *py_ctdb_status(PyObject *self, PyObject *args_unused)
 		return NULL;
 	}
 
-	err = ctdb_ctrl_get_recmaster(ctx->mem_ctx, ctx->ev, ctx->client,
-				      ctx->target_pnn, TIMEOUT(ctx), &recmaster);
-	if (err != 0) {
+	leader = get_leader(ctx);
+	if (leader == NULL) {
 		Py_DECREF(pynodes);
 		Py_DECREF(pyvnn);
-		PyErr_Format(
-			PyExc_RuntimeError,
-			"Failed to get recmode: %s\n",
-			strerror(abs(err))
-		);
 		return NULL;
 	}
 
 	out = Py_BuildValue(
-		"{s:O,s:O,s:i,s:s,s:I}",
+		"{s:O,s:O,s:i,s:s,s:O}",
 		"nodemap", pynodes,
 		"vnnmap", pyvnn,
 		"recovery_mode_raw", recmode,
 		"recovery_mode_str", recmode == CTDB_RECOVERY_NORMAL ? "NORMAL" : "RECOVERY",
-		"recovery_master", recmaster
+		"leader_pnn", leader
 	);
 	Py_XDECREF(pynodes);
+	Py_XDECREF(leader);
 	Py_XDECREF(pyvnn);
 	if (out == NULL) {
 		PyErr_NoMemory();
@@ -1465,7 +1534,7 @@ static PyObject *py_ctdb_getcaps(PyObject *self, PyObject *args_unused)
 
 	out = Py_BuildValue(
 		"{s:O,s:O,s:I}",
-		"recmaster", (caps & CTDB_CAP_RECMASTER) ? Py_True : Py_False,
+		"leader", (caps & CTDB_CAP_RECMASTER) ? Py_True : Py_False,
 		"lmaster", (caps & CTDB_CAP_LMASTER) ? Py_True : Py_False,
 		"raw", caps
 	);
@@ -1479,20 +1548,7 @@ static PyObject *py_ctdb_getcaps(PyObject *self, PyObject *args_unused)
 static PyObject *py_ctdb_recmaster(PyObject *self, PyObject *args_unused)
 {
 	py_ctdb_client_ctx *ctx = (py_ctdb_client_ctx *)self;
-	uint32_t recmaster = 0;
-	int err;
-
-	err = ctdb_ctrl_get_recmaster(ctx->mem_ctx, ctx->ev, ctx->client,
-				      ctx->target_pnn, TIMEOUT(ctx), &recmaster);
-	if (err != 0) {
-		PyErr_Format(
-			PyExc_RuntimeError,
-			"Failed to get recmode: %s\n",
-			strerror(abs(err))
-		);
-		return NULL;
-	}
-	return Py_BuildValue("I", recmaster);
+	return get_leader(ctx);
 }
 
 static PyObject *py_ctdb_get_runstate(PyObject *self, PyObject *args_unused)

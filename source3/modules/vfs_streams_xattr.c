@@ -404,7 +404,7 @@ static int streams_xattr_openat(struct vfs_handle_struct *handle,
 		ret = SMB_VFS_FSETXATTR(fsp->base_fsp,
 					xattr_name,
 					NULL, 0,
-					flags & O_EXCL ? XATTR_CREATE : 0);
+					how->flags & O_EXCL ? XATTR_CREATE : 0);
 		if (ret != 0) {
 			goto fail;
 		}
