@@ -110,6 +110,7 @@ static NTSTATUS winmsa_inherit_acl(vfs_handle_struct *handle,
 	int flags, tmp_fd, error;
 	mode_t unix_mode;
 	bool do_acl_inherit;
+	struct vfs_open_how how;
 
 	status = create_internal_fsp(handle->conn, smb_fname, &tmp_fsp);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -142,7 +143,8 @@ static NTSTATUS winmsa_inherit_acl(vfs_handle_struct *handle,
 	/*
 	 * Use fd_openat() and fd_close() for symlink safety.
 	 */
-	status= fd_openat(dirfsp, tmp_fname, tmp_fsp, flags, unix_mode);
+	how = (struct vfs_open_how) { .flags = flags, .mode = unix_mode};
+	status= fd_openat(dirfsp, tmp_fname, tmp_fsp, &how);
 	if (!NT_STATUS_IS_OK(status)) {
 		DBG_ERR("Failed to open %s, flags 0x%08x, mode: 0o%o: %s\n",
 			smb_fname_str_dbg(tmp_fname), flags, unix_mode,
