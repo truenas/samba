@@ -23,6 +23,12 @@
 
 #ifndef __UTIL_SD_H__
 #define __UTIL_SD_H__
+#ifdef HAVE_JANSSON
+#include <jansson.h>
+#include "audit_logging.h" /* various JSON helpers */
+#include "auth/common_auth.h"
+#endif /*HAVE_JANSSON*/
+
 
 void SidToString(struct cli_state *cli, fstring str, const struct dom_sid *sid,
 		 bool numeric);
@@ -33,5 +39,7 @@ bool parse_ace(struct cli_state *cli, struct security_ace *ace,
 	       const char *orig_str);
 void sec_desc_print(struct cli_state *cli, FILE *f,
 		    struct security_descriptor *sd, bool numeric);
+bool sec_desc_to_json(struct cli_state *cli, struct json_object *out,
+                      struct security_descriptor *sd, bool numeric, bool share_acl);
 
 #endif
