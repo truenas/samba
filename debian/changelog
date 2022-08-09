@@ -1,8 +1,8 @@
-samba (2:4.17.RC0+ix-0) unstable; urgency=medium
+samba (2:4.17.0RC1+ix-0) unstable; urgency=medium
 
-  * Update to Samba 4.17 STABLE (prior to RC1)
+  * Update to Samba 4.17.0-RC1
 
- -- Andrew Walker <awalker@ixsystems.com>  Wed, 27 Jul 2022 17:00:00 +0000
+ -- Andrew Walker <awalker@ixsystems.com>  Tue, 09 Aug 2022 17:00:00 +0000
 
 
 
