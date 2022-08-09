@@ -404,7 +404,7 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 		 * ensure we have valid stat on our synthetic FSP
 		 */
 
-		status = inherit_new_acl(pathref->fsp_name, c_fsp);
+		status = inherit_new_acl(pathref, c_fsp);
 		if (!NT_STATUS_IS_OK(status)) {
 			DBG_ERR("fail: %s: %s\n", ds->mountpoint, nt_errstr(status));
 		}
