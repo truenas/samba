@@ -25,6 +25,13 @@
  *
  */
 
+#if defined (FREEBSD)
+#include <sys/param.h>
+#include <sys/ucred.h>
+#include <sys/mount.h>
+#else
+#include <fcntl.h>
+#endif
 #include <talloc.h>
 #include <sys/stat.h>
 #include <stdint.h>
@@ -1076,70 +1083,127 @@ zhandle_get_props(struct smbzhandle *zfsp_ext,
 	return 0;
 }
 
-bool resolve_legacy(struct zfs_dataset *ds)
+#if defined (FREEBSD)
+static bool resolve_legacy(struct zfs_dataset *ds)
 {
-	zfs_handle_t *zfsp = get_zhandle_from_smbzhandle(ds->zhandle);
-	zfs_handle_t *p = zfsp;
-	bool ok = false;
-	int ret;
-	char buf[ZFS_MAX_DATASET_NAME_LEN];
-	char parent[ZFS_MAX_DATASET_NAME_LEN];
-	char mp[PATH_MAX];
-	char *slashp = NULL;
+	const char *dsname = zfs_get_name(get_zhandle_from_smbzhandle(ds->zhandle));
+	struct statfs *sfs = NULL;
+	int err, i, nmounts;
 
-	strlcpy(buf, zfs_get_name(zfsp), sizeof(buf));
-	while ((slashp = strrchr(buf, '/'))) {
-		*parent = '\0';
-		*mp = '\0';
-		*slashp = '\0';
-		ret = zfs_parent_name(p, parent, sizeof(parent));
-		if (ret != 0) {
-			return false;
+	/* getfsstat() will return count of mounted filesystems if buf is NULL */
+	nmounts = getfsstat(sfs, 0, MNT_NOWAIT);
+	if (nmounts == -1) {
+		DBG_ERR("getfsstat() failed: %s", strerror(errno));
+		return false;
+	}
+
+	sfs = calloc(nmounts, sizeof(struct statfs));
+	if (sfs == NULL) {
+		DBG_ERR("calloc() failed: %s\n", strerror(errno));
+		return false;
+	}
+
+	err = getfsstat(sfs, (nmounts * sizeof(struct statfs)), MNT_NOWAIT);
+	if (err == -1) {
+		DBG_ERR("getfsstat() failed: %s", strerror(errno));
+		free(sfs);
+		return false;
+	}
+
+	for (i = 0; i < nmounts; i++) {
+		if (strcmp(dsname, sfs[i].f_mntfromname) != 0) {
+			continue;
 		}
-		if (p != zfsp) {
-			zfs_close(p);
-		}
-		p = zfs_open(ds->zhandle->lz,
-			     parent,
-			     ZFS_TYPE_DATASET);
+		strlcpy(ds->mountpoint, sfs[i].f_mntonname, sizeof(ds->mountpoint));
+		free(sfs);
+		return true;
+	}
 
-		ret = zfs_prop_get(p, ZFS_PROP_MOUNTPOINT, mp,
-				   sizeof(mp), NULL, NULL, 0, 0);
+	free(sfs);
+	return false;
+}
+#else
+static bool find_dataset_mp(FILE *mntinfo, struct zfs_dataset *ds)
+{
+	const char *dsname = zfs_get_name(get_zhandle_from_smbzhandle(ds->zhandle));
+	char *line = NULL;
+	size_t linecap = 0;
 
-		if (ret != 0) {
-			return false;
-		}
+	/*
+	 * Sample line from /proc/self/mountinfo:
+	 * 27 1 0:24 / / rw,relatime shared:1 - zfs boot-pool/ROOT/22.02.3 rw,xattr,noacl
+	 * (0)(1)(2)(3)(4) (5)       (6)      (7)(8)(9)                    (10)
+	 * 0 - mount id
+	 * 1 - parent id
+	 * 2 - major:minor
+	 * 3 - root
+	 * 4 - mount point
+	 * 5 - mount options
+	 * 6 - optional fields
+	 * 7 - separator
+	 * 8 - filesystem type
+	 * 9 - mount source
+	 * 10 - super_options
+	 */
+	while (getline(&line, &linecap, mntinfo) > 0) {
+		char *saveptr = NULL, *found = NULL, *token = NULL;
+		int i;
 
-		if (strcmp(mp, "legacy") == 0) {
+		found = strstr(line, dsname);
+		if (found == NULL) {
 			continue;
 		}
 
-		ok = true;
-		break;
-	}
-
-	if (!ok) {
-		if (p != zfsp) {
-			zfs_close(p);
+		/* Spaces are escaped in proc mountinfo */
+		if (((found + strlen(dsname))[0] != ' ') ||
+		    ((found - 1)[0] != ' ')) {
+			continue;
 		}
-		return false;
-	}
-	slashp = strstr(buf, zfs_get_name(p));
-	if (slashp == NULL) {
-		DBG_ERR("%s not found in %s\n", zfs_get_name(p), buf);
-		if (p != zfsp) {
-			zfs_close(p);
-		}
-		return false;
-	}
-	snprintf(ds->mountpoint, sizeof(ds->mountpoint), "%s%s",
-		 mp, slashp + strlen(zfs_get_name(p)));
 
-	if (p != zfsp) {
-		zfs_close(p);
+		token = strtok_r(line, " ", &saveptr);
+		for (i = 0; i < 4; i++) {
+			token = strtok_r(NULL, " ", &saveptr);
+			/*
+			 * Dump core if we have invalid lines in mountinfo
+			 * This would be something worth investigating.
+			 */
+			SMB_ASSERT(token != NULL);
+		}
+		strlcpy(ds->mountpoint, token, sizeof(ds->mountpoint));
+		free(line);
+		return true;
 	}
-	return true;
+	DBG_ERR("Failed to find dataset %s in /proc/self/mountinfo\n", dsname);
+	errno = ENOENT;
+	free(line);
+	return false;
 }
+
+static bool resolve_legacy(struct zfs_dataset *ds)
+{
+	FILE *mnt = NULL;
+	bool ok;
+	int fd;
+
+	fd = open("/proc/self/mountinfo", O_RDONLY);
+	if (fd == -1) {
+		DBG_ERR("Failed to open mountinfo %s\n", strerror(errno));
+		return NULL;
+	}
+
+	mnt = fdopen(fd, "r");
+	if (mnt == NULL) {
+		DBG_ERR("fdopen() failed: %s\n",
+			strerror(errno));
+		close(fd);
+		return NULL;
+	}
+
+	ok = find_dataset_mp(mnt, ds);
+	fclose(mnt);
+	return ok;
+}
+#endif
 
 dataset_t *lookup_dataset_by_devid(dev_t dev_id)
 {
@@ -1798,7 +1862,7 @@ int conn_zfs_init(TALLOC_CTX *mem_ctx,
 	}
 
 	ds = zhandle_get_dataset(mem_ctx, conn_zfsp, true, true);
-	if (has_tcon) {
+	if (has_tcon && ds) {
 		ret = put_share_dataset_list(mem_ctx, connectpath, ds);
 		if (ret != 0) {
 			DBG_ERR("Failed to store share dataset list\n");
