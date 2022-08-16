@@ -56,6 +56,7 @@ static struct zfs_dataset *smbfname_to_ds(const struct connection_struct *conn,
 	char path[PATH_MAX + 1];
 	int len;
 
+	SMB_ASSERT(config->ds != NULL);
 	if (VALID_STAT(smb_fname->st)) {
 		psbuf = &smb_fname->st;
 	}
@@ -717,6 +718,8 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 			    &config->ds,
 			    handle->conn->tcon != NULL);
 	if (ret != 0 || (config->ds == NULL)) {
+		config->zfs_space_enabled = false;
+		config->zfs_quota_enabled = false;
 		DBG_ERR("Failed to initialize ZFS data: %s\n",
 			strerror(errno));
 		return ret;
