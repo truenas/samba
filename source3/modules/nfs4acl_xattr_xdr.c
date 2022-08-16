@@ -276,6 +276,8 @@ static NTSTATUS nfs4acl_xdr_blob_to_nfs4acli(struct vfs_handle_struct *handle,
 	return NT_STATUS_OK;
 }
 
+#define ACL4_ALL_FLAGS (ACL4_AUTO_INHERIT | ACL4_PROTECTED | ACL4_DEFAULTED)
+
 static NTSTATUS nfs4acli_to_smb4acl(struct vfs_handle_struct *handle,
 				    TALLOC_CTX *mem_ctx,
 				    nfsacl41i *nacl,
@@ -300,7 +302,8 @@ static NTSTATUS nfs4acli_to_smb4acl(struct vfs_handle_struct *handle,
 	if (config->nfs_version > ACL4_XATTR_VERSION_40) {
 		nfsacl41_flag = nfs4acli_get_flags(nacl);
 		smb4acl_flags = nfs4acl_to_smb4acl_flags(nfsacl41_flag);
-		smbacl4_set_controlflags(smb4acl, smb4acl_flags);
+		smbacl4_set_controlflags(smb4acl, smb4acl_flags & ACL4_ALL_FLAGS);
+		smbacl4_set_trivial(smb4acl, smb4acl_flags & ACL4_IS_TRIVIAL);
 	}
 
 	DBG_DEBUG("flags [%x] nace [%u]\n", smb4acl_flags, naces);

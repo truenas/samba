@@ -93,6 +93,8 @@ const ACL4_XATTR_VERSION_DEFAULT = ACL4_XATTR_VERSION_40;
 const ACL4_AUTO_INHERIT         = 0x00000001;
 const ACL4_PROTECTED            = 0x00000002;
 const ACL4_DEFAULTED            = 0x00000004;
+const ACL4_IS_TRIVIAL           = 0x00010000;
+const ACL4_IS_DIR               = 0x00020000;
 
 typedef u_int aclflag4;
 

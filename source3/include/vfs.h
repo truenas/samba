@@ -440,6 +440,7 @@ typedef struct files_struct {
 		bool closing : 1;
 		bool lock_failure_seen : 1;
 		bool encryption_required : 1;
+		bool acl_is_trivial : 1;
 	} fsp_flags;
 
 	struct tevent_timer *update_write_time_event;
