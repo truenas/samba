@@ -1733,7 +1733,7 @@ static PyObject *ips_to_py(TALLOC_CTX *mem_ctx,
 			return NULL;
 		}
 
-		alias = py_ctdb_sock_addr(&ips->ip->addr, false);
+		alias = py_ctdb_sock_addr(&ips->ip[i].addr, false);
 		if (alias == NULL) {
 			return NULL;
 		}
