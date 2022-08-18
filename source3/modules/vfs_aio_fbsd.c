@@ -24,27 +24,6 @@
 #include <aio.h>
 
 /*
- * If possible, wait for existing aio requests to complete.
- * May need to fine-tune the timeout later.
- */
-static void vfs_aio_fbsd_request_waitcomplete(struct aiocb *iocbp)
-{
-	int ret;
-	struct timespec timeout = {5,0};
-	DBG_ERR("aio op currently in progress for "
-		"fd [%d], waiting for completion\n",
-		iocbp->aio_fildes);
-	ret = aio_waitcomplete(&iocbp, &timeout);
-	if (ret == -1) {
-		DBG_ERR("aio_waitcomplete() failed "
-			"%s\n", strerror(errno));
-	}
-	else if (ret == EINPROGRESS) {
-		DBG_ERR("timer expired and aio still in-flight\n");
-	}
-}
-
-/*
  * First try to cancel any pending AIO if the request is ending in
  * an unexpected fashion. Failing that, wait up to five seconds
  * for the pending AIO to complete.
@@ -53,37 +32,31 @@ static void vfs_aio_fbsd_cleanup(struct tevent_req *req,
 				 enum tevent_req_state req_state)
 {
 	int ret;
-	struct aiocb *iocbp = NULL;
+	struct tevent_aiocb *iocbp = NULL;
 	switch(req_state) {
 	case TEVENT_REQ_DONE:
 	case TEVENT_REQ_RECEIVED:
 	case TEVENT_REQ_USER_ERROR:
 		break;
 	default:
-		iocbp = tevent_req_data(req, struct aiocb);
+	        iocbp = tevent_req_data(req, struct tevent_aiocb);
 		if (iocbp == NULL) {
 			DBG_ERR("Failed to get tevent aio request in aio "
 				"aio cleanup function\n");
 			return;
 		}
-		ret = aio_cancel(iocbp->aio_fildes, iocbp);
-		if (ret == -1) {
-			DBG_ERR("aio_cancel returned -1: %s\n",
-				strerror(errno));
-		}
-		/* return 0x2 = AIO_NOTCANCELED */
-		else if (ret == 2) {
-			ret = aio_error(iocbp);
-			if (ret == -1) {
-				DBG_ERR("aio_error failed: %s\n",
-					strerror(errno));
-			}
-			else if (ret == EINPROGRESS) {
-				vfs_aio_fbsd_request_waitcomplete(iocbp);
-			}
-		}
+		tevent_aio_cancel(iocbp);
+		iocbp->completed = true;
 		break;
 	}
+}
+
+static int aio_destructor(struct tevent_aiocb *iocbp)
+{
+	if (!iocbp->completed) {
+		tevent_aio_cancel(iocbp);
+	}
+	return 0;
 }
 
 static struct tevent_req *vfs_aio_fbsd_pread_send(struct vfs_handle_struct *handle,
@@ -102,19 +75,21 @@ static struct tevent_req *vfs_aio_fbsd_pread_send(struct vfs_handle_struct *hand
 	if (req == NULL) {
 		return NULL;
 	}
-	taiocbp->iocbp = talloc_zero(req, struct aiocb);
+	taiocbp->iocbp = talloc_zero(taiocbp, struct aiocb);
+	taiocbp->ev = ev;
+	taiocbp->req = req;
 	iocbp = taiocbp->iocbp;
 
 	iocbp->aio_fildes = fsp_get_io_fd(fsp);
 	iocbp->aio_offset = offset;
 	iocbp->aio_buf = data;
 	iocbp->aio_sigevent.sigev_notify_kevent_flags = EV_ONESHOT;
-	iocbp->aio_sigevent.sigev_value.sival_ptr = req;
+	iocbp->aio_sigevent.sigev_value.sival_ptr = taiocbp;
 	iocbp->aio_sigevent.sigev_notify = SIGEV_KEVENT;
 	iocbp->aio_nbytes = n;
 
 	tevent_req_set_cleanup_fn(req, vfs_aio_fbsd_cleanup);
-	ret = tevent_add_aio_read(ev, taiocbp);
+	ret = tevent_add_aio_read(taiocbp);
 	if (ret != 0) {
 		if (errno == EAGAIN) {
 			taiocbp->rv = pread(fsp_get_io_fd(fsp), data, n, offset);
@@ -127,6 +102,7 @@ static struct tevent_req *vfs_aio_fbsd_pread_send(struct vfs_handle_struct *hand
 		tevent_req_error(req, errno);
 		return tevent_req_post(req, ev);
 	}
+	talloc_set_destructor(taiocbp, aio_destructor);
 	return req;
 }
 
@@ -155,17 +131,19 @@ static struct tevent_req *vfs_aio_fbsd_pwrite_send(struct vfs_handle_struct *han
 	if (req == NULL) {
 		return NULL;
 	}
-	taiocbp->iocbp = talloc_zero(req, struct aiocb);
+	taiocbp->iocbp = talloc_zero(taiocbp, struct aiocb);
+	taiocbp->ev = ev;
+	taiocbp->req = req;
 	iocbp = taiocbp->iocbp;
 	iocbp->aio_fildes = fsp_get_io_fd(fsp);
 	iocbp->aio_offset = offset;
 	iocbp->aio_buf = discard_const(data);
-	iocbp->aio_sigevent.sigev_value.sival_ptr = req;
+	iocbp->aio_sigevent.sigev_value.sival_ptr = taiocbp;
 	iocbp->aio_sigevent.sigev_notify_kevent_flags = EV_ONESHOT;
 	iocbp->aio_sigevent.sigev_notify = SIGEV_KEVENT;
 	iocbp->aio_nbytes = n;
 
-	ret = tevent_add_aio_write(ev, taiocbp);
+	ret = tevent_add_aio_write(taiocbp);
 	if (ret != 0) {
 		if (errno == EAGAIN) {
 			taiocbp->rv = pwrite(fsp_get_io_fd(fsp), data, n, offset);
@@ -178,6 +156,8 @@ static struct tevent_req *vfs_aio_fbsd_pwrite_send(struct vfs_handle_struct *han
 		tevent_req_error(req, errno);
 		return tevent_req_post(req, ev);
 	}
+
+	talloc_set_destructor(taiocbp, aio_destructor);
 	return req;
 }
 
@@ -195,15 +175,17 @@ static struct tevent_req *vfs_aio_fbsd_fsync_send(struct vfs_handle_struct *hand
 	if (req == NULL) {
 		return NULL;
 	}
-	taiocbp->iocbp = talloc_zero(req, struct aiocb);
+	taiocbp->iocbp = talloc_zero(taiocbp, struct aiocb);
+	taiocbp->ev = ev;
+	taiocbp->req = req;
 	iocbp = taiocbp->iocbp;
 	iocbp->aio_fildes = fsp_get_io_fd(fsp);
-	iocbp->aio_sigevent.sigev_value.sival_ptr = req;
+	iocbp->aio_sigevent.sigev_value.sival_ptr = taiocbp;
 	iocbp->aio_sigevent.sigev_notify = SIGEV_KEVENT;
 	iocbp->aio_sigevent.sigev_notify_kevent_flags = EV_ONESHOT;
 
 	tevent_req_set_cleanup_fn(req, vfs_aio_fbsd_cleanup);
-	ret = tevent_add_aio_fsync(ev, taiocbp);
+	ret = tevent_add_aio_fsync(taiocbp);
 	if (ret != 0) {
 		if (errno == EAGAIN) {
 			taiocbp->rv = fsync(fsp_get_io_fd(fsp));
@@ -216,6 +198,8 @@ static struct tevent_req *vfs_aio_fbsd_fsync_send(struct vfs_handle_struct *hand
 		tevent_req_error(req, errno);
 		return tevent_req_post(req, ev);
 	}
+
+	talloc_set_destructor(taiocbp, aio_destructor);
 	return req;
 }
 
