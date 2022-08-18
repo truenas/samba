@@ -25,11 +25,22 @@
 #include <aio.h>
 
 struct tevent_aiocb {
+	const char *location;
+	struct tevent_req *req;
+	struct tevent_context *ev;
 	struct aiocb *iocbp;
 	int saved_errno;
 	int rv;
+	bool completed;
 };
 
-int tevent_add_aio_read(struct tevent_context *ev, struct tevent_aiocb *taiocb);
-int tevent_add_aio_write(struct tevent_context *ev, struct tevent_aiocb *taiocb);
-int tevent_add_aio_fsync(struct tevent_context *ev, struct tevent_aiocb *taiocb);
+#define tevent_add_aio_read(taiocb)\
+        (int)_tevent_add_aio_read(taiocb, __location__)
+
+#define tevent_add_aio_write(taiocb)\
+        (int)_tevent_add_aio_write(taiocb, __location__)
+
+#define tevent_add_aio_fsync(taiocb)\
+        (int)_tevent_add_aio_fsync(taiocb, __location__)
+
+void tevent_aio_cancel(struct tevent_aiocb *taiocb);
