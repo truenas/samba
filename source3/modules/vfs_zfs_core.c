@@ -600,7 +600,6 @@ static int zfs_core_chdir(vfs_handle_struct *handle,
 	return SMB_VFS_NEXT_CHDIR(handle, smb_fname);
 }
 
-#if 0 /*pending rework of case insensitve renames */
 /*
  * Windows clients return NT_STATUS_OBJECT_NAME_COLLISION in case of
  * rename in case of rename in case insensitive dataset. MacOS does
@@ -633,6 +632,11 @@ static int zfs_core_renameat(vfs_handle_struct *handle,
 					     smb_fname_src,
 					     dstfsp,
 					     smb_fname_dst);
+	}
+
+	if (is_named_stream(smb_fname_src) || is_named_stream(smb_fname_dst)) {
+		errno = ENOENT;
+		return -1;
 	}
 
 	srcid = SMB_VFS_FS_FILE_ID(handle->conn, &srcfsp->fsp_name->st);
@@ -674,7 +678,6 @@ static int zfs_core_renameat(vfs_handle_struct *handle,
 	TALLOC_FREE(tmp_base_name);
 	return result;
 }
-#endif
 
 static int zfs_core_connect(struct vfs_handle_struct *handle,
 			    const char *service, const char *user)
@@ -758,6 +761,7 @@ static struct vfs_fn_pointers zfs_core_fns = {
 	.fs_capabilities_fn = zfs_core_fs_capabilities,
 	.chdir_fn = zfs_core_chdir,
 	.connect_fn = zfs_core_connect,
+	.renameat_fn = zfs_core_renameat,
 	.get_quota_fn = zfs_core_get_quota,
 	.set_quota_fn = zfs_core_set_quota,
 	.disk_free_fn = zfs_core_disk_free
