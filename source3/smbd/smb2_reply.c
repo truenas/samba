@@ -1385,7 +1385,7 @@ NTSTATUS rename_internals_fsp(connection_struct *conn,
 	NTSTATUS status = NT_STATUS_OK;
 	struct share_mode_lock *lck = NULL;
 	uint32_t access_mask = SEC_DIR_ADD_FILE;
-	bool dst_exists, old_is_stream, new_is_stream;
+	bool dst_exists, old_is_stream, new_is_stream, is_same_fileid;
 	int ret;
 	bool case_sensitive = (fsp->posix_flags & FSP_POSIX_FLAGS_OPEN) ?
 				true : conn->case_sensitive;
@@ -1546,7 +1546,15 @@ NTSTATUS rename_internals_fsp(connection_struct *conn,
 
 	dst_exists = vfs_stat(conn, smb_fname_dst) == 0;
 
-	if(!replace_if_exists && dst_exists) {
+	if (dst_exists) {
+		struct file_id file_id_src, file_id_dst;
+
+		file_id_src = vfs_file_id_from_sbuf(conn, &fsp->fsp_name->st);
+		file_id_dst = vfs_file_id_from_sbuf(conn, &smb_fname_dst->st);
+		is_same_fileid = file_id_equal(&file_id_src, &file_id_dst);
+	}
+
+	if(!replace_if_exists && dst_exists && !is_same_fileid) {
 		DEBUG(3, ("rename_internals_fsp: dest exists doing rename "
 			  "%s -> %s\n", smb_fname_str_dbg(fsp->fsp_name),
 			  smb_fname_str_dbg(smb_fname_dst)));
@@ -1564,7 +1572,7 @@ NTSTATUS rename_internals_fsp(connection_struct *conn,
 		SMB_ASSERT(smb_fname_dst_in->fsp == NULL);
 	}
 
-	if (dst_exists) {
+	if (dst_exists && !is_same_fileid) {
 		struct file_id fileid = vfs_file_id_from_sbuf(conn,
 		    &smb_fname_dst->st);
 		files_struct *dst_fsp = file_find_di_first(conn->sconn,
