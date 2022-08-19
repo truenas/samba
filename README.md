@@ -9,20 +9,11 @@ Since 1992, Samba has provided secure, stable and fast file and print services
 for all clients using the SMB/CIFS protocol, such as all versions of DOS
 and Windows, OS/2, Linux and many others.
 Samba is an important component to seamlessly integrate Linux/Unix Servers and
-Desktops into Active Directory environments. It can function both as a
-domain controller or as a regular domain member.
-
-
-For the AD DC implementation a full HOWTO is provided at:
-      https://wiki.samba.org/index.php/Samba4/HOWTO
-
-Community guidelines can be read at:
-      https://wiki.samba.org/index.php/How_to_do_Samba:_Nicely
+Desktops into Active Directory environments.
 
 This software is freely distributable under the GNU public license, a
 copy of which you should have received with this software (in a file
 called COPYING).
-
 
 
 CONTRIBUTIONS
@@ -34,19 +25,11 @@ for Samba via GitLab.
 
 Samba's GitLab mirror is at https://gitlab.com/samba-team/samba
 
-OUR CONTRIBUTORS
-================
+This particular Samba repository represents the Samba source included
+in TrueNAS.
 
-See https://www.samba.org/samba/team/ for details of the Samba Team,
-as well as details of all those currently active in Samba development.
-
-If you like a particular feature then look through the git change-log
-(on the web at https://gitweb.samba.org/?p=samba.git;a=summary) and see
-who added it, then send them an email.
-
-Remember that free software of this kind lives or dies by the response
-we get. If no one tells us they like it then we'll probably move onto
-something else.
+Any contributions and bug reports related to Samba in TrueNAS should be
+made through the iXsystems bug tracker at https://jira.ixsystems.com
 
 
 MORE INFO
@@ -61,6 +44,14 @@ including man pages and the wiki at https://wiki.samba.org
 If you would like to help with our documentation, please contribute
 that improved content to the wiki, we are moving as much content there
 as possible.
+
+TrueNAS-specific documentation may be found at https://truenas.com/docs
+
+
+IXSYSTEMS COMMUNITY FORUMS
+--------------------------
+Help configuring or troubleshooting Samba on TrueNAS may be found on
+the iXsystems community forum at https://ixsystems.com/community
 
 
 MAILING LIST
@@ -121,8 +112,6 @@ A few tips when submitting to this or any mailing list.
 
 7. Give as much *relevant* information as possible such as Samba
    release number, OS, kernel version, etc...
-
-8. RTFM. Google.
 
 
 WEBSITE
