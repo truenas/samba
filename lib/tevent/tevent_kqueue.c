@@ -453,29 +453,32 @@ static int kqueue_process_fd(struct kq_context *kqueue_ev,
 static void kqueue_process_aio(struct kq_context *kqueue_ev,
 			       void *udata)
 {
-	struct tevent_req *req = NULL;
 	struct tevent_aiocb *tiocbp = NULL;
 
-	req = talloc_get_type_abort(udata, struct tevent_req);
-	if (!tevent_req_is_in_progress(req)) {
-		return;
-	}
-	tiocbp = tevent_req_data(req, struct tevent_aiocb);
-	if (tiocbp == NULL) {
+	tiocbp = talloc_get_type_abort(udata, struct tevent_aiocb);
+	if (tiocbp->completed) {
 		tevent_debug(kqueue_ev->ev, TEVENT_DEBUG_FATAL,
-			     "failed to retrieve struct aiocb from "
-			     "tevent request. Aborting.\n");
+			     "aiocb request is already completed.\n");
 		abort();
 	}
+
+	if (!tevent_req_is_in_progress(tiocbp->req)) {
+		tevent_debug(kqueue_ev->ev, TEVENT_DEBUG_FATAL,
+			     "tevent request for aio event is not in progress.\n");
+		abort();
+	}
+
 	tiocbp->rv = aio_return(tiocbp->iocbp);
+	tiocbp->completed = true;
 	if (tiocbp->rv == -1) {
 		tevent_debug(kqueue_ev->ev, TEVENT_DEBUG_FATAL,
 			     "Processing AIO - failed: %s\n", strerror(errno));
 		tiocbp->saved_errno = errno;
-		tevent_req_error(req, errno);
+		tevent_req_error(tiocbp->req, errno);
 		return;
 	}
-	tevent_req_done(req);
+
+	tevent_req_done(tiocbp->req);
 }
 
 static void kqueue_process_kev(struct kq_context *kqueue_ev,
@@ -820,33 +823,99 @@ static int kqueue_event_context_init(struct tevent_context *ev)
 	return 0;
 }
 
-static struct aiocb *get_aiocb(struct tevent_context *ev,
-			       struct tevent_aiocb *taiocb)
+static void tevent_aio_waitcomplete(struct tevent_context *ev, struct aiocb *iocbp)
 {
-	struct kq_context *kqueue_ev = EVTOKQ(ev);
+	int ret;
+	struct timespec timeout = {30,0};
+
+	tevent_debug(
+		ev, TEVENT_DEBUG_WARNING,
+		"tevent_aio_waitcomplete(): aio op currently in progress for "
+		"fd [%d], waiting for completion\n", iocbp->aio_fildes
+	);
+
+	ret = aio_waitcomplete(&iocbp, &timeout);
+	if (ret == -1) {
+		tevent_debug(
+			ev, TEVENT_DEBUG_FATAL,
+			"tevent_aio_waitcomplete(): aio_waitcomplete() failed: %s\n",
+			strerror(errno)
+		);
+		abort();
+	} else if (ret == EINPROGRESS) {
+		tevent_debug(
+			ev, TEVENT_DEBUG_FATAL,
+			"tevent_aio_waitcomplete(): aio_waitcomplete() "
+			"failed to complete after 30 seconds\n"
+		);
+		abort();
+	}
+}
+
+void tevent_aio_cancel(struct tevent_aiocb *taiocb)
+{
+	int ret;
+	struct aiocb *iocbp = taiocb->iocbp;
+
+	if (taiocb->completed) {
+		abort();
+	}
+
+	ret = aio_cancel(iocbp->aio_fildes, iocbp);
+	if (ret == -1) {
+		tevent_debug(
+			taiocb->ev, TEVENT_DEBUG_WARNING,
+			"tevent_aio_cancel(): "
+			"aio_cancel() returned -1: %s\n",
+			 strerror(errno)
+		);
+		abort();
+
+	/* return 0x2 = AIO_NOTCANCELED */
+	} else if (ret == 2) {
+		ret = aio_error(iocbp);
+		if (ret == -1) {
+			tevent_debug(
+				taiocb->ev, TEVENT_DEBUG_WARNING,
+				"tevent_aio_cancel(): "
+				"aio_error() failed: %s\n",
+				 strerror(errno)
+			);
+			abort();
+		}
+		else if (ret == EINPROGRESS) {
+			tevent_aio_waitcomplete(taiocb->ev, iocbp);
+		}
+	}
+	taiocb->completed = true;
+}
+
+static struct aiocb *get_aiocb(struct tevent_aiocb *taiocb)
+{
+	struct kq_context *kqueue_ev = EVTOKQ(taiocb->ev);
 	struct aiocb *iocbp = taiocb->iocbp;
 	iocbp->aio_sigevent.sigev_notify_kqueue = kqueue_ev->rdwrq->kq_fd;
 	return iocbp;
 }
 
-int tevent_add_aio_read(struct tevent_context *ev,
-			struct tevent_aiocb *taiocb)
+int _tevent_add_aio_read(struct tevent_aiocb *taiocb, const char *location)
 {
-	struct aiocb *iocbp = get_aiocb(ev, taiocb);
+	struct aiocb *iocbp = get_aiocb(taiocb);
+	taiocb->location = location;
 	return aio_read(iocbp);
 }
 
-int tevent_add_aio_write(struct tevent_context *ev,
-			 struct tevent_aiocb *taiocb)
+int _tevent_add_aio_write(struct tevent_aiocb *taiocb, const char *location)
 {
-	struct aiocb *iocbp = get_aiocb(ev, taiocb);
+	struct aiocb *iocbp = get_aiocb(taiocb);
+	taiocb->location = location;
 	return aio_write(iocbp);
 }
 
-int tevent_add_aio_fsync(struct tevent_context *ev,
-			 struct tevent_aiocb *taiocb)
+int _tevent_add_aio_fsync(struct tevent_aiocb *taiocb, const char *location)
 {
-	struct aiocb *iocbp = get_aiocb(ev, taiocb);
+	struct aiocb *iocbp = get_aiocb(taiocb);
+	taiocb->location = location;
 	return aio_fsync(O_SYNC, iocbp);
 }
 
