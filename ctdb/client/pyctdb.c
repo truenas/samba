@@ -153,7 +153,7 @@ static PyMethodDef ctdb_client_methods[] = {
 	{
 		.ml_name = "status",
 		.ml_meth = py_ctdb_status,
-		.ml_flags = METH_NOARGS,
+		.ml_flags = METH_VARARGS,
 		.ml_doc = "Show node status"
 	},
 	{
@@ -1261,7 +1261,7 @@ static PyObject *vnnmap_to_python(TALLOC_CTX *mem_ctx,
 	return out;
 }
 
-static PyObject *py_ctdb_status(PyObject *self, PyObject *args_unused)
+static PyObject *py_ctdb_status(PyObject *self, PyObject *args)
 {
 	py_ctdb_client_ctx *ctx = (py_ctdb_client_ctx *)self;
 	struct ctdb_node_map *nodemap = NULL;
@@ -1270,10 +1270,15 @@ static PyObject *py_ctdb_status(PyObject *self, PyObject *args_unused)
 	PyObject *pyvnn = NULL;
 	PyObject *out = NULL;
 	PyObject *leader = NULL;
+	bool must_get_leader = false;
 	int recmode;
 	uint32_t recmaster;
 	char *recmode_str;
 	int err;
+
+	if (!PyArg_ParseTuple(args, "|b", &must_get_leader)) {
+		return NULL;
+	}
 
 	nodemap = get_nodemap(ctx, false);
 	if (nodemap == NULL) {
@@ -1318,7 +1323,11 @@ static PyObject *py_ctdb_status(PyObject *self, PyObject *args_unused)
 		return NULL;
 	}
 
-	leader = get_leader(ctx);
+	if (must_get_leader) {
+		leader = get_leader(ctx);
+	} else {
+		leader = Py_BuildValue("I", CTDB_UNKNOWN_PNN);
+	}
 	if (leader == NULL) {
 		Py_DECREF(pynodes);
 		Py_DECREF(pyvnn);
