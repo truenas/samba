@@ -117,7 +117,12 @@ static char *wcache_path(void)
 	 * Data needs to be kept persistent in state directory for
 	 * running with "winbindd offline logon".
 	 */
+#ifndef FREEBSD
+	return cache_path(talloc_tos(), "winbindd_cache.tdb");
+#else
 	return state_path(talloc_tos(), "winbindd_cache.tdb");
+#endif
+
 }
 
 static void winbindd_domain_init_backend(struct winbindd_domain *domain)
