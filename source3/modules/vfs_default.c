@@ -49,7 +49,28 @@
 
 static int vfswrap_connect(vfs_handle_struct *handle, const char *service, const char *user)
 {
+	bool bval;
+
 	handle->conn->have_proc_fds = sys_have_proc_fds();
+
+	/*
+	 * assume the kernel will support openat2(),
+	 * it will be reset on the first ENOSYS.
+	 *
+	 * Note that libreplace will always provide openat2(),
+	 * but return -1/errno = ENOSYS...
+	 *
+	 * The option is only there to test the fallback code.
+	 */
+	bval = lp_parm_bool(SNUM(handle->conn),
+			    "vfs_default",
+			    "VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS",
+			    true);
+	if (bval) {
+		handle->conn->open_how_resolve |=
+			VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS;
+	}
+
 	return 0;    /* Return >= 0 for success */
 }
 
@@ -701,24 +722,67 @@ static int vfswrap_openat(vfs_handle_struct *handle,
 
 	START_PROFILE(syscall_openat);
 
-	if (how->resolve != 0) {
+	if (how->resolve & ~VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS) {
 		errno = ENOSYS;
 		result = -1;
 		goto out;
 	}
 
-	if (is_named_stream(smb_fname)) {
-		errno = ENOENT;
-		result = -1;
-		goto out;
-	}
+	SMB_ASSERT(!is_named_stream(smb_fname));
 
 #ifdef O_PATH
 	have_opath = true;
 	if (fsp->fsp_flags.is_pathref) {
 		flags |= O_PATH;
 	}
+	if (flags & O_PATH) {
+		/*
+		 * From "man 2 openat":
+		 *
+		 *   When O_PATH is specified in flags, flag bits other than
+		 *   O_CLOEXEC, O_DIRECTORY, and O_NOFOLLOW are ignored.
+		 *
+		 * From "man 2 openat2":
+		 *
+		 *   Whereas  openat(2)  ignores  unknown  bits  in  its  flags
+		 *   argument, openat2() returns an error if unknown or
+		 *   conflicting flags are specified in how.flags.
+		 *
+		 * So we better clear ignored/invalid flags
+		 * and only keep the exptected once.
+		 */
+		flags &= (O_PATH|O_CLOEXEC|O_DIRECTORY|O_NOFOLLOW);
+	}
 #endif
+
+	if (how->resolve & VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS) {
+		struct open_how linux_how = {
+			.flags = flags,
+			.mode = mode,
+			.resolve = RESOLVE_NO_SYMLINKS,
+		};
+
+		result = openat2(fsp_get_pathref_fd(dirfsp),
+				 smb_fname->base_name,
+				 &linux_how,
+				 sizeof(linux_how));
+		if (result == -1) {
+			if (errno == ENOSYS) {
+				/*
+				 * The kernel doesn't support
+				 * openat2(), so indicate to
+				 * the callers that
+				 * VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS
+				 * would just be a waste of time.
+				 */
+				fsp->conn->open_how_resolve &=
+					~VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS;
+			}
+			goto out;
+		}
+
+		goto done;
+	}
 
 	if (fsp->fsp_flags.is_pathref && !have_opath) {
 		become_root();
@@ -734,6 +798,7 @@ static int vfswrap_openat(vfs_handle_struct *handle,
 		unbecome_root();
 	}
 
+done:
 	fsp->fsp_flags.have_proc_fds = fsp->conn->have_proc_fds;
 
 out:
@@ -1258,17 +1323,14 @@ static int vfswrap_renameat(vfs_handle_struct *handle,
 
 	START_PROFILE(syscall_renameat);
 
-	if (is_named_stream(smb_fname_src) || is_named_stream(smb_fname_dst)) {
-		errno = ENOENT;
-		goto out;
-	}
+	SMB_ASSERT(!is_named_stream(smb_fname_src));
+	SMB_ASSERT(!is_named_stream(smb_fname_dst));
 
 	result = renameat(fsp_get_pathref_fd(srcfsp),
 			smb_fname_src->base_name,
 			fsp_get_pathref_fd(dstfsp),
 			smb_fname_dst->base_name);
 
- out:
 	END_PROFILE(syscall_renameat);
 	return result;
 }
@@ -1280,14 +1342,11 @@ static int vfswrap_stat(vfs_handle_struct *handle,
 
 	START_PROFILE(syscall_stat);
 
-	if (is_named_stream(smb_fname)) {
-		errno = ENOENT;
-		goto out;
-	}
+	SMB_ASSERT(!is_named_stream(smb_fname));
 
 	result = sys_stat(smb_fname->base_name, &smb_fname->st,
 			  lp_fake_directory_create_times(SNUM(handle->conn)));
- out:
+
 	END_PROFILE(syscall_stat);
 	return result;
 }
@@ -1310,14 +1369,11 @@ static int vfswrap_lstat(vfs_handle_struct *handle,
 
 	START_PROFILE(syscall_lstat);
 
-	if (is_named_stream(smb_fname)) {
-		errno = ENOENT;
-		goto out;
-	}
+	SMB_ASSERT(!is_named_stream(smb_fname));
 
 	result = sys_lstat(smb_fname->base_name, &smb_fname->st,
 			   lp_fake_directory_create_times(SNUM(handle->conn)));
- out:
+
 	END_PROFILE(syscall_lstat);
 	return result;
 }
@@ -1333,10 +1389,7 @@ static int vfswrap_fstatat(
 
 	START_PROFILE(syscall_fstatat);
 
-	if (is_named_stream(smb_fname)) {
-		errno = ENOENT;
-		goto out;
-	}
+	SMB_ASSERT(!is_named_stream(smb_fname));
 
 	result = sys_fstatat(
 		fsp_get_pathref_fd(dirfsp),
@@ -1344,7 +1397,7 @@ static int vfswrap_fstatat(
 		sbuf,
 		flags,
 		lp_fake_directory_create_times(SNUM(handle->conn)));
- out:
+
 	END_PROFILE(syscall_fstatat);
 	return result;
 }
@@ -1440,6 +1493,8 @@ static NTSTATUS vfswrap_fsctl(struct vfs_handle_struct *handle,
 	const char *in_data = (const char *)_in_data;
 	char **out_data = (char **)_out_data;
 	NTSTATUS status;
+
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
 
 	switch (function) {
 	case FSCTL_SET_SPARSE:
@@ -1805,6 +1860,8 @@ static struct tevent_req *vfswrap_get_dos_attributes_send(
 	struct tevent_req *subreq = NULL;
 	struct vfswrap_get_dos_attributes_state *state = NULL;
 
+	SMB_ASSERT(!is_named_stream(smb_fname));
+
 	req = tevent_req_create(mem_ctx, &state,
 				struct vfswrap_get_dos_attributes_state);
 	if (req == NULL) {
@@ -1961,6 +2018,8 @@ static NTSTATUS vfswrap_fget_dos_attributes(struct vfs_handle_struct *handle,
 {
 	bool offline;
 
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
+
 	offline = vfswrap_is_offline(handle->conn, fsp->fsp_name);
 	if (offline) {
 		*dosmode |= FILE_ATTRIBUTE_OFFLINE;
@@ -1973,6 +2032,8 @@ static NTSTATUS vfswrap_fset_dos_attributes(struct vfs_handle_struct *handle,
 					    struct files_struct *fsp,
 					    uint32_t dosmode)
 {
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
+
 	return set_ea_dos_attribute(handle->conn, fsp->fsp_name, dosmode);
 }
 
@@ -2654,15 +2715,12 @@ static int vfswrap_unlinkat(vfs_handle_struct *handle,
 
 	START_PROFILE(syscall_unlinkat);
 
-	if (is_named_stream(smb_fname)) {
-		errno = ENOENT;
-		goto out;
-	}
+	SMB_ASSERT(!is_named_stream(smb_fname));
+
 	result = unlinkat(fsp_get_pathref_fd(dirfsp),
 			smb_fname->base_name,
 			flags);
 
- out:
 	END_PROFILE(syscall_unlinkat);
 	return result;
 }
@@ -3147,6 +3205,8 @@ static int vfswrap_linux_setlease(vfs_handle_struct *handle, files_struct *fsp,
 
 	START_PROFILE(syscall_linux_setlease);
 
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
+
 #ifdef HAVE_KERNEL_OPLOCKS_LINUX
 	result = linux_setlease(fsp_get_io_fd(fsp), leasetype);
 #else
@@ -3165,6 +3225,8 @@ static int vfswrap_symlinkat(vfs_handle_struct *handle,
 
 	START_PROFILE(syscall_symlinkat);
 
+	SMB_ASSERT(!is_named_stream(new_smb_fname));
+
 	result = symlinkat(link_target->base_name,
 			fsp_get_pathref_fd(dirfsp),
 			new_smb_fname->base_name);
@@ -3181,6 +3243,8 @@ static int vfswrap_readlinkat(vfs_handle_struct *handle,
 	int result;
 
 	START_PROFILE(syscall_readlinkat);
+
+	SMB_ASSERT(!is_named_stream(smb_fname));
 
 	result = readlinkat(fsp_get_pathref_fd(dirfsp),
 			smb_fname->base_name,
@@ -3202,6 +3266,9 @@ static int vfswrap_linkat(vfs_handle_struct *handle,
 
 	START_PROFILE(syscall_linkat);
 
+	SMB_ASSERT(!is_named_stream(old_smb_fname));
+	SMB_ASSERT(!is_named_stream(new_smb_fname));
+
 	result = linkat(fsp_get_pathref_fd(srcfsp),
 			old_smb_fname->base_name,
 			fsp_get_pathref_fd(dstfsp),
@@ -3221,6 +3288,8 @@ static int vfswrap_mknodat(vfs_handle_struct *handle,
 	int result;
 
 	START_PROFILE(syscall_mknodat);
+
+	SMB_ASSERT(!is_named_stream(smb_fname));
 
 	result = sys_mknodat(fsp_get_pathref_fd(dirfsp),
 			smb_fname->base_name,
@@ -3259,6 +3328,8 @@ static int vfswrap_fchflags(vfs_handle_struct *handle,
 {
 #ifdef HAVE_FCHFLAGS
 	int fd = fsp_get_pathref_fd(fsp);
+
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
 
 	if (!fsp->fsp_flags.is_pathref) {
 		return fchflags(fd, flags);
@@ -3330,6 +3401,8 @@ static NTSTATUS vfswrap_fstreaminfo(vfs_handle_struct *handle,
 	unsigned int num_streams = *pnum_streams;
 	struct stream_struct *streams = *pstreams;
 	NTSTATUS status;
+
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
 
 	if (fsp->fsp_flags.is_directory) {
 		/*
@@ -3431,6 +3504,9 @@ static NTSTATUS vfswrap_fget_nt_acl(vfs_handle_struct *handle,
 	NTSTATUS result;
 
 	START_PROFILE(fget_nt_acl);
+
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
+
 	result = posix_fget_nt_acl(fsp, security_info,
 				   mem_ctx, ppdesc);
 	END_PROFILE(fget_nt_acl);
@@ -3442,6 +3518,9 @@ static NTSTATUS vfswrap_fset_nt_acl(vfs_handle_struct *handle, files_struct *fsp
 	NTSTATUS result;
 
 	START_PROFILE(fset_nt_acl);
+
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
+
 	result = set_nt_acl(fsp, security_info_sent, psd);
 	END_PROFILE(fset_nt_acl);
 	return result;
@@ -3461,6 +3540,8 @@ static SMB_ACL_T vfswrap_sys_acl_get_fd(vfs_handle_struct *handle,
 					SMB_ACL_TYPE_T type,
 					TALLOC_CTX *mem_ctx)
 {
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
+
 	return sys_acl_get_fd(handle, fsp, type, mem_ctx);
 }
 
@@ -3469,12 +3550,16 @@ static int vfswrap_sys_acl_set_fd(vfs_handle_struct *handle,
 				  SMB_ACL_TYPE_T type,
 				  SMB_ACL_T theacl)
 {
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
+
 	return sys_acl_set_fd(handle, fsp, type, theacl);
 }
 
 static int vfswrap_sys_acl_delete_def_fd(vfs_handle_struct *handle,
 					 files_struct *fsp)
 {
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
+
 	return sys_acl_delete_def_fd(handle, fsp);
 }
 
@@ -3489,6 +3574,8 @@ static ssize_t vfswrap_fgetxattr(struct vfs_handle_struct *handle,
 				 size_t size)
 {
 	int fd = fsp_get_pathref_fd(fsp);
+
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
 
 	if (!fsp->fsp_flags.is_pathref) {
 		return fgetxattr(fd, name, value, size);
@@ -3559,6 +3646,8 @@ static struct tevent_req *vfswrap_getxattrat_send(
 	bool have_per_thread_cwd = false;
 	bool have_per_thread_creds = false;
 	bool do_async = false;
+
+	SMB_ASSERT(!is_named_stream(smb_fname));
 
 	req = tevent_req_create(mem_ctx, &state,
 				struct vfswrap_getxattrat_state);
@@ -3666,10 +3755,9 @@ static void vfswrap_getxattrat_do_sync(struct tevent_req *req)
 {
 	struct vfswrap_getxattrat_state *state = tevent_req_data(
 		req, struct vfswrap_getxattrat_state);
-	struct files_struct *fsp = metadata_fsp(state->smb_fname->fsp);
 
 	state->xattr_size = vfswrap_fgetxattr(state->handle,
-					      fsp,
+					      state->smb_fname->fsp,
 					      state->xattr_name,
 					      state->xattr_value,
 					      talloc_array_length(state->xattr_value));
@@ -3689,7 +3777,6 @@ static void vfswrap_getxattrat_do_async(void *private_data)
 	struct timespec start_time;
 	struct timespec end_time;
 	int ret;
-	struct files_struct *fsp = metadata_fsp(state->smb_fname->fsp);
 
 	PROFILE_TIMESTAMP(&start_time);
 	SMBPROFILE_BYTES_ASYNC_SET_BUSY(state->profile_bytes);
@@ -3713,7 +3800,7 @@ static void vfswrap_getxattrat_do_async(void *private_data)
 	}
 
 	state->xattr_size = vfswrap_fgetxattr(state->handle,
-					      fsp,
+					      state->smb_fname->fsp,
 					      state->xattr_name,
 					      state->xattr_value,
 					      talloc_array_length(state->xattr_value));
@@ -3814,6 +3901,8 @@ static ssize_t vfswrap_flistxattr(struct vfs_handle_struct *handle, struct files
 {
 	int fd = fsp_get_pathref_fd(fsp);
 
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
+
 	if (!fsp->fsp_flags.is_pathref) {
 		return flistxattr(fd, list, size);
 	}
@@ -3840,6 +3929,8 @@ static int vfswrap_fremovexattr(struct vfs_handle_struct *handle, struct files_s
 {
 	int fd = fsp_get_pathref_fd(fsp);
 
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
+
 	if (!fsp->fsp_flags.is_pathref) {
 		return fremovexattr(fd, name);
 	}
@@ -3865,6 +3956,8 @@ static int vfswrap_fremovexattr(struct vfs_handle_struct *handle, struct files_s
 static int vfswrap_fsetxattr(struct vfs_handle_struct *handle, struct files_struct *fsp, const char *name, const void *value, size_t size, int flags)
 {
 	int fd = fsp_get_pathref_fd(fsp);
+
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
 
 	if (!fsp->fsp_flags.is_pathref) {
 		return fsetxattr(fd, name, value, size, flags);

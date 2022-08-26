@@ -468,7 +468,7 @@ struct locking_tdb_data_fetch_state {
 static void locking_tdb_data_fetch_fn(
 	struct server_id exclusive,
 	size_t num_shared,
-	struct server_id *shared,
+	const struct server_id *shared,
 	const uint8_t *data,
 	size_t datalen,
 	void *private_data)
@@ -768,7 +768,7 @@ struct get_static_share_mode_data_state {
 static void get_static_share_mode_data_fn(
 	struct server_id exclusive,
 	size_t num_shared,
-	struct server_id *shared,
+	const struct server_id *shared,
 	const uint8_t *data,
 	size_t datalen,
 	void *private_data)
@@ -1005,6 +1005,17 @@ static int share_mode_lock_destructor(struct share_mode_lock *lck)
 	return 0;
 }
 
+/*******************************************************************
+ Fetch a share mode where we know one MUST exist. This call reference
+ counts it internally to allow for nested lock fetches.
+********************************************************************/
+
+struct share_mode_lock *get_existing_share_mode_lock(TALLOC_CTX *mem_ctx,
+						     const struct file_id id)
+{
+	return get_share_mode_lock(mem_ctx, id, NULL, NULL, NULL);
+}
+
 struct share_mode_do_locked_state {
 	TDB_DATA key;
 	void (*fn)(const uint8_t *buf,
@@ -1017,7 +1028,7 @@ struct share_mode_do_locked_state {
 static void share_mode_do_locked_fn(
 	struct server_id exclusive,
 	size_t num_shared,
-	struct server_id *shared,
+	const struct server_id *shared,
 	const uint8_t *data,
 	size_t datalen,
 	void *private_data)
@@ -1324,7 +1335,7 @@ struct fetch_share_mode_unlocked_state {
 static void fetch_share_mode_unlocked_parser(
 	struct server_id exclusive,
 	size_t num_shared,
-	struct server_id *shared,
+	const struct server_id *shared,
 	const uint8_t *data,
 	size_t datalen,
 	void *private_data)
@@ -1395,7 +1406,7 @@ struct fetch_share_mode_state {
 static void fetch_share_mode_fn(
 	struct server_id exclusive,
 	size_t num_shared,
-	struct server_id *shared,
+	const struct server_id *shared,
 	const uint8_t *data,
 	size_t datalen,
 	void *private_data);
@@ -1460,7 +1471,7 @@ struct tevent_req *fetch_share_mode_send(TALLOC_CTX *mem_ctx,
 static void fetch_share_mode_fn(
 	struct server_id exclusive,
 	size_t num_shared,
-	struct server_id *shared,
+	const struct server_id *shared,
 	const uint8_t *data,
 	size_t datalen,
 	void *private_data)
@@ -1564,7 +1575,7 @@ struct share_mode_forall_state {
 static void share_mode_forall_dump_fn(
 	struct server_id exclusive,
 	size_t num_shared,
-	struct server_id *shared,
+	const struct server_id *shared,
 	const uint8_t *data,
 	size_t datalen,
 	void *private_data)
@@ -1782,6 +1793,7 @@ bool set_share_mode(struct share_mode_lock *lck,
 		    uid_t uid,
 		    uint64_t mid,
 		    uint16_t op_type,
+		    const struct smb2_lease_key *lease_key,
 		    uint32_t share_access,
 		    uint32_t access_mask)
 {
@@ -1839,7 +1851,7 @@ bool set_share_mode(struct share_mode_lock *lck,
 	if (op_type == LEASE_OPLOCK) {
 		const struct GUID *client_guid = fsp_client_guid(fsp);
 		e.client_guid = *client_guid;
-		e.lease_key = fsp->lease->lease.lease_key;
+		e.lease_key = *lease_key;
 	}
 
 	ok = share_mode_entry_put(&e, &e_buf);
@@ -2108,7 +2120,7 @@ struct share_mode_count_entries_state {
 static void share_mode_count_entries_fn(
 	struct server_id exclusive,
 	size_t num_shared,
-	struct server_id *shared,
+	const struct server_id *shared,
 	const uint8_t *data,
 	size_t datalen,
 	void *private_data)

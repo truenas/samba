@@ -350,22 +350,10 @@ NTSTATUS sync_file(connection_struct *conn, files_struct *fsp, bool write_throug
 
 uint32_t ucf_flags_from_smb_request(struct smb_request *req);
 uint32_t filename_create_ucf_flags(struct smb_request *req, uint32_t create_disposition);
-NTSTATUS unix_convert(TALLOC_CTX *ctx,
-		      connection_struct *conn,
-		      const char *orig_path,
-		      NTTIME twrp,
-		      struct smb_filename **smb_fname,
-		      uint32_t ucf_flags);
 bool extract_snapshot_token(char *fname, NTTIME *twrp);
 NTSTATUS canonicalize_snapshot_path(struct smb_filename *smb_fname,
 				    uint32_t ucf_flags,
 				    NTTIME twrp);
-NTSTATUS get_real_filename_full_scan(connection_struct *conn,
-				     const char *path,
-				     const char *name,
-				     bool mangled,
-				     TALLOC_CTX *mem_ctx,
-				     char **found_name);
 NTSTATUS get_real_filename_full_scan_at(struct files_struct *dirfsp,
 					const char *name,
 					bool mangled,
@@ -395,7 +383,7 @@ void fsp_set_gen_id(files_struct *fsp);
 NTSTATUS file_new(struct smb_request *req, connection_struct *conn,
 		  files_struct **result);
 NTSTATUS fsp_bind_smb(struct files_struct *fsp, struct smb_request *req);
-void file_close_conn(connection_struct *conn);
+void file_close_conn(connection_struct *conn, enum file_close_type close_type);
 bool file_init_global(void);
 bool file_init(struct smbd_server_connection *sconn);
 void file_close_user(struct smbd_server_connection *sconn, uint64_t vuid);
@@ -560,13 +548,11 @@ bool remove_msdfs_link(const struct junction_map *jucn,
 struct junction_map *enum_msdfs_links(TALLOC_CTX *ctx,
 				      struct auth_session_info *session_info,
 				      size_t *p_num_jn);
-NTSTATUS dfs_redirect(TALLOC_CTX *ctx,
-			connection_struct *conn,
-			const char *name_in,
-			uint32_t ucf_flags,
-			bool allow_broken_path,
-			NTTIME *twrp,
-			char **pp_name_out);
+NTSTATUS dfs_filename_convert(TALLOC_CTX *ctx,
+			      connection_struct *conn,
+			      uint32_t ucf_flags,
+			      const char *dfs_path_in,
+			      char **pp_path_out);
 struct connection_struct;
 struct smb_filename;
 
@@ -942,6 +928,7 @@ bool disk_quotas(connection_struct *conn, struct smb_filename *fname,
 
 NTSTATUS check_path_syntax(char *path);
 NTSTATUS check_path_syntax_posix(char *path);
+NTSTATUS check_path_syntax_smb2(char *path, bool dfs_path);
 size_t srvstr_get_path(TALLOC_CTX *ctx,
 			const char *inbuf,
 			uint16_t smb_flags2,
@@ -1067,7 +1054,9 @@ NTSTATUS make_connection_snum(struct smbXsrv_connection *xconn,
 			      int snum,
 			      struct smbXsrv_session *session,
 			      const char *pdev);
-void close_cnum(connection_struct *conn, uint64_t vuid);
+void close_cnum(connection_struct *conn,
+		uint64_t vuid,
+		enum file_close_type close_type);
 
 /* The following definitions come from smbd/session.c  */
 struct sessionid;

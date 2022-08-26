@@ -1,7 +1,7 @@
 Release Announcements
 =====================
 
-This is the first release candidate of Samba 4.17.  This is *not*
+This is the third release candidate of Samba 4.17.  This is *not*
 intended for production environments and is designed for testing
 purposes only.  Please report any defects via the Samba bug reporting
 system at https://bugzilla.samba.org/.
@@ -15,6 +15,27 @@ UPGRADING
 
 NEW FEATURES/CHANGES
 ====================
+
+SMB Server performance improvements
+-----------------------------------
+
+The security improvements in recent releases
+(4.13, 4.14, 4.15, 4.16), mainly as protection against symlink races,
+caused performance regressions for meta data heavy workloads.
+
+With 4.17 the situation improved a lot again:
+
+- Pathnames given by a client are devided into dirname and basename.
+  The amount of syscalls to validate dirnames is reduced to 2 syscalls
+  (openat, close) per component. On modern Linux kernels (>= 5.6) smbd
+  makes use of the openat2() syscall with RESOLVE_NO_SYMLINKS,
+  in order to just use 2 syscalls (openat2, close) for the whole dirname.
+
+- Contended path based operations used to generate a lot of unsolicited
+  wakeup events causing thundering herd problems, which lead to masive
+  latencies for some clients. These events are now avoided in order
+  to provide stable latencies and much higher throughput of open/close
+  operations.
 
 Configure without the SMB1 Server
 ---------------------------------
@@ -147,6 +168,25 @@ can cause the Kerberos password salt to change.  This means that after
 *both* an account rename and a password change, only the current
 password will be recognised for password history purposes.
 
+Python API for smbconf
+----------------------
+
+Samba's smbconf library provides a generic frontend to various
+configuration backends (plain text file, registry) as a C library. A
+new Python wrapper, importable as 'samba.smbconf' is available.  An
+additional module, 'samba.samba3.smbconf', is also available to enable
+registry backend support. These libraries allow Python programs to
+read, and optionally write, Samba configuration natively.
+
+JSON support for smbstatus
+--------------------------
+
+It is now possible to print detailed information in JSON format in
+the smbstatus program using the new option --json. The JSON output
+covers all the existing text output including sessions, connections,
+open files, byte-range locks, notifies and profile data with all
+low-level information maintained by Samba in the respective databases.
+
 
 REMOVED FEATURES
 ================
@@ -164,6 +204,55 @@ smb.conf changes
   --------------                          -----------     -------
   dns port                                New default     53
   nt hash store				  New parameter   always
+  volume serial number			  New parameter   -1
+
+CHANGES SINCE 4.17.0rc2
+=======================
+
+o  Jeremy Allison <jra@samba.org>
+   * BUG 15128: Possible use after free of connection_struct when iterating
+     smbd_server_connection->connections.
+
+o  Christian Ambach <ambi@samba.org>
+   * BUG 15145: `net usershare add` fails with flag works with --long but fails
+     with -l.
+
+o  Ralph Boehme <slow@samba.org>
+   * BUG 15126: acl_xattr VFS module may unintentionally use filesystem
+     permissions instead of ACL from xattr.
+
+o  Stefan Metzmacher <metze@samba.org>
+   * BUG 15125: Performance regression on contended path based operations.
+   * BUG 15148: Missing READ_LEASE break could cause data corruption.
+
+o  Andreas Schneider <asn@samba.org>
+   * BUG 15141: libsamba-errors uses a wrong version number.
+
+o  Joseph Sutton <josephsutton@catalyst.net.nz>
+   * BUG 15152: SMB1 negotiation can fail to handle connection errors.
+
+
+CHANGES SINCE 4.17.0rc1
+=======================
+
+o  Jeremy Allison <jra@samba.org>
+   * BUG 15143: New filename parser doesn't check veto files smb.conf parameter.
+   * BUG 15144: 4.17.rc1 still uses symlink-race prone unix_convert()
+   * BUG 15146: Backport fileserver related changed to 4.17.0rc2
+
+o  Jule Anger <janger@samba.org>
+   * BUG 15147: Manpage for smbstatus json is missing
+
+o  Volker Lendecke <vl@samba.org>
+   * BUG 15146: Backport fileserver related changed to 4.17.0rc2
+
+o  Stefan Metzmacher <metze@samba.org>
+   * BUG 15125: Performance regression on contended path based operations
+   * BUG 15146: Backport fileserver related changed to 4.17.0rc2
+
+o  Andreas Schneider <asn@samba.org>
+   * BUG 15140: Fix issues found by coverity in smbstatus json code
+   * BUG 15146: Backport fileserver related changed to 4.17.0rc2
 
 
 KNOWN ISSUES

@@ -26,6 +26,7 @@ struct share_mode_lock;
 struct share_mode_entry;
 struct smb_filename;
 struct files_struct;
+struct smb2_lease_key;
 
 bool locking_init(void);
 bool locking_init_readonly(void);
@@ -37,6 +38,8 @@ struct share_mode_lock *get_share_mode_lock(
 	const char *servicepath,
 	const struct smb_filename *smb_fname,
 	const struct timespec *old_write_time);
+struct share_mode_lock *get_existing_share_mode_lock(TALLOC_CTX *mem_ctx,
+						     struct file_id id);
 
 bool del_share_mode(struct share_mode_lock *lck,
 		    struct files_struct *fsp);
@@ -52,6 +55,7 @@ bool set_share_mode(
 	uid_t uid,
 	uint64_t mid,
 	uint16_t op_type,
+	const struct smb2_lease_key *lease_key,
 	uint32_t share_access,
 	uint32_t access_mask);
 bool reset_share_mode_entry(

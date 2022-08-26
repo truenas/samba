@@ -128,8 +128,6 @@ void locking_close_file(files_struct *fsp,
 char *share_mode_str(TALLOC_CTX *ctx, int num,
 		     const struct file_id *id,
 		     const struct share_mode_entry *e);
-struct share_mode_lock *get_existing_share_mode_lock(TALLOC_CTX *mem_ctx,
-						     struct file_id id);
 
 bool rename_share_filename(struct messaging_context *msg_ctx,
 			struct share_mode_lock *lck,
@@ -212,7 +210,6 @@ bool release_posix_lock_posix_flavour(files_struct *fsp,
 /* The following definitions come from locking/leases_util.c */
 uint32_t map_oplock_to_lease_type(uint16_t op_type);
 uint32_t fsp_lease_type(struct files_struct *fsp);
-bool fsp_lease_type_is_exclusive(struct files_struct *fsp);
 const struct GUID *fsp_client_guid(const files_struct *fsp);
 
 #endif /* _LOCKING_PROTO_H_ */
