@@ -275,6 +275,8 @@ sub setup_nt4_dc
 	server schannel = auto
 	rpc start on demand helpers = false
 
+	vfs_default:VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS = no
+
 	fss: sequence timeout = 1
 	check parent directory delete on close = yes
 ";
@@ -1914,6 +1916,10 @@ sub setup_fileserver
 	path = $veto_sharedir
 	delete veto files = yes
 
+[veto_files]
+	path = $veto_sharedir
+	veto files = /veto_name*/
+
 [delete_yes_unwrite]
 	read only = no
 	path = $delete_unwrite_sharedir
@@ -2766,6 +2772,7 @@ sub provision($$)
 	panic action = cd $self->{srcdir} && $self->{srcdir}/selftest/gdb_backtrace %d %\$(MAKE_TEST_BINARY)
 	smbd:suicide mode = yes
 	smbd:FSCTL_SMBTORTURE = yes
+	smbd:validate_oplock_types = yes
 
 	client min protocol = SMB2_02
 	server min protocol = SMB2_02
@@ -3365,6 +3372,13 @@ sub provision($$)
 [streams_xattr]
 	copy = tmp
 	vfs objects = streams_xattr xattr_tdb
+
+[acl_streams_xattr]
+	copy = tmp
+	vfs objects = acl_xattr streams_xattr fake_acls xattr_tdb
+	acl_xattr:ignore system acls = yes
+	acl_xattr:security_acl_name = user.acl
+	xattr_tdb:ignore_user_xattr = yes
 
 [compound_find]
 	copy = tmp

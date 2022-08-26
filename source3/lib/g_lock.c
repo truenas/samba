@@ -236,7 +236,7 @@ struct g_lock_ctx *g_lock_ctx_init(TALLOC_CTX *mem_ctx,
 		mem_ctx,
 		db_path,
 		0,
-		TDB_CLEAR_IF_FIRST|TDB_INCOMPATIBLE_HASH,
+		TDB_CLEAR_IF_FIRST|TDB_INCOMPATIBLE_HASH|TDB_VOLATILE,
 		O_RDWR|O_CREAT,
 		0600,
 		DBWRAP_LOCK_ORDER_3,
@@ -1210,7 +1210,7 @@ struct g_lock_dump_state {
 	TDB_DATA key;
 	void (*fn)(struct server_id exclusive,
 		   size_t num_shared,
-		   struct server_id *shared,
+		   const struct server_id *shared,
 		   const uint8_t *data,
 		   size_t datalen,
 		   void *private_data);
@@ -1238,12 +1238,14 @@ static void g_lock_dump_fn(TDB_DATA key, TDB_DATA data,
 		return;
 	}
 
-	shared = talloc_array(
-		state->mem_ctx, struct server_id, lck.num_shared);
-	if (shared == NULL) {
-		DBG_DEBUG("talloc failed\n");
-		state->status = NT_STATUS_NO_MEMORY;
-		return;
+	if (lck.num_shared > 0) {
+		shared = talloc_array(
+			state->mem_ctx, struct server_id, lck.num_shared);
+		if (shared == NULL) {
+			DBG_DEBUG("talloc failed\n");
+			state->status = NT_STATUS_NO_MEMORY;
+			return;
+		}
 	}
 
 	for (i=0; i<lck.num_shared; i++) {
@@ -1265,7 +1267,7 @@ static void g_lock_dump_fn(TDB_DATA key, TDB_DATA data,
 NTSTATUS g_lock_dump(struct g_lock_ctx *ctx, TDB_DATA key,
 		     void (*fn)(struct server_id exclusive,
 				size_t num_shared,
-				struct server_id *shared,
+				const struct server_id *shared,
 				const uint8_t *data,
 				size_t datalen,
 				void *private_data),
@@ -1300,7 +1302,7 @@ struct tevent_req *g_lock_dump_send(
 	TDB_DATA key,
 	void (*fn)(struct server_id exclusive,
 		   size_t num_shared,
-		   struct server_id *shared,
+		   const struct server_id *shared,
 		   const uint8_t *data,
 		   size_t datalen,
 		   void *private_data),

@@ -82,6 +82,9 @@ NTSTATUS vfs_at_fspcwd(TALLOC_CTX *mem_ctx,
 		       struct connection_struct *conn,
 		       struct files_struct **_fsp);
 
+NTSTATUS vfs_fget_dos_attributes(struct files_struct *fsp,
+				 uint32_t *dosmode);
+
 #include "source3/lib/interface.h"
 
 /* The following definitions come from lib/ldap_debug_handler.c  */
@@ -171,7 +174,6 @@ int sys_fcntl_long(int fd, int cmd, long arg);
 int sys_fcntl_int(int fd, int cmd, int arg);
 void update_stat_ex_mtime(struct stat_ex *dst, struct timespec write_ts);
 void update_stat_ex_create_time(struct stat_ex *dst, struct timespec create_time);
-void update_stat_ex_file_id(struct stat_ex *dst, uint64_t file_id);
 void update_stat_ex_from_saved_stat(struct stat_ex *dst,
 				    const struct stat_ex *src);
 int sys_stat(const char *fname, SMB_STRUCT_STAT *sbuf,

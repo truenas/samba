@@ -913,11 +913,20 @@ NTSTATUS smbXsrv_tcon_disconnect(struct smbXsrv_tcon *tcon, uint64_t vuid)
 				  tcon->global->tcon_global_id,
 				  tcon->global->share_name,
 				  nt_errstr(status)));
+			/*
+			 * We must call close_cnum() on
+			 * error, as the caller is going
+			 * to free tcon and tcon->compat
+			 * so we must ensure tcon->compat is
+			 * removed from the linked list
+			 * conn->sconn->connections.
+			 */
+			close_cnum(tcon->compat, vuid, ERROR_CLOSE);
 			tcon->compat = NULL;
 			return status;
 		}
 
-		close_cnum(tcon->compat, vuid);
+		close_cnum(tcon->compat, vuid, SHUTDOWN_CLOSE);
 		tcon->compat = NULL;
 	}
 

@@ -366,7 +366,7 @@ NTSTATUS fget_ea_dos_attribute(struct files_struct *fsp,
 	/* Don't reset pattr to zero as we may already have filename-based attributes we
 	   need to preserve. */
 
-	sizeret = SMB_VFS_FGETXATTR(fsp->base_fsp ? fsp->base_fsp : fsp,
+	sizeret = SMB_VFS_FGETXATTR(fsp,
 				    SAMBA_XATTR_DOS_ATTRIB,
 				    attrstr,
 				    sizeof(attrstr));
@@ -377,7 +377,7 @@ NTSTATUS fget_ea_dos_attribute(struct files_struct *fsp,
 		   rights than the real user
 		*/
 		become_root();
-		sizeret = SMB_VFS_FGETXATTR(fsp->base_fsp ? fsp->base_fsp : fsp,
+		sizeret = SMB_VFS_FGETXATTR(fsp,
 					    SAMBA_XATTR_DOS_ATTRIB,
 					    attrstr,
 					    sizeof(attrstr));
@@ -727,7 +727,7 @@ uint32_t fdos_mode(struct files_struct *fsp)
 	}
 
 	/* Get the DOS attributes via the VFS if we can */
-	status = SMB_VFS_FGET_DOS_ATTRIBUTES(fsp->conn, fsp, &result);
+	status = vfs_fget_dos_attributes(fsp, &result);
 	if (!NT_STATUS_IS_OK(status)) {
 		/*
 		 * Only fall back to using UNIX modes if we get NOT_IMPLEMENTED.
@@ -932,9 +932,8 @@ int file_set_dosmode(connection_struct *conn,
 
 	if (smb_fname->fsp != NULL) {
 		/* Store the DOS attributes in an EA by preference. */
-		status = SMB_VFS_FSET_DOS_ATTRIBUTES(conn,
-						     smb_fname->fsp,
-						     dosmode);
+		status = SMB_VFS_FSET_DOS_ATTRIBUTES(
+			conn, metadata_fsp(smb_fname->fsp), dosmode);
 	} else {
 		status = NT_STATUS_OBJECT_NAME_NOT_FOUND;
 	}
@@ -1100,6 +1099,19 @@ NTSTATUS file_set_sparse(connection_struct *conn,
 		DEBUG(9, ("attempt to %s sparse flag over invalid conn\n",
 			  (sparse ? "set" : "clear")));
 		return NT_STATUS_INVALID_PARAMETER;
+	}
+
+	if (fsp_is_alternate_stream(fsp)) {
+		/*
+		 * MS-FSA 2.1.1.5 IsSparse
+		 *
+		 * This is a per stream attribute, but our backends don't
+		 * support it a consistent way, therefor just pretend
+		 * success and ignore the request.
+		 */
+		DBG_DEBUG("Ignoring request to set FILE_ATTRIBUTE_SPARSE on "
+			  "[%s]\n", fsp_str_dbg(fsp));
+		return NT_STATUS_OK;
 	}
 
 	DEBUG(10,("file_set_sparse: setting sparse bit %u on file %s\n",

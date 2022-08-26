@@ -244,6 +244,51 @@ NTSTATUS check_path_syntax_posix(char *path)
 }
 
 /****************************************************************************
+ Check the path for an SMB2 DFS path.
+ SMB2 DFS paths look like hostname\share (followed by a possible \extrapath.
+ Path returned from here must look like:
+	hostname/share (followed by a possible /extrapath).
+****************************************************************************/
+
+static NTSTATUS check_path_syntax_smb2_msdfs(char *path)
+{
+	char *share = NULL;
+	char *remaining_path = NULL;
+	/* No SMB2 names can start with '\\' */
+	if (path[0] == '\\') {
+		return NT_STATUS_OBJECT_NAME_INVALID;
+	}
+	/*
+	 * smbclient libraries sometimes set the DFS flag and send
+	 * local pathnames. Cope with this by just calling
+	 * check_path_syntax() on the whole path if it doesn't
+	 * look like a DFS path, similar to what parse_dfs_path() does.
+	 */
+	/* servername should be at path[0] */
+	share = strchr(path, '\\');
+	if (share == NULL) {
+		return check_path_syntax(path);
+	}
+	*share++ = '/';
+	remaining_path = strchr(share, '\\');
+	if (remaining_path == NULL) {
+		/* Only hostname\share. We're done. */
+		return NT_STATUS_OK;
+	}
+	*remaining_path++ = '/';
+	return check_path_syntax(remaining_path);
+}
+
+NTSTATUS check_path_syntax_smb2(char *path, bool dfs_path)
+{
+	if (dfs_path) {
+		return check_path_syntax_smb2_msdfs(path);
+	} else {
+		return check_path_syntax(path);
+	}
+}
+
+/****************************************************************************
  Pull a string and check the path allowing a wildcard - provide for error return.
  Passes in posix flag.
 ****************************************************************************/
@@ -309,6 +354,29 @@ static size_t srvstr_get_path_internal(TALLOC_CTX *ctx,
 		 * processing as a local path.
 		 */
 		server = dst;
+
+		/*
+		 * Cosmetic fix for Linux-only DFS clients.
+		 * The Linux kernel SMB1 client has a bug - it sends
+		 * DFS pathnames as:
+		 *
+		 * \\server\share\path
+		 *
+		 * Causing us to mis-parse server,share,remaining_path here
+		 * and jump into 'goto local_path' at 'share\path' instead
+		 * of 'path'.
+		 *
+		 * This doesn't cause an error as the limits on share names
+		 * are similar to those on pathnames.
+		 *
+		 * parse_dfs_path() which we call before filename parsing
+		 * copes with this by calling trim_char on the leading '\'
+		 * characters before processing.
+		 * Do the same here so logging of pathnames looks better.
+		 */
+		if (server[1] == path_sep) {
+			trim_char(&server[1], path_sep, '\0');
+		}
 
 		/*
 		 * Look to see if we also have /share following.

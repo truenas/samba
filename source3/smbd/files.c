@@ -793,21 +793,115 @@ NTSTATUS openat_pathref_dirfsp_nosymlink(
 		goto nomem;
 	}
 
+	/*
+	 * First split the path into individual components.
+	 */
 	path = path_to_strv(talloc_tos(), path_in);
 	if (path == NULL) {
 		DBG_DEBUG("path_to_strv() failed\n");
 		goto nomem;
 	}
-	rel_fname.base_name = path;
 
+	/*
+	 * First we loop over all components
+	 * in order to verify, there's no '.' or '..'
+	 */
+	rel_fname.base_name = path;
+	while (rel_fname.base_name != NULL) {
+
+		next = strv_next(path, rel_fname.base_name);
+
+		if (ISDOT(rel_fname.base_name) || ISDOTDOT(rel_fname.base_name)) {
+			DBG_DEBUG("%s contains a dot\n", path_in);
+			status = NT_STATUS_OBJECT_NAME_INVALID;
+			goto fail;
+		}
+
+		/* Check veto files. */
+		if (IS_VETO_PATH(conn, rel_fname.base_name)) {
+			DBG_DEBUG("%s contains veto files path component %s\n",
+				  path_in, rel_fname.base_name);
+			status = NT_STATUS_OBJECT_PATH_NOT_FOUND;
+			goto fail;
+		}
+
+		rel_fname.base_name = next;
+	}
+
+	if (conn->open_how_resolve & VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS) {
+
+		/*
+		 * Try a direct openat2 with RESOLVE_NO_SYMLINKS to
+		 * avoid the openat/close loop further down.
+		 */
+
+		rel_fname.base_name = discard_const_p(char, path_in);
+		how.resolve = VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS;
+
+		fd = SMB_VFS_OPENAT(conn, dirfsp, &rel_fname, fsp, &how);
+		if (fd >= 0) {
+			fsp_set_fd(fsp, fd);
+			TALLOC_FREE(full_fname.base_name);
+			full_fname = rel_fname;
+			goto done;
+		}
+
+		status = map_nt_error_from_unix(errno);
+		DBG_DEBUG("SMB_VFS_OPENAT(%s, %s, RESOLVE_NO_SYMLINKS) returned %d %s => %s\n",
+			  smb_fname_str_dbg(dirfsp->fsp_name), path_in,
+			  errno, strerror(errno), nt_errstr(status));
+		SMB_ASSERT(fd == -1);
+		switch (errno) {
+		case ENOSYS:
+			/*
+			 * We got ENOSYS, so fallback to the old code
+			 * if the kernel doesn't support openat2() yet.
+			 */
+			break;
+
+		case ELOOP:
+		case ENOTDIR:
+			/*
+			 * For ELOOP we also fallback in order to
+			 * return the correct information with
+			 * NT_STATUS_STOPPED_ON_SYMLINK.
+			 *
+			 * O_NOFOLLOW|O_DIRECTORY results in
+			 * ENOTDIR instead of ELOOP for the final
+			 * component.
+			 */
+			break;
+
+		case ENOENT:
+			/*
+			 * If we got ENOENT, the filesystem could
+			 * be case sensitive. For now we only do
+			 * the get_real_filename_at() dance in
+			 * the fallback loop below.
+			 */
+			break;
+
+		default:
+			goto fail;
+		}
+
+		/*
+		 * Just fallback to the openat loop
+		 */
+		how.resolve = 0;
+	}
+
+	/*
+	 * Now we loop over all components
+	 * opening each one and using it
+	 * as dirfd for the next one.
+	 *
+	 * It means we can detect symlinks
+	 * within the path.
+	 */
+	rel_fname.base_name = path;
 next:
 	next = strv_next(path, rel_fname.base_name);
-
-	if (ISDOT(rel_fname.base_name) || ISDOTDOT(rel_fname.base_name)) {
-		DBG_DEBUG("%s contains a dot\n", path_in);
-		status = NT_STATUS_OBJECT_NAME_INVALID;
-		goto fail;
-	}
 
 	fd = SMB_VFS_OPENAT(
 		conn,
@@ -817,6 +911,8 @@ next:
 		&how);
 
 	if ((fd == -1) && (errno == ENOENT)) {
+		const char *orig_base_name = rel_fname.base_name;
+
 		status = get_real_filename_at(
 			dirfsp,
 			rel_fname.base_name,
@@ -829,6 +925,14 @@ next:
 			goto fail;
 		}
 
+		/* Name might have been demangled - check veto files. */
+		if (IS_VETO_PATH(conn, rel_fname.base_name)) {
+			DBG_DEBUG("%s contains veto files path component %s => %s\n",
+				  path_in, orig_base_name, rel_fname.base_name);
+			status = NT_STATUS_OBJECT_PATH_NOT_FOUND;
+			goto fail;
+		}
+
 		fd = SMB_VFS_OPENAT(
 			conn,
 			dirfsp,
@@ -837,7 +941,15 @@ next:
 			&how);
 	}
 
-	if ((fd == -1) && (errno == ENOTDIR)) {
+	/*
+	 * O_NOFOLLOW|O_DIRECTORY results in
+	 * ENOTDIR instead of ELOOP.
+	 *
+	 * But we should be prepared to handle ELOOP too.
+	 */
+	if ((fd == -1) && (errno == ENOTDIR || errno == ELOOP)) {
+		NTSTATUS orig_status = map_nt_error_from_unix(errno);
+
 		status = readlink_talloc(
 			mem_ctx, dirfsp, &rel_fname, substitute);
 
@@ -856,6 +968,18 @@ next:
 					*unparsed = len - parsed;
 				}
 			}
+			/*
+			 * If we're on an MSDFS share, see if this is
+			 * an MSDFS link.
+			 */
+			if (lp_host_msdfs() &&
+			    lp_msdfs_root(SNUM(conn)) &&
+			    (substitute != NULL) &&
+			    strnequal(*substitute, "msdfs:", 6) &&
+			    is_msdfs_link(dirfsp, &rel_fname))
+			{
+				status = NT_STATUS_PATH_NOT_COVERED;
+			}
 		} else {
 
 			DBG_DEBUG("readlink_talloc failed: %s\n",
@@ -863,7 +987,7 @@ next:
 			/*
 			 * Restore the error status from SMB_VFS_OPENAT()
 			 */
-			status = NT_STATUS_NOT_A_DIRECTORY;
+			status = orig_status;
 		}
 		goto fail;
 	}
@@ -924,6 +1048,7 @@ next:
 		dirfsp = NULL;
 	}
 
+done:
 	fsp->fsp_flags.is_pathref = true;
 	fsp->fsp_name = NULL;
 
@@ -1133,7 +1258,8 @@ NTSTATUS parent_pathref(TALLOC_CTX *mem_ctx,
 	return NT_STATUS_OK;
 }
 
-static bool close_file_in_loop(struct files_struct *fsp)
+static bool close_file_in_loop(struct files_struct *fsp,
+			       enum file_close_type close_type)
 {
 	if (fsp_is_alternate_stream(fsp)) {
 		/*
@@ -1151,7 +1277,7 @@ static bool close_file_in_loop(struct files_struct *fsp)
 		fsp->base_fsp->stream_fsp = NULL;
 		fsp->base_fsp = NULL;
 
-		close_file_free(NULL, &fsp, SHUTDOWN_CLOSE);
+		close_file_free(NULL, &fsp, close_type);
 		return NULL;
 	}
 
@@ -1175,7 +1301,7 @@ static bool close_file_in_loop(struct files_struct *fsp)
 		return false;
 	}
 
-	close_file_free(NULL, &fsp, SHUTDOWN_CLOSE);
+	close_file_free(NULL, &fsp, close_type);
 	return true;
 }
 
@@ -1185,6 +1311,7 @@ static bool close_file_in_loop(struct files_struct *fsp)
 
 struct file_close_conn_state {
 	struct connection_struct *conn;
+	enum file_close_type close_type;
 	bool fsp_left_behind;
 };
 
@@ -1206,7 +1333,7 @@ static struct files_struct *file_close_conn_fn(
 		fsp->op->global->durable = false;
 	}
 
-	did_close = close_file_in_loop(fsp);
+	did_close = close_file_in_loop(fsp, state->close_type);
 	if (!did_close) {
 		state->fsp_left_behind = true;
 	}
@@ -1214,9 +1341,10 @@ static struct files_struct *file_close_conn_fn(
 	return NULL;
 }
 
-void file_close_conn(connection_struct *conn)
+void file_close_conn(connection_struct *conn, enum file_close_type close_type)
 {
-	struct file_close_conn_state state = { .conn = conn };
+	struct file_close_conn_state state = { .conn = conn,
+					       .close_type = close_type };
 
 	files_forall(conn->sconn, file_close_conn_fn, &state);
 
@@ -1302,7 +1430,7 @@ static struct files_struct *file_close_user_fn(
 		return NULL;
 	}
 
-	did_close = close_file_in_loop(fsp);
+	did_close = close_file_in_loop(fsp, SHUTDOWN_CLOSE);
 	if (!did_close) {
 		state->fsp_left_behind = true;
 	}

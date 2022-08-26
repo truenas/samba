@@ -75,7 +75,8 @@ static int add_server_id_to_json(struct json_object *parent_json,
 		goto failure;
 	}
 
-	pid_str = talloc_asprintf(tmp_ctx, "%lu", server_id.pid);
+	pid_str = talloc_asprintf(
+		tmp_ctx, "%lu", (unsigned long)server_id.pid);
 	result = json_add_string(&sub_json, "pid", pid_str);
 	if (result < 0) {
 		goto failure;
@@ -90,7 +91,8 @@ static int add_server_id_to_json(struct json_object *parent_json,
 	if (result < 0) {
 		goto failure;
 	}
-	unique_id_str = talloc_asprintf(tmp_ctx, "%lu", server_id.unique_id);
+	unique_id_str = talloc_asprintf(
+		tmp_ctx, "%"PRIu64, server_id.unique_id);
 	result = json_add_string(&sub_json, "unique_id", unique_id_str);
 	if (result < 0) {
 		goto failure;
@@ -187,7 +189,12 @@ int add_profile_item_to_json(struct traverse_state *state,
 			     const char *key,
 			     uintmax_t value)
 {
-	struct json_object section_json, subsection_json;
+	struct json_object section_json = {
+		.valid = false,
+	};
+	struct json_object subsection_json = {
+		.valid = false,
+	};
 	int result = 0;
 
 	section_json = json_get_object(&state->root_json, section);
@@ -794,8 +801,12 @@ static int add_open_to_json(struct json_object *parent_json,
 			    uint32_t lease_type,
 			    const char *uid_str)
 {
-	struct json_object sub_json;
-	struct json_object opens_json;
+	struct json_object sub_json = {
+		.valid = false,
+	};
+	struct json_object opens_json = {
+		.valid = false,
+	};
 	struct timeval_buf tv_buf;
 	int result = 0;
 	char *timestr;
@@ -834,7 +845,7 @@ static int add_open_to_json(struct json_object *parent_json,
 	if (result < 0) {
 		goto failure;
 	}
-	share_file_id = talloc_asprintf(tmp_ctx, "%lu", e->share_file_id);
+	share_file_id = talloc_asprintf(tmp_ctx, "%"PRIu64, e->share_file_id);
 	result = json_add_string(&sub_json, "share_file_id", share_file_id);
 	if (result < 0) {
 		goto failure;
@@ -871,7 +882,7 @@ static int add_open_to_json(struct json_object *parent_json,
 	}
 
 	pid = server_id_str_buf(e->pid, &tmp);
-	key = talloc_asprintf(tmp_ctx, "%s/%lu", pid, e->share_file_id);
+	key = talloc_asprintf(tmp_ctx, "%s/%"PRIu64, pid, e->share_file_id);
 	result = json_add_object(&opens_json, key, &sub_json);
 	if (result < 0) {
 		goto failure;
@@ -934,8 +945,12 @@ int print_share_mode_json(struct traverse_state *state,
 			  uint32_t lease_type,
 			  const char *filename)
 {
-	struct json_object locks_json;
-	struct json_object file_json;
+	struct json_object locks_json = {
+		.valid = false,
+	};
+	struct json_object file_json = {
+		.valid = false,
+	};
 	char *key = NULL;
 	int result = 0;
 
@@ -1011,8 +1026,12 @@ static int add_lock_to_json(struct json_object *parent_json,
 			    intmax_t start,
 			    intmax_t size)
 {
-	struct json_object sub_json;
-	struct json_object locks_json;
+	struct json_object sub_json = {
+		.valid = false,
+	};
+	struct json_object locks_json = {
+		.valid = false,
+	};
 	const char *flavour_str;
 	int result = 0;
 
@@ -1196,7 +1215,7 @@ bool print_notify_rec_json(struct traverse_state *state,
 		goto failure;
 	}
 	subdir_filter = talloc_asprintf(tmp_ctx, "%u", instance->subdir_filter);
-	if (filter == NULL) {
+	if (subdir_filter == NULL) {
 		goto failure;
 	}
 	result = json_add_string(&sub_json, "subdir_filter", subdir_filter);

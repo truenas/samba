@@ -99,9 +99,11 @@ static NTSTATUS smbd_check_access_rights_fname(
 				struct connection_struct *conn,
 				const struct smb_filename *smb_fname,
 				bool use_privs,
-				uint32_t access_mask)
+				uint32_t access_mask,
+				uint32_t do_not_check_mask)
 {
 	uint32_t rejected_share_access;
+	uint32_t effective_access;
 
 	rejected_share_access = access_mask & ~(conn->share_access);
 
@@ -112,6 +114,14 @@ static NTSTATUS smbd_check_access_rights_fname(
 			  smb_fname_str_dbg(smb_fname),
 			  rejected_share_access);
 		return NT_STATUS_ACCESS_DENIED;
+	}
+
+	effective_access = access_mask & ~do_not_check_mask;
+	if (effective_access == 0) {
+		DBG_DEBUG("do_not_check_mask override on %s. Granting 0x%x for free.\n",
+			  smb_fname_str_dbg(smb_fname),
+			  (unsigned int)access_mask);
+		return NT_STATUS_OK;
 	}
 
 	if (!use_privs && get_current_uid(conn) == (uid_t)0) {
@@ -151,37 +161,14 @@ static NTSTATUS smbd_check_access_rights_sd(
 				const struct smb_filename *smb_fname,
 				struct security_descriptor *sd,
 				bool use_privs,
-				uint32_t access_mask)
+				uint32_t access_mask,
+				uint32_t do_not_check_mask)
 {
 	uint32_t rejected_mask = access_mask;
-	uint32_t do_not_check_mask = 0;
 	NTSTATUS status;
 
 	if (sd == NULL) {
 		goto access_denied;
-	}
-
- 	/*
-	 * If we can access the path to this file, by
-	 * default we have FILE_READ_ATTRIBUTES from the
-	 * containing directory. See the section:
-	 * "Algorithm to Check Access to an Existing File"
-	 * in MS-FSA.pdf.
-	 *
-	 * se_file_access_check() also takes care of
-	 * owner WRITE_DAC and READ_CONTROL.
-	 */
-	do_not_check_mask = FILE_READ_ATTRIBUTES;
-
-	/*
-	 * Samba 3.6 and earlier granted execute access even
-	 * if the ACL did not contain execute rights.
-	 * Samba 4.0 is more correct and checks it.
-	 * The compatibilty mode allows one to skip this check
-	 * to smoothen upgrades.
-	 */
-	if (lp_acl_allow_execute_always(SNUM(conn))) {
-		do_not_check_mask |= FILE_EXECUTE;
 	}
 
 	status = se_file_access_check(sd,
@@ -264,6 +251,7 @@ NTSTATUS smbd_check_access_rights_fsp(struct files_struct *dirfsp,
 				      uint32_t access_mask)
 {
 	struct security_descriptor *sd = NULL;
+	uint32_t do_not_check_mask = 0;
 	NTSTATUS status;
 
 	/* Cope with fake/printer fsp's. */
@@ -289,15 +277,39 @@ NTSTATUS smbd_check_access_rights_fsp(struct files_struct *dirfsp,
 		return NT_STATUS_OK;
 	}
 
+	/*
+	 * If we can access the path to this file, by
+	 * default we have FILE_READ_ATTRIBUTES from the
+	 * containing directory. See the section:
+	 * "Algorithm to Check Access to an Existing File"
+	 * in MS-FSA.pdf.
+	 *
+	 * se_file_access_check() also takes care of
+	 * owner WRITE_DAC and READ_CONTROL.
+	 */
+	do_not_check_mask = FILE_READ_ATTRIBUTES;
+
+	/*
+	 * Samba 3.6 and earlier granted execute access even
+	 * if the ACL did not contain execute rights.
+	 * Samba 4.0 is more correct and checks it.
+	 * The compatibilty mode allows one to skip this check
+	 * to smoothen upgrades.
+	 */
+	if (lp_acl_allow_execute_always(SNUM(fsp->conn))) {
+		do_not_check_mask |= FILE_EXECUTE;
+	}
+
 	status = smbd_check_access_rights_fname(fsp->conn,
 						fsp->fsp_name,
 						use_privs,
-						access_mask);
+						access_mask,
+						do_not_check_mask);
 	if (!NT_STATUS_EQUAL(status, NT_STATUS_MORE_PROCESSING_REQUIRED)) {
 		return status;
 	}
 
-	status = SMB_VFS_FGET_NT_ACL(fsp,
+	status = SMB_VFS_FGET_NT_ACL(metadata_fsp(fsp),
 				     (SECINFO_OWNER |
 				      SECINFO_GROUP |
 				      SECINFO_DACL),
@@ -315,7 +327,8 @@ NTSTATUS smbd_check_access_rights_fsp(struct files_struct *dirfsp,
 					   fsp->fsp_name,
 					   sd,
 					   use_privs,
-					   access_mask);
+					   access_mask,
+					   do_not_check_mask);
 }
 
 /*
@@ -1441,7 +1454,7 @@ static NTSTATUS open_file(struct smb_request *req,
 #endif
 
 		/* Don't create files with Microsoft wildcard characters. */
-		if (fsp->base_fsp) {
+		if (fsp_is_alternate_stream(fsp)) {
 			/*
 			 * wildcard characters are allowed in stream names
 			 * only test the basefilename
@@ -1457,7 +1470,7 @@ static NTSTATUS open_file(struct smb_request *req,
 		}
 
 		/* Can we access this file ? */
-		if (!fsp->base_fsp) {
+		if (!fsp_is_alternate_stream(fsp)) {
 			/* Only do this check on non-stream open. */
 			if (file_existed) {
 				status = smbd_check_access_rights_fsp(
@@ -1646,29 +1659,36 @@ static NTSTATUS open_file(struct smb_request *req,
 			}
 		}
 
-		status = smbd_check_access_rights_fsp(dirfsp,
-						      fsp,
-						      false,
-						      access_mask);
+		/*
+		 * Access to streams is checked by checking the basefile and
+		 * that has alreay been checked by check_base_file_access()
+		 * in create_file_unixpath().
+		 */
+		if (!fsp_is_alternate_stream(fsp)) {
+			status = smbd_check_access_rights_fsp(dirfsp,
+							      fsp,
+							      false,
+							      access_mask);
 
-		if (NT_STATUS_EQUAL(status, NT_STATUS_OBJECT_NAME_NOT_FOUND) &&
-				posix_open &&
-				S_ISLNK(smb_fname->st.st_ex_mode)) {
-			/* This is a POSIX stat open for delete
-			 * or rename on a symlink that points
-			 * nowhere. Allow. */
-			DEBUG(10,("open_file: allowing POSIX "
-				  "open on bad symlink %s\n",
-				  smb_fname_str_dbg(smb_fname)));
-			status = NT_STATUS_OK;
-		}
+			if (NT_STATUS_EQUAL(status, NT_STATUS_OBJECT_NAME_NOT_FOUND) &&
+			    posix_open &&
+			    S_ISLNK(smb_fname->st.st_ex_mode)) {
+				/* This is a POSIX stat open for delete
+				 * or rename on a symlink that points
+				 * nowhere. Allow. */
+				DEBUG(10,("open_file: allowing POSIX "
+					  "open on bad symlink %s\n",
+					  smb_fname_str_dbg(smb_fname)));
+				status = NT_STATUS_OK;
+			}
 
-		if (!NT_STATUS_IS_OK(status)) {
-			DBG_DEBUG("smbd_check_access_rights_fsp on file "
-				"%s returned %s\n",
-				fsp_str_dbg(fsp),
-				nt_errstr(status));
-			return status;
+			if (!NT_STATUS_IS_OK(status)) {
+				DBG_DEBUG("smbd_check_access_rights_fsp on file "
+					  "%s returned %s\n",
+					  fsp_str_dbg(fsp),
+					  nt_errstr(status));
+				return status;
+			}
 		}
 	}
 
@@ -2225,7 +2245,20 @@ static bool validate_oplock_types_fn(
 static bool validate_oplock_types(struct share_mode_lock *lck)
 {
 	struct validate_oplock_types_state state = { .valid = true };
+	static bool skip_validation;
+	bool validate;
 	bool ok;
+
+	if (skip_validation) {
+		return true;
+	}
+
+	validate = lp_parm_bool(-1, "smbd", "validate_oplock_types", false);
+	if (!validate) {
+		DBG_DEBUG("smbd:validate_oplock_types not set to yes\n");
+		skip_validation = true;
+		return true;
+	}
 
 	ok = share_mode_forall_entries(lck, validate_oplock_types_fn, &state);
 	if (!ok) {
@@ -2538,7 +2571,7 @@ static bool delay_for_oplock_fn(
 	struct files_struct *fsp = state->fsp;
 	const struct smb2_lease *lease = state->lease;
 	bool e_is_lease = (e->op_type == LEASE_OPLOCK);
-	uint32_t e_lease_type = get_lease_type(e, fsp->file_id);
+	uint32_t e_lease_type = SMB2_LEASE_NONE;
 	uint32_t break_to;
 	bool lease_is_breaking = false;
 
@@ -2557,7 +2590,7 @@ static bool delay_for_oplock_fn(
 			&e->client_guid,
 			&e->lease_key,
 			&fsp->file_id,
-			NULL, /* current_state */
+			&e_lease_type, /* current_state */
 			&lease_is_breaking,
 			NULL, /* breaking_to_requested */
 			NULL, /* breaking_to_required */
@@ -2599,6 +2632,8 @@ static bool delay_for_oplock_fn(
 				nt_errstr(status));
 			smb_panic("leases_db_get() failed");
 		}
+	} else {
+		e_lease_type = get_lease_type(e, fsp->file_id);
 	}
 
 	if (!state->got_handle_lease &&
@@ -2811,7 +2846,7 @@ grant:
 	if (granted & SMB2_LEASE_READ) {
 		uint32_t acc, sh, ls;
 		share_mode_flags_get(lck, &acc, &sh, &ls);
-		ls |= SHARE_MODE_LEASE_READ;
+		ls |= SMB2_LEASE_READ;
 		share_mode_flags_set(lck, acc, sh, ls, NULL);
 	}
 
@@ -3290,7 +3325,7 @@ static NTSTATUS smbd_calculate_maximum_allowed_access_fsp(
 		return NT_STATUS_OK;
 	}
 
-	status = SMB_VFS_FGET_NT_ACL(fsp,
+	status = SMB_VFS_FGET_NT_ACL(metadata_fsp(fsp),
 				     (SECINFO_OWNER |
 					SECINFO_GROUP |
 					SECINFO_DACL),
@@ -3552,6 +3587,7 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 	uint32_t existing_dos_attributes = 0;
 	struct share_mode_lock *lck = NULL;
 	uint32_t open_access_mask = access_mask;
+	const struct smb2_lease_key *lease_key = NULL;
 	NTSTATUS status;
 	SMB_STRUCT_STAT saved_stat = smb_fname->st;
 	struct timespec old_write_time;
@@ -3652,7 +3688,7 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 			 */
 			uint32_t attr = 0;
 
-			status = SMB_VFS_FGET_DOS_ATTRIBUTES(conn, smb_fname->fsp, &attr);
+			status = vfs_fget_dos_attributes(smb_fname->fsp, &attr);
 			if (NT_STATUS_IS_OK(status)) {
 				existing_dos_attributes = attr;
 			}
@@ -4067,6 +4103,10 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 		return status;
 	}
 
+	if (fsp->oplock_type == LEASE_OPLOCK) {
+		lease_key = &lease->lease_key;
+	}
+
 	share_mode_flags_restrict(lck, access_mask, share_access, 0);
 
 	ok = set_share_mode(
@@ -4075,6 +4115,7 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 		get_current_uid(fsp->conn),
 		req ? req->mid : 0,
 		fsp->oplock_type,
+		lease_key,
 		share_access,
 		access_mask);
 	if (!ok) {
@@ -4370,7 +4411,7 @@ static NTSTATUS mkdir_internal(connection_struct *conn,
 	 */
 	fsp->fsp_flags.is_pathref = true;
 
-	status = fd_openat(conn->cwd_fsp, smb_dname, fsp, &how);
+	status = fd_openat(parent_dir_fname->fsp, smb_fname_atname, fsp, &how);
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
@@ -4763,6 +4804,7 @@ static NTSTATUS open_directory(connection_struct *conn,
 		get_current_uid(conn),
 		req ? req->mid : 0,
 		NO_OPLOCK,
+		NULL,
 		share_access,
 		fsp->access_mask);
 	if (!ok) {
@@ -5296,7 +5338,7 @@ NTSTATUS inherit_new_acl(files_struct *dirfsp, files_struct *fsp)
 		/* We need to be root to force this. */
 		become_root();
 	}
-	status = SMB_VFS_FSET_NT_ACL(fsp,
+	status = SMB_VFS_FSET_NT_ACL(metadata_fsp(fsp),
 			security_info_sent,
 			psd);
 	if (inherit_owner) {
@@ -5495,7 +5537,7 @@ static bool lease_match_break_fn(
 {
 	struct lease_match_break_state *state = private_data;
 	bool stale, equal;
-	uint32_t e_lease_type;
+	uint32_t e_lease_type = SMB2_LEASE_NONE;
 	NTSTATUS status;
 
 	stale = share_entry_stale_pid(e);
@@ -5512,7 +5554,7 @@ static bool lease_match_break_fn(
 		&e->client_guid,
 		&e->lease_key,
 		&state->id,
-		NULL, /* current_state */
+		&e_lease_type, /* current_state */
 		NULL, /* breaking */
 		NULL, /* breaking_to_requested */
 		NULL, /* breaking_to_required */
@@ -5523,9 +5565,9 @@ static bool lease_match_break_fn(
 	} else {
 		DBG_WARNING("Could not find version/epoch: %s\n",
 			    nt_errstr(status));
+		return false;
 	}
 
-	e_lease_type = get_lease_type(e, state->id);
 	if (e_lease_type == SMB2_LEASE_NONE) {
 		return false;
 	}

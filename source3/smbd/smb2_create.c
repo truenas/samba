@@ -430,6 +430,7 @@ static NTSTATUS smbd_smb2_create_durable_lease_check(struct smb_request *smb1req
 	uint32_t ucf_flags;
 	NTTIME twrp = fsp->fsp_name->twrp;
 	NTSTATUS status;
+	bool is_dfs = (smb1req->flags2 & FLAGS2_DFS_PATHNAMES);
 
 	if (lease_ptr == NULL) {
 		if (fsp->oplock_type != LEASE_OPLOCK) {
@@ -459,7 +460,7 @@ static NTSTATUS smbd_smb2_create_durable_lease_check(struct smb_request *smb1req
 	}
 
 	/* This also converts '\' to '/' */
-	status = check_path_syntax(filename);
+	status = check_path_syntax_smb2(filename, is_dfs);
 	if (!NT_STATUS_IS_OK(status)) {
 		TALLOC_FREE(filename);
 		return status;
@@ -714,6 +715,7 @@ static struct tevent_req *smbd_smb2_create_send(TALLOC_CTX *mem_ctx,
 	struct files_struct *dirfsp = NULL;
 	struct smb_filename *smb_fname = NULL;
 	uint32_t ucf_flags;
+	bool is_dfs = false;
 
 	req = tevent_req_create(mem_ctx, &state,
 				struct smbd_smb2_create_state);
@@ -959,18 +961,13 @@ static struct tevent_req *smbd_smb2_create_send(TALLOC_CTX *mem_ctx,
 		state->lease_ptr = NULL;
 	}
 
-	/*
-	 * For a DFS path the function parse_dfs_path()
-	 * will do the path processing.
-	 */
+	is_dfs = (smb1req->flags2 & FLAGS2_DFS_PATHNAMES);
 
-	if (!(smb1req->flags2 & FLAGS2_DFS_PATHNAMES)) {
-		/* convert '\\' into '/' */
-		status = check_path_syntax(state->fname);
-		if (!NT_STATUS_IS_OK(status)) {
-			tevent_req_nterror(req, status);
-			return tevent_req_post(req, state->ev);
-		}
+	/* convert '\\' into '/' */
+	status = check_path_syntax_smb2(state->fname, is_dfs);
+	if (!NT_STATUS_IS_OK(status)) {
+		tevent_req_nterror(req, status);
+		return tevent_req_post(req, state->ev);
 	}
 
 	ucf_flags = filename_create_ucf_flags(
