@@ -1086,7 +1086,11 @@ static bool do_winbind_online(struct tevent_context *ev_ctx,
 		return False;
 	}
 
+#ifndef FREEBSD
 	db_path = cache_path(talloc_tos(), "winbindd_cache.tdb");
+#else
+	db_path = state_path(talloc_tos(), "winbindd_cache.tdb");
+#endif
 	if (db_path == NULL) {
 		return false;
 	}
