@@ -810,6 +810,17 @@ static int vfs_gluster_openat(struct vfs_handle_struct *handle,
 		}
 	}
 
+	/*
+	 * Handle non-posix behavior of glfs regarding open flags.
+	 * in future revision investigate passing O_PATH here
+	 * pathref opens pass flags O_NONBLOCK | O_NOFOLLOW. Retry
+	 * via glfs_opendir if we fail here.
+	 */
+	if ((glfd == NULL) && (errno = EISDIR) &&
+	    (how->flags == O_NONBLOCK | O_NOFOLLOW)) {
+		glfd = glfs_opendir(handle->data, smb_fname->base_name);
+	}
+
 	if (became_root) {
 		unbecome_root();
 	}
