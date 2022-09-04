@@ -383,10 +383,11 @@ static int fsp_get_acl_brand(files_struct *fsp)
 	if (rv == -1) {
 		if (errno == ENODATA) {
 			return ACL_BRAND_POSIX;
+		} else if (errno != EOPNOTSUPP) {
+			DBG_ERR("%s: fgetxattr() for %s failed: %s\n",
+				fsp_str_dbg(fsp), ACL_XATTR, strerror(errno));
+			return ACL_BRAND_UNKNOWN;
 		}
-		DBG_ERR("%s: fgetxattr() for %s failed: %s\n",
-			fsp_str_dbg(fsp), ACL_XATTR, strerror(errno));
-		return ACL_BRAND_UNKNOWN;
 	}
 
 	rv = SMB_VFS_FGETXATTR(fsp, ACL4_XATTR, NULL, 0);
