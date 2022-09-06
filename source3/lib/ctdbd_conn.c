@@ -659,7 +659,7 @@ static int ctdbd_control(struct ctdbd_connection *conn,
 			 TALLOC_CTX *mem_ctx, TDB_DATA *outdata,
 			 int32_t *cstatus)
 {
-	struct ctdb_req_control_old req;
+	struct ctdb_req_control_old req = { 0 };
 	struct ctdb_req_header *hdr;
 	struct ctdb_reply_control_old *reply = NULL;
 	struct iovec iov[2];
@@ -1131,8 +1131,15 @@ int ctdbd_register_ips(struct ctdbd_connection *conn,
 				 void *private_data),
 		       void *private_data)
 {
-	struct ctdb_connection p;
+	struct ctdb_connection *p = calloc(1, sizeof(struct ctdb_connection));
+	if (p == NULL) {
+		return ENOMEM;
+	}
+#if 0
+	struct ctdb_connection p = { 0 };
 	TDB_DATA data = { .dptr = (uint8_t *)&p, .dsize = sizeof(p) };
+#endif
+	TDB_DATA data = { .dptr = (uint8_t *)p, .dsize = sizeof(struct ctdb_connection) };
 	int ret;
 	struct sockaddr_storage client;
 	struct sockaddr_storage server;
@@ -1146,14 +1153,15 @@ int ctdbd_register_ips(struct ctdbd_connection *conn,
 
 	switch (client.ss_family) {
 	case AF_INET:
-		memcpy(&p.dst.ip, &server, sizeof(p.dst.ip));
-		memcpy(&p.src.ip, &client, sizeof(p.src.ip));
+		memcpy(p.dst.ip, &server, sizeof(p.dst.ip));
+		memcpy(p.src.ip, &client, sizeof(p.src.ip));
 		break;
 	case AF_INET6:
-		memcpy(&p.dst.ip6, &server, sizeof(p.dst.ip6));
-		memcpy(&p.src.ip6, &client, sizeof(p.src.ip6));
+		memcpy(p.dst.ip6, &server, sizeof(p.dst.ip6));
+		memcpy(p.src.ip6, &client, sizeof(p.src.ip6));
 		break;
 	default:
+		free(p);
 		return EIO;
 	}
 
@@ -1164,6 +1172,7 @@ int ctdbd_register_ips(struct ctdbd_connection *conn,
 	ret = register_with_ctdbd(conn, CTDB_SRVID_RELEASE_IP,
 				  cb, private_data);
 	if (ret != 0) {
+		free(p);
 		return ret;
 	}
 
@@ -1177,6 +1186,7 @@ int ctdbd_register_ips(struct ctdbd_connection *conn,
 				  CTDB_CTRL_FLAG_NOREPLY, data, NULL, NULL,
 				  NULL);
 	if (ret != 0) {
+		free(p);
 		return ret;
 	}
 	return 0;

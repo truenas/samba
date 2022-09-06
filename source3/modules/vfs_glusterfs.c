@@ -373,6 +373,7 @@ static int vfs_gluster_connect(struct vfs_handle_struct *handle,
 		ret = -1;
 		goto done;
 	}
+	handle->conn->have_proc_fds = false;
 	logfile = lp_parm_substituted_string(tmp_ctx,
 					     lp_sub,
 					     SNUM(handle->conn),
@@ -872,7 +873,11 @@ static int vfs_gluster_close(struct vfs_handle_struct *handle,
 
 	VFS_REMOVE_FSP_EXTENSION(handle, fsp);
 
-	ret = glfs_close(glfd);
+	if (S_ISDIR(fsp->fsp_name->st.st_mode)) {
+		ret = glfs_closedir(glfd);
+	} else {
+		ret = glfs_close(glfd);
+	}
 	END_PROFILE(syscall_close);
 
 	return ret;
