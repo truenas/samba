@@ -1,7 +1,7 @@
 Release Announcements
 =====================
 
-This is the third release candidate of Samba 4.17.  This is *not*
+This is the fifth release candidate of Samba 4.17.  This is *not*
 intended for production environments and is designed for testing
 purposes only.  Please report any defects via the Samba bug reporting
 system at https://bugzilla.samba.org/.
@@ -68,8 +68,8 @@ even when Samba is configured as --without-smb1-server. This is
 to ensure maximum compatibility with environments containing old
 SMB1 servers.
 
-Bronze bit and S4U support with MIT Kerberos 1.20
--------------------------------------------------
+Bronze bit and S4U support now also with MIT Kerberos 1.20
+----------------------------------------------------------
 
 In 2020 Microsoft Security Response Team received another Kerberos-related
 report. Eventually, that led to a security update of the CVE-2020-17049,
@@ -87,16 +87,23 @@ but 'Bronze Bit' mitigation is provided only with MIT Kerberos 1.20.
 In addition to fixing the ‘Bronze Bit’ issue, Samba AD DC now fully supports
 S4U2Self and S4U2Proxy Kerberos extensions.
 
+Note the default (Heimdal-based) KDC was already fixed in 2021,
+see https://bugzilla.samba.org/show_bug.cgi?id=14642
+
 Resource Based Constrained Delegation (RBCD) support
 ----------------------------------------------------
 
 Samba AD DC built with MIT Kerberos 1.20 offers RBCD support now. With MIT
 Kerberos 1.20 we have complete RBCD support passing Sambas S4U testsuite.
-Note that samba-tool lacks support for setting this up yet!
+
+samba-tool delegation got the 'add-principal' and 'del-principal' subcommands
+in order to manage RBCD.
 
 To complete RBCD support and make it useful to Administrators we added the
 Asserted Identity [1] SID into the PAC for constrained delegation. This is
 available for Samba AD compiled with MIT Kerberos 1.20.
+
+Note the default (Heimdal-based) KDC does not support RBCD yet.
 
 [1] https://docs.microsoft.com/en-us/windows-server/security/kerberos/kerberos-constrained-delegation-overview
 
@@ -187,6 +194,45 @@ covers all the existing text output including sessions, connections,
 open files, byte-range locks, notifies and profile data with all
 low-level information maintained by Samba in the respective databases.
 
+Protected Users security group
+------------------------------
+
+Samba AD DC now includes support for the Protected Users security
+group introduced in Windows Server 2012 R2. The feature reduces the
+attack surface of user accounts by preventing the use of weak
+encryption types. It also mitigates the effects of credential theft by
+limiting credential lifetime and scope.
+
+The protections are intended for user accounts only, and service or
+computer accounts should not be added to the Protected Users
+group. User accounts added to the group are granted the following
+security protections:
+
+   * NTLM authentication is disabled.
+   * Kerberos ticket-granting tickets (TGTs) encrypted with RC4 are
+     not issued to or accepted from affected principals. Tickets
+     encrypted with AES, and service tickets encrypted with RC4, are
+     not affected by this restriction.
+   * The lifetime of Kerberos TGTs is restricted to a maximum of four
+     hours.
+   * Kerberos constrained and unconstrained delegation is disabled.
+
+If the Protected Users group is not already present in the domain, it
+can be created with 'samba-tool group add'. The new '--special'
+parameter must be specified, with 'Protected Users' as the name of the
+group. An example command invocation is:
+
+samba-tool group add 'Protected Users' --special
+
+or against a remote server:
+
+samba-tool group add 'Protected Users' --special -H ldap://dc1.example.com -U Administrator
+
+The Protected Users group is identified in the domain by its having a
+RID of 525. Thus, it should only be created with samba-tool and the
+'--special' parameter, as above, so that it has the required RID
+to function correctly.
+
 
 REMOVED FEATURES
 ================
@@ -197,14 +243,51 @@ LanMan Authentication and password storage removed from the AD DC
 The storage and authentication with LanMan passwords has been entirely
 removed from the Samba AD DC, even when "lanman auth = yes" is set.
 
+
 smb.conf changes
 ================
 
   Parameter Name                          Description     Default
   --------------                          -----------     -------
   dns port                                New default     53
-  nt hash store				  New parameter   always
-  volume serial number			  New parameter   -1
+  fruit:zero_file_id                      New default     yes
+  nt hash store                           New parameter   always
+  smb1 unix extensions                    Replaces "unix extensions"
+  volume serial number                    New parameter   -1
+  winbind debug traceid                   New parameter   no
+
+
+CHANGES SINCE 4.17.0rc4
+=======================
+
+o  Ralph Boehme <slow@samba.org>
+   * BUG 15126: acl_xattr VFS module may unintentionally use filesystem
+     permissions instead of ACL from xattr.
+   * BUG 15153: Missing SMB2-GETINFO access checks from MS-SMB2 3.3.5.20.1.
+   * BUG 15161: assert failed: !is_named_stream(smb_fname)") at
+     ../../lib/util/fault.c:197.
+
+o  Volker Lendecke <vl@samba.org>
+   * BUG 15126: acl_xattr VFS module may unintentionally use filesystem
+     permissions instead of ACL from xattr.
+   * BUG 15161: assert failed: !is_named_stream(smb_fname)") at
+     ../../lib/util/fault.c:197.
+
+o  Stefan Metzmacher <metze@samba.org>
+   * BUG 15159: Cross-node multi-channel reconnects result in SMB2 Negotiate
+     returning NT_STATUS_NOT_SUPPORTED.
+
+o  Noel Power <noel.power@suse.com>
+   * BUG 15160: winbind at info level debug can coredump when processing
+     wb_lookupusergroups.
+
+
+CHANGES SINCE 4.17.0rc3
+=======================
+
+o  Anoop C S <anoopcs@samba.org>
+   * BUG 15157: Make use of glfs_*at() API calls in vfs_glusterfs.
+
 
 CHANGES SINCE 4.17.0rc2
 =======================

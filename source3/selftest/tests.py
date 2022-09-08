@@ -1080,6 +1080,8 @@ for t in tests:
     elif t == "smb2.twrp":
         # This is being driven by samba3.blackbox.shadow_copy_torture
         pass
+    elif t == "smb2.create_no_streams":
+        plansmbtorture4testsuite(t, "fileserver", '//$SERVER_IP/nfs4acl_simple_40 -U$USERNAME%$PASSWORD')
     elif t == "rpc.wkssvc":
         plansmbtorture4testsuite(t, "ad_member", '//$SERVER/tmp -U$DC_USERNAME%$DC_PASSWORD')
     elif t == "rpc.srvsvc":
@@ -1366,6 +1368,13 @@ plantestsuite("samba3.blackbox.smbXsrv_client_dead_rec", "fileserver:local",
                             "script/tests/test_smbXsrv_client_dead_rec.sh"),
                configuration,
                '$SERVER_IP',
+               "tmp"])
+
+plantestsuite("samba3.blackbox.smbXsrv_client_cross_node", "clusteredmember:local",
+              [os.path.join(samba3srcdir,
+                            "script/tests/test_smbXsrv_client_cross_node.sh"),
+               configuration,
+               'ctdb0', 'ctdb1',
                "tmp"])
 
 env = 'fileserver'
