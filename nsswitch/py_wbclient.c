@@ -829,8 +829,11 @@ static int py_wbdomain_init(PyObject *obj,
 
 	/* attempt to pre-populate domain information */
 	tmp_domain_info = wbclient_domain_info(obj, NULL);
-	Py_XDECREF(tmp_domain_info);
+	if (tmp_domain_info == NULL) {
+		PyErr_Clear();
+	}
 
+	Py_XDECREF(tmp_domain_info);
 	return 0;
 }
 
