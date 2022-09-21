@@ -31,16 +31,19 @@ struct tevent_aiocb {
 	struct aiocb *iocbp;
 	int saved_errno;
 	int rv;
-	bool completed;
 };
 
+int _tevent_add_aio_read(struct tevent_aiocb *taiocb, const char *location);
 #define tevent_add_aio_read(taiocb)\
         (int)_tevent_add_aio_read(taiocb, __location__)
 
+int _tevent_add_aio_write(struct tevent_aiocb *taiocb, const char *location);
 #define tevent_add_aio_write(taiocb)\
         (int)_tevent_add_aio_write(taiocb, __location__)
 
+int _tevent_add_aio_fsync(struct tevent_aiocb *taiocb, const char *location);
 #define tevent_add_aio_fsync(taiocb)\
         (int)_tevent_add_aio_fsync(taiocb, __location__)
 
 void tevent_aio_cancel(struct tevent_aiocb *taiocb);
+struct aiocb *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb);
