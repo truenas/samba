@@ -2038,7 +2038,8 @@ NTSTATUS smbd_smb2_request_pending_queue(struct smbd_smb2_request *req,
 		 */
 		const uint8_t *inhdr = SMBD_SMB2_IN_HDR_PTR(req);
 
-		if (SVAL(inhdr, SMB2_HDR_OPCODE) != SMB2_OP_CREATE) {
+		if ((SVAL(inhdr, SMB2_HDR_OPCODE) != SMB2_OP_CREATE) &&
+		    (SVAL(inhdr, SMB2_HDR_OPCODE) != SMB2_OP_FLUSH)) {
 			/*
 			 * Cancel the outstanding request.
 			 */
