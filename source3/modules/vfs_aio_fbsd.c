@@ -1,5 +1,5 @@
 /*
- * Copyright (C) iXsystems 2021
+ * Copyright (C) iXsystems 2022
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -20,44 +20,7 @@
 #include "lib/util/tevent_unix.h"
 #include "lib/tevent/tevent_kqueue.h"
 #include "smbd/smbd.h"
-#include <sys/event.h>
 #include <aio.h>
-
-/*
- * First try to cancel any pending AIO if the request is ending in
- * an unexpected fashion. Failing that, wait up to five seconds
- * for the pending AIO to complete.
- */
-static void vfs_aio_fbsd_cleanup(struct tevent_req *req,
-				 enum tevent_req_state req_state)
-{
-	int ret;
-	struct tevent_aiocb *iocbp = NULL;
-	switch(req_state) {
-	case TEVENT_REQ_DONE:
-	case TEVENT_REQ_RECEIVED:
-	case TEVENT_REQ_USER_ERROR:
-		break;
-	default:
-	        iocbp = tevent_req_data(req, struct tevent_aiocb);
-		if (iocbp == NULL) {
-			DBG_ERR("Failed to get tevent aio request in aio "
-				"aio cleanup function\n");
-			return;
-		}
-		tevent_aio_cancel(iocbp);
-		iocbp->completed = true;
-		break;
-	}
-}
-
-static int aio_destructor(struct tevent_aiocb *iocbp)
-{
-	if (!iocbp->completed) {
-		tevent_aio_cancel(iocbp);
-	}
-	return 0;
-}
 
 static struct tevent_req *vfs_aio_fbsd_pread_send(struct vfs_handle_struct *handle,
 					     TALLOC_CTX *mem_ctx,
@@ -75,20 +38,15 @@ static struct tevent_req *vfs_aio_fbsd_pread_send(struct vfs_handle_struct *hand
 	if (req == NULL) {
 		return NULL;
 	}
-	taiocbp->iocbp = talloc_zero(taiocbp, struct aiocb);
 	taiocbp->ev = ev;
 	taiocbp->req = req;
-	iocbp = taiocbp->iocbp;
 
+	iocbp = tevent_ctx_get_iocb(taiocbp);
 	iocbp->aio_fildes = fsp_get_io_fd(fsp);
 	iocbp->aio_offset = offset;
 	iocbp->aio_buf = data;
-	iocbp->aio_sigevent.sigev_notify_kevent_flags = EV_ONESHOT;
-	iocbp->aio_sigevent.sigev_value.sival_ptr = taiocbp;
-	iocbp->aio_sigevent.sigev_notify = SIGEV_KEVENT;
 	iocbp->aio_nbytes = n;
 
-	tevent_req_set_cleanup_fn(req, vfs_aio_fbsd_cleanup);
 	ret = tevent_add_aio_read(taiocbp);
 	if (ret != 0) {
 		if (errno == EAGAIN) {
@@ -102,7 +60,6 @@ static struct tevent_req *vfs_aio_fbsd_pread_send(struct vfs_handle_struct *hand
 		tevent_req_error(req, errno);
 		return tevent_req_post(req, ev);
 	}
-	talloc_set_destructor(taiocbp, aio_destructor);
 	return req;
 }
 
@@ -131,16 +88,13 @@ static struct tevent_req *vfs_aio_fbsd_pwrite_send(struct vfs_handle_struct *han
 	if (req == NULL) {
 		return NULL;
 	}
-	taiocbp->iocbp = talloc_zero(taiocbp, struct aiocb);
 	taiocbp->ev = ev;
 	taiocbp->req = req;
-	iocbp = taiocbp->iocbp;
+
+	iocbp = tevent_ctx_get_iocb(taiocbp);
 	iocbp->aio_fildes = fsp_get_io_fd(fsp);
 	iocbp->aio_offset = offset;
 	iocbp->aio_buf = discard_const(data);
-	iocbp->aio_sigevent.sigev_value.sival_ptr = taiocbp;
-	iocbp->aio_sigevent.sigev_notify_kevent_flags = EV_ONESHOT;
-	iocbp->aio_sigevent.sigev_notify = SIGEV_KEVENT;
 	iocbp->aio_nbytes = n;
 
 	ret = tevent_add_aio_write(taiocbp);
@@ -157,7 +111,6 @@ static struct tevent_req *vfs_aio_fbsd_pwrite_send(struct vfs_handle_struct *han
 		return tevent_req_post(req, ev);
 	}
 
-	talloc_set_destructor(taiocbp, aio_destructor);
 	return req;
 }
 
@@ -175,16 +128,12 @@ static struct tevent_req *vfs_aio_fbsd_fsync_send(struct vfs_handle_struct *hand
 	if (req == NULL) {
 		return NULL;
 	}
-	taiocbp->iocbp = talloc_zero(taiocbp, struct aiocb);
 	taiocbp->ev = ev;
 	taiocbp->req = req;
-	iocbp = taiocbp->iocbp;
-	iocbp->aio_fildes = fsp_get_io_fd(fsp);
-	iocbp->aio_sigevent.sigev_value.sival_ptr = taiocbp;
-	iocbp->aio_sigevent.sigev_notify = SIGEV_KEVENT;
-	iocbp->aio_sigevent.sigev_notify_kevent_flags = EV_ONESHOT;
 
-	tevent_req_set_cleanup_fn(req, vfs_aio_fbsd_cleanup);
+	iocbp = tevent_ctx_get_iocb(taiocbp);
+	iocbp->aio_fildes = fsp_get_io_fd(fsp);
+
 	ret = tevent_add_aio_fsync(taiocbp);
 	if (ret != 0) {
 		if (errno == EAGAIN) {
@@ -199,7 +148,6 @@ static struct tevent_req *vfs_aio_fbsd_fsync_send(struct vfs_handle_struct *hand
 		return tevent_req_post(req, ev);
 	}
 
-	talloc_set_destructor(taiocbp, aio_destructor);
 	return req;
 }
 
