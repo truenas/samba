@@ -67,6 +67,7 @@ struct kq_context {
 	bool panic_force_replay;
 	bool *panic_state;
 	bool (*panic_fallback)(struct tevent_context *ev, bool replay);
+	TALLOC_CTX *aio_pool;
 };
 #define	EVTOKQ(x) (talloc_get_type_abort(x->additional_data, struct kq_context))
 #define	DATATOFDE(x) (talloc_get_type_abort(x, struct tevent_fd))
@@ -456,7 +457,13 @@ static void kqueue_process_aio(struct kq_context *kqueue_ev,
 	struct tevent_aiocb *tiocbp = NULL;
 
 	tiocbp = talloc_get_type_abort(udata, struct tevent_aiocb);
-	if (tiocbp->completed) {
+	if (tiocbp == NULL) {
+		tevent_debug(kqueue_ev->ev, TEVENT_DEBUG_FATAL,
+			     "aio request was freed after being put on kevent queue. "
+			     "memory may leak.\n");
+		return;
+	}
+	if (tiocbp->iocbp == NULL) {
 		tevent_debug(kqueue_ev->ev, TEVENT_DEBUG_FATAL,
 			     "aiocb request is already completed.\n");
 		abort();
@@ -469,15 +476,19 @@ static void kqueue_process_aio(struct kq_context *kqueue_ev,
 	}
 
 	tiocbp->rv = aio_return(tiocbp->iocbp);
-	tiocbp->completed = true;
 	if (tiocbp->rv == -1) {
-		tevent_debug(kqueue_ev->ev, TEVENT_DEBUG_FATAL,
-			     "Processing AIO - failed: %s\n", strerror(errno));
+		tevent_debug(
+			kqueue_ev->ev, TEVENT_DEBUG_WARNING,
+			"%s: processing AIO [%p] - failed: %s\n",
+			 tiocbp->location, tiocbp->iocbp, strerror(errno)
+		);
 		tiocbp->saved_errno = errno;
+		TALLOC_FREE(tiocbp->iocbp);
 		tevent_req_error(tiocbp->req, errno);
 		return;
 	}
 
+	TALLOC_FREE(tiocbp->iocbp);
 	tevent_req_done(tiocbp->req);
 }
 
@@ -529,7 +540,7 @@ static void kqueue_process_kev(struct kq_context *kqueue_ev,
 			}
 			tevent_debug(kqueue_ev->ev, TEVENT_DEBUG_TRACE,
 				"EVFILT_READ EV_EOF on fd: %d flags: 0x%08x: "
-				"additional flags: 0x%08x\n",
+				"additional flags: 0x%08lx\n",
 				fde->fd, fde->flags,
 				fde->additional_flags);
 		}
@@ -857,7 +868,14 @@ void tevent_aio_cancel(struct tevent_aiocb *taiocb)
 	int ret;
 	struct aiocb *iocbp = taiocb->iocbp;
 
-	if (taiocb->completed) {
+	tevent_debug(
+		taiocb->ev, TEVENT_DEBUG_WARNING,
+		"tevent_aio_cancel(): "
+		"taio: %p, iocbp: %p\n",
+		taiocb, iocbp
+	);
+
+	if (iocbp == NULL) {
 		abort();
 	}
 
@@ -887,36 +905,86 @@ void tevent_aio_cancel(struct tevent_aiocb *taiocb)
 			tevent_aio_waitcomplete(taiocb->ev, iocbp);
 		}
 	}
-	taiocb->completed = true;
-}
-
-static struct aiocb *get_aiocb(struct tevent_aiocb *taiocb)
-{
-	struct kq_context *kqueue_ev = EVTOKQ(taiocb->ev);
-	struct aiocb *iocbp = taiocb->iocbp;
-	iocbp->aio_sigevent.sigev_notify_kqueue = kqueue_ev->rdwrq->kq_fd;
-	return iocbp;
+	TALLOC_FREE(taiocb->iocbp);
 }
 
 int _tevent_add_aio_read(struct tevent_aiocb *taiocb, const char *location)
 {
-	struct aiocb *iocbp = get_aiocb(taiocb);
+	int err;
+
 	taiocb->location = location;
-	return aio_read(iocbp);
+	err = aio_read(taiocb->iocbp);
+	if (err) {
+		TALLOC_FREE(taiocb->iocbp);
+	}
+
+	return err;
 }
 
 int _tevent_add_aio_write(struct tevent_aiocb *taiocb, const char *location)
 {
-	struct aiocb *iocbp = get_aiocb(taiocb);
+	int err;
+
 	taiocb->location = location;
-	return aio_write(iocbp);
+	err = aio_write(taiocb->iocbp);
+	if (err) {
+		TALLOC_FREE(taiocb->iocbp);
+	}
+
+	return err;
 }
 
 int _tevent_add_aio_fsync(struct tevent_aiocb *taiocb, const char *location)
 {
-	struct aiocb *iocbp = get_aiocb(taiocb);
+	int err;
+
 	taiocb->location = location;
-	return aio_fsync(O_SYNC, iocbp);
+	err = aio_fsync(O_SYNC, taiocb->iocbp);
+	if (err) {
+		TALLOC_FREE(taiocb->iocbp);
+	}
+
+	return err;
+}
+
+static bool aio_req_cancel(struct tevent_req *req)
+{
+	struct tevent_aiocb *taiocb = tevent_req_data(req, struct tevent_aiocb);
+	tevent_aio_cancel(taiocb);
+	return true;
+}
+
+static int aio_destructor(struct tevent_aiocb *taio)
+{
+	if (taio->iocbp != NULL) {
+		tevent_aio_cancel(taio);
+	}
+	return 0;
+}
+
+struct aiocb *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb)
+{
+	struct kq_context *kqueue_ev = EVTOKQ(taiocb->ev);
+	struct aiocb *iocbp = NULL;
+	if (kqueue_ev->aio_pool == NULL) {
+		kqueue_ev->aio_pool = talloc_pool(taiocb->ev, 128 * sizeof(struct aiocb));
+		if (kqueue_ev->aio_pool == NULL) {
+			abort();
+		}
+	}
+
+	tevent_req_set_cancel_fn(taiocb->req, aio_req_cancel);
+	iocbp = talloc_zero(kqueue_ev->aio_pool, struct aiocb);
+	if (iocbp == NULL) {
+		abort();
+	}
+	iocbp->aio_sigevent.sigev_notify_kqueue = kqueue_ev->rdwrq->kq_fd;
+	iocbp->aio_sigevent.sigev_value.sival_ptr = taiocb;
+	iocbp->aio_sigevent.sigev_notify = SIGEV_KEVENT;
+	iocbp->aio_sigevent.sigev_notify_kevent_flags = EV_ONESHOT;
+	taiocb->iocbp = iocbp;
+	talloc_set_destructor(taiocb, aio_destructor);
+	return iocbp;
 }
 
 static struct tevent_fd *kqueue_event_add_fd(struct tevent_context *ev,
