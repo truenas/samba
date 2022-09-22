@@ -126,6 +126,7 @@ static struct tevent_req *smbd_smb2_flush_send(TALLOC_CTX *mem_ctx,
 	struct tevent_req *subreq;
 	struct smbd_smb2_flush_state *state;
 	struct smb_request *smbreq;
+	bool is_compound = false;
 
 	req = tevent_req_create(mem_ctx, &state,
 				struct smbd_smb2_flush_state);
@@ -186,6 +187,11 @@ static struct tevent_req *smbd_smb2_flush_send(TALLOC_CTX *mem_ctx,
 		 */
 		tevent_req_done(req);
 		return tevent_req_post(req, ev);
+	}
+
+	is_compound = smbd_smb2_is_compound(smb2req);
+	if (is_compound) {
+		smb2_request_set_async_internal(smb2req, true);
 	}
 
 	subreq = SMB_VFS_FSYNC_SEND(state, ev, fsp);
