@@ -427,6 +427,7 @@ static struct tevent_req *smbd_smb2_ioctl_send(TALLOC_CTX *mem_ctx,
 	struct tevent_req *req;
 	struct smbd_smb2_ioctl_state *state;
 	struct smb_request *smbreq;
+	bool is_compound = false;
 
 	req = tevent_req_create(mem_ctx, &state,
 				struct smbd_smb2_ioctl_state);
@@ -450,6 +451,11 @@ static struct tevent_req *smbd_smb2_ioctl_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 	state->smbreq = smbreq;
+
+	is_compound = smbd_smb2_is_compound(smb2req);
+	if (is_compound) {
+		smb2_request_set_async_internal(smb2req, true);
+	}
 
 	switch (in_ctl_code & IOCTL_DEV_TYPE_MASK) {
 	case FSCTL_DFS:
