@@ -1,5 +1,3 @@
-
-
 #ifndef __ZFSACL_H__
 #define __ZFSACL_H__
 
@@ -41,8 +39,23 @@ struct native_acl {
         zfsacl_brand_t brand;
 };
 
-typedef void *zfsacl_entry_t;
-struct zfsacl;
+#if defined (FREEBSD)
+
+#define zfsacl_entry acl_entry
+#define zfsacl acl_t_struct
+
+#else
+
+struct zfsacl_entry { uint netlong[5]; };
+struct zfsacl {
+        size_t aclbuf_size;
+        zfsacl_brand_t brand;
+        uint *aclbuf;
+};
+
+#endif
+
+typedef struct zfsacl_entry *zfsacl_entry_t;
 typedef struct zfsacl *zfsacl_t;
 
 typedef unsigned int zfsace_flagset_t;
@@ -159,6 +172,15 @@ bool zfsacl_get_aclentry(zfsacl_t _acl, int _idx, zfsacl_entry_t *_pentry);
 bool zfsacl_delete_aclentry(zfsacl_t _acl, int _idx);
 
 
+/**
+ * @brief convert an ACL to text. Returns malloced string.
+ *
+ * @param[in] _acl ZFS ACL
+ * @return pointer to text form the of specified ACLe
+ */
+char *zfsacl_to_text(zfsacl_t _acl);
+
+
 /* ACL entry specific functions */
 bool zfsace_get_permset(zfsacl_entry_t _entry, zfsace_permset_t *_pperm);
 bool zfsace_get_flagset(zfsacl_entry_t _entry, zfsace_flagset_t *_pflags);
@@ -270,32 +292,36 @@ const struct {
 const struct {
 	zfsace_permset_t perm;
 	const char *name;
+	char letter;
 } aceperm2name[] = {
-	{ ZFSACE_READ_DATA, "READ_DATA" },
-	{ ZFSACE_LIST_DIRECTORY, "LIST_DIRECTORY" },
-	{ ZFSACE_WRITE_DATA, "WRITE_DATA" },
-	{ ZFSACE_ADD_FILE, "ADD_FILE" },
-	{ ZFSACE_APPEND_DATA, "APPEND_DATA" },
-	{ ZFSACE_ADD_SUBDIRECTORY, "ADD_SUBDIRECTORY" },
-	{ ZFSACE_READ_NAMED_ATTRS, "READ_NAMED_ATTRS" },
-	{ ZFSACE_WRITE_NAMED_ATTRS, "WRITE_NAMED_ATTRS" },
-	{ ZFSACE_READ_ATTRIBUTES, "READ_ATTRIBUTES" },
-	{ ZFSACE_WRITE_ATTRIBUTES, "WRITE_ATTRIBUTES" },
-	{ ZFSACE_DELETE, "DELETE" },
-	{ ZFSACE_READ_ACL, "READ_ACL" },
-	{ ZFSACE_WRITE_ACL, "WRITE_ACL" },
-	{ ZFSACE_WRITE_OWNER, "WRITE_OWNER" },
-	{ ZFSACE_SYNCHRONIZE, "SYNCHRONIZE" },
+	{ ZFSACE_READ_DATA, "READ_DATA", 'r' },
+	{ ZFSACE_LIST_DIRECTORY, "LIST_DIRECTORY", '\0' },
+	{ ZFSACE_WRITE_DATA, "WRITE_DATA", 'w' },
+	{ ZFSACE_ADD_FILE, "ADD_FILE", '\0' },
+	{ ZFSACE_APPEND_DATA, "APPEND_DATA", 'p' },
+	{ ZFSACE_DELETE, "DELETE", 'd' },
+	{ ZFSACE_DELETE_CHILD, "DELETE_CHILD", 'D' },
+	{ ZFSACE_ADD_SUBDIRECTORY, "ADD_SUBDIRECTORY", '\0' },
+	{ ZFSACE_READ_ATTRIBUTES, "READ_ATTRIBUTES", 'a' },
+	{ ZFSACE_WRITE_ATTRIBUTES, "WRITE_ATTRIBUTES", 'A' },
+	{ ZFSACE_READ_NAMED_ATTRS, "READ_NAMED_ATTRS", 'R' },
+	{ ZFSACE_WRITE_NAMED_ATTRS, "WRITE_NAMED_ATTRS", 'W' },
+	{ ZFSACE_READ_ACL, "READ_ACL", 'c' },
+	{ ZFSACE_WRITE_ACL, "WRITE_ACL", 'C' },
+	{ ZFSACE_WRITE_OWNER, "WRITE_OWNER", 'o' },
+	{ ZFSACE_SYNCHRONIZE, "SYNCHRONIZE", 's' },
 };
 
 const struct {
 	zfsace_flagset_t flag;
 	const char *name;
+	char letter;
 } aceflag2name[] = {
-	{ ZFSACE_FILE_INHERIT, "FILE_INHERIT" },
-	{ ZFSACE_DIRECTORY_INHERIT, "DIRECTORY_INHERIT" },
-	{ ZFSACE_NO_PROPAGATE_INHERIT, "NO_PROPAGATE_INHERIT" },
-	{ ZFSACE_INHERITED_ACE, "INHERITED" },
+	{ ZFSACE_FILE_INHERIT, "FILE_INHERIT", 'f' },
+	{ ZFSACE_DIRECTORY_INHERIT, "DIRECTORY_INHERIT", 'd' },
+	{ ZFSACE_INHERIT_ONLY, "INHERIT_ONLY", 'i' },
+	{ ZFSACE_NO_PROPAGATE_INHERIT, "NO_PROPAGATE_INHERIT", 'n' },
+	{ ZFSACE_INHERITED_ACE, "INHERITED", 'I' },
 };
 
 const struct {
