@@ -1562,7 +1562,7 @@ def parse_args():
         fmt = ('%(asctime)s:%(name)s %(levelname)s(pid %(process)d): '
                '%(message)s')
 
-    logging.basicConfig(level=log_level, format=fmt)
+    logging.basicConfig(filename='/var/log/wsdd.log', level=log_level, format=fmt)
     logger = logging.getLogger('wsdd')
 
     if not args.interface:
