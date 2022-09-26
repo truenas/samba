@@ -74,6 +74,24 @@ static const struct {
 #define KERN_DOSMODES (UF_READONLY | UF_ARCHIVE | UF_SYSTEM | \
 	UF_HIDDEN | UF_SPARSE | UF_OFFLINE | UF_REPARSE)
 
+static void _dump_acl_info(zfsacl_t theacl, const char *fn)
+{
+	char *acltext = NULL;
+
+	if (!CHECK_DEBUGLVL(DBGLVL_DEBUG)) {
+		return;
+	}
+
+	acltext = zfsacl_to_text(theacl);
+	if (acltext == NULL) {
+		DBG_ERR("zfsacl_to_text() failed: %s\n", strerror(errno));
+		return;
+	}
+
+	DBG_ERR("%s():\n%s\n", fn, acltext);
+	free(acltext);
+}
+#define dump_acl_info(x) _dump_acl_info(x, __func__)
 
 #ifndef FREEBSD
 static int ixnas_pathref_reopen(const files_struct *fsp, int flags)
@@ -695,6 +713,7 @@ static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 
 	to_check = fsp->base_fsp ? fsp->base_fsp : fsp;
 	zfsacl = fsp_get_zfsacl(to_check);
+	dump_acl_info(zfsacl);
 	if (zfsacl == NULL) {
 		if ((errno == EINVAL) &&
 		    (fsp_get_acl_brand(fsp) == ACL_BRAND_POSIX)) {
@@ -838,6 +857,7 @@ static bool ixnas_process_smbacl(vfs_handle_struct *handle,
 		return false;
 	}
 
+	dump_acl_info(zfsacl);
 	if (!fsp_set_zfsacl(fsp, zfsacl)) {
 		DBG_ERR("%s: failed to set acl: %s\n",
 			fsp_str_dbg(fsp), strerror(errno));
@@ -1257,6 +1277,7 @@ static int ixnas_fchmod(vfs_handle_struct *handle,
 			fsp_str_dbg(fsp), strerror(errno));
 		return -1;
 	}
+	dump_acl_info(zacl);
 	ok = zfsacl_is_trivial(zacl, &trivial);
 	if (!ok) {
 		DBG_ERR("zfsacl_is_trivial() failed: %s\n", strerror(errno));
@@ -1281,6 +1302,7 @@ static int ixnas_fchmod(vfs_handle_struct *handle,
 			fsp_str_dbg(fsp));
 		goto failure;
 	}
+	dump_acl_info(new_acl);
 	ok = fsp_set_zfsacl(fsp, new_acl);
 	if (!ok) {
 		DBG_ERR("Failed to set new ACL on %s: %s\n",

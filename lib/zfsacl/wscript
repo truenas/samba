@@ -26,7 +26,6 @@ def options(opt):
 
 def configure(conf):
     conf.RECURSE('lib/replace')
-    #conf.RECURSE('lib/talloc')
 
     conf.SAMBA_CHECK_PYTHON()
     conf.SAMBA_CHECK_PYTHON_HEADERS()
@@ -44,6 +43,11 @@ def build(bld):
     else:
         SRC = 'zfsacl_impl_freebsd.c'
 
+    zfsacl_cflags = ''
+    if bld.CONFIG_SET('FREEBSD'):
+        zfsacl_cflags += ' -DFREEBSD'
+        zfsacl_cflags += ' -D_ACL_PRIVATE'
+
     bld.SAMBA_LIBRARY('zfsacl',
                       SRC,
                       enabled= True,
@@ -51,6 +55,7 @@ def build(bld):
                       abi_directory='ABI',
                       abi_match='zfsacl_*',
                       vnum=VERSION,
+                      deps='replace',
                       public_headers=(''),
                       public_headers_install=False,
                       private_library=True)
