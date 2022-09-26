@@ -19,16 +19,10 @@
 #define ACE4_SZ (sizeof(uint) * 5)
 #define ACL4_METADATA (sizeof(uint) * 2)
 #define ACL4SZ_FROM_ACECNT(cnt) (ACL4_METADATA + (cnt * ACE4_SZ))
-#define ACL4_GETENTRY(aclp, idx) ((char *)aclp + ACL4SZ_FROM_ACECNT(idx))
+#define ACL4_GETENTRY(aclp, idx) (zfsacl_entry_t)((char *)aclp + ACL4SZ_FROM_ACECNT(idx))
 #define ACLBUF_TO_ACES(aclp) (
 
-struct zfsacl {
-	size_t aclbuf_size;
-	zfsacl_brand_t brand;
-	uint *aclbuf;
-};
-
-struct zfsace4 { uint netlong[5]; };
+#define zfsace4 zfsacl_entry
 #define ACL4BUF_TO_ACES(aclp) ((struct zfsace4 *)(aclp + 2))
 
 static bool acl_check_brand(zfsacl_t _acl, zfsacl_brand_t expected)
@@ -384,7 +378,8 @@ bool zfsace_set_permset(zfsacl_entry_t _entry, zfsace_permset_t _perm)
 	return true;
 }
 
-bool zfsace_set_flagset(zfsacl_entry_t _entry, zfsace_flagset_t _flags) {
+bool zfsace_set_flagset(zfsacl_entry_t _entry, zfsace_flagset_t _flags)
+{
 	uint *pflags = (uint *)_entry + ZFSACE_FLAGSET_OFFSET;
 
 	if (ZFSACE_FLAG_INVALID(_flags)) {
@@ -688,4 +683,219 @@ bool zfsacl_is_trivial(zfsacl_t _acl, bool *trivialp)
 {
 	errno = EOPNOTSUPP;
 	return false;
+}
+
+#define MAX_ENTRY_LENGTH 512
+
+static bool format_perms(char *str, size_t sz, const zfsacl_entry_t entry, size_t *off)
+{
+	int i, cnt = 0;
+	zfsace_permset_t p;
+
+	if (!zfsace_get_permset(entry, &p)) {
+		return false;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(aceperm2name); i++) {
+		int rv;
+		char to_set;
+
+		if (aceperm2name[i].letter == '\0') {
+			continue;
+		}
+		if (p & aceperm2name[i].perm) {
+			to_set = aceperm2name[i].letter;
+		} else {
+			to_set = '-';
+		}
+		str[cnt] = to_set;
+		cnt++;
+	}
+
+	*off += cnt;
+	return true;
+}
+
+static bool format_flags(char *str, size_t sz, const zfsacl_entry_t entry, size_t *off)
+{
+	int i, cnt = 0;
+	zfsace_flagset_t flag;
+
+	if (!zfsace_get_flagset(entry, &flag)) {
+		return false;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(aceflag2name); i++) {
+		int rv;
+		char to_set;
+
+		if (aceflag2name[i].letter == '\0') {
+			continue;
+		}
+		if (flag & aceflag2name[i].flag) {
+			to_set = aceflag2name[i].letter;
+		} else {
+			to_set = '-';
+		}
+		str[cnt] = to_set;
+		cnt += rv;
+	}
+
+	*off += cnt;
+	return true;
+}
+
+static bool format_who(char *str, size_t sz, const zfsacl_entry_t _entry, size_t *off)
+{
+	uid_t id;
+	zfsace_who_t who;
+	int cnt = 0;
+
+	if (!zfsace_get_who(_entry, &who, &id)) {
+		return false;
+	}
+
+	switch (who) {
+	case ZFSACL_USER_OBJ:
+		cnt = snprintf(str, sz, "owner@");
+		break;
+	case ZFSACL_GROUP_OBJ:
+		cnt = snprintf(str, sz, "group@");
+		break;
+	case ZFSACL_EVERYONE:
+		cnt = snprintf(str, sz, "everyone@");
+		break;
+	case ZFSACL_USER:
+		cnt = snprintf(str, sz, "user:%d", id);
+		break;
+	case ZFSACL_GROUP:
+		cnt = snprintf(str, sz, "group:%d", id);
+		break;
+	default:
+		errno = EINVAL;
+		return false;
+	}
+
+	if (cnt == -1) {
+		return false;
+	}
+
+	*off += cnt;
+	return true;
+}
+
+static bool format_entry_type(char *str, size_t sz, const zfsacl_entry_t _entry, size_t *off)
+{
+	zfsace_entry_type_t entry_type;
+	int cnt = 0;
+
+	if (!zfsace_get_entry_type(_entry, &entry_type)) {
+		return false;
+	}
+
+	switch (entry_type) {
+	case ZFSACL_ENTRY_TYPE_ALLOW:
+		cnt = snprintf(str, sz, "allow");
+		break;
+	case ZFSACL_ENTRY_TYPE_DENY:
+		cnt = snprintf(str, sz, "deny");
+		break;
+	case ZFSACL_ENTRY_TYPE_AUDIT:
+		cnt = snprintf(str, sz, "audit");
+		break;
+	case ZFSACL_ENTRY_TYPE_ALARM:
+		cnt = snprintf(str, sz, "alarm");
+		break;
+	default:
+		errno = EINVAL;
+		return false;
+	}
+
+	if (cnt == -1) {
+		return false;
+	}
+
+	*off += cnt;
+	return true;
+}
+
+static bool add_format_separator(char *str, size_t sz, size_t *off)
+{
+	int cnt;
+
+	cnt = snprintf(str, sz, ":");
+	if (cnt == -1)
+		return false;
+
+	*off += cnt;
+	return true;
+}
+
+static size_t format_entry(char *str, size_t sz, const zfsacl_entry_t _entry)
+{
+	int cnt;
+	size_t off = 0;
+	char buf[MAX_ENTRY_LENGTH + 1] = { 0 };
+
+	if (!format_who(buf, sizeof(buf), _entry, &off))
+		return -1;
+
+	if (!add_format_separator(buf +off, sizeof(buf) - off, &off))
+		return -1;
+
+	if (!format_perms(buf + off, sizeof(buf) - off, _entry, &off))
+		return -1;
+
+	if (!add_format_separator(buf +off, sizeof(buf) - off, &off))
+		return -1;
+
+	if (!format_flags(buf + off, sizeof(buf) - off, _entry, &off))
+		return -1;
+
+	if (!add_format_separator(buf +off, sizeof(buf) - off, &off))
+		return -1;
+
+	if (!format_entry_type(buf + off, sizeof(buf) - off, _entry, &off))
+		return -1;
+
+	buf[off] = '\n';
+	return strlcpy(str, buf, sz);
+}
+
+char *zfsacl_to_text(zfsacl_t _acl)
+{
+	uint acecnt, i;
+	char *str = NULL;
+	size_t off = 0, bufsz;
+
+	if (!zfsacl_get_acecnt(_acl, &acecnt)) {
+		return NULL;
+	}
+
+	str = calloc(acecnt, MAX_ENTRY_LENGTH);
+	if (str == NULL) {
+		return NULL;
+	}
+
+	bufsz = acecnt * MAX_ENTRY_LENGTH;
+
+	for (i = 0; i < acecnt; i++) {
+		zfsacl_entry_t entry;
+		size_t written;
+
+		if (!zfsacl_get_aclentry(_acl, i, &entry)) {
+			free(str);
+			return NULL;
+		}
+
+		written = format_entry(str + off, bufsz - off, entry);
+		if (written == -1) {
+			free(str);
+			return NULL;
+		}
+
+		off += written;
+	}
+
+	return str;
 }

@@ -513,3 +513,9 @@ bool zfsacl_is_trivial(zfsacl_t _acl, bool *_trivialp)
 	*_trivialp = (triv == 1) ? true : false;
 	return true;
 }
+
+char *zfsacl_to_text(zfsacl_t _acl)
+{
+	acl_t acl = BSDACL(_acl);
+	return acl_to_text_np(acl, NULL, ACL_TEXT_NUMERIC_IDS);
+}
