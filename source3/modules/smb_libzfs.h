@@ -370,4 +370,5 @@ int conn_zfs_init(TALLOC_CTX *mem_ctx,
 		  struct zfs_dataset **ppds,
 		  bool has_tcon);
 
+bool inode_is_ctldir(ino_t ino);
 #endif	/* !__SMB_LIBZFS_H */
