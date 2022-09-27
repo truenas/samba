@@ -72,6 +72,14 @@ struct mntent
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof(a[0]))
 #endif
 
+#ifndef ZFSCTL_INO_ROOT
+#if defined (FREEBSD)
+#define ZFSCTL_INO_ROOT     0x1
+#else
+#define ZFSCTL_INO_ROOT     0x0000FFFFFFFFFFFFULL
+#endif /* OS-specific inode number for ZFS ctldir */
+#endif /* ZFSCTL_INO_ROOT */
+
 typedef struct dataset_entry_internal {
 	struct zfs_dataset *ds;
 } dataset_t;
@@ -393,6 +401,11 @@ static zfs_handle_t *fget_zhandle(libzfs_handle_t *lz, dev_t *dev_id, int fd)
 out:
 	ZFS_UNLOCK();
 	return zfsp;
+}
+
+bool inode_is_ctldir(ino_t ino)
+{
+	return ino == ZFSCTL_INO_ROOT ? true : false;
 }
 
 static zfs_handle_t *get_zhandle_from_smbzhandle(struct smbzhandle *smbzhandle)
