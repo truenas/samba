@@ -38,9 +38,14 @@ static int vfs_recycle_debug_level = DBGC_VFS;
 
 #define BIN_INCREMENT 10
 #define BIN2FSP(bin)	(bin->mnt_path_ref->fsp)
+#define BIN2ST(bin)	(bin->mnt_path_ref->fsp->fsp_name->st)
+
+struct internal_fsp {
+	files_struct *fsp;
+};
 
 struct recycle_bin {
-	struct smb_filename *mnt_path_ref; // O_PATH open for directory where recycle bin located
+	struct internal_fsp *mnt_path_ref; // O_PATH open for directory where recycle bin located
 	char *recycle_path; // path for recycle bin relative to connectpath
 	size_t mp_len;
 };
@@ -57,15 +62,79 @@ struct recycle_config_data {
 
 static bool recycle_create_dir(vfs_handle_struct *handle, const files_struct *dirfsp, const char *dname);
 
+static int internal_destructor(struct internal_fsp *wrapper)
+{
+	fd_close(wrapper->fsp);
+	file_free(NULL, wrapper->fsp);
+	return 0;
+}
+
+static bool create_pathref_fsp(TALLOC_CTX *mem_ctx,
+			       vfs_handle_struct *handle,
+			       const files_struct *dirfsp,
+			       const char *fname_in,
+			       bool is_dir,
+			       struct internal_fsp **fsp_out)
+{
+	struct internal_fsp *wrapper = NULL;
+	struct smb_filename *smb_fname = NULL;
+	int fd;
+	NTSTATUS status;
+
+#ifdef FREEBSD
+	struct vfs_open_how how = {
+		.flags = O_PATH | O_RESOLVE_BENEATH
+	};
+#else
+	struct vfs_open_how how = {
+		.flags = O_PATH,
+		.resolve = VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS
+	};
+#endif
+
+	if (is_dir) {
+		how.flags |= O_DIRECTORY;
+	}
+
+	wrapper = talloc_zero(mem_ctx, struct internal_fsp);
+	if (wrapper == NULL) {
+		return false;
+	}
+
+        smb_fname = synthetic_smb_fname(wrapper, fname_in, NULL, NULL, 0, 0);
+	if (smb_fname == NULL) {
+		return false;
+	}
+
+	status = create_internal_fsp(handle->conn, smb_fname, &wrapper->fsp);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("Failed to create internal FSP for %s: %s\n",
+			smb_fname_str_dbg(smb_fname), nt_errstr(status));
+		return false;
+	}
+	wrapper->fsp->fsp_flags.is_pathref = true;
+	wrapper->fsp->fsp_flags.is_directory = is_dir;
+	talloc_set_destructor(wrapper, internal_destructor);
+
+	fd = SMB_VFS_NEXT_OPENAT(handle, dirfsp, smb_fname, wrapper->fsp, &how);
+	if (fd == -1) {
+		TALLOC_FREE(wrapper);
+		return false;
+	}
+
+	fsp_set_fd(wrapper->fsp, fd);
+	*fsp_out = wrapper;
+	return true;
+}
+
 static bool make_new_bin(vfs_handle_struct *handle,
 			 struct recycle_config_data *config,
                          const files_struct *dirfsp,
 			 const char *mntpath)
 {
 	int ret;
-	NTSTATUS status;
 	bool ok, is_connectpath;
-	struct smb_filename *smb_fname = NULL;
+	struct internal_fsp *wrapper = NULL;
 	char fname[PATH_MAX];
 	struct recycle_bin *to_add = NULL;
 
@@ -92,25 +161,24 @@ static bool make_new_bin(vfs_handle_struct *handle,
 		smb_panic("Mountpath is incorrect");	
 	}
 
-	status = synthetic_pathref(config,
-				   dirfsp,
-				   fname,
-				   NULL,
-				   NULL,
-				   0,
-				   0,
-				   &smb_fname);
-	if (!NT_STATUS_IS_OK(status)) {
-		DBG_ERR("%s: synthetic_pathref() failed: %s\n",
-			fname, nt_errstr(status));
-		return false;
-	}
-
 	to_add = talloc_zero(config, struct recycle_bin);
 	if (to_add == NULL) {
 		errno = ENOMEM;
 		DBG_ERR("talloc failure\n");
-		TALLOC_FREE(smb_fname);
+		return false;
+	}
+
+	ok = create_pathref_fsp(to_add, handle, dirfsp, fname, true, &wrapper);
+	if (!ok) {
+		DBG_ERR("%s, create_pathref_fsp() failed: %s\n", fname, strerror(errno));
+		TALLOC_FREE(to_add);
+		return false;
+	}
+
+	ret = SMB_VFS_FSTAT(wrapper->fsp, &wrapper->fsp->fsp_name->st);
+	if (ret != 0) {
+		DBG_ERR("Failed to fstat() %s: %s\n", fsp_str_dbg(wrapper->fsp), strerror(errno));
+		TALLOC_FREE(to_add);
 		return false;
 	}
 
@@ -122,11 +190,14 @@ static bool make_new_bin(vfs_handle_struct *handle,
 		to_add->recycle_path = talloc_asprintf(config, "%s/%s",
 						       fname, config->repository);
 	}
-	to_add->mnt_path_ref = smb_fname;
+
+	to_add->mnt_path_ref = wrapper;
 	config->bins[config->next_entry] = to_add;
 	config->next_entry++;
+	// If destructor isn't removed, then we'll double-free on session teardown
+	talloc_set_destructor(wrapper, NULL);
 
-	ok = recycle_create_dir(handle, smb_fname->fsp, config->repository);
+	ok = recycle_create_dir(handle, wrapper->fsp, config->repository);
 	if (!ok) {
 		return false;
 	}
@@ -257,7 +328,7 @@ static recycle_bin *get_recycle_bin(vfs_handle_struct *handle,
 				return NULL);
 
 	for (thebin = config->bins[i]; thebin; thebin = config->bins[i++]) {
-		SMB_STRUCT_STAT sbuf = thebin->mnt_path_ref->st;
+		SMB_STRUCT_STAT sbuf = BIN2ST(thebin);
 		if (sbuf.st_ex_dev == smb_fname->st.st_ex_dev) {
 			out = thebin;
 			break;
@@ -593,42 +664,38 @@ static void recycle_do_touch(vfs_handle_struct *handle,
 			     const struct smb_filename *smb_fname,
 			     bool touch_mtime)
 {
-	struct smb_filename *smb_fname_tmp = NULL;
 	struct smb_file_time ft;
+	struct internal_fsp *wrapper = NULL;
 	int ret, err;
-	NTSTATUS status;
+	bool ok;
 
 	init_smb_file_time(&ft);
 
-	status = synthetic_pathref(talloc_tos(),
-				   dirfsp,
-				   smb_fname->base_name,
-				   smb_fname->stream_name,
-				   NULL,
-				   smb_fname->twrp,
-				   smb_fname->flags,
-				   &smb_fname_tmp);
-	if (!NT_STATUS_IS_OK(status)) {
-		DBG_DEBUG("synthetic_pathref for '%s' failed: %s\n",
-			  smb_fname_str_dbg(smb_fname), nt_errstr(status));
+	ok = create_pathref_fsp(talloc_tos(), handle, dirfsp, smb_fname->base_name,
+				S_ISDIR(smb_fname->st.st_ex_mode),
+				&wrapper);
+
+	if (!ok) {
+		DBG_ERR("failed to open pathref for %s\n",
+			smb_fname_str_dbg(smb_fname));
 		return;
 	}
 
 	/* atime */
 	ft.atime = timespec_current();
 	/* mtime */
-	ft.mtime = touch_mtime ? ft.atime : smb_fname_tmp->st.st_ex_mtime;
+	ft.mtime = touch_mtime ? ft.atime : smb_fname->st.st_ex_mtime;
 
 	become_root();
-	ret = SMB_VFS_NEXT_FNTIMES(handle, smb_fname_tmp->fsp, &ft);
+	ret = SMB_VFS_NEXT_FNTIMES(handle, wrapper->fsp, &ft);
 	err = errno;
 	unbecome_root();
 	if (ret == -1 ) {
 		DEBUG(0, ("recycle: touching %s failed, reason = %s\n",
-			  smb_fname_str_dbg(smb_fname_tmp), strerror(err)));
+			  fsp_str_dbg(wrapper->fsp), strerror(err)));
 	}
 
-	TALLOC_FREE(smb_fname_tmp);
+	TALLOC_FREE(wrapper);
 }
 
 static char *full_path_fname(
@@ -978,7 +1045,7 @@ static int recycle_connect(struct vfs_handle_struct *handle,
 static struct vfs_fn_pointers vfs_recycle_fns = {
 	.unlinkat_fn = recycle_unlinkat,
 	.chdir_fn = recycle_chdir,
-	.connect_fn = recycle_connect
+	.connect_fn = recycle_connect,
 };
 
 static_decl_vfs;
