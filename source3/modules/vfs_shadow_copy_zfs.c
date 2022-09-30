@@ -1268,7 +1268,7 @@ static NTSTATUS shadow_copy_zfs_get_real_filename_at(
 		0,
 		&conv_fname);
 	if (!NT_STATUS_IS_OK(status)) {
-		DBG_ERR("%s: failed to create synthetic pathref: %s\",
+		DBG_ERR("%s: failed to create synthetic pathref: %s\n",
 			conv, nt_errstr(status));
 		TALLOC_FREE(conv);
 		return status;
