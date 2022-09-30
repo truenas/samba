@@ -568,8 +568,17 @@ static bool zfs_lookup_snapshot_list(vfs_handle_struct *handle,
 		sizeof(data->mountpoint));
 
 	if (entry == NULL) {
-		DBG_ERR("[%s()]: %s: no snapshot found\n",
-			location, smb_fname_str_dbg(fname_in));
+		/*
+		 * snapshot of parent dir may not exist if
+		 * it is a different mountpoint.
+		 */
+		if (strcmp(fname_in->base_name, "..") != 0) {
+			DBG_ERR("[%s()]: %s: no snapshot found\n",
+				location, smb_fname_str_dbg(fname_in));
+		} else {
+			DBG_INFO("[%s()]: %s: no snapshot found\n",
+				 location, smb_fname_str_dbg(fname_in));
+		}
 		errno = ENOENT;
 		return false;
 	}
@@ -1224,8 +1233,7 @@ static int shadow_copy_zfs_fsetxattr(struct vfs_handle_struct *handle,
 	return SMB_VFS_NEXT_FSETXATTR(handle, fsp, aname, value, size, flags);
 }
 
-#if 0 /* XXX: MUST BE FIXED BEFORE RELEASE */
-static NTSTATUS shadow_copy2_get_real_filename_at(
+static NTSTATUS shadow_copy_zfs_get_real_filename_at(
         struct vfs_handle_struct *handle,
         struct files_struct *dirfsp,
         const char *path,
@@ -1234,32 +1242,55 @@ static NTSTATUS shadow_copy2_get_real_filename_at(
 {
 	ssize_t ret;
 	char *conv = NULL;
-	struct smb_filename *conv_smb_fname = NULL;
+	NTSTATUS status;
+	struct smb_filename *conv_fname = NULL;
 
-	if (shadow_copy_zfs_match_name(handle, path)) {
-		conv = convert_shadow_zfs_name(handle, path);
-		if (conv == NULL) {
-			return -1;
-		}
-		conv_smb_fname = synthetic_smb_fname(talloc_tos(),
-						conv,
-						NULL,
-						NULL,
-						0,
-						path->flags);
-		TALLOC_FREE(conv);
-		if (conv_smb_fname == NULL) {
-			return -1;
-		}
-		ret = SMB_VFS_NEXT_GET_REAL_FILENAME_AT(handle, conv_smb_fname, name,
-							mem_ctx, found_name);
-		TALLOC_FREE(conv_smb_fname);
-		return ret;
+	if (!shadow_copy_zfs_match_name(handle, dirfsp->fsp_name)) {
+		return SMB_VFS_NEXT_GET_REAL_FILENAME_AT(handle, dirfsp, path,
+							 mem_ctx, found_name);
 	}
-	return SMB_VFS_NEXT_GET_REAL_FILENAME(handle, path, name,
-					      mem_ctx, found_name);
+
+	conv = convert_shadow_zfs_name(handle, dirfsp->fsp_name);
+	if (conv == NULL) {
+		status = map_nt_error_from_unix(errno);
+		DBG_DEBUG("%s: convert_shadow_zfs_name() failed: %s\n",
+			  fsp_str_dbg(dirfsp), strerror(errno));
+		return map_nt_error_from_unix(errno);
+	}
+
+	status = synthetic_pathref(
+		talloc_tos(),
+		dirfsp->conn->cwd_fsp,
+		conv,
+		NULL,
+		NULL,
+		0,
+		0,
+		&conv_fname);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("%s: failed to create synthetic pathref: %s\",
+			conv, nt_errstr(status));
+		TALLOC_FREE(conv);
+		return status;
+	}
+
+	status = get_real_filename_full_scan_at(
+		conv_fname->fsp, path, false, mem_ctx, found_name);
+
+	TALLOC_FREE(conv_fname);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_DEBUG("Scan [%s] for [%s] failed\n",
+			  conv, path);
+		TALLOC_FREE(conv);
+		return status;
+	}
+
+	DBG_DEBUG("Scan [%s] for [%s] returned [%s]\n",
+		  conv, path, *found_name);
+
+	TALLOC_FREE(conv);
+	return NT_STATUS_OK;
 }
-#endif
 
 static const char *shadow_copy_zfs_connectpath(struct vfs_handle_struct *handle,
 					    const struct smb_filename *smb_fname)
@@ -1478,9 +1509,7 @@ static struct vfs_fn_pointers vfs_shadow_copy_zfs_fns = {
 	.mkdirat_fn = shadow_copy_zfs_mkdirat,
 	.fsetxattr_fn = shadow_copy_zfs_fsetxattr,
 	.fchflags_fn = shadow_copy_zfs_fchflags,
-#if 0 /* XXX: to fix */
-	.get_real_filename_fn = shadow_copy_zfs_get_real_filename,
-#endif
+	.get_real_filename_at_fn = shadow_copy_zfs_get_real_filename_at,
 	.connectpath_fn = shadow_copy_zfs_connectpath,
 };
 
