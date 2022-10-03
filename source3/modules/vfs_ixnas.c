@@ -147,12 +147,6 @@ static bool ixnas_set_native_dosmode(struct files_struct *fsp, uint64_t dosmode)
 	int err;
 #if defined (FREEBSD)
 	err = SMB_VFS_FCHFLAGS(fsp, dosmode);
-	if (err) {
-		DBG_WARNING("Setting dosmode failed for %s: %s\n",
-			    fsp_str_dbg(fsp), strerror(errno));
-
-		return false;
-	}
 #else
 	if (!fsp->fsp_flags.is_pathref) {
 		err = ioctl(fsp_get_io_fd(fsp), ZFS_IOC_SETDOSFLAGS, &dosmode);
@@ -168,12 +162,17 @@ static bool ixnas_set_native_dosmode(struct files_struct *fsp, uint64_t dosmode)
 		close(fd);
 	}
 
+#endif /* FREEBSD */
 	if (err) {
-		DBG_WARNING("%s: ioctl to set dosmode failed: %s\n",
-			    fsp_str_dbg(fsp), strerror(errno));
+		if (errno != EPERM) {
+			DBG_WARNING("Setting dosmode failed for %s: %s\n",
+				    fsp_str_dbg(fsp), strerror(errno));
+		} else {
+			DBG_DEBUG("Setting dosmode failed for %s: %s\n",
+				  fsp_str_dbg(fsp), strerror(errno));
+		}
 		return false;
 	}
-#endif /* FREEBSD */
 	return true;
 }
 
@@ -290,8 +289,10 @@ static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
 	}
 
 	ok = ixnas_set_native_dosmode(fsp, flags);
-	if (ok && errno != EPERM) {
+	if (ok) {
 		return NT_STATUS_OK;
+	} else if (errno != EPERM) {
+		return map_nt_error_from_unix(errno);
 	}
 
 	status = smbd_check_access_rights_fsp(handle->conn->cwd_fsp, fsp,
