@@ -755,7 +755,7 @@ NTSTATUS parent_pathref(TALLOC_CTX *mem_ctx,
  Close all open files for a connection.
 ****************************************************************************/
 
-void file_close_conn(connection_struct *conn)
+void file_close_conn(connection_struct *conn, enum file_close_type close_type)
 {
 	files_struct *fsp, *next;
 
@@ -770,7 +770,7 @@ void file_close_conn(connection_struct *conn)
 			 */
 			fsp->op->global->durable = false;
 		}
-		close_file(NULL, fsp, SHUTDOWN_CLOSE);
+		close_file(NULL, fsp, close_type);
 	}
 }
 
@@ -1486,4 +1486,17 @@ void fsp_set_base_fsp(struct files_struct *fsp, struct files_struct *base_fsp)
 	if (fsp->base_fsp != NULL) {
 		fsp->base_fsp->stream_fsp = fsp;
 	}
+}
+
+bool fsp_is_alternate_stream(const struct files_struct *fsp)
+{
+	return (fsp->base_fsp != NULL);
+}
+
+struct files_struct *metadata_fsp(struct files_struct *fsp)
+{
+	if (fsp_is_alternate_stream(fsp)) {
+		return fsp->base_fsp;
+	}
+	return fsp;
 }

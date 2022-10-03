@@ -278,7 +278,7 @@ NTSTATUS smbd_check_access_rights_fsp(struct files_struct *dirfsp,
 		return NT_STATUS_OK;
 	}
 
-	status = SMB_VFS_FGET_NT_ACL(fsp,
+	status = SMB_VFS_FGET_NT_ACL(metadata_fsp(fsp),
 				     (SECINFO_OWNER |
 				      SECINFO_GROUP |
 				      SECINFO_DACL),
@@ -857,7 +857,8 @@ static NTSTATUS non_widelink_open(const struct files_struct *dirfsp,
 
   out:
 	fsp->fsp_name = orig_fsp_name;
-	if (fsp->base_fsp != NULL) {
+
+	if (orig_base_fsp_name != NULL) {
 		/* Save off the temporary name. */
 		struct smb_filename *base_smb_fname_rel =
 			fsp->base_fsp->fsp_name;
@@ -1395,7 +1396,7 @@ static NTSTATUS open_file(files_struct *fsp,
 #endif
 
 		/* Don't create files with Microsoft wildcard characters. */
-		if (fsp->base_fsp) {
+		if (fsp_is_alternate_stream(fsp)) {
 			/*
 			 * wildcard characters are allowed in stream names
 			 * only test the basefilename
@@ -1411,7 +1412,7 @@ static NTSTATUS open_file(files_struct *fsp,
 		}
 
 		/* Can we access this file ? */
-		if (!fsp->base_fsp) {
+		if (!fsp_is_alternate_stream(fsp)) {
 			/* Only do this check on non-stream open. */
 			if (file_existed) {
 				status = smbd_check_access_rights_fsp(
@@ -1598,29 +1599,36 @@ static NTSTATUS open_file(files_struct *fsp,
 			}
 		}
 
-		status = smbd_check_access_rights_fsp(parent_dir->fsp,
-						      fsp,
-						      false,
-						      access_mask);
+		/*
+		 * Access to streams is checked by checking the basefile and
+		 * that has alreay been checked by check_base_file_access()
+		 * in create_file_unixpath().
+		 */
+		if (!fsp_is_alternate_stream(fsp)) {
+			status = smbd_check_access_rights_fsp(parent_dir->fsp,
+							      fsp,
+							      false,
+							      access_mask);
 
-		if (NT_STATUS_EQUAL(status, NT_STATUS_OBJECT_NAME_NOT_FOUND) &&
-				(fsp->posix_flags & FSP_POSIX_FLAGS_OPEN) &&
-				S_ISLNK(smb_fname->st.st_ex_mode)) {
-			/* This is a POSIX stat open for delete
-			 * or rename on a symlink that points
-			 * nowhere. Allow. */
-			DEBUG(10,("open_file: allowing POSIX "
-				  "open on bad symlink %s\n",
-				  smb_fname_str_dbg(smb_fname)));
-			status = NT_STATUS_OK;
-		}
+			if (NT_STATUS_EQUAL(status, NT_STATUS_OBJECT_NAME_NOT_FOUND) &&
+			    (fsp->posix_flags & FSP_POSIX_FLAGS_OPEN) &&
+			    S_ISLNK(smb_fname->st.st_ex_mode)) {
+				/* This is a POSIX stat open for delete
+				 * or rename on a symlink that points
+				 * nowhere. Allow. */
+				DEBUG(10,("open_file: allowing POSIX "
+					  "open on bad symlink %s\n",
+					  smb_fname_str_dbg(smb_fname)));
+				status = NT_STATUS_OK;
+			}
 
-		if (!NT_STATUS_IS_OK(status)) {
-			DBG_DEBUG("smbd_check_access_rights_fsp on file "
-				"%s returned %s\n",
-				fsp_str_dbg(fsp),
-				nt_errstr(status));
-			return status;
+			if (!NT_STATUS_IS_OK(status)) {
+				DBG_DEBUG("smbd_check_access_rights_fsp on file "
+					  "%s returned %s\n",
+					  fsp_str_dbg(fsp),
+					  nt_errstr(status));
+				return status;
+			}
 		}
 	}
 
@@ -2763,7 +2771,7 @@ grant:
 	if (granted & SMB2_LEASE_READ) {
 		uint32_t acc, sh, ls;
 		share_mode_flags_get(lck, &acc, &sh, &ls);
-		ls |= SHARE_MODE_LEASE_READ;
+		ls |= SMB2_LEASE_READ;
 		share_mode_flags_set(lck, acc, sh, ls, NULL);
 	}
 
@@ -3242,7 +3250,7 @@ static NTSTATUS smbd_calculate_maximum_allowed_access_fsp(
 		return NT_STATUS_OK;
 	}
 
-	status = SMB_VFS_FGET_NT_ACL(fsp,
+	status = SMB_VFS_FGET_NT_ACL(metadata_fsp(fsp),
 				     (SECINFO_OWNER |
 					SECINFO_GROUP |
 					SECINFO_DACL),
@@ -3601,7 +3609,7 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 			 */
 			uint32_t attr = 0;
 
-			status = SMB_VFS_FGET_DOS_ATTRIBUTES(conn, smb_fname->fsp, &attr);
+			status = vfs_fget_dos_attributes(smb_fname->fsp, &attr);
 			if (NT_STATUS_IS_OK(status)) {
 				existing_dos_attributes = attr;
 			}
@@ -5283,7 +5291,7 @@ NTSTATUS inherit_new_acl(struct smb_filename *parent_dir_fname,
 		/* We need to be root to force this. */
 		become_root();
 	}
-	status = SMB_VFS_FSET_NT_ACL(fsp,
+	status = SMB_VFS_FSET_NT_ACL(metadata_fsp(fsp),
 			security_info_sent,
 			psd);
 	if (inherit_owner) {
@@ -6281,7 +6289,7 @@ NTSTATUS create_file_default(connection_struct *conn,
 		}
 
 		if (!(conn->fs_capabilities & FILE_NAMED_STREAMS)) {
-			status = NT_STATUS_OBJECT_NAME_NOT_FOUND;
+			status = NT_STATUS_OBJECT_NAME_INVALID;
 			goto fail;
 		}
 	}
