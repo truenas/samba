@@ -132,7 +132,7 @@ bool zfsacl_set_fd(int _fd, zfsacl_t _acl)
 	int err;
 
 	BSD_BRAND(acl);
-	err = acl_set_fd_np(_fd, acl, acl->ats_brand);
+	err = acl_set_fd_np(_fd, acl, brand_to_type(saved));
 	acl->ats_brand = saved;
 
 	return err ? false : true;
