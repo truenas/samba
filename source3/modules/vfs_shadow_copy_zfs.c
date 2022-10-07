@@ -1401,6 +1401,47 @@ static int shadow_copy_zfs_get_quota(vfs_handle_struct *handle, const struct smb
 	}
 }
 
+static NTSTATUS zfs_parent_pathname(struct vfs_handle_struct *handle,
+				    TALLOC_CTX *mem_ctx,
+				    const struct smb_filename *smb_fname_in,
+				    struct smb_filename **parent_dir_out,
+				    struct smb_filename **atname_out)
+{
+	NTSTATUS status;
+	char *tmp_fname = NULL;
+	struct smb_filename *fname_ref = NULL;
+
+	status = SMB_VFS_NEXT_PARENT_PATHNAME(
+		handle, mem_ctx,
+		smb_fname_in, parent_dir_out,
+		atname_out
+	);
+
+	/*
+	 * 34 is a special inode number on ZFS indicating a dataset
+	 * mountpoint.
+	 */
+	if (!NT_STATUS_IS_OK(status) ||
+            (smb_fname_in->st.st_ex_ino != 34) ||
+	    !shadow_copy_zfs_match_name(handle, smb_fname_in)) {
+		return status;
+	}
+
+	fname_ref = *parent_dir_out;
+
+	tmp_fname = convert_shadow_zfs_name(handle, fname_ref);
+	if (tmp_fname == NULL) {
+		if (errno != ENOENT) {
+			status = map_nt_error_from_unix(errno);
+		}
+		fname_ref->twrp = 0;
+	} else {
+		TALLOC_FREE(tmp_fname);
+	}
+
+	return status;
+}
+
 static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 				const char *service, const char *user)
 {
@@ -1511,6 +1552,7 @@ static struct vfs_fn_pointers vfs_shadow_copy_zfs_fns = {
 	.fchflags_fn = shadow_copy_zfs_fchflags,
 	.get_real_filename_at_fn = shadow_copy_zfs_get_real_filename_at,
 	.connectpath_fn = shadow_copy_zfs_connectpath,
+	.parent_pathname_fn = zfs_parent_pathname,
 };
 
 NTSTATUS vfs_shadow_copy_zfs_init(TALLOC_CTX *);
