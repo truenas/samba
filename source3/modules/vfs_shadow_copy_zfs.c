@@ -67,6 +67,7 @@ struct shadow_copy_zfs_config {
 struct snapshot_data {
 	char mountpoint[PATH_MAX];
 	char shadow_cp[PATH_MAX];
+	enum casesensitivity sens;
 	struct snapshot_entry *snap;
 };
 
@@ -305,7 +306,8 @@ static bool shadow_copy_zfs_update_snaplist(struct vfs_handle_struct *handle,
 					    const char *path,
 					    files_struct *fsp,
 					    bool do_update,
-					    struct snapshot_list **snapp)
+					    struct snapshot_list **snapp,
+					    enum casesensitivity *psens)
 {
 	bool snaplist_updated = false;
 	double seconds = 0.0;
@@ -381,6 +383,7 @@ static bool shadow_copy_zfs_update_snaplist(struct vfs_handle_struct *handle,
 		*snapp = cached_snaps;
 	}
 
+	*psens = ds->properties->casesens;
 	return snaplist_updated;
 }
 
@@ -522,6 +525,7 @@ static void cp_snapshot_data(struct snapshot_data *in,
 
 	out->snap->nt_time = in->snap->nt_time;
 	out->snap->cr_time = in->snap->cr_time;
+	out->sens = in->sens;
 
 	strlcpy(out->snap->name,
 		in->snap->name,
@@ -540,6 +544,7 @@ static bool zfs_lookup_snapshot_list(vfs_handle_struct *handle,
 	char *normalized_fname = NULL;
 	struct snapshot_list *snapshots = NULL;
 	struct snapshot_entry *entry = NULL;
+	enum casesensitivity sens;
 	int err;
 
 	if (fname_in->fsp != NULL) {
@@ -563,7 +568,7 @@ static bool zfs_lookup_snapshot_list(vfs_handle_struct *handle,
 	}
 
 	shadow_copy_zfs_update_snaplist(handle, handle->conn, normalized_fname,
-					NULL, false, &snapshots);
+					NULL, false, &snapshots, &sens);
 	if (snapshots == NULL) {
 		DBG_ERR("[%s()]: Failed to get snapshot list for %s\n",
 			location, normalized_fname);
@@ -594,6 +599,7 @@ static bool zfs_lookup_snapshot_list(vfs_handle_struct *handle,
 	data->shadow_cp[0] = '\0';
 	data->snap->cr_time = entry->cr_time;
 	data->snap->nt_time = entry->nt_time;
+	data->sens = sens;
 
 	strlcpy(data->snap->name, entry->name, sizeof(data->snap->name));
 	strlcpy(data->snap->label, entry->label, sizeof(data->snap->label));
@@ -658,7 +664,7 @@ static char *_do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 
 	ret = get_snapshot_path(talloc_tos(), handle->conn->connectpath,
 				snapshots.mountpoint, res_fname,
-				mpoffset, snapshots.snap, config->singleton->properties->casesens);
+				mpoffset, snapshots.snap, snapshots.sens);
 
 	if (out != NULL) {
 		size_t off = 0;
@@ -1095,6 +1101,7 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 	uint idx = 0;
 	const char *mpoffset = NULL;
 	ssize_t len, cpathlen, mplen, flen;
+	enum casesensitivity sens;
 	int rv;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config, struct shadow_copy_zfs_config,
@@ -1128,7 +1135,8 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 					NULL,
 					fsp,
 					true,
-					&snapshots);
+					&snapshots,
+					&sens);
 	if (snapshots == NULL) {
 		DBG_INFO("failed to retrieve snapshots for %s\n", fsp_str_dbg(fsp));
 		return -1;
@@ -1173,7 +1181,7 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 					     snapshots->mountpoint,
 					     fsp->fsp_name->base_name,
 					     mpoffset, entry,
-					     config->singleton->properties->casesens);
+					     sens);
 
 		DBG_INFO("snapshot[%d]: ts: %ld, gmt: %s, name: %s, "
 			 "createtxg: %ld, path: %s\n",
