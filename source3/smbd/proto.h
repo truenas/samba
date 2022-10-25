@@ -397,7 +397,7 @@ void fsp_set_gen_id(files_struct *fsp);
 NTSTATUS file_new(struct smb_request *req, connection_struct *conn,
 		  files_struct **result);
 NTSTATUS fsp_bind_smb(struct files_struct *fsp, struct smb_request *req);
-void file_close_conn(connection_struct *conn);
+void file_close_conn(connection_struct *conn, enum file_close_type close_type);
 bool file_init_global(void);
 bool file_init(struct smbd_server_connection *sconn);
 void file_close_user(struct smbd_server_connection *sconn, uint64_t vuid);
@@ -438,6 +438,8 @@ NTSTATUS fsp_set_smb_fname(struct files_struct *fsp,
 			   const struct smb_filename *smb_fname_in);
 size_t fsp_fullbasepath(struct files_struct *fsp, char *buf, size_t buflen);
 void fsp_set_base_fsp(struct files_struct *fsp, struct files_struct *base_fsp);
+bool fsp_is_alternate_stream(const struct files_struct *fsp);
+struct files_struct *metadata_fsp(struct files_struct *fsp);
 
 NTSTATUS create_internal_fsp(connection_struct *conn,
 			     const struct smb_filename *smb_fname,
@@ -1129,7 +1131,9 @@ connection_struct *make_connection(struct smb_request *req,
 				   const char *service_in,
 				   const char *pdev, uint64_t vuid,
 				   NTSTATUS *status);
-void close_cnum(connection_struct *conn, uint64_t vuid);
+void close_cnum(connection_struct *conn,
+		uint64_t vuid,
+		enum file_close_type close_type);
 
 /* The following definitions come from smbd/session.c  */
 struct sessionid;

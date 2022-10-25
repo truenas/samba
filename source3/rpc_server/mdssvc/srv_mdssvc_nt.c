@@ -91,19 +91,22 @@ static NTSTATUS create_mdssvc_policy_handle(TALLOC_CTX *mem_ctx,
 					    struct policy_handle *handle)
 {
 	struct mds_ctx *mds_ctx;
+	NTSTATUS status;
 
 	ZERO_STRUCTP(handle);
 
-	mds_ctx = mds_init_ctx(mem_ctx,
-			       messaging_tevent_context(p->msg_ctx),
-			       p->msg_ctx,
-			       p->session_info,
-			       snum,
-			       sharename,
-			       path);
-	if (mds_ctx == NULL) {
-		DEBUG(1, ("error in mds_init_ctx for: %s\n", path));
-		return NT_STATUS_UNSUCCESSFUL;
+	status = mds_init_ctx(mem_ctx,
+			      messaging_tevent_context(p->msg_ctx),
+			      p->msg_ctx,
+			      p->session_info,
+			      snum,
+			      sharename,
+			      path,
+			      &mds_ctx);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_DEBUG("mds_init_ctx() path [%s] failed: %s\n",
+			  path, nt_errstr(status));
+		return status;
 	}
 
 	if (!create_policy_hnd(p, handle, 0, mds_ctx)) {
@@ -149,6 +152,11 @@ void _mdssvc_open(struct pipes_struct *p, struct mdssvc_open *r)
 					     r->in.share_name,
 					     path,
 					     r->out.handle);
+	if (NT_STATUS_EQUAL(status, NT_STATUS_WRONG_VOLUME)) {
+		ZERO_STRUCTP(r->out.handle);
+		talloc_free(path);
+		return;
+	}
 	if (!NT_STATUS_IS_OK(status)) {
 		DBG_ERR("Couldn't create policy handle for %s\n",
 			r->in.share_name);

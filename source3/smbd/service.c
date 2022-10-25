@@ -1122,14 +1122,16 @@ connection_struct *make_connection(struct smb_request *req,
  Close a cnum.
 ****************************************************************************/
 
-void close_cnum(connection_struct *conn, uint64_t vuid)
+void close_cnum(connection_struct *conn,
+		uint64_t vuid,
+		enum file_close_type close_type)
 {
 	char rootpath[2] = { '/', '\0'};
 	struct smb_filename root_fname = { .base_name = rootpath };
 	const struct loadparm_substitution *lp_sub =
 		loadparm_s3_global_substitution();
 
-	file_close_conn(conn);
+	file_close_conn(conn, close_type);
 
 	change_to_root_user();
 
