@@ -107,19 +107,19 @@ acl_from_aces(zfsacl_t aclp, const ace_t *aces, int nentries)
 			abort();
 		}
 
-		ok = zfsace_set_permset(aclp, permset);
+		ok = zfsace_set_permset(entry, permset);
 		if (!ok) {
 			return (errno);
 		}
-		ok = zfsace_set_flagset(aclp, flagset);
+		ok = zfsace_set_flagset(entry, flagset);
 		if (!ok) {
 			return (errno);
 		}
-		ok = zfsace_set_who(aclp, whotype, whoid);
+		ok = zfsace_set_who(entry, whotype, whoid);
 		if (!ok) {
 			return (errno);
 		}
-		ok = zfsace_set_entry_type(aclp, entry_type);
+		ok = zfsace_set_entry_type(entry, entry_type);
 		if (!ok) {
 			return (errno);
 		}
