@@ -2301,7 +2301,8 @@ int samdb_set_password_callback(struct ldb_request *req, struct ldb_reply *ares)
  * change failed.
  *
  * Results: NT_STATUS_OK, NT_STATUS_INVALID_PARAMETER, NT_STATUS_UNSUCCESSFUL,
- *   NT_STATUS_WRONG_PASSWORD, NT_STATUS_PASSWORD_RESTRICTION
+ *   NT_STATUS_WRONG_PASSWORD, NT_STATUS_PASSWORD_RESTRICTION,
+ *   NT_STATUS_ACCESS_DENIED, NT_STATUS_ACCOUNT_LOCKED_OUT, NT_STATUS_NO_MEMORY
  */
 static NTSTATUS samdb_set_password_internal(struct ldb_context *ldb, TALLOC_CTX *mem_ctx,
 			    struct ldb_dn *user_dn, struct ldb_dn *domain_dn,
@@ -2413,7 +2414,10 @@ static NTSTATUS samdb_set_password_internal(struct ldb_context *ldb, TALLOC_CTX 
 		return NT_STATUS_NO_MEMORY;
 	}
 
-	ret = dsdb_autotransaction_request(ldb, req);
+	ret = ldb_request(ldb, req);
+	if (ret == LDB_SUCCESS) {
+		ret = ldb_wait(req->handle, LDB_WAIT_ALL);
+	}
 
 	if (req->context != NULL) {
 		struct ldb_control *control = talloc_get_type_abort(req->context,
@@ -2474,6 +2478,9 @@ static NTSTATUS samdb_set_password_internal(struct ldb_context *ldb, TALLOC_CTX 
 			if (W_ERROR_EQUAL(werr, WERR_PASSWORD_RESTRICTION)) {
 				status = NT_STATUS_PASSWORD_RESTRICTION;
 			}
+			if (W_ERROR_EQUAL(werr, WERR_ACCOUNT_LOCKED_OUT)) {
+				status = NT_STATUS_ACCOUNT_LOCKED_OUT;
+			}
 		}
 	} else if (ret == LDB_ERR_NO_SUCH_OBJECT) {
 		/* don't let the caller know if an account doesn't exist */
@@ -2523,6 +2530,7 @@ NTSTATUS samdb_set_password(struct ldb_context *ldb, TALLOC_CTX *mem_ctx,
  * Results: NT_STATUS_OK, NT_STATUS_INTERNAL_DB_CORRUPTION,
  *   NT_STATUS_INVALID_PARAMETER, NT_STATUS_UNSUCCESSFUL,
  *   NT_STATUS_WRONG_PASSWORD, NT_STATUS_PASSWORD_RESTRICTION,
+ *   NT_STATUS_ACCESS_DENIED, NT_STATUS_ACCOUNT_LOCKED_OUT, NT_STATUS_NO_MEMORY
  *   NT_STATUS_TRANSACTION_ABORTED, NT_STATUS_NO_SUCH_USER
  */
 NTSTATUS samdb_set_password_sid(struct ldb_context *ldb, TALLOC_CTX *mem_ctx,
@@ -5363,9 +5371,9 @@ int dsdb_create_partial_replica_NC(struct ldb_context *ldb,  struct ldb_dn *dn)
  * This also requires that the domain_msg have (if present):
  *  - lockOutObservationWindow
  */
-static int dsdb_effective_badPwdCount(const struct ldb_message *user_msg,
-				      int64_t lockOutObservationWindow,
-				      NTTIME now)
+int dsdb_effective_badPwdCount(const struct ldb_message *user_msg,
+			       int64_t lockOutObservationWindow,
+			       NTTIME now)
 {
 	int64_t badPasswordTime;
 	badPasswordTime = ldb_msg_find_attr_as_int64(user_msg, "badPasswordTime", 0);
@@ -5412,25 +5420,24 @@ static struct ldb_result *lookup_user_pso(struct ldb_context *sam_ldb,
 }
 
 /*
- * Return the effective badPwdCount
+ * Return the msDS-LockoutObservationWindow for a user message
  *
  * This requires that the user_msg have (if present):
- *  - badPasswordTime
- *  - badPwdCount
  *  - msDS-ResultantPSO
  */
-int samdb_result_effective_badPwdCount(struct ldb_context *sam_ldb,
-				       TALLOC_CTX *mem_ctx,
-				       struct ldb_dn *domain_dn,
-				       const struct ldb_message *user_msg)
+int64_t samdb_result_msds_LockoutObservationWindow(
+	struct ldb_context *sam_ldb,
+	TALLOC_CTX *mem_ctx,
+	struct ldb_dn *domain_dn,
+	const struct ldb_message *user_msg)
 {
-	struct timeval tv_now = timeval_current();
-	NTTIME now = timeval_to_nttime(&tv_now);
 	int64_t lockOutObservationWindow;
 	struct ldb_result *res = NULL;
 	const char *attrs[] = { "msDS-LockoutObservationWindow",
 				NULL };
-
+	if (domain_dn == NULL) {
+		smb_panic("domain dn is NULL");
+	}
 	res = lookup_user_pso(sam_ldb, mem_ctx, user_msg, attrs);
 
 	if (res != NULL) {
@@ -5446,7 +5453,27 @@ int samdb_result_effective_badPwdCount(struct ldb_context *sam_ldb,
 			 samdb_search_int64(sam_ldb, mem_ctx, 0, domain_dn,
 					    "lockOutObservationWindow", NULL);
 	}
+	return lockOutObservationWindow;
+}
 
+/*
+ * Return the effective badPwdCount
+ *
+ * This requires that the user_msg have (if present):
+ *  - badPasswordTime
+ *  - badPwdCount
+ *  - msDS-ResultantPSO
+ */
+int samdb_result_effective_badPwdCount(struct ldb_context *sam_ldb,
+				       TALLOC_CTX *mem_ctx,
+				       struct ldb_dn *domain_dn,
+				       const struct ldb_message *user_msg)
+{
+	struct timeval tv_now = timeval_current();
+	NTTIME now = timeval_to_nttime(&tv_now);
+	int64_t lockOutObservationWindow =
+		samdb_result_msds_LockoutObservationWindow(
+			sam_ldb, mem_ctx, domain_dn, user_msg);
 	return dsdb_effective_badPwdCount(user_msg, lockOutObservationWindow, now);
 }
 

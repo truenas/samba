@@ -45,6 +45,7 @@
 #include "lib/crypto/md4.h"
 #include "param/param.h"
 #include "lib/krb5_wrap/krb5_samba.h"
+#include "auth/auth_sam.h"
 #include "auth/common_auth.h"
 #include "lib/messaging/messaging.h"
 #include "lib/param/loadparm.h"
@@ -2729,27 +2730,10 @@ static int make_error_and_update_badPwdCount(struct setup_password_fields_io *io
 	struct ldb_context *ldb = ldb_module_get_ctx(io->ac->module);
 	struct ldb_message *mod_msg = NULL;
 	struct ldb_message *pso_msg = NULL;
-	NTSTATUS status;
+	struct ldb_message *current = NULL;
+	NTSTATUS status = NT_STATUS_OK;
 	int ret; /* The errors we will actually return */
 	int dbg_ret; /* The errors we can only complain about in logs */
-
-	/* PSO search result is optional (NULL if no PSO applies) */
-	if (io->ac->pso_res != NULL) {
-		pso_msg = io->ac->pso_res->message;
-	}
-
-	status = dsdb_update_bad_pwd_count(io->ac, ldb,
-					   io->ac->search_res->message,
-					   io->ac->dom_res->message,
-					   pso_msg,
-					   &mod_msg);
-	if (!NT_STATUS_IS_OK(status)) {
-		goto done;
-	}
-
-	if (mod_msg == NULL) {
-		goto done;
-	}
 
 	/*
 	 * OK, horrible semantics ahead.
@@ -2793,6 +2777,39 @@ static int make_error_and_update_badPwdCount(struct setup_password_fields_io *io
 		goto done;
 	}
 
+	/*
+	 * Re-read the account details, using the GUID in case the DN
+	 * is being changed.
+	 */
+	status = authsam_reread_user_logon_data(
+		ldb, io->ac,
+		io->ac->search_res->message,
+		&current);
+	if (!NT_STATUS_IS_OK(status)) {
+		/* The re-read can return account locked out, as well
+		 * as an internal error
+		 */
+		goto end_transaction;
+	}
+
+	/* PSO search result is optional (NULL if no PSO applies) */
+	if (io->ac->pso_res != NULL) {
+		pso_msg = io->ac->pso_res->message;
+	}
+
+	status = dsdb_update_bad_pwd_count(io->ac, ldb,
+					   current,
+					   io->ac->dom_res->message,
+					   pso_msg,
+					   &mod_msg);
+	if (!NT_STATUS_IS_OK(status)) {
+		goto end_transaction;
+	}
+
+	if (mod_msg == NULL) {
+		goto end_transaction;
+	}
+
 	dbg_ret = dsdb_module_modify(io->ac->module, mod_msg,
 				 DSDB_FLAG_NEXT_MODULE,
 				 io->ac->req);
@@ -2806,6 +2823,7 @@ static int make_error_and_update_badPwdCount(struct setup_password_fields_io *io
 		 */
 	}
 
+end_transaction:
 	dbg_ret = ldb_next_end_trans(io->ac->module);
 	if (dbg_ret != LDB_SUCCESS) {
 		ldb_debug(ldb, LDB_DEBUG_ERROR,
@@ -2830,7 +2848,11 @@ static int make_error_and_update_badPwdCount(struct setup_password_fields_io *io
 
 done:
 	ret = LDB_ERR_CONSTRAINT_VIOLATION;
-	*werror = WERR_INVALID_PASSWORD;
+	if (NT_STATUS_EQUAL(status, NT_STATUS_ACCOUNT_LOCKED_OUT)) {
+		*werror = WERR_ACCOUNT_LOCKED_OUT;
+	} else {
+		*werror = WERR_INVALID_PASSWORD;
+	}
 	ldb_asprintf_errstring(ldb,
 			       "%08X: %s - check_password_restrictions: "
 			       "The old password specified doesn't match!",
