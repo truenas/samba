@@ -189,6 +189,7 @@ static void smbXsrv_client_global_verify_record(struct db_record *db_rec,
 					bool *is_free,
 					bool *was_free,
 					TALLOC_CTX *mem_ctx,
+					const struct server_id *dead_server_id,
 					struct smbXsrv_client_global0 **_g,
 					uint32_t *pseqnum)
 {
@@ -198,6 +199,7 @@ static void smbXsrv_client_global_verify_record(struct db_record *db_rec,
 	struct smbXsrv_client_globalB global_blob;
 	enum ndr_err_code ndr_err;
 	struct smbXsrv_client_global0 *global = NULL;
+	bool dead = false;
 	bool exists;
 	TALLOC_CTX *frame = talloc_stackframe();
 
@@ -231,8 +233,7 @@ static void smbXsrv_client_global_verify_record(struct db_record *db_rec,
 			(ndr_pull_flags_fn_t)ndr_pull_smbXsrv_client_globalB);
 	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
 		NTSTATUS status = ndr_map_error2ntstatus(ndr_err);
-		DBG_WARNING("smbXsrv_client_global_verify_record: "
-			    "key '%s' ndr_pull_struct_blob - %s\n",
+		DBG_WARNING("key '%s' ndr_pull_struct_blob - %s\n",
 			    hex_encode_talloc(frame, key.dptr, key.dsize),
 			    nt_errstr(status));
 		TALLOC_FREE(frame);
@@ -254,6 +255,22 @@ static void smbXsrv_client_global_verify_record(struct db_record *db_rec,
 	}
 
 	global = global_blob.info.info0;
+
+	dead = server_id_equal(dead_server_id, &global->server_id);
+	if (dead) {
+		struct server_id_buf tmp;
+
+		DBG_NOTICE("key '%s' server_id %s is already dead.\n",
+			   hex_encode_talloc(frame, key.dptr, key.dsize),
+			   server_id_str_buf(global->server_id, &tmp));
+		if (DEBUGLVL(DBGLVL_NOTICE)) {
+			NDR_PRINT_DEBUG(smbXsrv_client_globalB, &global_blob);
+		}
+		TALLOC_FREE(frame);
+		dbwrap_record_delete(db_rec);
+		*is_free = true;
+		return;
+	}
 
 	exists = serverid_exists(&global->server_id);
 	if (!exists) {
@@ -472,6 +489,7 @@ struct smb2srv_client_mc_negprot_state {
 	struct db_record *db_rec;
 	uint64_t watch_instance;
 	uint32_t last_seqnum;
+	struct tevent_req *filter_subreq;
 };
 
 static void smb2srv_client_mc_negprot_cleanup(struct tevent_req *req,
@@ -534,7 +552,9 @@ static void smb2srv_client_mc_negprot_next(struct tevent_req *req)
 	struct tevent_req *subreq = NULL;
 	NTSTATUS status;
 	uint32_t seqnum = 0;
+	struct server_id last_server_id = { .pid = 0, };
 
+	TALLOC_FREE(state->filter_subreq);
 	SMB_ASSERT(state->db_rec == NULL);
 	state->db_rec = smbXsrv_client_global_fetch_locked(table->global.db_ctx,
 							   &client_guid,
@@ -544,10 +564,14 @@ static void smb2srv_client_mc_negprot_next(struct tevent_req *req)
 		return;
 	}
 
+verify_again:
+	TALLOC_FREE(global);
+
 	smbXsrv_client_global_verify_record(state->db_rec,
 					    &is_free,
 					    NULL,
 					    state,
+					    &last_server_id,
 					    &global,
 					    &seqnum);
 	if (is_free) {
@@ -601,6 +625,16 @@ static void smb2srv_client_mc_negprot_next(struct tevent_req *req)
 		return;
 	}
 
+	/*
+	 * If last_server_id is set, we expect
+	 * smbXsrv_client_global_verify_record()
+	 * to detect the already dead global->server_id
+	 * as state->db_rec is still locked and its
+	 * value didn't change.
+	 */
+	SMB_ASSERT(last_server_id.pid == 0);
+	last_server_id = global->server_id;
+
 	if (procid_is_local(&global->server_id)) {
 		subreq = messaging_filtered_read_send(state,
 						      state->ev,
@@ -611,6 +645,37 @@ static void smb2srv_client_mc_negprot_next(struct tevent_req *req)
 			return;
 		}
 		tevent_req_set_callback(subreq, smb2srv_client_mc_negprot_done, req);
+		state->filter_subreq = subreq;
+	}
+
+	if (procid_is_local(&global->server_id)) {
+		status = smb2srv_client_connection_pass(state->smb2req,
+							global);
+		if (NT_STATUS_EQUAL(status, NT_STATUS_OBJECT_NAME_NOT_FOUND)) {
+			/*
+			 * We remembered last_server_id = global->server_id
+			 * above, so we'll treat it as dead in the
+			 * next round to smbXsrv_client_global_verify_record().
+			 */
+			goto verify_again;
+		}
+		if (tevent_req_nterror(req, status)) {
+			return;
+		}
+	} else {
+		status = smb2srv_client_connection_drop(state->smb2req,
+							global);
+		if (NT_STATUS_EQUAL(status, NT_STATUS_OBJECT_NAME_NOT_FOUND)) {
+			/*
+			 * We remembered last_server_id = global->server_id
+			 * above, so we'll treat it as dead in the
+			 * next round to smbXsrv_client_global_verify_record().
+			 */
+			goto verify_again;
+		}
+		if (tevent_req_nterror(req, status)) {
+			return;
+		}
 	}
 
 	/*
@@ -644,22 +709,7 @@ static void smb2srv_client_mc_negprot_next(struct tevent_req *req)
 	}
 	tevent_req_set_callback(subreq, smb2srv_client_mc_negprot_watched, req);
 
-	if (procid_is_local(&global->server_id)) {
-		status = smb2srv_client_connection_pass(state->smb2req,
-							global);
-		TALLOC_FREE(global);
-		if (tevent_req_nterror(req, status)) {
-			return;
-		}
-	} else {
-		status = smb2srv_client_connection_drop(state->smb2req,
-							global);
-		TALLOC_FREE(global);
-		if (tevent_req_nterror(req, status)) {
-			return;
-		}
-	}
-
+	TALLOC_FREE(global);
 	TALLOC_FREE(state->db_rec);
 	return;
 }
@@ -693,6 +743,9 @@ static void smb2srv_client_mc_negprot_done(struct tevent_req *subreq)
 	struct smbXsrv_connection_pass0 *passed_info0 = NULL;
 	NTSTATUS status;
 	int ret;
+
+	SMB_ASSERT(state->filter_subreq == subreq);
+	state->filter_subreq = NULL;
 
 	ret = messaging_filtered_read_recv(subreq, state, &rec);
 	TALLOC_FREE(subreq);
@@ -1111,6 +1164,16 @@ static void smbXsrv_client_connection_pass_loop(struct tevent_req *subreq)
 	}
 
 	status = smb2srv_client_connection_passed(client, pass_info0);
+	if (NT_STATUS_EQUAL(status, NT_STATUS_OBJECT_NAME_NOT_FOUND)) {
+		/*
+		 * We hit a race where, the client dropped the connection
+		 * while the socket was passed to us and the origin
+		 * process already existed.
+		 */
+		DBG_DEBUG("smb2srv_client_connection_passed() ignore %s\n",
+			  nt_errstr(status));
+		status = NT_STATUS_OK;
+	}
 	if (!NT_STATUS_IS_OK(status)) {
 		const char *r = "smb2srv_client_connection_passed() failed";
 		DBG_ERR("%s => %s\n", r, nt_errstr(status));

@@ -1002,6 +1002,8 @@ if ('SAMBA4_USES_HEIMDAL' in config_hash or
 else:
     tkt_sig_support = 0
 
+gnutls_pbkdf2_support = int('HAVE_GNUTLS_PBKDF2' in config_hash)
+
 if 'HAVE_MIT_KRB5_1_20' in config_hash:
     kadmin_is_tgs = 1
 else:
@@ -1022,6 +1024,7 @@ krb5_environ = {
     'CLAIMS_SUPPORT': claims_support,
     'COMPOUND_ID_SUPPORT': compound_id_support,
     'TKT_SIG_SUPPORT': tkt_sig_support,
+    'GNUTLS_PBKDF2_SUPPORT': gnutls_pbkdf2_support,
     'EXPECT_PAC': expect_pac,
     'EXPECT_EXTRA_PAC_BUFFERS': extra_pac_buffers,
     'CHECK_CNAME': check_cname,
@@ -1507,6 +1510,9 @@ planoldpythontestsuite(env, "ridalloc_exop",
 #
 # That is why this test is run on the isolated environment and not on
 # those connected with ad_dc (vampiredc/promoteddc)
+#
+# The chgdcpass enviroment is likewise isolated and emulates Samba 4.5
+# with regard to GET_ANC
 
 env = 'schema_pair_dc'
 planoldpythontestsuite("%s:local" % env, "samba_tool_drs",
@@ -1514,6 +1520,12 @@ planoldpythontestsuite("%s:local" % env, "samba_tool_drs",
                        name="samba4.drs.samba_tool_drs.python(%s)" % env,
                        environ={'DC1': '$DC_SERVER', 'DC2': '$SERVER'},
                        extra_args=['-U$DOMAIN/$DC_USERNAME%$DC_PASSWORD'])
+for env in ['chgdcpass', 'schema_pair_dc']:
+    planoldpythontestsuite("%s:local" % env, "samba_tool_drs_critical",
+                           extra_path=[os.path.join(samba4srcdir, 'torture/drs/python')],
+                           name="samba4.drs.samba_tool_drs_critical.python(%s)" % env,
+                           environ={'DC1': '$DC_SERVER', 'DC2': '$SERVER'},
+                           extra_args=['-U$DOMAIN/$DC_USERNAME%$DC_PASSWORD'])
 planoldpythontestsuite(env, "getnc_schema",
                        extra_path=[os.path.join(samba4srcdir, 'torture/drs/python')],
                        name="samba4.drs.getnc_schema.python(%s)" % env,
@@ -1558,11 +1570,6 @@ for env in ['vampire_dc', 'promoted_dc']:
                            name="samba4.drs.repl_move.python(%s)" % env,
                            environ={'DC1': "$DC_SERVER", 'DC2': '$SERVER'},
                            extra_args=['-U$DOMAIN/$DC_USERNAME%$DC_PASSWORD'])
-    planoldpythontestsuite(env, "getnc_exop",
-                           extra_path=[os.path.join(samba4srcdir, 'torture/drs/python')],
-                           name="samba4.drs.getnc_exop.python(%s)" % env,
-                           environ={'DC1': "$DC_SERVER", 'DC2': '$SERVER'},
-                           extra_args=['-U$DOMAIN/$DC_USERNAME%$DC_PASSWORD'])
     planoldpythontestsuite(env, "getnc_unpriv",
                            extra_path=[os.path.join(samba4srcdir, 'torture/drs/python')],
                            name="samba4.drs.getnc_unpriv.python(%s)" % env,
@@ -1578,6 +1585,15 @@ for env in ['vampire_dc', 'promoted_dc']:
                            name="samba4.drs.link_conflicts.python(%s)" % env,
                            environ={'DC1': "$DC_SERVER", 'DC2': '$SERVER'},
 			   extra_args=['-U$DOMAIN/$DC_USERNAME%$DC_PASSWORD'])
+
+# Environment chgdcpass has the Samba 4.5 GET_ANC behaviour, which we
+# set a knownfail to expect
+for env in ['vampire_dc', 'promoted_dc', 'chgdcpass']:
+    planoldpythontestsuite(env, "getnc_exop",
+                           extra_path=[os.path.join(samba4srcdir, 'torture/drs/python')],
+                           name="samba4.drs.getnc_exop.python(%s)" % env,
+                           environ={'DC1': "$DC_SERVER", 'DC2': '$SERVER'},
+                           extra_args=['-U$DOMAIN/$DC_USERNAME%$DC_PASSWORD'])
 
 for env in ['vampire_dc', 'promoted_dc', 'vampire_2000_dc']:
     planoldpythontestsuite(env, "repl_schema",
@@ -1726,6 +1742,10 @@ for env, nt_hash in [("ad_dc:local", True),
 planoldpythontestsuite(
     'ad_dc',
     'samba.tests.krb5.kpasswd_tests',
+    environ=krb5_environ)
+planoldpythontestsuite(
+    'ad_dc:local',
+    'samba.tests.krb5.lockout_tests',
     environ=krb5_environ)
 
 for env in [

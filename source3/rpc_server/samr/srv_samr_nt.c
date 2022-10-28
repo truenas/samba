@@ -4946,9 +4946,7 @@ static NTSTATUS set_user_info_23(TALLOC_CTX *mem_ctx,
 		}
 	}
 
-	if (plaintext_buf) {
-		memset(plaintext_buf, '\0', strlen(plaintext_buf));
-	}
+	BURN_STR(plaintext_buf);
 
 	if (IS_SAM_CHANGED(pwd, PDB_GROUPSID) &&
 	    (!NT_STATUS_IS_OK(status =  pdb_set_unix_primary_group(mem_ctx,
@@ -5018,7 +5016,7 @@ static bool set_user_info_pw(uint8_t *pass, const char *rhost, struct samu *pwd)
 		}
 	}
 
-	memset(plaintext_buf, '\0', strlen(plaintext_buf));
+	BURN_STR(plaintext_buf);
 
 	DEBUG(5,("set_user_info_pw: pdb_update_pwd()\n"));
 
@@ -5066,7 +5064,7 @@ set_user_info_pw_aes(DATA_BLOB *pw_data, const char *rhost, struct samu *pwd)
 
 			username = pdb_get_username(pwd);
 			if (username == NULL) {
-				DBG_WARNING("User unkown\n");
+				DBG_WARNING("User unknown\n");
 				return false;
 			}
 
@@ -7683,7 +7681,6 @@ NTSTATUS _samr_ChangePasswordUser4(struct pipes_struct *p,
 	struct dcesrv_connection *dcesrv_conn = dce_call->conn;
 	const struct tsocket_address *remote_address =
 		dcesrv_connection_get_remote_address(dcesrv_conn);
-	enum samPwdChangeReason reject_reason;
 	char *rhost = NULL;
 	struct samu *sampass = NULL;
 	char *username = NULL;
@@ -7699,6 +7696,11 @@ NTSTATUS _samr_ChangePasswordUser4(struct pipes_struct *p,
 		.data = cdk_data,
 		.length = sizeof(cdk_data),
 	};
+	char *new_passwd = NULL;
+	bool updated_badpw = false;
+	NTSTATUS update_login_attempts_status;
+	char *mutex_name_by_user = NULL;
+	struct named_mutex *mtx = NULL;
 	NTSTATUS status = NT_STATUS_WRONG_PASSWORD;
 	bool ok;
 	int rc;
@@ -7768,18 +7770,143 @@ NTSTATUS _samr_ChangePasswordUser4(struct pipes_struct *p,
 	}
 
 	status = samr_set_password_aes(frame,
-				       sampass,
-				       rhost,
 				       &cdk,
 				       r->in.password,
-				       &reject_reason);
+				       &new_passwd);
 	BURN_DATA(cdk_data);
-	if (NT_STATUS_EQUAL(status, NT_STATUS_NO_SUCH_USER)) {
-		return NT_STATUS_WRONG_PASSWORD;
+
+	/*
+	 * We must re-load the sam acount information under a mutex
+	 * lock to ensure we don't miss any concurrent account lockout
+	 * changes.
+	 */
+
+	/* Clear out old sampass info. */
+	TALLOC_FREE(sampass);
+
+	sampass = samu_new(frame);
+	if (sampass == NULL) {
+		status = NT_STATUS_NO_MEMORY;
+		goto done;
 	}
+
+	mutex_name_by_user = talloc_asprintf(frame,
+					     "check_sam_security_mutex_%s",
+					     username);
+	if (mutex_name_by_user == NULL) {
+		status = NT_STATUS_NO_MEMORY;
+		goto done;
+	}
+
+	/* Grab the named mutex under root with 30 second timeout. */
+	become_root();
+	mtx = grab_named_mutex(frame, mutex_name_by_user, 30);
+	if (mtx != NULL) {
+		/* Re-load the account information if we got the mutex. */
+		ok = pdb_getsampwnam(sampass, username);
+	}
+	unbecome_root();
+
+	/* Everything from here on until mtx is freed is done under the mutex.*/
+
+	if (mtx == NULL) {
+		DBG_ERR("Acquisition of mutex %s failed "
+			"for user %s\n",
+			mutex_name_by_user,
+			username);
+		status = NT_STATUS_INTERNAL_ERROR;
+		goto done;
+	}
+
+	if (!ok) {
+		/*
+		 * Re-load of account failed. This could only happen if the
+		 * user was deleted in the meantime.
+		 */
+		DBG_NOTICE("reload of user '%s' in passdb failed.\n",
+			   username);
+		status = NT_STATUS_NO_SUCH_USER;
+		goto done;
+	}
+
+	/*
+	 * Check if the account is now locked out - now under the mutex.
+	 * This can happen if the server is under
+	 * a password guess attack and the ACB_AUTOLOCK is set by
+	 * another process.
+	 */
+	if (pdb_get_acct_ctrl(sampass) & ACB_AUTOLOCK) {
+		DBG_NOTICE("Account for user %s was locked out.\n", username);
+		status = NT_STATUS_ACCOUNT_LOCKED_OUT;
+		goto done;
+	}
+
+	/*
+	 * Notify passdb backend of login success/failure. If not
+	 * NT_STATUS_OK the backend doesn't like the login
+	 */
+	update_login_attempts_status = pdb_update_login_attempts(
+		sampass, NT_STATUS_IS_OK(status));
+
+	if (!NT_STATUS_IS_OK(status)) {
+		bool increment_bad_pw_count = false;
+
+		if (NT_STATUS_EQUAL(status, NT_STATUS_WRONG_PASSWORD) &&
+		    (pdb_get_acct_ctrl(sampass) & ACB_NORMAL) &&
+		    NT_STATUS_IS_OK(update_login_attempts_status))
+		{
+			increment_bad_pw_count = true;
+		}
+
+		if (increment_bad_pw_count) {
+			pdb_increment_bad_password_count(sampass);
+			updated_badpw = true;
+		} else {
+			pdb_update_bad_password_count(sampass,
+						      &updated_badpw);
+		}
+	} else {
+		if ((pdb_get_acct_ctrl(sampass) & ACB_NORMAL) &&
+		    (pdb_get_bad_password_count(sampass) > 0))
+		{
+			pdb_set_bad_password_count(sampass, 0, PDB_CHANGED);
+			pdb_set_bad_password_time(sampass, 0, PDB_CHANGED);
+			updated_badpw = true;
+		}
+	}
+
+	if (updated_badpw) {
+		NTSTATUS update_status;
+		become_root();
+		update_status = pdb_update_sam_account(sampass);
+		unbecome_root();
+
+		if (!NT_STATUS_IS_OK(update_status)) {
+			DEBUG(1, ("Failed to modify entry: %s\n",
+				  nt_errstr(update_status)));
+		}
+	}
+
+	if (!NT_STATUS_IS_OK(status)) {
+		goto done;
+	}
+
+	become_root();
+	status = change_oem_password(sampass,
+				     rhost,
+				     NULL,
+				     new_passwd,
+				     true,
+				     NULL);
+	unbecome_root();
+	TALLOC_FREE(new_passwd);
 
 done:
 	TALLOC_FREE(frame);
+
+	if (NT_STATUS_EQUAL(status, NT_STATUS_NO_SUCH_USER)) {
+		return NT_STATUS_WRONG_PASSWORD;
+	}
 
 	return status;
 #else  /* HAVE_GNUTLS_PBKDF2 */
