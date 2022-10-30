@@ -45,5 +45,4 @@ int _tevent_add_aio_fsync(struct tevent_aiocb *taiocb, const char *location);
 #define tevent_add_aio_fsync(taiocb)\
         (int)_tevent_add_aio_fsync(taiocb, __location__)
 
-void tevent_aio_cancel(struct tevent_aiocb *taiocb);
 struct aiocb *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb);
