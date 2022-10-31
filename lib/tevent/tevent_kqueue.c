@@ -847,6 +847,9 @@ static void tevent_aio_waitcomplete(struct tevent_context *ev, struct aiocb *ioc
 
 	ret = aio_waitcomplete(&iocbp, &timeout);
 	if (ret == -1) {
+		if (errno == ECANCELED) {
+			return;
+		}
 		tevent_debug(
 			ev, TEVENT_DEBUG_FATAL,
 			"tevent_aio_waitcomplete(): aio_waitcomplete() failed: %s\n",
@@ -863,7 +866,7 @@ static void tevent_aio_waitcomplete(struct tevent_context *ev, struct aiocb *ioc
 	}
 }
 
-void tevent_aio_cancel(struct tevent_aiocb *taiocb)
+static bool tevent_aio_cancel(struct tevent_aiocb *taiocb)
 {
 	int ret;
 	struct aiocb *iocbp = taiocb->iocbp;
@@ -880,7 +883,8 @@ void tevent_aio_cancel(struct tevent_aiocb *taiocb)
 	}
 
 	ret = aio_cancel(iocbp->aio_fildes, iocbp);
-	if (ret == -1) {
+	switch (ret) {
+	case -1:
 		tevent_debug(
 			taiocb->ev, TEVENT_DEBUG_WARNING,
 			"tevent_aio_cancel(): "
@@ -888,9 +892,7 @@ void tevent_aio_cancel(struct tevent_aiocb *taiocb)
 			 strerror(errno)
 		);
 		abort();
-
-	/* return 0x2 = AIO_NOTCANCELED */
-	} else if (ret == 2) {
+	case AIO_NOTCANCELED:
 		ret = aio_error(iocbp);
 		if (ret == -1) {
 			tevent_debug(
@@ -901,10 +903,20 @@ void tevent_aio_cancel(struct tevent_aiocb *taiocb)
 			);
 			abort();
 		}
-		else if (ret == EINPROGRESS) {
-			tevent_aio_waitcomplete(taiocb->ev, iocbp);
-		}
-	}
+		break;
+	case AIO_CANCELED:
+	case AIO_ALLDONE:
+		break;
+	default:
+		tevent_debug(
+			taiocb->ev, TEVENT_DEBUG_WARNING,
+			"%d: unexpected aio_cancel() return.\n",
+			ret
+		);
+		abort();
+	};
+
+	tevent_aio_waitcomplete(taiocb->ev, iocbp);
 	TALLOC_FREE(taiocb->iocbp);
 }
 
