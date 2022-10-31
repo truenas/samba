@@ -689,30 +689,120 @@ static PyMethodDef ace_object_methods[] = {
 	{ NULL, NULL, 0, NULL }
 };
 
+PyDoc_STRVAR(py_ace_idx__doc__,
+"Position of Access control entry in the ACL.\n"
+);
+
+PyDoc_STRVAR(py_ace_permset__doc__,
+"int : access mask for the access control list entry.\n"
+"This should be bitwise or of following values as defined\n"
+"in RFC 3530 Section 5.11.2.\n\n"
+"Values\n"
+"------\n"
+"NFSv4 and POSIX1E common permissions:\n"
+"zfsacl.PERM_READ_DATA - Permission to read data of the file\n"
+"zfsacl.PERM_WRITE_DATA - Permission to modify file's data\n"
+"zfsacl.PERM_EXECUTE - Permission to execute a file\n"
+"NFSv4 brand specific permissions:\n"
+"zfsacl.PERM_LIST_DIRECTORY - Permission to list contents of "
+"a directory\n"
+"zfsacl.PERM_ADD_FILE - Permission to add a new file to a directory\n"
+"zfsacl.PERM_APPEND_DATA - Permission to append data to a file\n"
+"zfsacl.PERM_ADD_SUBDIRECTORY - Permission to create a subdirectory "
+"to a directory\n"
+"zfsacl.PERM_READ_NAMED_ATTRS - Permission to read the named "
+"attributes of a file\n"
+"zfsacl.PERM_WRITE_NAMED_ATTRS - Permission to write the named "
+"attributes of a file\n"
+"zfsacl.PERM_DELETE_CHILD - Permission to delete a file or directory "
+"within a directorey\n"
+"zfsacl.PERM_READ_ATTRIBUTES - Permission to stat() a file\n"
+"zfsacl.PERM_WRITE_ATTRIBUTES - Permission to change basic attributes\n"
+"zfsacl.PERM_DELETE - Permission to delete the file\n"
+"zfsacl.PERM_WRITE_ACL - Permission to write the ACL\n"
+"zfsacl.PERM_WRITE_OWNER - Permission to change the owner\n"
+"zfsacl.PERM_SYNCHRONIZE - Not Implemented\n\n"
+"Warning\n"
+"-------\n"
+"The exact behavior of these permissions bits may vary depending\n"
+"on operating system implementation. Please review relevant OS\n"
+"documention and validate the behavior before deploying an access\n"
+"control scheme in a production environment.\n"
+);
+
+PyDoc_STRVAR(py_ace_flagset__doc__,
+"int : inheritance flags for the access control list entry.\n"
+"This should be bitwise or of the following values as defined\n"
+"in RFC 5661 Section 6.2.1.4.\n\n"
+"Values\n"
+"------\n"
+"zfsacl.FLAG_FILE_INHERIT - Any non-directory file in any subdirectory\n"
+"will get this ACE inherited\n"
+"zfsacl.FLAG_DIRECTORY_INHERIT - This ACE will be added to any new "
+"subdirectory created in this directory\n"
+"zfsacl.FLAG_NO_PROPAGATE_INHERIT - Inheritance of this ACE should stop\n"
+"at newly created child directories\n"
+"zfsacl.FLAG_INHERIT_ONLY - ACE is not enforced on this directory, but\n"
+"will be enforced (cleared) on newly created files and directories\n"
+"zfsacl.FLAG_INHERITED - This ace was inherited from a parent directory\n\n"
+"Note: flags are not valid for POSIX1E ACLs. The only flag valid for\n"
+"files is zfsacl.FLAG_INHERITED, presence of other flags in any ACL entries\n"
+"in an ACL will cause setacl attempt on a non-directory file to fail.\n"
+);
+
+PyDoc_STRVAR(py_ace_who__doc__,
+"tuple : tuple containing information about to whom the ACL entry applies.\n"
+"(<who_type>, <who_id>).\n\n"
+"Values - whotype\n"
+"----------------\n"
+"zfsacl.WHOTYPE_USER_OBJ - The owning user of the file. If this is set, then numeric\n"
+"id must be set to -1\n"
+"zfsacl.WHOTYPE_GROUP_OBJ - The owning group of the file. If this is set, then\n"
+"numeric id must be set to -1\n"
+"zfsacl.WHOTYPE_EVERYONE - All users. For NFSv4 ACL brand, this includes the\n"
+"file owner and group (as opposed to `other` in conventional POSIX mode)\n"
+"zfsacl.WHOTYPE_USER - The numeric ID <who_id> is a user.\n"
+"zfsacl.WHOTYPE_GROUP - The numeric ID <who_id> is a group.\n"
+);
+
+PyDoc_STRVAR(py_ace_entry_type__doc__,
+"int : ACE type. See RFC 5661 Section 6.2.1.1 and relevant operating system\n"
+"documentation for more implementation details.\n\n"
+"Values\n"
+"------\n"
+"zfsacl.ENTRY_TYPE_ALLOW - Explicitly grants the access defined in permset\n"
+"zfsacl.ENTRY_TYPE_DENY - Explicitly denies the access defined in permset\n"
+);
+
 static PyGetSetDef ace_object_getsetters[] = {
 	{
 		.name    = discard_const_p(char, "idx"),
 		.get     = (getter)ace_get_idx,
+		.doc     = py_ace_idx__doc__,
 	},
 	{
 		.name    = discard_const_p(char, "permset"),
 		.get     = (getter)ace_get_permset,
 		.set     = (setter)ace_set_permset,
+		.doc     = py_ace_permset__doc__,
 	},
 	{
 		.name    = discard_const_p(char, "flagset"),
 		.get     = (getter)ace_get_flagset,
 		.set     = (setter)ace_set_flagset,
+		.doc     = py_ace_flagset__doc__,
 	},
 	{
 		.name    = discard_const_p(char, "who"),
 		.get     = (getter)ace_get_who,
 		.set     = (setter)ace_set_who,
+		.doc     = py_ace_who__doc__,
 	},
 	{
 		.name    = discard_const_p(char, "entry_type"),
 		.get     = (getter)ace_get_entry_type,
 		.set     = (setter)ace_set_entry_type,
+		.doc     = py_ace_entry_type__doc__,
 	},
 	{ .name = NULL }
 };
@@ -996,6 +1086,20 @@ static bool pyargs_get_index(py_acl *self, PyObject *args, int *pidx, bool requi
 	return true;
 }
 
+PyDoc_STRVAR(py_acl_create_entry__doc__,
+"create_entry(index)\n"
+"--\n\n"
+"Create a new ACL entry. If index is unspecified then entry\n"
+"will be appended to ACL.\n\n"
+"Parameters\n"
+"----------\n"
+"index : int, optional\n"
+"    Position of new entry in ACL.\n\n"
+"Returns\n"
+"-------\n"
+"    new zfsacl.ACLEntry object\n"
+);
+
 static PyObject *py_acl_create_entry(PyObject *obj, PyObject *args)
 {
 	py_acl *self = (py_acl *)obj;
@@ -1024,6 +1128,19 @@ static PyObject *py_acl_create_entry(PyObject *obj, PyObject *args)
 
 	return (PyObject *)pyentry;
 }
+
+PyDoc_STRVAR(py_acl_get_entry__doc__,
+"get_entry(index)\n"
+"--\n\n"
+"Retrieve ACL entry with specified index from ACL.\n\n"
+"Parameters\n"
+"----------\n"
+"index : int\n"
+"    Position of entry in ACL to be retrieved.\n\n"
+"Returns\n"
+"-------\n"
+"    new zfsacl.ACLEntry object\n"
+);
 
 static PyObject *py_acl_get_entry(PyObject *obj, PyObject *args)
 {
@@ -1054,6 +1171,19 @@ static PyObject *py_acl_get_entry(PyObject *obj, PyObject *args)
 	return (PyObject *)pyentry;
 }
 
+PyDoc_STRVAR(py_acl_delete_entry__doc__,
+"delete_entry(index)\n"
+"--\n\n"
+"Remove the ACL entry specified by index from the ACL.\n\n"
+"Parameters\n"
+"----------\n"
+"index : int\n"
+"    Position of entry in ACL to be removed.\n\n"
+"Returns\n"
+"-------\n"
+"    None\n"
+);
+
 static PyObject *py_acl_delete_entry(PyObject *obj, PyObject *args)
 {
 	py_acl *self = (py_acl *)obj;
@@ -1080,6 +1210,22 @@ static PyObject *py_acl_delete_entry(PyObject *obj, PyObject *args)
 
 	Py_RETURN_NONE;
 }
+
+PyDoc_STRVAR(py_acl_set__doc__,
+"setacl(fd=-1, path=None)\n"
+"--\n\n"
+"Set the acl on either a path or open file.\n"
+"Either a path or file must be specified (not both).\n\n"
+"Parameters\n"
+"----------\n"
+"fd : int, optional\n"
+"    Open file descriptor to use for setting ACL.\n"
+"path : string, optional\n"
+"    Path of file on which to set ACL.\n\n"
+"Returns\n"
+"-------\n"
+"    None\n"
+);
 
 static PyObject *py_acl_set(PyObject *obj, PyObject *args, PyObject *kwargs)
 {
@@ -1136,79 +1282,78 @@ static PyObject *py_acl_iter(PyObject *obj, PyObject *args_unused)
 	return (PyObject *)out;
 }
 
-static PyObject *py_native_data(PyObject *obj, PyObject *args, PyObject *kwargs)
-{
-	py_acl *self = (py_acl *)obj;
-	PyObject *out =NULL;
-	struct native_acl native;
-	bool ok;
-
-	ok = zfsacl_to_native(self->theacl, &native);
-	if (!ok) {
-		set_exc_from_errno("zfsacl_to_native()");
-		return NULL;
-	}
-
-	out = PyBytes_FromStringAndSize(
-		(const char *)native.data,
-		native.datalen
-	);
-	free(native.data);
-	return out;
-}
-
 static PyMethodDef acl_object_methods[] = {
 	{
 		.ml_name = "setacl",
 		.ml_meth = (PyCFunction)py_acl_set,
 		.ml_flags = METH_VARARGS|METH_KEYWORDS,
-		.ml_doc = "Set ACL on path or fd"
+		.ml_doc = py_acl_set__doc__
 	},
 	{
 		.ml_name = "create_entry",
 		.ml_meth = py_acl_create_entry,
 		.ml_flags = METH_VARARGS,
-		.ml_doc = "Create new entry at specied index"
+		.ml_doc = py_acl_create_entry__doc__
 	},
 	{
 		.ml_name = "get_entry",
 		.ml_meth = py_acl_get_entry,
 		.ml_flags = METH_VARARGS,
-		.ml_doc = "Get entry at specied index"
+		.ml_doc = py_acl_get_entry__doc__
 	},
 	{
 		.ml_name = "delete_entry",
 		.ml_meth = py_acl_delete_entry,
 		.ml_flags = METH_VARARGS,
-		.ml_doc = "Delete entry by specied index"
-	},
-	{
-		.ml_name = "native_data",
-		.ml_meth = py_native_data,
-		.ml_flags = METH_VARARGS,
-		.ml_doc = "Returns bytes of native ACL"
+		.ml_doc = py_acl_delete_entry__doc__
 	},
 	{ NULL, NULL, 0, NULL }
 };
+
+PyDoc_STRVAR(py_acl_verbose__doc__,
+"bool : Attribute controls whether information about the ACL\n"
+"will be printed in verbose format.\n"
+);
+
+PyDoc_STRVAR(py_acl_flags__doc__,
+"int : ACL-wide flags. For description of flags see RFC-5661\n"
+"section 6.4.2.3 - Automatic Inheritance.\n\n"
+"These flags are interpreted by client applications (for example \n"
+"Samba) and should be evaluated by applications that recursively\n"
+"manage ACLs.\n\n"
+"Examples: zfsacl.AUTO_INHERIT, zfsacl.PROTECTED\n"
+);
+
+PyDoc_STRVAR(py_acl_brand__doc__,
+"read-only attribute indicating the brand of ACL (POSIX1E or NFSv4).\n"
+);
+
+PyDoc_STRVAR(py_acl_ace_count__doc__,
+"read-only attribute indicating the number of ACEs in the ACL.\n"
+);
 
 static PyGetSetDef acl_object_getsetters[] = {
 	{
 		.name    = discard_const_p(char, "verbose_output"),
 		.get     = (getter)acl_get_verbose,
 		.set     = (setter)acl_set_verbose,
+		.doc     = py_acl_verbose__doc__,
 	},
 	{
 		.name    = discard_const_p(char, "acl_flags"),
 		.get     = (getter)acl_get_flags,
 		.set     = (setter)acl_set_flags,
+		.doc     = py_acl_flags__doc__,
 	},
 	{
 		.name    = discard_const_p(char, "brand"),
 		.get     = (getter)acl_get_brand,
+		.doc     = py_acl_brand__doc__,
 	},
 	{
 		.name    = discard_const_p(char, "ace_count"),
 		.get     = (getter)acl_get_acecnt,
+		.doc     = py_acl_ace_count__doc__,
 	},
 	{ .name = NULL }
 };
@@ -1239,7 +1384,6 @@ static struct PyModuleDef moduledef = {
 	.m_methods = acl_module_methods,
 };
 
-PyObject* module_init(void);
 PyObject* module_init(void)
 {
 	PyObject *m = NULL;
@@ -1320,7 +1464,6 @@ PyObject* module_init(void)
 	return m;
 }
 
-PyMODINIT_FUNC PyInit_zfsacl(void);
 PyMODINIT_FUNC PyInit_zfsacl(void)
 {
 	return module_init();
