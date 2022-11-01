@@ -1897,7 +1897,7 @@ static bool test_event_kqueue_aio(struct torture_context *test,
 	torture_comment(test, "result: %s\n", buf);
 	torture_assert(test, strcmp(buf, CANARY) == 0, "Unexpected result");
 
-	ok = aio_pread_send(test, ev_ctx, fd, &req); 
+	ok = aio_fsync_send(test, ev_ctx, fd, &req);
 	torture_assert(test, ok, "aio_fsync_send() failed");
 
 	ok = tevent_req_poll(req, ev_ctx);
