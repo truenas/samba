@@ -758,7 +758,7 @@ filename_convert_dirfsp_nosymlink(TALLOC_CTX *mem_ctx,
 			".",
 			NULL,
 			NULL,
-			0,
+			twrp,
 			posix ? SMB_FILENAME_POSIX_PATH : 0);
 		if (smb_dirname == NULL) {
 			return NT_STATUS_NO_MEMORY;
