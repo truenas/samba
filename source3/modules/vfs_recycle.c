@@ -954,7 +954,9 @@ static int recycle_chdir(vfs_handle_struct *handle,
 				return -1);
 
 	ret = SMB_VFS_NEXT_CHDIR(handle, smb_fname);
-	if (ret == -1 || config->bins[0] != NULL) {
+	if ((ret == -1) ||
+	    (config->bins[0] != NULL) ||
+	    (strcmp(smb_fname->base_name, "/") == 0)) {
 		return ret;
 	}
 
