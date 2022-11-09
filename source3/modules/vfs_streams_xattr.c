@@ -1644,6 +1644,43 @@ static int streams_xattr_fcntl(vfs_handle_struct *handle,
 	return ret;
 }
 
+static NTSTATUS streams_xattr_fsctl(struct vfs_handle_struct *handle,
+				    struct files_struct *fsp,
+				    TALLOC_CTX *ctx,
+				    uint32_t function,
+				    uint16_t req_flags, /* Needed for UNICODE ... */
+				    const uint8_t *_in_data,
+				    uint32_t in_len,
+				    uint8_t **_out_data,
+				    uint32_t max_out_len,
+				    uint32_t *out_len)
+{
+	NTSTATUS result;
+	struct files_struct *target = NULL;
+
+	if (fsp->base_fsp != NULL) {
+		target = fsp->base_fsp;
+		DBG_INFO("Passing FSCTL 0x%08x on stream %s  to base file %s\",
+			 function, fsp->fsp_name->stream_name, fsp_str_dbg(fsp->base_fsp));
+	} else {
+		target = fsp;
+	}
+
+	result = SMB_VFS_NEXT_FSCTL(handle,
+				target,
+				ctx,
+				function,
+				req_flags,
+				_in_data,
+				in_len,
+				_out_data,
+				max_out_len,
+				out_len);
+
+	return result;
+}
+
+
 static struct vfs_fn_pointers vfs_streams_xattr_fns = {
 	.fs_capabilities_fn = streams_xattr_fs_capabilities,
 	.connect_fn = streams_xattr_connect,
@@ -1675,6 +1712,7 @@ static struct vfs_fn_pointers vfs_streams_xattr_fns = {
 	.linux_setlease_fn = streams_xattr_linux_setlease,
 	.strict_lock_check_fn = streams_xattr_strict_lock_check,
 	.fcntl_fn = streams_xattr_fcntl,
+	.fsctl_fn = streams_xattr_fsctl,
 
 	.fchown_fn = streams_xattr_fchown,
 	.fchmod_fn = streams_xattr_fchmod,
