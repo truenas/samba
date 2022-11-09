@@ -1142,7 +1142,7 @@ static NTSTATUS filename_convert_dirfsp_nosymlink(
 			".",
 			NULL,
 			NULL,
-			0,
+			twrp,
 			posix ? SMB_FILENAME_POSIX_PATH : 0,
 			&smb_dirname);
 	} else {
@@ -1153,7 +1153,7 @@ static NTSTATUS filename_convert_dirfsp_nosymlink(
 			mem_ctx,
 			conn,
 			dirname,
-			0,
+			twrp,
 			&smb_dirname,
 			&unparsed,
 			&substitute);
