@@ -214,6 +214,7 @@ char *get_snapshot_path(TALLOC_CTX *mem_ctx,
 	int (*strncmp_fn)(const char *s1, const char *s2, size_t len);
 
 	switch(sens) {
+	case SMBZFS_MIXED:
 	case SMBZFS_SENSITIVE:
 		strcmp_fn = strcmp;
 		strncmp_fn = strncmp;
