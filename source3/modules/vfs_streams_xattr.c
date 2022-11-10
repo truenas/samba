@@ -1660,7 +1660,7 @@ static NTSTATUS streams_xattr_fsctl(struct vfs_handle_struct *handle,
 
 	if (fsp->base_fsp != NULL) {
 		target = fsp->base_fsp;
-		DBG_INFO("Passing FSCTL 0x%08x on stream %s  to base file %s\",
+		DBG_INFO("Passing FSCTL 0x%08x on stream %s  to base file %s\n",
 			 function, fsp->fsp_name->stream_name, fsp_str_dbg(fsp->base_fsp));
 	} else {
 		target = fsp;
