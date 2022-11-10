@@ -289,12 +289,11 @@ static int py_uid_gid_init(PyObject *obj,
 	self->id = id;
 
 	self->wbclient = (py_wbclient *)pyclient;
+	Py_INCREF(self->wbclient);
 
 	if (!parse_sid_info(self)) {
 		return -1;
 	}
-
-	Py_INCREF(self->wbclient);
 
 	return 0;
 }
