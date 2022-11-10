@@ -3839,6 +3839,100 @@ static bool test_ioctl_sparse_qar_malformed(struct torture_context *torture,
 	return true;
 }
 
+static NTSTATUS test_ioctl_stream(struct torture_context *torture,
+			       TALLOC_CTX *mem_ctx,
+			       struct smb2_tree *tree,
+			       struct smb2_handle fh)
+{
+	union smb_ioctl ioctl;
+	NTSTATUS status;
+	struct file_zero_data_info zdata_info;
+	TALLOC_CTX *tmp_ctx = talloc_new(mem_ctx);
+	if (tmp_ctx == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	ZERO_STRUCT(ioctl);
+	ioctl.smb2.level = RAW_IOCTL_SMB2;
+	ioctl.smb2.in.file.handle = fh;
+	ioctl.smb2.in.function = FSCTL_CREATE_OR_GET_OBJECT_ID,
+	ioctl.smb2.in.max_output_response = 64;
+	ioctl.smb2.in.flags = SMB2_IOCTL_FLAG_IS_FSCTL;
+
+	status = smb2_ioctl(tree, tmp_ctx, &ioctl.smb2);
+	if (!NT_STATUS_IS_OK(status)) {
+		goto err_out;
+	}
+
+	status = NT_STATUS_OK;
+err_out:
+	talloc_free(tmp_ctx);
+	return status;
+}
+
+bool test_ioctl_alternate_data_stream(struct torture_context *tctx)
+{
+	bool ret = true;
+	int offset, beyond_final_zero;
+	const char *fname = DNAME "\\test_stream_ioctl_dir";
+	const char *sname = DNAME "\\test_stream_ioctl_dir:stream";
+	NTSTATUS status;
+	struct smb2_create create = { };
+	struct smb2_tree *tree = NULL;
+	struct smb2_handle h1 = {{0}};
+	const char *data = "test data";
+
+	if (!torture_smb2_connection(tctx, &tree)) {
+		torture_comment(tctx, "Initializing smb2 connection failed.\n");
+		return false;
+	}
+
+	smb2_deltree(tree, DNAME);
+
+	status = torture_smb2_testdir(tree, DNAME, &h1);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"torture_smb2_testdir failed\n");
+
+	smb2_util_close(tree, h1);
+	create = (struct smb2_create) {
+		.in.desired_access = SEC_FILE_ALL,
+		.in.share_access = NTCREATEX_SHARE_ACCESS_MASK,
+		.in.file_attributes = FILE_ATTRIBUTE_HIDDEN,
+		.in.create_disposition = NTCREATEX_DISP_CREATE,
+		.in.impersonation_level = SMB2_IMPERSONATION_IMPERSONATION,
+		.in.fname = fname,
+	};
+
+	status = smb2_create(tree, tctx, &create);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"smb2_create failed\n");
+
+	h1 = create.out.file.handle;
+	status = smb2_util_close(tree, h1);
+
+	create = (struct smb2_create) {
+		.in.desired_access = SEC_FILE_ALL,
+		.in.share_access = NTCREATEX_SHARE_ACCESS_MASK,
+		.in.file_attributes = FILE_ATTRIBUTE_NORMAL,
+		.in.create_disposition = NTCREATEX_DISP_CREATE,
+		.in.impersonation_level = SMB2_IMPERSONATION_IMPERSONATION,
+		.in.fname = sname,
+	};
+	status = smb2_create(tree, tctx, &create);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"smb2_create failed\n");
+        h1 = create.out.file.handle;
+
+	status = test_ioctl_stream(tctx, tctx, tree, h1);
+	if (!NT_STATUS_IS_OK(status)) {
+		smb2_util_close(tree, h1);
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						"test_ioctl_stream failed\n");
+	}
+done:
+	return ret;
+}
+
 /*
  * 2.3.57 FSCTL_SET_ZERO_DATA Request
  *
