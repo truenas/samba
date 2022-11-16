@@ -762,6 +762,12 @@ NTSTATUS create_file_default(connection_struct *conn,
 			     int *pinfo,
 			     const struct smb2_create_blobs *in_context_blobs,
 			     struct smb2_create_blobs *out_context_blobs);
+NTSTATUS reopen_from_fsp_default(struct files_struct *dirfsp,
+				 struct smb_filename *smb_fname,
+				 struct files_struct *fsp,
+				 int flags,
+				 mode_t mode,
+				 bool *p_file_created);
 
 /* The following definitions come from smbd/oplock.c  */
 

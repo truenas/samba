@@ -569,6 +569,13 @@
 #define SMB_VFS_NEXT_AIO_FORCE(handle,fsp) \
 	smb_vfs_call_aio_force((handle)->next,(fsp))
 
+#define SMB_VFS_REOPEN_FROM_FSP(dir, smb_fname, fsp_out, flags, mode, p_created) \
+	smb_vfs_call_reopen_from_fsp((dir)->conn->vfs_handles, (dir), (smb_fname), \
+				     (fsp_out), (flags), (mode), (p_created))
+#define SMB_VFS_NEXT_REOPEN_FROM_FSP(handle, dir, smb_fname, fsp_out, flags, mode, p_created) \
+	smb_vfs_call_reopen_from_fsp((handle)->next, (dir), (smb_fname), \
+				     (fsp_out), (flags), (mode), (p_created))
+
 /* durable handle operations */
 
 #define SMB_VFS_DURABLE_COOKIE(fsp, mem_ctx, cookie) \
