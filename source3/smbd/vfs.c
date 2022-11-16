@@ -2847,3 +2847,21 @@ NTSTATUS smb_vfs_call_freaddir_attr(struct vfs_handle_struct *handle,
 					     mem_ctx,
 					     attr_data);
 }
+
+NTSTATUS smb_vfs_call_reopen_from_fsp(struct vfs_handle_struct *handle,
+				      struct files_struct *dirfsp,
+				      struct smb_filename *smb_fname,
+				      struct files_struct *fsp,
+				      int flags,
+				      mode_t mode,
+				      bool *p_file_created)
+{
+	VFS_FIND(reopen_from_fsp);
+	return handle->fns->reopen_from_fsp_fn(handle,
+					       dirfsp,
+					       smb_fname,
+					       fsp,
+					       flags,
+					       mode,
+					       p_file_created);
+}

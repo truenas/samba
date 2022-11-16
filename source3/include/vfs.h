@@ -1241,6 +1241,15 @@ struct vfs_fn_pointers {
 				struct vfs_aio_state *aio_state,
 				uint32_t *dosmode);
 
+	NTSTATUS (*reopen_from_fsp_fn)(
+				struct vfs_handle_struct *handle,
+				struct files_struct *dirfsp,
+				struct smb_filename *smb_fname,
+				struct files_struct *fsp,
+				int flags,
+				mode_t mode,
+				bool *p_file_created);
+
 	/* NT ACL operations. */
 
 	NTSTATUS (*fget_nt_acl_fn)(struct vfs_handle_struct *handle,
@@ -1834,6 +1843,13 @@ NTSTATUS smb_vfs_call_freaddir_attr(struct vfs_handle_struct *handle,
 				    struct files_struct *fsp,
 				    TALLOC_CTX *mem_ctx,
 				    struct readdir_attr_data **attr_data);
+NTSTATUS smb_vfs_call_reopen_from_fsp(struct vfs_handle_struct *handle,
+				      struct files_struct *dirfsp,
+				      struct smb_filename *smb_fname,
+				      struct files_struct *fsp,
+				      int flags,
+				      mode_t mode,
+				      bool *p_file_created);
 
 NTSTATUS smb_register_vfs(int version, const char *name,
 			  const struct vfs_fn_pointers *fns);

@@ -1297,12 +1297,12 @@ static NTSTATUS reopen_from_procfd(struct files_struct *fsp,
 	return NT_STATUS_OK;
 }
 
-static NTSTATUS reopen_from_fsp(struct files_struct *dirfsp,
-				struct smb_filename *smb_fname,
-				struct files_struct *fsp,
-				int flags,
-				mode_t mode,
-				bool *p_file_created)
+NTSTATUS reopen_from_fsp_default(struct files_struct *dirfsp,
+				 struct smb_filename *smb_fname,
+				 struct files_struct *fsp,
+				 int flags,
+				 mode_t mode,
+				 bool *p_file_created)
 {
 	bool __unused_file_created = false;
 	NTSTATUS status;
@@ -1531,7 +1531,8 @@ static NTSTATUS open_file(struct smb_request *req,
 		 * Actually do the open - if O_TRUNC is needed handle it
 		 * below under the share mode lock.
 		 */
-		status = reopen_from_fsp(dirfsp,
+		status = SMB_VFS_REOPEN_FROM_FSP(
+					 dirfsp,
 					 smb_fname_atname,
 					 fsp,
 					 local_flags & ~O_TRUNC,
@@ -4716,7 +4717,7 @@ static NTSTATUS open_directory(connection_struct *conn,
 		FILE_ADD_SUBDIRECTORY;
 
 	if (access_mask & need_fd_access) {
-		status = reopen_from_fsp(
+		status = SMB_VFS_REOPEN_FROM_FSP(
 			fsp->conn->cwd_fsp,
 			fsp->fsp_name,
 			fsp,

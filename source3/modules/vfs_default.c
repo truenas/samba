@@ -4048,6 +4048,18 @@ static NTSTATUS vfswrap_durable_reconnect(struct vfs_handle_struct *handle,
 					     fsp, new_cookie);
 }
 
+static NTSTATUS vfswrap_reopen_from_fsp(struct vfs_handle_struct *handle,
+					struct files_struct *dirfsp,
+					struct smb_filename *smb_fname,
+					struct files_struct *fsp,
+					int flags,
+					mode_t mode,
+					bool *p_file_created)
+{
+	return reopen_from_fsp_default(dirfsp, smb_fname, fsp, flags,
+				       mode, p_file_created);
+}
+
 static struct vfs_fn_pointers vfs_default_fns = {
 	/* Disk operations */
 
@@ -4140,6 +4152,7 @@ static struct vfs_fn_pointers vfs_default_fns = {
 	.offload_write_recv_fn = vfswrap_offload_write_recv,
 	.fget_compression_fn = vfswrap_fget_compression,
 	.set_compression_fn = vfswrap_set_compression,
+	.reopen_from_fsp_fn = vfswrap_reopen_from_fsp,
 
 	/* NT ACL operations. */
 
