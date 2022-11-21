@@ -52,6 +52,16 @@ static int vfs_shadow_copy_zfs_debug_level = DBGC_VFS;
 #undef DBGC_CLASS
 #define DBGC_CLASS vfs_shadow_copy_zfs_debug_level
 
+struct shadow_copy_zfs_config;
+
+typedef struct open_snapdir {
+	char mp_path[PATH_MAX + 1];
+	int mp_fd;
+	int refcnt;
+	struct shadow_copy_zfs_config *config;
+	struct open_snapdir *next, *prev;
+} snapdir_open_t;
+
 struct shadow_copy_zfs_config {
 	struct zfs_dataset	*ds;
 	struct zfs_dataset	*singleton;
@@ -62,6 +72,9 @@ struct shadow_copy_zfs_config {
 	struct snap_filter	*filter;
 	struct snapshot_list 	*snapshots;
 	char			*shadow_connectpath;
+
+	snapdir_open_t		*opens;
+	int refcnt;
 };
 
 struct snapshot_data {
@@ -71,12 +84,118 @@ struct snapshot_data {
 	struct snapshot_entry *snap;
 };
 
-struct shadow_copy_fsp_ext {
+typedef struct shadow_copy_fsp_ext {
 	struct snapshot_data *data;
 	void *fsp_name_ptr;
 	struct files_struct *fsp;
 	vfs_handle_struct *handle;
-};
+	struct open_snapdir *open;
+	struct shadow_copy_zfs_config *config;
+} shadow_fsp_ext_t;
+
+static snapdir_open_t *check_for_open(snapdir_open_t *opens, const char *mp)
+{
+	snapdir_open_t *entry = NULL;
+	if (opens == NULL) {
+		return NULL;
+	}
+
+	/*
+	 * check linked list of opens for this mountpoint
+	 * promote result to head of list if it isn't already
+	 * there.
+	 */
+	for (entry = opens; entry; entry = entry->next) {
+		if (strcmp(entry->mp_path, mp) == 0) {
+			if (entry != opens) {
+				DLIST_PROMOTE(opens, entry);
+			}
+			break;
+		}
+	}
+
+	return entry;
+}
+
+static int snapdir_open_destructor(snapdir_open_t *entry)
+{
+	SMB_ASSERT(entry->refcnt >= 0);
+	int ret = 0;
+	switch (entry->refcnt) {
+	case 1:
+		DBG_DEBUG("%s: destructor called: %d\n",
+			  entry->mp_path, entry->refcnt);
+		entry->refcnt--;
+		DLIST_REMOVE(entry->config->opens, entry);
+		break;
+	case 0:
+		break;
+	default:
+		DBG_DEBUG("%s: destructor called: %d\n",
+			  entry->mp_path, entry->refcnt);
+		entry->refcnt--;
+		/*
+		 * There are still references to this
+		 * decrement refcnt but don't free it
+		 */
+		ret = -1;
+		break;
+	}
+
+	if (ret == 0) {
+		if (entry->mp_fd > 0) {
+			close(entry->mp_fd);
+			entry->mp_fd = 0;
+		}
+		entry->config->refcnt--;
+	}
+	return ret;
+}
+
+static void destroy_fsp_ext_snapshot_data(void *p_data)
+{
+	shadow_fsp_ext_t *data = (shadow_fsp_ext_t *)p_data;
+	if (data->open) {
+		TALLOC_FREE(data->open);
+	}
+	data->config->refcnt--;
+}
+
+static bool open_snapdir(struct shadow_copy_fsp_ext *ext)
+{
+	SMB_ASSERT(ext->data->mountpoint[0] != '\0');
+	snapdir_open_t *snapdir= NULL;
+
+	snapdir = check_for_open(ext->config->opens, ext->data->shadow_cp);
+	if (snapdir != NULL) {
+		goto out;
+	}
+
+	snapdir = talloc_zero(ext->config, snapdir_open_t);
+	if (snapdir == NULL) {
+		return false;
+	}
+
+	snapdir->config = ext->config;
+	strlcpy(snapdir->mp_path, ext->data->shadow_cp,
+	    sizeof(snapdir->mp_path));
+	snapdir->mp_fd = open(ext->data->shadow_cp, O_DIRECTORY);
+	if (snapdir->mp_fd == -1) {
+		DBG_ERR("%s: snapdir open failed: %s\n",
+			snapdir->mp_path, strerror(errno));
+		TALLOC_FREE(snapdir);
+		return false;
+	}
+	talloc_set_destructor(snapdir, snapdir_open_destructor);
+	DLIST_ADD(snapdir->config->opens, snapdir);
+
+out:
+	ext->open = snapdir;
+	snapdir->config->refcnt++;
+	snapdir->refcnt++;
+	DBG_DEBUG("%s: added reference: %d\n", snapdir->mp_path, snapdir->refcnt);
+	return true;
+}
 
 static struct zfs_dataset *shadow_path_to_dataset(
     struct vfs_handle_struct *handle,
@@ -396,8 +515,8 @@ static bool shadow_copy_zfs_match_name(vfs_handle_struct *handle,
 	}
 
 	if (name->fsp != NULL) {
-		struct shadow_copy_fsp_ext *fsp_ext = NULL;
-		fsp_ext = (struct shadow_copy_fsp_ext *)
+		shadow_fsp_ext_t *fsp_ext = NULL;
+		fsp_ext = (shadow_fsp_ext_t *)
 		    VFS_FETCH_FSP_EXTENSION(handle, name->fsp);
 
 		if (fsp_ext) {
@@ -550,8 +669,8 @@ static bool zfs_lookup_snapshot_list(vfs_handle_struct *handle,
 
 	if (fname_in->fsp != NULL) {
 		// Linked FSP may have snapshot data in extension
-		struct shadow_copy_fsp_ext *fsp_ext = NULL;
-		fsp_ext = (struct shadow_copy_fsp_ext *)
+		shadow_fsp_ext_t *fsp_ext = NULL;
+		fsp_ext = (shadow_fsp_ext_t *)
 		    VFS_FETCH_FSP_EXTENSION(handle, fname_in->fsp);
 
 		if (fsp_ext) {
@@ -865,9 +984,10 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 {
 	int ret;
 	char *conv = NULL;
+	struct shadow_copy_zfs_config *config = NULL;
 	struct smb_filename *smb_fname = NULL;
 	struct snapshot_data *data = NULL;
-	struct shadow_copy_fsp_ext *fsp_ext = NULL;
+	shadow_fsp_ext_t *fsp_ext = NULL;
 	struct vfs_open_how tmp_how = { .flags = how->flags, .mode = how->mode};
 
 	smb_fname = full_path_from_dirfsp_atname(talloc_tos(),
@@ -882,6 +1002,8 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 					   fsp, how);
 	}
 
+	SMB_VFS_HANDLE_GET_DATA(handle, config, struct shadow_copy_zfs_config,
+				return -1);
 	/*
 	 * If dirfsp is an open in a snapshot directory, then concatenate the
 	 * dirfsp path with smb_fname relative path, convert into an absolute
@@ -910,12 +1032,16 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 				  fsp, &tmp_how);
 	TALLOC_FREE(smb_fname);
 	if (ret != -1) {
-		fsp_ext = VFS_ADD_FSP_EXTENSION(handle, fsp, struct shadow_copy_fsp_ext, NULL);
+		fsp_ext = VFS_ADD_FSP_EXTENSION(handle, fsp, struct shadow_copy_fsp_ext,
+						destroy_fsp_ext_snapshot_data);
 		SMB_ASSERT(fsp_ext != NULL);
 		fsp_ext->data = talloc_move(VFS_MEMCTX_FSP_EXTENSION(handle, fsp), &data);
 		fsp_ext->handle = handle;
 		fsp_ext->fsp = fsp;
 		fsp_ext->fsp_name_ptr = fsp->fsp_name;
+		fsp_ext->config = config;
+		config->refcnt++;
+		SMB_ASSERT(open_snapdir(fsp_ext) == true);
 	} else {
 		TALLOC_FREE(data);
 	}
@@ -1467,6 +1593,17 @@ static NTSTATUS zfs_parent_pathname(struct vfs_handle_struct *handle,
 	return status;
 }
 
+static void shadow_copy_data_destroy(void **pdatap)
+{
+	struct shadow_copy_zfs_config *config = (struct shadow_copy_zfs_config *)*pdatap;
+	if (config->refcnt) {
+		DBG_ERR("Refusing to free configuration information "
+			"due to unfreed refrences: %d\n", config->refcnt);
+		return;
+	}
+	TALLOC_FREE(config);
+}
+
 static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 				const char *service, const char *user)
 {
@@ -1537,7 +1674,8 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 	config->zcache = memcache_init(handle->conn, (memcache_sz * 1024));
 
 	SMB_VFS_HANDLE_SET_DATA(handle, config,
-				NULL, struct shadow_copy_zfs_config,
+				shadow_copy_data_destroy,
+				struct shadow_copy_zfs_config,
 				return -1);
 
 	return 0;
