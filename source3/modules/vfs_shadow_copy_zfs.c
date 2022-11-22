@@ -54,8 +54,15 @@ static int vfs_shadow_copy_zfs_debug_level = DBGC_VFS;
 
 struct shadow_copy_zfs_config;
 
+struct snapshot_data {
+	char mountpoint[PATH_MAX];
+	char shadow_cp[PATH_MAX];
+	enum casesensitivity sens;
+	struct snapshot_entry snap;
+};
+
 typedef struct open_snapdir {
-	char mp_path[PATH_MAX + 1];
+	struct snapshot_data data;
 	int mp_fd;
 	int refcnt;
 	struct shadow_copy_zfs_config *config;
@@ -71,27 +78,47 @@ struct shadow_copy_zfs_config {
 	/* Snapshot parameters */
 	struct snap_filter	*filter;
 	struct snapshot_list 	*snapshots;
-	char			*shadow_connectpath;
+	struct snapshot_data	*shadow_connectpath;
 
 	snapdir_open_t		*opens;
 	int refcnt;
 };
 
-struct snapshot_data {
-	char mountpoint[PATH_MAX];
-	char shadow_cp[PATH_MAX];
-	enum casesensitivity sens;
-	struct snapshot_entry *snap;
-};
-
 typedef struct shadow_copy_fsp_ext {
-	struct snapshot_data *data;
+	struct snapshot_data data;
 	void *fsp_name_ptr;
 	struct files_struct *fsp;
 	vfs_handle_struct *handle;
 	struct open_snapdir *open;
 	struct shadow_copy_zfs_config *config;
 } shadow_fsp_ext_t;
+
+static void cp_snapshot_data(struct snapshot_data *in,
+			     struct snapshot_data *out)
+{
+	strlcpy(out->mountpoint,
+		in->mountpoint,
+		sizeof(out->mountpoint));
+
+	strlcpy(out->shadow_cp,
+		in->shadow_cp,
+		sizeof(out->shadow_cp));
+
+	strlcpy(out->shadow_cp,
+		in->shadow_cp,
+		sizeof(out->shadow_cp));
+
+	out->snap.nt_time = in->snap.nt_time;
+	out->snap.cr_time = in->snap.cr_time;
+	out->sens = in->sens;
+
+	strlcpy(out->snap.name,
+		in->snap.name,
+		sizeof(out->snap.name));
+	strlcpy(out->snap.label,
+		in->snap.label,
+		sizeof(out->snap.label));
+}
 
 static snapdir_open_t *check_for_open(snapdir_open_t *opens, const char *mp)
 {
@@ -106,7 +133,7 @@ static snapdir_open_t *check_for_open(snapdir_open_t *opens, const char *mp)
 	 * there.
 	 */
 	for (entry = opens; entry; entry = entry->next) {
-		if (strcmp(entry->mp_path, mp) == 0) {
+		if (strcmp(entry->data.shadow_cp, mp) == 0) {
 			if (entry != opens) {
 				DLIST_PROMOTE(opens, entry);
 			}
@@ -124,7 +151,7 @@ static int snapdir_open_destructor(snapdir_open_t *entry)
 	switch (entry->refcnt) {
 	case 1:
 		DBG_DEBUG("%s: destructor called: %d\n",
-			  entry->mp_path, entry->refcnt);
+			  entry->data.shadow_cp, entry->refcnt);
 		entry->refcnt--;
 		DLIST_REMOVE(entry->config->opens, entry);
 		break;
@@ -132,7 +159,7 @@ static int snapdir_open_destructor(snapdir_open_t *entry)
 		break;
 	default:
 		DBG_DEBUG("%s: destructor called: %d\n",
-			  entry->mp_path, entry->refcnt);
+			  entry->data.shadow_cp, entry->refcnt);
 		entry->refcnt--;
 		/*
 		 * There are still references to this
@@ -163,10 +190,10 @@ static void destroy_fsp_ext_snapshot_data(void *p_data)
 
 static bool open_snapdir(struct shadow_copy_fsp_ext *ext)
 {
-	SMB_ASSERT(ext->data->mountpoint[0] != '\0');
+	SMB_ASSERT(ext->data.mountpoint[0] != '\0');
 	snapdir_open_t *snapdir= NULL;
 
-	snapdir = check_for_open(ext->config->opens, ext->data->shadow_cp);
+	snapdir = check_for_open(ext->config->opens, ext->data.shadow_cp);
 	if (snapdir != NULL) {
 		goto out;
 	}
@@ -177,23 +204,24 @@ static bool open_snapdir(struct shadow_copy_fsp_ext *ext)
 	}
 
 	snapdir->config = ext->config;
-	strlcpy(snapdir->mp_path, ext->data->shadow_cp,
-	    sizeof(snapdir->mp_path));
-	snapdir->mp_fd = open(ext->data->shadow_cp, O_DIRECTORY);
+	cp_snapshot_data(&ext->data, &snapdir->data);
+	snapdir->mp_fd = open(ext->data.shadow_cp, O_DIRECTORY);
 	if (snapdir->mp_fd == -1) {
 		DBG_ERR("%s: snapdir open failed: %s\n",
-			snapdir->mp_path, strerror(errno));
+			snapdir->data.shadow_cp, strerror(errno));
 		TALLOC_FREE(snapdir);
 		return false;
 	}
 	talloc_set_destructor(snapdir, snapdir_open_destructor);
 	DLIST_ADD(snapdir->config->opens, snapdir);
+	snapdir->config->refcnt++;
 
 out:
 	ext->open = snapdir;
-	snapdir->config->refcnt++;
 	snapdir->refcnt++;
-	DBG_DEBUG("%s: added reference: %d\n", snapdir->mp_path, snapdir->refcnt);
+	DBG_DEBUG("%s: added reference: %d\n",
+		  snapdir->data.shadow_cp,
+		  snapdir->refcnt);
 	return true;
 }
 
@@ -537,7 +565,7 @@ static char *snapshot_mp_to_dataset(TALLOC_CTX *mem_ctx,
 		DBG_ERR("Invalid snapshot name: %s\n", snapshot_mp);
 		return NULL;
 	}
-	ds_path = strstr(snapshot_mp, "/.zfs/snapshot/");
+	ds_path = strstr(snapshot_mp, SHADOW_COPY_ZFS_SNAP_DIR);
 	if (ds_path != NULL) {
 		to_remove = strlen(ds_path);
 		new_len = strlen(snapshot_mp) - to_remove;
@@ -553,7 +581,7 @@ static bool path_in_ctldir(const char *path, bool *is_snapdir)
 	char tmp[PATH_MAX];
 	int err;
 
-	p = strstr(path, ".zfs/snapshot");
+	p = strstr(path, SHADOW_COPY_ZFS_SNAP_DIR);
 	if (p == NULL) {
 		*is_snapdir = false;
 		return true;
@@ -571,17 +599,65 @@ static bool path_in_ctldir(const char *path, bool *is_snapdir)
 	return true;
 }
 
+static void fill_snapshot_from_open_path(const char *path,
+					 struct shadow_copy_zfs_config *config,
+					 struct snapshot_data *data)
+{
+	snapdir_open_t *entry = NULL;
+	char *p = NULL;
+	char *snap = NULL;
+	char tmp[PATH_MAX];
+
+	/*
+	 * path may be something like /mnt/dozer/.zfs/snapshot/t1/testfile
+	 * we want to basically reduce to /mnt/dozer/.zfs/snapshot/t1
+	 * and then look up an existing open
+	 */
+	p = strstr(path, SHADOW_COPY_ZFS_SNAP_DIR);
+	SMB_ASSERT(p != NULL);
+
+	snap = strstr(p + strlen(SHADOW_COPY_ZFS_SNAP_DIR), "/");
+
+	/* ZFS ctldir should never be exposed over SMB. */
+	SMB_ASSERT(snap != NULL);
+
+	p = strstr(snap, "/");
+	if (p == NULL) {
+		p = snap;
+	}
+
+	strlcpy(tmp, path, sizeof(tmp));
+	tmp[PTR_DIFF(p + 4, path)] = '\0';
+
+	entry = check_for_open(config->opens, tmp);
+
+	/* There should be an existing O_DIRECTORY open for this path */
+	SMB_ASSERT(entry != NULL);
+
+	cp_snapshot_data(&entry->data, data);
+}
+
 static void resolve_path(vfs_handle_struct *handle,
 			 struct shadow_copy_zfs_config *priv,
 			 const char *name,
 			 char *buf,
 			 size_t bufsz,
+			 struct snapshot_data *data,
 			 bool *is_shadow_path)
 {
 	if (name[0] != '/') {
-		char *scp = priv->shadow_connectpath;
+		char *scp = NULL;
 		char *cwd = handle->conn->cwd_fsp->fsp_name->base_name;
+
+		if (priv->shadow_connectpath) {
+			scp = priv->shadow_connectpath->shadow_cp;
+		}
 		if (scp && (strncmp(cwd, scp, strlen(scp)) == 0)) {
+			if (data != NULL) {
+				DBG_ERR("copying snapshot data\n");
+				cp_snapshot_data(priv->shadow_connectpath,
+						 data);
+			}
 			*is_shadow_path = true;
 		}
 		if (ISDOT(name) || name[0] == '\0') {
@@ -608,51 +684,25 @@ static void resolve_path(vfs_handle_struct *handle,
 			DBG_ERR("%s: could not determine whether path is "
 				"in ZFS snapdir: %s\n", buf, strerror(errno));
 		}
+
+		if (*is_shadow_path) {
+			fill_snapshot_from_open_path(buf, priv, data);
+		}
 	}
 }
 
 static void store_connectpath(vfs_handle_struct *handle,
-			      const char *connectpath)
+			      struct snapshot_data *data)
 {
 	struct shadow_copy_zfs_config *priv = NULL;
 	SMB_VFS_HANDLE_GET_DATA(handle, priv, struct shadow_copy_zfs_config,
 				return);
 
 	TALLOC_FREE(priv->shadow_connectpath);
-	if (connectpath) {
-		DBG_INFO("shadow connectpath = %s\n", connectpath);
-		priv->shadow_connectpath = talloc_strdup(handle->conn, connectpath);
-		if (priv->shadow_connectpath == NULL) {
-			smb_panic("talloc failed\n");
-		}
+	if (data != NULL) {
+		DBG_INFO("shadow connectpath = %s\n", data->shadow_cp);
+		priv->shadow_connectpath = data;
 	}
-}
-
-static void cp_snapshot_data(struct snapshot_data *in,
-			     struct snapshot_data *out)
-{
-	strlcpy(out->mountpoint,
-		in->mountpoint,
-		sizeof(out->mountpoint));
-
-	strlcpy(out->shadow_cp,
-		in->shadow_cp,
-		sizeof(out->shadow_cp));
-
-	strlcpy(out->shadow_cp,
-		in->shadow_cp,
-		sizeof(out->shadow_cp));
-
-	out->snap->nt_time = in->snap->nt_time;
-	out->snap->cr_time = in->snap->cr_time;
-	out->sens = in->sens;
-
-	strlcpy(out->snap->name,
-		in->snap->name,
-		sizeof(out->snap->name));
-	strlcpy(out->snap->label,
-		in->snap->label,
-		sizeof(out->snap->label));
 }
 
 static bool zfs_lookup_snapshot_list(vfs_handle_struct *handle,
@@ -676,7 +726,7 @@ static bool zfs_lookup_snapshot_list(vfs_handle_struct *handle,
 		if (fsp_ext) {
 			DBG_ERR("[%s()] using stored snapshot data\n",
 				location);
-			cp_snapshot_data(fsp_ext->data, data);
+			cp_snapshot_data(&fsp_ext->data, data);
 			return true;
 		}
 	}
@@ -727,11 +777,11 @@ static bool zfs_lookup_snapshot_list(vfs_handle_struct *handle,
 	// shadow connecpath has not been determined yet
 	data->shadow_cp[0] = '\0';
 	data->sens = sens;
-	data->snap->cr_time = entry->cr_time;
-	data->snap->nt_time = entry->nt_time;
+	data->snap.cr_time = entry->cr_time;
+	data->snap.nt_time = entry->nt_time;
 
-	strlcpy(data->snap->name, entry->name, sizeof(data->snap->name));
-	strlcpy(data->snap->label, entry->label, sizeof(data->snap->label));
+	strlcpy(data->snap.name, entry->name, sizeof(data->snap.name));
+	strlcpy(data->snap.label, entry->label, sizeof(data->snap.label));
 
 	return true;
 }
@@ -746,16 +796,14 @@ static char *_do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 					 const char *location)
 {
 	struct shadow_copy_zfs_config *config = NULL;
-	struct snapshot_entry snap = {0};
-	struct snapshot_data snapshots = (struct snapshot_data) {
-		.snap = &snap,
-	};
+	struct snapshot_data snapshots;
 	const char *mpoffset = NULL;
 	int offset;
 	char *ret = NULL, *res_fname = NULL;
 	char buf[PATH_MAX] = {0};
 	bool found = false;
 
+	ZERO_STRUCT(snapshots);
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct shadow_copy_zfs_config,
 				smb_panic(location));
@@ -767,7 +815,7 @@ static char *_do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 		return NULL;
 	}
 
-	resolve_path(handle, config, fname_in->base_name, buf, sizeof(buf), &found);
+	resolve_path(handle, config, fname_in->base_name, buf, sizeof(buf), out, &found);
 	if (found) {
 		return talloc_strdup(talloc_tos(), buf);
 	}
@@ -793,21 +841,14 @@ static char *_do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 
 	ret = get_snapshot_path(talloc_tos(), handle->conn->connectpath,
 				snapshots.mountpoint, res_fname,
-				mpoffset, snapshots.snap, snapshots.sens);
+				mpoffset, &snapshots.snap, snapshots.sens);
 
 	if (out != NULL) {
 		size_t off = 0;
-		out->snap = talloc_zero(out, struct snapshot_entry);
-		if (out->snap == NULL) {
-			errno = ENOMEM;
-			return NULL;
-		}
-
 		cp_snapshot_data(&snapshots, out);
-
 		off = snprintf(out->shadow_cp, sizeof(out->shadow_cp),
 			       "%s/%s/%s", snapshots.mountpoint,
-			       SHADOW_COPY_ZFS_SNAP_DIR, snapshots.snap->name);
+			       SHADOW_COPY_ZFS_SNAP_DIR, snapshots.snap.name);
 		/*
 		 * This mountpoint ends up getting stored as part of CWD
 		 * in the chdir() function.
@@ -986,7 +1027,7 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 	char *conv = NULL;
 	struct shadow_copy_zfs_config *config = NULL;
 	struct smb_filename *smb_fname = NULL;
-	struct snapshot_data *data = NULL;
+	struct snapshot_data data;
 	shadow_fsp_ext_t *fsp_ext = NULL;
 	struct vfs_open_how tmp_how = { .flags = how->flags, .mode = how->mode};
 
@@ -1009,43 +1050,36 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 	 * dirfsp path with smb_fname relative path, convert into an absolute
 	 * path in the relevant snapdir, and pass to openat().
 	 */
-	data = talloc_zero(handle, struct snapshot_data);
-	if (data == NULL) {
-		TALLOC_FREE(smb_fname);
-		errno = ENOMEM;
-		return -1;
-	}
+
+	ZERO_STRUCT(data);
 	conv = do_convert_shadow_zfs_name(handle,
 					  smb_fname,
-					  data);
+					  &data);
 	if (conv == NULL) {
 		TALLOC_FREE(smb_fname);
-		TALLOC_FREE(data);
 		return -1;
 	}
-
 
 	smb_fname->base_name = conv;
 	tmp_how.flags &= ~(O_WRONLY | O_RDWR | O_CREAT);
 
 	ret = SMB_VFS_NEXT_OPENAT(handle, dirfsp, smb_fname,
 				  fsp, &tmp_how);
-	TALLOC_FREE(smb_fname);
+
 	if (ret != -1) {
 		fsp_ext = VFS_ADD_FSP_EXTENSION(handle, fsp, struct shadow_copy_fsp_ext,
 						destroy_fsp_ext_snapshot_data);
 		SMB_ASSERT(fsp_ext != NULL);
-		fsp_ext->data = talloc_move(VFS_MEMCTX_FSP_EXTENSION(handle, fsp), &data);
+		cp_snapshot_data(&data, &fsp_ext->data);
 		fsp_ext->handle = handle;
 		fsp_ext->fsp = fsp;
 		fsp_ext->fsp_name_ptr = fsp->fsp_name;
 		fsp_ext->config = config;
 		config->refcnt++;
 		SMB_ASSERT(open_snapdir(fsp_ext) == true);
-	} else {
-		TALLOC_FREE(data);
 	}
 
+	TALLOC_FREE(smb_fname);
 	return ret;
 }
 
@@ -1100,9 +1134,8 @@ static int shadow_copy_zfs_chdir(vfs_handle_struct *handle,
 				 const struct smb_filename *smb_fname)
 {
 	int ret;
-	char *conv = NULL;
 	struct snapshot_data *data = NULL;
-	struct smb_filename *conv_smb_fname = NULL;
+	struct smb_filename conv = { .flags = smb_fname->flags };
 
 	if (!shadow_copy_zfs_match_name(handle, smb_fname)) {
 		ret =  SMB_VFS_NEXT_CHDIR(handle, smb_fname);
@@ -1115,28 +1148,21 @@ static int shadow_copy_zfs_chdir(vfs_handle_struct *handle,
 		errno = ENOMEM;
 		return -1;
 	}
-	conv = do_convert_shadow_zfs_name(handle, smb_fname, data);
-	if (conv == NULL) {
+
+	conv.base_name = do_convert_shadow_zfs_name(handle, smb_fname, data);
+	if (conv.base_name == NULL) {
+		TALLOC_FREE(data);
 		return -1;
 	}
 
-	conv_smb_fname = synthetic_smb_fname(talloc_tos(),
-					     conv,
-					     NULL,
-					     NULL,
-					     0,
-					     smb_fname->flags);
-	if (conv_smb_fname == NULL) {
-		TALLOC_FREE(conv);
-		return -1;
-	}
-
-	ret = SMB_VFS_NEXT_CHDIR(handle, conv_smb_fname);
+	ret = SMB_VFS_NEXT_CHDIR(handle, &conv);
 	if (ret == 0) {
-		store_connectpath(handle, data->shadow_cp);
+		store_connectpath(handle, data);
+	} else {
+		TALLOC_FREE(data);
 	}
-	TALLOC_FREE(conv);
-	TALLOC_FREE(conv_smb_fname);
+
+	TALLOC_FREE(conv.base_name);
 	return ret;
 }
 
@@ -1455,8 +1481,8 @@ static const char *shadow_copy_zfs_connectpath(struct vfs_handle_struct *handle,
 
 	if (config->shadow_connectpath != NULL) {
 		DBG_INFO("cached connect path is [%s]\n",
-			 config->shadow_connectpath);
-		return config->shadow_connectpath;
+			 config->shadow_connectpath->shadow_cp);
+		return config->shadow_connectpath->shadow_cp;
 	}
 
 	if (shadow_copy_zfs_match_name(handle, smb_fname)) {
