@@ -446,7 +446,12 @@ NTSTATUS se_create_child_secdesc(TALLOC_CTX *ctx,
 	struct security_acl *new_dacl = NULL, *the_acl = NULL;
 	struct security_ace *new_ace_list = NULL;
 	unsigned int new_ace_list_ndx = 0, i;
+#if 0
+	//FIXME - UPSTREAM: below is wrong. It prevents INHERITED flag from being set on
+	// ACLs where DACL_PROTECTED is set.
 	bool set_inherited_flags = (parent_ctr->type & SEC_DESC_DACL_AUTO_INHERITED);
+#endif
+	bool set_inherited_flags = true;
 
 	TALLOC_CTX *frame;
 
