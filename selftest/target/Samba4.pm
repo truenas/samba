@@ -1498,6 +1498,8 @@ sub provision_promoted_dc($$$)
 
         ntlm auth = ntlmv2-only
 
+	kdc force enable rc4 weak session keys = yes
+
 [sysvol]
 	path = $ctx->{statedir}/sysvol
 	read only = yes
@@ -1617,7 +1619,6 @@ sub provision_ad_dc_ntvfs($$$)
         my $extra_conf_options = "netbios aliases = localDC1-a
         server services = +winbind -winbindd
 	ldap server require strong auth = allow_sasl_over_tls
-	allow nt4 crypto = yes
 	raw NTLMv2 auth = yes
 	lsa over netlogon = yes
         rpc server port = 1027
@@ -1625,10 +1626,53 @@ sub provision_ad_dc_ntvfs($$$)
 	dsdb event notification = true
 	dsdb password event notification = true
 	dsdb group change notification = true
-	server schannel = auto
 	# override the new SMB2 only default
 	client min protocol = CORE
 	server min protocol = LANMAN1
+
+	CVE_2020_1472:warn_about_unused_debug_level = 3
+	CVE_2022_38023:warn_about_unused_debug_level = 3
+	allow nt4 crypto:torturetest\$ = yes
+	server reject md5 schannel:schannel2\$ = no
+	server reject md5 schannel:schannel3\$ = no
+	server reject md5 schannel:schannel8\$ = no
+	server reject md5 schannel:schannel9\$ = no
+	server reject md5 schannel:torturetest\$ = no
+	server reject md5 schannel:tests4u2proxywk\$ = no
+	server reject md5 schannel:tests4u2selfbdc\$ = no
+	server reject md5 schannel:tests4u2selfwk\$ = no
+	server reject md5 schannel:torturepacbdc\$ = no
+	server reject md5 schannel:torturepacwksta\$ = no
+	server require schannel:schannel0\$ = no
+	server require schannel:schannel1\$ = no
+	server require schannel:schannel2\$ = no
+	server require schannel:schannel3\$ = no
+	server require schannel:schannel4\$ = no
+	server require schannel:schannel5\$ = no
+	server require schannel:schannel6\$ = no
+	server require schannel:schannel7\$ = no
+	server require schannel:schannel8\$ = no
+	server require schannel:schannel9\$ = no
+	server require schannel:schannel10\$ = no
+	server require schannel:schannel11\$ = no
+	server require schannel:torturetest\$ = no
+	server schannel require seal:schannel0\$ = no
+	server schannel require seal:schannel1\$ = no
+	server schannel require seal:schannel2\$ = no
+	server schannel require seal:schannel3\$ = no
+	server schannel require seal:schannel4\$ = no
+	server schannel require seal:schannel5\$ = no
+	server schannel require seal:schannel6\$ = no
+	server schannel require seal:schannel7\$ = no
+	server schannel require seal:schannel8\$ = no
+	server schannel require seal:schannel9\$ = no
+	server schannel require seal:schannel10\$ = no
+	server schannel require seal:schannel11\$ = no
+	server schannel require seal:torturetest\$ = no
+
+	# needed for 'samba.tests.auth_log' tests
+	server require schannel:LOCALDC\$ = no
+	server schannel require seal:LOCALDC\$ = no
 	";
 	push (@{$extra_provision_options}, "--use-ntvfs");
 	my $ret = $self->provision($prefix,
@@ -1666,6 +1710,13 @@ sub provision_fl2000dc($$)
 	my $extra_conf_options = "
 	spnego:simulate_w2k=yes
 	ntlmssp_server:force_old_spnego=yes
+
+	CVE_2022_38023:warn_about_unused_debug_level = 3
+	server reject md5 schannel:tests4u2proxywk\$ = no
+	server reject md5 schannel:tests4u2selfbdc\$ = no
+	server reject md5 schannel:tests4u2selfwk\$ = no
+	server reject md5 schannel:torturepacbdc\$ = no
+	server reject md5 schannel:torturepacwksta\$ = no
 ";
 	my $extra_provision_options = ["--base-schema=2008_R2"];
 	# This environment uses plain text secrets
@@ -1709,7 +1760,16 @@ sub provision_fl2003dc($$$)
 	my $extra_conf_options = "allow dns updates = nonsecure and secure
 	dcesrv:header signing = no
 	dcesrv:max auth states = 0
-	dns forwarder = $ip_addr1 $ip_addr2";
+	dns forwarder = $ip_addr1 $ip_addr2
+
+	CVE_2022_38023:warn_about_unused_debug_level = 3
+	server reject md5 schannel:tests4u2proxywk\$ = no
+	server reject md5 schannel:tests4u2selfbdc\$ = no
+	server reject md5 schannel:tests4u2selfwk\$ = no
+	server reject md5 schannel:torturepacbdc\$ = no
+	server reject md5 schannel:torturepacwksta\$ = no
+";
+
 	my $extra_provision_options = ["--base-schema=2008_R2"];
 	my $ret = $self->provision($prefix,
 				   "domain controller",
@@ -1764,6 +1824,13 @@ sub provision_fl2008r2dc($$$)
 	ldap server require strong auth = no
         # delay by 10 seconds, 10^7 usecs
 	ldap_server:delay_expire_disconnect = 10000
+
+	CVE_2022_38023:warn_about_unused_debug_level = 3
+	server reject md5 schannel:tests4u2proxywk\$ = no
+	server reject md5 schannel:tests4u2selfbdc\$ = no
+	server reject md5 schannel:tests4u2selfwk\$ = no
+	server reject md5 schannel:torturepacbdc\$ = no
+	server reject md5 schannel:torturepacwksta\$ = no
 ";
 	my $extra_provision_options = ["--base-schema=2008_R2"];
 	my $ret = $self->provision($prefix,
@@ -1975,8 +2042,48 @@ sub provision_ad_dc($$$$$$$)
 	lpq cache time = 0
 	print notify backchannel = yes
 
-	server schannel = auto
-        auth event notification = true
+	CVE_2020_1472:warn_about_unused_debug_level = 3
+	CVE_2022_38023:warn_about_unused_debug_level = 3
+	CVE_2022_38023:error_debug_level = 2
+	server reject md5 schannel:schannel2\$ = no
+	server reject md5 schannel:schannel3\$ = no
+	server reject md5 schannel:schannel8\$ = no
+	server reject md5 schannel:schannel9\$ = no
+	server reject md5 schannel:torturetest\$ = no
+	server reject md5 schannel:tests4u2proxywk\$ = no
+	server reject md5 schannel:tests4u2selfbdc\$ = no
+	server reject md5 schannel:tests4u2selfwk\$ = no
+	server reject md5 schannel:torturepacbdc\$ = no
+	server reject md5 schannel:torturepacwksta\$ = no
+	server reject md5 schannel:samlogontest\$ = no
+	server require schannel:schannel0\$ = no
+	server require schannel:schannel1\$ = no
+	server require schannel:schannel2\$ = no
+	server require schannel:schannel3\$ = no
+	server require schannel:schannel4\$ = no
+	server require schannel:schannel5\$ = no
+	server require schannel:schannel6\$ = no
+	server require schannel:schannel7\$ = no
+	server require schannel:schannel8\$ = no
+	server require schannel:schannel9\$ = no
+	server require schannel:schannel10\$ = no
+	server require schannel:schannel11\$ = no
+	server require schannel:torturetest\$ = no
+	server schannel require seal:schannel0\$ = no
+	server schannel require seal:schannel1\$ = no
+	server schannel require seal:schannel2\$ = no
+	server schannel require seal:schannel3\$ = no
+	server schannel require seal:schannel4\$ = no
+	server schannel require seal:schannel5\$ = no
+	server schannel require seal:schannel6\$ = no
+	server schannel require seal:schannel7\$ = no
+	server schannel require seal:schannel8\$ = no
+	server schannel require seal:schannel9\$ = no
+	server schannel require seal:schannel10\$ = no
+	server schannel require seal:schannel11\$ = no
+	server schannel require seal:torturetest\$ = no
+
+	auth event notification = true
 	dsdb event notification = true
 	dsdb password event notification = true
 	dsdb group change notification = true
@@ -2653,6 +2760,10 @@ sub setup_ad_dc_smb1
 [global]
 	client min protocol = CORE
 	server min protocol = LANMAN1
+
+	# needed for 'samba.tests.auth_log' tests
+	server require schannel:ADDCSMB1\$ = no
+	server schannel require seal:ADDCSMB1\$ = no
 ";
 	return _setup_ad_dc($self, $path, $conf_opts, "addcsmb1", "addom2.samba.example.com");
 }
