@@ -18,6 +18,10 @@
 
 import sys
 import os
+
+sys.path.insert(0, "bin/python")
+os.environ["PYTHONUNBUFFERED"] = "1"
+
 from datetime import datetime, timezone
 import tempfile
 import binascii
@@ -48,10 +52,18 @@ from samba.dsdb import (
     UF_SERVER_TRUST_ACCOUNT,
     UF_TRUSTED_TO_AUTHENTICATE_FOR_DELEGATION
 )
+from samba.dcerpc.misc import (
+    SEC_CHAN_NULL,
+    SEC_CHAN_WKSTA,
+    SEC_CHAN_BDC,
+)
 from samba.join import DCJoinContext
 from samba.ndr import ndr_pack, ndr_unpack
 from samba import net
 from samba.samdb import SamDB, dsdb_Dn
+
+rc4_bit = security.KERB_ENCTYPE_RC4_HMAC_MD5
+aes256_sk_bit = security.KERB_ENCTYPE_AES256_CTS_HMAC_SHA1_96_SK
 
 from samba.tests import delete_force
 import samba.tests.krb5.kcrypto as kcrypto
@@ -82,9 +94,6 @@ from samba.tests.krb5.rfc4120_constants import (
     PADATA_ENC_TIMESTAMP,
     PADATA_ETYPE_INFO2,
 )
-
-sys.path.insert(0, "bin/python")
-os.environ["PYTHONUNBUFFERED"] = "1"
 
 global_asn1_print = False
 global_hexdump = False
@@ -243,7 +252,7 @@ class KDCBaseTest(RawKerberosTest):
     def create_account(self, samdb, name, account_type=AccountType.USER,
                        spn=None, upn=None, additional_details=None,
                        ou=None, account_control=0, add_dollar=True,
-                       expired_password=False):
+                       expired_password=False, force_nt4_hash=False):
         '''Create an account for testing.
            The dn of the created account is added to self.accounts,
            which is used by tearDownClass to clean up the created accounts.
@@ -264,6 +273,7 @@ class KDCBaseTest(RawKerberosTest):
         # run failed
         delete_force(samdb, dn)
         account_name = name
+        secure_schannel_type = SEC_CHAN_NULL
         if account_type is self.AccountType.USER:
             object_class = "user"
             account_control |= UF_NORMAL_ACCOUNT
@@ -273,8 +283,10 @@ class KDCBaseTest(RawKerberosTest):
                 account_name += '$'
             if account_type is self.AccountType.COMPUTER:
                 account_control |= UF_WORKSTATION_TRUST_ACCOUNT
+                secure_schannel_type = SEC_CHAN_WKSTA
             elif account_type is self.AccountType.SERVER:
                 account_control |= UF_SERVER_TRUST_ACCOUNT
+                secure_schannel_type = SEC_CHAN_BDC
             else:
                 self.fail()
 
@@ -301,6 +313,26 @@ class KDCBaseTest(RawKerberosTest):
             details.update(additional_details)
         samdb.add(details)
 
+        expected_kvno = 1
+
+        if force_nt4_hash:
+            admin_creds = self.get_admin_creds()
+            lp = self.get_lp()
+            net_ctx = net.Net(admin_creds, lp, server=self.dc_host)
+            domain = samdb.domain_netbios_name().upper()
+
+            password = generate_random_password(32, 32)
+            utf16pw = ('"%s"' % password).encode('utf-16-le')
+
+            try:
+                net_ctx.set_password(newpassword=password,
+                                     account_name=account_name,
+                                     domain_name=domain,
+                                     force_samr_18=True)
+                expected_kvno += 1
+            except Exception as e:
+                self.fail(e)
+
         creds = KerberosCredentials()
         creds.guess(self.get_lp())
         creds.set_realm(samdb.domain_dns_name().upper())
@@ -311,6 +343,7 @@ class KDCBaseTest(RawKerberosTest):
             creds.set_workstation('')
         else:
             creds.set_workstation(name)
+        creds.set_secure_channel_type(secure_schannel_type)
         creds.set_dn(ldb.Dn(samdb, dn))
         creds.set_upn(upn)
         creds.set_spn(spn)
@@ -325,8 +358,8 @@ class KDCBaseTest(RawKerberosTest):
                            attrs=['msDS-KeyVersionNumber'])
         kvno = res[0].get('msDS-KeyVersionNumber', idx=0)
         if kvno is not None:
-            self.assertEqual(int(kvno), 1)
-        creds.set_kvno(1)
+            self.assertEqual(int(kvno), expected_kvno)
+        creds.set_kvno(expected_kvno)
 
         return (creds, dn)
 
@@ -485,7 +518,8 @@ class KDCBaseTest(RawKerberosTest):
         dns_hostname = samdb.host_dns_name()
         (bind, handle, _) = drsuapi_connect(dns_hostname,
                                             self.get_lp(),
-                                            admin_creds)
+                                            admin_creds,
+                                            ip=self.dc_host)
 
         req = drsuapi.DsGetNCChangesRequest8()
 
@@ -536,7 +570,7 @@ class KDCBaseTest(RawKerberosTest):
 
         return bind, identifier, attributes
 
-    def get_keys(self, samdb, dn):
+    def get_keys(self, samdb, dn, expected_etypes=None):
         admin_creds = self.get_admin_creds()
 
         bind, identifier, attributes = self.get_secrets(
@@ -554,6 +588,8 @@ class KDCBaseTest(RawKerberosTest):
         for attr in attributes:
             if attr.attid == drsuapi.DRSUAPI_ATTID_supplementalCredentials:
                 net_ctx.replicate_decrypt(bind, attr, rid)
+                if attr.value_ctr.num_values == 0:
+                    continue
                 attr_val = attr.value_ctr.values[0].blob
 
                 spl = ndr_unpack(drsblobs.supplementalCredentialsBlob,
@@ -574,9 +610,10 @@ class KDCBaseTest(RawKerberosTest):
                 pwd = attr.value_ctr.values[0].blob
                 keys[kcrypto.Enctype.RC4] = pwd.hex()
 
-        default_enctypes = self.get_default_enctypes()
+        if expected_etypes is None:
+            expected_etypes = self.get_default_enctypes()
 
-        self.assertCountEqual(default_enctypes, keys)
+        self.assertCountEqual(expected_etypes, keys)
 
         return keys
 
@@ -585,7 +622,9 @@ class KDCBaseTest(RawKerberosTest):
             for enctype, key in keys.items():
                 creds.set_forced_key(enctype, key)
 
-    def creds_set_enctypes(self, creds):
+    def creds_set_enctypes(self, creds,
+                           extra_bits=None,
+                           remove_bits=None):
         samdb = self.get_samdb()
 
         res = samdb.search(creds.get_dn(),
@@ -594,19 +633,41 @@ class KDCBaseTest(RawKerberosTest):
         supported_enctypes = res[0].get('msDS-SupportedEncryptionTypes', idx=0)
 
         if supported_enctypes is None:
-            supported_enctypes = 0
+            supported_enctypes = self.default_etypes
+        if supported_enctypes is None:
+            lp = self.get_lp()
+            supported_enctypes = lp.get('kdc default domain supported enctypes')
+            if supported_enctypes == 0:
+                supported_enctypes = rc4_bit | aes256_sk_bit
+        supported_enctypes = int(supported_enctypes)
+
+        if extra_bits is not None:
+            # We need to add in implicit or implied encryption types.
+            supported_enctypes |= extra_bits
+        if remove_bits is not None:
+            # We also need to remove certain bits, such as the non-encryption
+            # type bit aes256-sk.
+            supported_enctypes &= ~remove_bits
 
         creds.set_as_supported_enctypes(supported_enctypes)
         creds.set_tgs_supported_enctypes(supported_enctypes)
         creds.set_ap_supported_enctypes(supported_enctypes)
 
-    def creds_set_default_enctypes(self, creds, fast_support=False):
+    def creds_set_default_enctypes(self, creds,
+                                   fast_support=False,
+                                   claims_support=False,
+                                   compound_id_support=False):
         default_enctypes = self.get_default_enctypes()
         supported_enctypes = KerberosCredentials.etypes_to_bits(
             default_enctypes)
 
         if fast_support:
-            supported_enctypes |= KerberosCredentials.fast_supported_bits
+            supported_enctypes |= security.KERB_ENCTYPE_FAST_SUPPORTED
+        if claims_support:
+            supported_enctypes |= security.KERB_ENCTYPE_CLAIMS_SUPPORTED
+        if compound_id_support:
+            supported_enctypes |= (
+                security.KERB_ENCTYPE_COMPOUND_IDENTITY_SUPPORTED)
 
         creds.set_as_supported_enctypes(supported_enctypes)
         creds.set_tgs_supported_enctypes(supported_enctypes)
@@ -663,7 +724,8 @@ class KDCBaseTest(RawKerberosTest):
             'delegation_from_dn': None,
             'trusted_to_auth_for_delegation': False,
             'fast_support': False,
-            'id': None
+            'id': None,
+            'force_nt4_hash': False,
         }
 
         account_opts = {
@@ -706,7 +768,8 @@ class KDCBaseTest(RawKerberosTest):
                             delegation_from_dn,
                             trusted_to_auth_for_delegation,
                             fast_support,
-                            id):
+                            id,
+                            force_nt4_hash):
         if account_type is self.AccountType.USER:
             self.assertIsNone(spn)
             self.assertIsNone(delegation_to_spn)
@@ -760,9 +823,13 @@ class KDCBaseTest(RawKerberosTest):
                                         additional_details=details,
                                         account_control=user_account_control,
                                         add_dollar=add_dollar,
+                                        force_nt4_hash=force_nt4_hash,
                                         expired_password=expired_password)
 
-        keys = self.get_keys(samdb, dn)
+        expected_etypes = None
+        if force_nt4_hash:
+            expected_etypes = {kcrypto.Enctype.RC4}
+        keys = self.get_keys(samdb, dn, expected_etypes=expected_etypes)
         self.creds_set_keys(creds, keys)
 
         # Handle secret replication to the RODC.
@@ -855,8 +922,15 @@ class KDCBaseTest(RawKerberosTest):
                        allow_missing_password=False,
                        allow_missing_keys=True):
         def create_mach_account():
-            return self.get_cached_creds(account_type=self.AccountType.COMPUTER,
-                                         opts={'fast_support': True})
+            return self.get_cached_creds(
+                account_type=self.AccountType.COMPUTER,
+                opts={
+                    'fast_support': True,
+                    'supported_enctypes': (
+                        security.KERB_ENCTYPE_RC4_HMAC_MD5 |
+                        security.KERB_ENCTYPE_AES256_CTS_HMAC_SHA1_96_SK
+                    ),
+                })
 
         c = self._get_krb5_creds(prefix='MAC',
                                  allow_missing_password=allow_missing_password,
@@ -872,7 +946,11 @@ class KDCBaseTest(RawKerberosTest):
                 account_type=self.AccountType.COMPUTER,
                 opts={
                     'trusted_to_auth_for_delegation': True,
-                    'fast_support': True
+                    'fast_support': True,
+                    'supported_enctypes': (
+                        security.KERB_ENCTYPE_RC4_HMAC_MD5 |
+                        security.KERB_ENCTYPE_AES256_CTS_HMAC_SHA1_96_SK
+                    ),
                 })
 
         c = self._get_krb5_creds(prefix='SERVICE',
@@ -924,7 +1002,11 @@ class KDCBaseTest(RawKerberosTest):
             # The RODC krbtgt account should support the default enctypes,
             # although it might not have the msDS-SupportedEncryptionTypes
             # attribute.
-            self.creds_set_default_enctypes(creds)
+            self.creds_set_default_enctypes(
+                creds,
+                fast_support=self.kdc_fast_support,
+                claims_support=self.kdc_claims_support,
+                compound_id_support=self.kdc_compound_id_support)
 
             return creds
 
@@ -970,7 +1052,13 @@ class KDCBaseTest(RawKerberosTest):
             keys = self.get_keys(samdb, dn)
             self.creds_set_keys(creds, keys)
 
-            self.creds_set_enctypes(creds)
+            extra_bits = (security.KERB_ENCTYPE_AES128_CTS_HMAC_SHA1_96 |
+                          security.KERB_ENCTYPE_AES256_CTS_HMAC_SHA1_96)
+            remove_bits = (security.KERB_ENCTYPE_AES256_CTS_HMAC_SHA1_96_SK |
+                           security.KERB_ENCTYPE_RC4_HMAC_MD5)
+            self.creds_set_enctypes(creds,
+                                    extra_bits=extra_bits,
+                                    remove_bits=remove_bits)
 
             return creds
 
@@ -1015,8 +1103,11 @@ class KDCBaseTest(RawKerberosTest):
             # The krbtgt account should support the default enctypes, although
             # it might not (on Samba) have the msDS-SupportedEncryptionTypes
             # attribute.
-            self.creds_set_default_enctypes(creds,
-                                            fast_support=self.kdc_fast_support)
+            self.creds_set_default_enctypes(
+                creds,
+                fast_support=self.kdc_fast_support,
+                claims_support=self.kdc_claims_support,
+                compound_id_support=self.kdc_compound_id_support)
 
             return creds
 
@@ -1060,7 +1151,12 @@ class KDCBaseTest(RawKerberosTest):
             keys = self.get_keys(samdb, dn)
             self.creds_set_keys(creds, keys)
 
-            self.creds_set_enctypes(creds)
+            extra_bits = (security.KERB_ENCTYPE_AES128_CTS_HMAC_SHA1_96 |
+                          security.KERB_ENCTYPE_AES256_CTS_HMAC_SHA1_96)
+            remove_bits = security.KERB_ENCTYPE_AES256_CTS_HMAC_SHA1_96_SK
+            self.creds_set_enctypes(creds,
+                                    extra_bits=extra_bits,
+                                    remove_bits=remove_bits)
 
             return creds
 
@@ -1102,7 +1198,12 @@ class KDCBaseTest(RawKerberosTest):
             keys = self.get_keys(samdb, dn)
             self.creds_set_keys(creds, keys)
 
-            self.creds_set_enctypes(creds)
+            extra_bits = (security.KERB_ENCTYPE_AES128_CTS_HMAC_SHA1_96 |
+                          security.KERB_ENCTYPE_AES256_CTS_HMAC_SHA1_96)
+            remove_bits = security.KERB_ENCTYPE_AES256_CTS_HMAC_SHA1_96_SK
+            self.creds_set_enctypes(creds,
+                                    extra_bits=extra_bits,
+                                    remove_bits=remove_bits)
 
             return creds
 
@@ -1145,6 +1246,8 @@ class KDCBaseTest(RawKerberosTest):
             if pa['padata-type'] == PADATA_ETYPE_INFO2:
                 padata_value = pa['padata-value']
                 break
+        else:
+            self.fail('expected to find ETYPE-INFO2')
 
         etype_info2 = self.der_decode(
             padata_value, asn1Spec=krb5_asn1.ETYPE_INFO2())
@@ -1406,7 +1509,8 @@ class KDCBaseTest(RawKerberosTest):
         krbtgt_key = self.TicketDecryptionKey_from_creds(krbtgt_creds)
         self.verify_ticket(service_ticket_creds, krbtgt_key,
                            service_ticket=True, expect_pac=expect_pac,
-                           expect_ticket_checksum=self.tkt_sig_support)
+                           expect_ticket_checksum=self.tkt_sig_support,
+                           expect_full_checksum=self.full_sig_support)
 
         self.tkt_cache[cache_key] = service_ticket_creds
 
@@ -1500,6 +1604,7 @@ class KDCBaseTest(RawKerberosTest):
             expect_pac_attrs=expect_pac_attrs,
             expect_pac_attrs_pac_request=expect_pac_attrs_pac_request,
             expect_requester_sid=expect_requester_sid,
+            strict_etype_info=False,
             to_rodc=to_rodc)
         self.check_pre_authentication(rep)
 

@@ -123,3 +123,94 @@ struct SDBFlags int2SDBFlags(unsigned n)
 	flags.do_not_store = (n >> 31) & 1;
 	return flags;
 }
+
+/* Set the etypes of an sdb_entry based on its available current keys. */
+krb5_error_code sdb_entry_set_etypes(struct sdb_entry *s)
+{
+	if (s->keys.val != NULL) {
+		unsigned i;
+
+		s->etypes = malloc(sizeof(*s->etypes));
+		if (s->etypes == NULL) {
+			return ENOMEM;
+		}
+
+		s->etypes->len = s->keys.len;
+
+		s->etypes->val = calloc(s->etypes->len, sizeof(*s->etypes->val));
+		if (s->etypes->val == NULL) {
+			return ENOMEM;
+		}
+
+		for (i = 0; i < s->etypes->len; i++) {
+			const struct sdb_key *k = &s->keys.val[i];
+
+			s->etypes->val[i] = KRB5_KEY_TYPE(&(k->key));
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Set the session etypes of a server sdb_entry based on its etypes, forcing in
+ * strong etypes as desired.
+ */
+krb5_error_code sdb_entry_set_session_etypes(struct sdb_entry *s,
+					     bool add_aes256,
+					     bool add_aes128,
+					     bool add_rc4)
+{
+	unsigned len = 0;
+
+	if (add_aes256) {
+		/* Reserve space for AES256 */
+		len += 1;
+	}
+
+	if (add_aes128) {
+		/* Reserve space for AES128 */
+		len += 1;
+	}
+
+	if (add_rc4) {
+		/* Reserve space for RC4. */
+		len += 1;
+	}
+
+	if (len != 0) {
+		unsigned j = 0;
+
+		s->session_etypes = malloc(sizeof(*s->session_etypes));
+		if (s->session_etypes == NULL) {
+			return ENOMEM;
+		}
+
+		/* session_etypes must be sorted in order of strength, with preferred etype first. */
+
+		s->session_etypes->val = calloc(len, sizeof(*s->session_etypes->val));
+		if (s->session_etypes->val == NULL) {
+			SAFE_FREE(s->session_etypes);
+			return ENOMEM;
+		}
+
+		if (add_aes256) {
+			/* Add AES256 */
+			s->session_etypes->val[j++] = ENCTYPE_AES256_CTS_HMAC_SHA1_96;
+		}
+
+		if (add_aes128) {
+			/* Add AES128. */
+			s->session_etypes->val[j++] = ENCTYPE_AES128_CTS_HMAC_SHA1_96;
+		}
+
+		if (add_rc4) {
+			/* Add RC4. */
+			s->session_etypes->val[j++] = ENCTYPE_ARCFOUR_HMAC;
+		}
+
+		s->session_etypes->len = j;
+	}
+
+	return 0;
+}

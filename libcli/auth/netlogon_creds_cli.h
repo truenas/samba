@@ -31,9 +31,11 @@ struct messaging_context;
 struct dcerpc_binding_handle;
 struct db_context;
 
-NTSTATUS netlogon_creds_cli_set_global_db(struct db_context **db);
+NTSTATUS netlogon_creds_cli_set_global_db(struct loadparm_context *lp_ctx, struct db_context **db);
 NTSTATUS netlogon_creds_cli_open_global_db(struct loadparm_context *lp_ctx);
 void netlogon_creds_cli_close_global_db(void);
+
+void netlogon_creds_cli_warn_options(struct loadparm_context *lp_ctx);
 
 NTSTATUS netlogon_creds_cli_context_global(struct loadparm_context *lp_ctx,
 				struct messaging_context *msg_ctx,

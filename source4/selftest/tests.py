@@ -907,6 +907,7 @@ have_fast_support = int('SAMBA_USES_MITKDC' in config_hash)
 claims_support = 0
 compound_id_support = 0
 tkt_sig_support = int('SAMBA4_USES_HEIMDAL' in config_hash)
+full_sig_support = int('SAMBA4_USES_HEIMDAL' in config_hash)
 expect_pac = int('SAMBA4_USES_HEIMDAL' in config_hash)
 extra_pac_buffers = int('SAMBA4_USES_HEIMDAL' in config_hash)
 krb5_environ = {
@@ -920,14 +921,20 @@ krb5_environ = {
     'CLAIMS_SUPPORT': claims_support,
     'COMPOUND_ID_SUPPORT': compound_id_support,
     'TKT_SIG_SUPPORT': tkt_sig_support,
+    'FULL_SIG_SUPPORT': full_sig_support,
     'EXPECT_PAC': expect_pac,
     'EXPECT_EXTRA_PAC_BUFFERS': extra_pac_buffers,
 }
 planoldpythontestsuite("none", "samba.tests.krb5.kcrypto")
 planoldpythontestsuite("ad_dc_default", "samba.tests.krb5.simple_tests",
                        environ=krb5_environ)
-planoldpythontestsuite("ad_dc_default:local", "samba.tests.krb5.s4u_tests",
-                       environ=krb5_environ)
+for env, fast_support in [("ad_dc_default:local", True),
+                          ("fl2003dc:local", False)]:
+    planoldpythontestsuite(env, "samba.tests.krb5.s4u_tests",
+                           environ={
+                               **krb5_environ,
+                               'FAST_SUPPORT': int(fast_support),
+                           })
 planoldpythontestsuite("rodc:local", "samba.tests.krb5.rodc_tests",
                        environ=krb5_environ)
 
@@ -1567,8 +1574,13 @@ for env in ["rodc", "promoted_dc", "fl2000dc", "fl2008r2dc"]:
 
 planpythontestsuite("ad_dc", "samba.tests.krb5.as_canonicalization_tests",
                     environ=krb5_environ)
-planpythontestsuite("ad_dc", "samba.tests.krb5.compatability_tests",
-                    environ=krb5_environ)
+for env, fast_support in [("ad_dc", True),
+                          ("fl2003dc", False)]:
+    planpythontestsuite(env, "samba.tests.krb5.compatability_tests",
+                        environ={
+                            **krb5_environ,
+                            'FAST_SUPPORT': int(fast_support),
+                        })
 planpythontestsuite("ad_dc", "samba.tests.krb5.kdc_tests",
                     environ=krb5_environ)
 planpythontestsuite(
@@ -1595,6 +1607,18 @@ planoldpythontestsuite(
     'ad_dc',
     'samba.tests.krb5.kpasswd_tests',
     environ=krb5_environ)
+for env, forced_rc4 in [('ad_dc', False),
+                        ('promoted_dc', True)]:
+    planoldpythontestsuite(
+        env,
+        'samba.tests.krb5.etype_tests',
+        environ={
+            **krb5_environ,
+            'DC_SERVER': '$SERVER',
+            'DC_SERVER_IP': '$SERVER_IP',
+            'DC_SERVER_IPV6': '$SERVER_IPV6',
+            'FORCED_RC4': int(forced_rc4),
+        })
 
 for env in [
         'vampire_dc',

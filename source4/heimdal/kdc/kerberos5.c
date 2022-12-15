@@ -225,6 +225,39 @@ out:
     return ret;
 }
 
+/*
+ * The principal's session_etypes must be sorted in order of strength, with
+ * preferred etype first.
+*/
+krb5_error_code
+_kdc_find_session_etype(krb5_context context,
+			krb5_enctype *etypes, size_t len,
+			const hdb_entry_ex *princ,
+			krb5_enctype *ret_enctype)
+{
+    size_t i;
+
+    if (princ->entry.session_etypes == NULL) {
+	/* The principal must have session etypes available. */
+	return KRB5KDC_ERR_ETYPE_NOSUPP;
+    }
+
+    /* Loop over the client's specified etypes. */
+    for (i = 0; i < len; ++i) {
+	size_t j;
+
+	/* Check that the server also supports the etype. */
+	for (j = 0; j < princ->entry.session_etypes->len; ++j) {
+	    if (princ->entry.session_etypes->val[j] == etypes[i]) {
+		*ret_enctype = etypes[i];
+		return 0;
+	    }
+	}
+    }
+
+    return KRB5KDC_ERR_ETYPE_NOSUPP;
+}
+
 krb5_error_code
 _kdc_make_anonymous_principalname (PrincipalName *pn)
 {
@@ -1154,6 +1187,12 @@ _kdc_as_rep(krb5_context context,
     memset(&ek, 0, sizeof(ek));
 
     /*
+     * This has to be here (not later), because we need to have r->sessionetype
+     * set prior to calling pa_pkinit_validate(), which in turn calls
+     * _kdc_pk_mk_pa_reply(), during padata validation.
+     */
+
+    /*
      * Select a session enctype from the list of the crypto system
      * supported enctypes that is supported by the client and is one of
      * the enctype of the enctype of the service (likely krbtgt).
@@ -1163,9 +1202,8 @@ _kdc_as_rep(krb5_context context,
      * enctype that an older version of a KDC in the same realm can't
      * decrypt.
      */
-    ret = _kdc_find_etype(context, config->as_use_strongest_session_key, FALSE,
-			  client, b->etype.val, b->etype.len, &sessionetype,
-			  NULL);
+    ret = _kdc_find_session_etype(context, b->etype.val, b->etype.len,
+				  server, &sessionetype);
     if (ret) {
 	kdc_log(context, config, 0,
 		"Client (%s) from %s has no common enctypes with KDC "
@@ -1391,7 +1429,6 @@ _kdc_as_rep(krb5_context context,
 			client_name);
 		continue;
 	    }
-	    free_PA_ENC_TS_ENC(&p);
 	    if (abs(kdc_time - p.patimestamp) > context->max_skew) {
 		char client_time[100];
 
@@ -1413,8 +1450,10 @@ _kdc_as_rep(krb5_context context,
 		 * there is a e_text, they become unhappy.
 		 */
 		e_text = NULL;
+		free_PA_ENC_TS_ENC(&p);
 		goto out;
 	    }
+	    free_PA_ENC_TS_ENC(&p);
 	    et.flags.pre_authent = 1;
 
 	    set_salt_padata(rep.padata, pa_key->salt);
@@ -1801,6 +1840,7 @@ _kdc_as_rep(krb5_context context,
 				 &skey->key, /* Server key */
 				 &krbtgt_key->key, /* TGS key */
 				 rodc_id,
+				 false, /* add_full_sig */
 				 &data);
 	    krb5_free_principal(context, client_pac);
 	    krb5_pac_free(context, p);
