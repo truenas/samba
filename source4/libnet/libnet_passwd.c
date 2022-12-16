@@ -57,13 +57,13 @@ static NTSTATUS libnet_ChangePassword_samr_aes(TALLOC_CTX *mem_ctx,
 	struct samr_EncryptedPasswordAES pwd_buf = {
 		.cipher_len = 0
 	};
-	DATA_BLOB iv = {
+	DATA_BLOB salt = {
 		.data = pwd_buf.salt,
 		.length = sizeof(pwd_buf.salt),
 	};
-	gnutls_datum_t iv_datum = {
-		.data = iv.data,
-		.size = iv.length,
+	gnutls_datum_t salt_datum = {
+		.data = pwd_buf.salt,
+		.size = sizeof(pwd_buf.salt),
 	};
 	uint64_t pbkdf2_iterations = generate_random_u64_range(5000, 1000000);
 	NTSTATUS status;
@@ -71,21 +71,25 @@ static NTSTATUS libnet_ChangePassword_samr_aes(TALLOC_CTX *mem_ctx,
 
 	E_md4hash(old_password, old_nt_key_data);
 
-	generate_nonce_buffer(iv.data, iv.length);
+	generate_nonce_buffer(salt.data, salt.length);
 
 	rc = gnutls_pbkdf2(GNUTLS_MAC_SHA512,
 			   &old_nt_key,
-			   &iv_datum,
+			   &salt_datum,
 			   pbkdf2_iterations,
 			   cek.data,
 			   cek.length);
 	BURN_DATA(old_nt_key_data);
 	if (rc < 0) {
-		status = gnutls_error_to_ntstatus(rc, NT_STATUS_WRONG_PASSWORD);
+		status = gnutls_error_to_ntstatus(rc, NT_STATUS_CRYPTO_SYSTEM_INVALID);
+		if (!NT_STATUS_IS_OK(status)) {
+			goto done;
+		}
 	}
 
 	status = init_samr_CryptPasswordAES(mem_ctx,
 					    new_password,
+					    &salt,
 					    &cek,
 					    &pwd_buf);
 	data_blob_clear(&cek);
@@ -100,17 +104,18 @@ static NTSTATUS libnet_ChangePassword_samr_aes(TALLOC_CTX *mem_ctx,
 	r.in.password = &pwd_buf;
 
 	status = dcerpc_samr_ChangePasswordUser4_r(h, mem_ctx, &r);
-	if (NT_STATUS_IS_OK(status)) {
+	if (!NT_STATUS_IS_OK(status)) {
 		goto done;
 	}
 	if (!NT_STATUS_IS_OK(r.out.result)) {
+		status = r.out.result;
 		*error_string = talloc_asprintf(mem_ctx,
 						"samr_ChangePasswordUser4 for "
 						"'%s\\%s' failed: %s",
 						server->string,
 						account->string,
 						nt_errstr(status));
-		status = r.out.result;
+		goto done;
 	}
 
 done:
@@ -423,20 +428,23 @@ static NTSTATUS libnet_ChangePassword_samr(struct libnet_context *ctx, TALLOC_CT
 		r->samr.in.oldpassword,
 		r->samr.in.newpassword,
 		&(r->samr.out.error_string));
-	if (!NT_STATUS_IS_OK(status)) {
-		if (NT_STATUS_EQUAL(status,
-				     NT_STATUS_RPC_PROCNUM_OUT_OF_RANGE) ||
-		    NT_STATUS_EQUAL(status, NT_STATUS_NOT_SUPPORTED) ||
-		    NT_STATUS_EQUAL(status, NT_STATUS_NOT_IMPLEMENTED)) {
-			/*
-			* Don't fallback to RC4 based SAMR if weak crypto is not
-			* allowed.
-			*/
-			if (lpcfg_weak_crypto(ctx->lp_ctx) ==
-			SAMBA_WEAK_CRYPTO_DISALLOWED) {
-				goto disconnect;
-			}
+	if (NT_STATUS_IS_OK(status)) {
+		goto disconnect;
+	} else if (NT_STATUS_EQUAL(status,
+				   NT_STATUS_RPC_PROCNUM_OUT_OF_RANGE) ||
+		   NT_STATUS_EQUAL(status, NT_STATUS_NOT_SUPPORTED) ||
+		   NT_STATUS_EQUAL(status, NT_STATUS_NOT_IMPLEMENTED)) {
+		/*
+		 * Don't fallback to RC4 based SAMR if weak crypto is not
+		 * allowed.
+		 */
+		if (lpcfg_weak_crypto(ctx->lp_ctx) ==
+		    SAMBA_WEAK_CRYPTO_DISALLOWED) {
+			goto disconnect;
 		}
+	} else {
+		/* libnet_ChangePassword_samr_aes is implemented and failed */
+		goto disconnect;
 	}
 
 	status = libnet_ChangePassword_samr_rc4(
@@ -747,6 +755,66 @@ out:
 	return status;
 }
 
+static NTSTATUS libnet_SetPassword_samr_handle_18(struct libnet_context *ctx, TALLOC_CTX *mem_ctx, union libnet_SetPassword *r)
+{
+	NTSTATUS status;
+	struct samr_SetUserInfo2 sui;
+	union samr_UserInfo u_info;
+	struct samr_Password ntpwd;
+	DATA_BLOB ntpwd_in;
+	DATA_BLOB ntpwd_out;
+	DATA_BLOB session_key;
+	int rc;
+
+	if (r->samr_handle.in.info21) {
+		return NT_STATUS_INVALID_PARAMETER_MIX;
+	}
+
+	/* prepare samr_SetUserInfo2 level 18 (nt_hash) */
+	ZERO_STRUCT(u_info);
+	E_md4hash(r->samr_handle.in.newpassword, ntpwd.hash);
+	ntpwd_in = data_blob_const(ntpwd.hash, sizeof(ntpwd.hash));
+	ntpwd_out = data_blob_const(u_info.info18.nt_pwd.hash,
+				    sizeof(u_info.info18.nt_pwd.hash));
+	u_info.info18.nt_pwd_active = 1;
+	u_info.info18.password_expired = 0;
+
+	status = dcerpc_fetch_session_key(r->samr_handle.in.dcerpc_pipe, &session_key);
+	if (!NT_STATUS_IS_OK(status)) {
+		r->samr_handle.out.error_string = talloc_asprintf(mem_ctx,
+						"dcerpc_fetch_session_key failed: %s",
+						nt_errstr(status));
+		return status;
+	}
+
+	rc = sess_crypt_blob(&ntpwd_out, &ntpwd_in,
+			     &session_key, SAMBA_GNUTLS_ENCRYPT);
+	if (rc < 0) {
+		status = gnutls_error_to_ntstatus(rc, NT_STATUS_CRYPTO_SYSTEM_INVALID);
+		goto out;
+	}
+
+	sui.in.user_handle = r->samr_handle.in.user_handle;
+	sui.in.info = &u_info;
+	sui.in.level = 18;
+
+	/* 9. try samr_SetUserInfo2 level 18 to set the password */
+	status = dcerpc_samr_SetUserInfo2_r(r->samr_handle.in.dcerpc_pipe->binding_handle, mem_ctx, &sui);
+	if (NT_STATUS_IS_OK(status) && !NT_STATUS_IS_OK(sui.out.result)) {
+		status = sui.out.result;
+	}
+	if (!NT_STATUS_IS_OK(status)) {
+		r->samr_handle.out.error_string
+			= talloc_asprintf(mem_ctx,
+					  "SetUserInfo2 level 18 for [%s] failed: %s",
+					  r->samr_handle.in.account_name, nt_errstr(status));
+	}
+
+out:
+	data_blob_clear(&session_key);
+	return status;
+}
+
 /*
  * 1. try samr_SetUserInfo2 level 26 to set the password
  * 2. try samr_SetUserInfo2 level 25 to set the password
@@ -764,6 +832,11 @@ static NTSTATUS libnet_SetPassword_samr_handle(struct libnet_context *ctx, TALLO
 		LIBNET_SET_PASSWORD_SAMR_HANDLE_23,
 	};
 	unsigned int i;
+
+	if (r->samr_handle.samr_level != 0) {
+		r->generic.level = r->samr_handle.samr_level;
+		return libnet_SetPassword(ctx, mem_ctx, r);
+	}
 
 	for (i=0; i < ARRAY_SIZE(levels); i++) {
 		r->generic.level = levels[i];
@@ -937,7 +1010,9 @@ static NTSTATUS libnet_SetPassword_samr(struct libnet_context *ctx, TALLOC_CTX *
 		goto disconnect;
 	}
 
+	ZERO_STRUCT(r2);
 	r2.samr_handle.level		= LIBNET_SET_PASSWORD_SAMR_HANDLE;
+	r2.samr_handle.samr_level	= r->samr.samr_level;
 	r2.samr_handle.in.account_name	= r->samr.in.account_name;
 	r2.samr_handle.in.newpassword	= r->samr.in.newpassword;
 	r2.samr_handle.in.user_handle   = &u_handle;
@@ -960,7 +1035,9 @@ static NTSTATUS libnet_SetPassword_generic(struct libnet_context *ctx, TALLOC_CT
 	NTSTATUS status;
 	union libnet_SetPassword r2;
 
+	ZERO_STRUCT(r2);
 	r2.samr.level		= LIBNET_SET_PASSWORD_SAMR;
+	r2.samr.samr_level	= r->generic.samr_level;
 	r2.samr.in.account_name	= r->generic.in.account_name;
 	r2.samr.in.domain_name	= r->generic.in.domain_name;
 	r2.samr.in.newpassword	= r->generic.in.newpassword;
@@ -1012,6 +1089,12 @@ NTSTATUS libnet_SetPassword(struct libnet_context *ctx, TALLOC_CTX *mem_ctx, uni
 				GNUTLS_FIPS140_SET_LAX_MODE();
 			}
 			status = libnet_SetPassword_samr_handle_23(ctx, mem_ctx, r);
+			break;
+		case LIBNET_SET_PASSWORD_SAMR_HANDLE_18:
+			if (encryption_state == SMB_ENCRYPTION_REQUIRED) {
+				GNUTLS_FIPS140_SET_LAX_MODE();
+			}
+			status = libnet_SetPassword_samr_handle_18(ctx, mem_ctx, r);
 			break;
 		case LIBNET_SET_PASSWORD_KRB5:
 			status = NT_STATUS_NOT_IMPLEMENTED;
