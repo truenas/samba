@@ -1002,6 +1002,11 @@ if ('SAMBA4_USES_HEIMDAL' in config_hash or
 else:
     tkt_sig_support = 0
 
+if 'SAMBA4_USES_HEIMDAL' in config_hash:
+    full_sig_support = 1
+else:
+    full_sig_support = 0
+
 gnutls_pbkdf2_support = int('HAVE_GNUTLS_PBKDF2' in config_hash)
 
 if 'HAVE_MIT_KRB5_1_20' in config_hash:
@@ -1024,6 +1029,7 @@ krb5_environ = {
     'CLAIMS_SUPPORT': claims_support,
     'COMPOUND_ID_SUPPORT': compound_id_support,
     'TKT_SIG_SUPPORT': tkt_sig_support,
+    'FULL_SIG_SUPPORT': full_sig_support,
     'GNUTLS_PBKDF2_SUPPORT': gnutls_pbkdf2_support,
     'EXPECT_PAC': expect_pac,
     'EXPECT_EXTRA_PAC_BUFFERS': extra_pac_buffers,
@@ -1034,8 +1040,13 @@ krb5_environ = {
 planoldpythontestsuite("none", "samba.tests.krb5.kcrypto")
 planoldpythontestsuite("ad_dc_default", "samba.tests.krb5.simple_tests",
                        environ=krb5_environ)
-planoldpythontestsuite("ad_dc_default:local", "samba.tests.krb5.s4u_tests",
-                       environ=krb5_environ)
+for env, fast_support in [("ad_dc_default:local", True),
+                          ("fl2003dc:local", False)]:
+    planoldpythontestsuite(env, "samba.tests.krb5.s4u_tests",
+                           environ={
+                               **krb5_environ,
+                               'FAST_SUPPORT': int(fast_support),
+                           })
 planoldpythontestsuite("rodc:local", "samba.tests.krb5.rodc_tests",
                        environ=krb5_environ)
 
@@ -1094,9 +1105,11 @@ if have_heimdal_support:
                            environ={'CLIENT_IP': '10.53.57.11',
                                     'SOCKET_WRAPPER_DEFAULT_IFACE': 11})
     planoldpythontestsuite("ad_dc_smb1", "samba.tests.auth_log_pass_change",
-                           extra_args=['-U"$USERNAME%$PASSWORD"'])
+                           extra_args=['-U"$USERNAME%$PASSWORD"'],
+                           environ={'GNUTLS_PBKDF2_SUPPORT': gnutls_pbkdf2_support})
     planoldpythontestsuite("ad_dc_ntvfs", "samba.tests.auth_log_pass_change",
-                           extra_args=['-U"$USERNAME%$PASSWORD"'])
+                           extra_args=['-U"$USERNAME%$PASSWORD"'],
+                           environ={'GNUTLS_PBKDF2_SUPPORT': gnutls_pbkdf2_support})
 
     # these tests use a NCA local RPC connection, so always run on the
     # :local testenv, and so don't need to fake a client connection
@@ -1113,7 +1126,8 @@ if have_heimdal_support:
                            "samba.tests.auth_log_winbind",
                            extra_args=['-U"$DC_USERNAME%$DC_PASSWORD"'])
     planoldpythontestsuite("ad_dc", "samba.tests.audit_log_pass_change",
-                           extra_args=['-U"$USERNAME%$PASSWORD"'])
+                           extra_args=['-U"$USERNAME%$PASSWORD"'],
+                           environ={'GNUTLS_PBKDF2_SUPPORT': gnutls_pbkdf2_support})
     planoldpythontestsuite("ad_dc", "samba.tests.audit_log_dsdb",
                            extra_args=['-U"$USERNAME%$PASSWORD"'])
     planoldpythontestsuite("ad_dc", "samba.tests.group_audit",
@@ -1698,8 +1712,13 @@ for env in ["rodc", "promoted_dc", "fl2000dc", "fl2008r2dc"]:
 
 planpythontestsuite("ad_dc", "samba.tests.krb5.as_canonicalization_tests",
                     environ=krb5_environ)
-planpythontestsuite("ad_dc", "samba.tests.krb5.compatability_tests",
-                    environ=krb5_environ)
+for env, fast_support in [("ad_dc", True),
+                          ("fl2003dc", False)]:
+    planpythontestsuite(env, "samba.tests.krb5.compatability_tests",
+                        environ={
+                            **krb5_environ,
+                            'FAST_SUPPORT': int(fast_support),
+                        })
 planpythontestsuite("ad_dc", "samba.tests.krb5.kdc_tests",
                     environ=krb5_environ)
 planpythontestsuite(
@@ -1747,6 +1766,18 @@ planoldpythontestsuite(
     'ad_dc:local',
     'samba.tests.krb5.lockout_tests',
     environ=krb5_environ)
+for env, forced_rc4 in [('ad_dc', False),
+                        ('promoted_dc', True)]:
+    planoldpythontestsuite(
+        env,
+        'samba.tests.krb5.etype_tests',
+        environ={
+            **krb5_environ,
+            'DC_SERVER': '$SERVER',
+            'DC_SERVER_IP': '$SERVER_IP',
+            'DC_SERVER_IPV6': '$SERVER_IPV6',
+            'FORCED_RC4': int(forced_rc4),
+        })
 
 for env in [
         'vampire_dc',

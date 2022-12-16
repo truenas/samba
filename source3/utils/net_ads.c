@@ -1414,6 +1414,8 @@ static int net_ads_status(struct net_context *c, int argc, const char **argv)
 		return -1;
 	}
 
+	net_warn_member_options();
+
 	status = ads_startup(c, true, tmp_ctx, &ads);
 	if (!ADS_ERR_OK(status)) {
 		goto out;
@@ -1556,6 +1558,8 @@ static ADS_STATUS net_ads_join_ok(struct net_context *c)
 		return ADS_ERROR_NT(NT_STATUS_ACCESS_DENIED);
 	}
 
+	net_warn_member_options();
+
 	net_use_krb_machine_account(c);
 
 	get_dc_name(lp_workgroup(), lp_realm(), dc_name, &dcip);
@@ -1587,6 +1591,8 @@ int net_ads_testjoin(struct net_context *c, int argc, const char **argv)
 			 _("Test if the existing join is ok"));
 		return -1;
 	}
+
+	net_warn_member_options();
 
 	/* Display success or failure */
 	status = net_ads_join_ok(c);
@@ -1684,6 +1690,8 @@ int net_ads_join(struct net_context *c, int argc, const char **argv)
 		TALLOC_FREE(tmp_ctx);
 		return net_ads_join_usage(c, argc, argv);
 	}
+
+	net_warn_member_options();
 
 	if (!modify_config) {
 		werr = check_ads_config();
@@ -2659,6 +2667,8 @@ int net_ads_changetrustpw(struct net_context *c, int argc, const char **argv)
 		goto out;
 	}
 
+	net_warn_member_options();
+
 	net_use_krb_machine_account(c);
 
 	use_in_memory_ccache();
@@ -2961,6 +2971,8 @@ static int net_ads_keytab_add(struct net_context *c,
 		return -1;
 	}
 
+	net_warn_member_options();
+
 	d_printf(_("Processing principals to add...\n"));
 
 	if (!c->opt_user_specified && c->opt_password == NULL) {
@@ -3010,6 +3022,8 @@ static int net_ads_keytab_create(struct net_context *c, int argc, const char **a
 		TALLOC_FREE(tmp_ctx);
 		return -1;
 	}
+
+	net_warn_member_options();
 
 	if (!c->opt_user_specified && c->opt_password == NULL) {
 		net_use_krb_machine_account(c);
@@ -3595,6 +3609,12 @@ static void net_ads_enctype_dump_enctypes(const char *username,
 	printf("[%s] 0x%08x AES256-CTS-HMAC-SHA1-96\n",
 		enctypes & ENC_HMAC_SHA1_96_AES256 ? "X" : " ",
 		ENC_HMAC_SHA1_96_AES256);
+	printf("[%s] 0x%08x AES256-CTS-HMAC-SHA1-96-SK\n",
+		enctypes & ENC_HMAC_SHA1_96_AES256_SK ? "X" : " ",
+		ENC_HMAC_SHA1_96_AES256_SK);
+	printf("[%s] 0x%08x RESOURCE-SID-COMPRESSION-DISABLED\n",
+		enctypes & KERB_ENCTYPE_RESOURCE_SID_COMPRESSION_DISABLED ? "X" : " ",
+		KERB_ENCTYPE_RESOURCE_SID_COMPRESSION_DISABLED);
 }
 
 static int net_ads_enctypes_list(struct net_context *c, int argc, const char **argv)
@@ -3673,13 +3693,10 @@ static int net_ads_enctypes_set(struct net_context *c, int argc, const char **ar
 		goto done;
 	}
 
-	etype_list = ENC_CRC32 | ENC_RSA_MD5 | ENC_RC4_HMAC_MD5;
-#ifdef HAVE_ENCTYPE_AES128_CTS_HMAC_SHA1_96
+	etype_list = 0;
+	etype_list |= ENC_RC4_HMAC_MD5;
 	etype_list |= ENC_HMAC_SHA1_96_AES128;
-#endif
-#ifdef HAVE_ENCTYPE_AES256_CTS_HMAC_SHA1_96
 	etype_list |= ENC_HMAC_SHA1_96_AES256;
-#endif
 
 	if (argv[1] != NULL) {
 		sscanf(argv[1], "%i", &etype_list);

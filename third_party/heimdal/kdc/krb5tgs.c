@@ -778,7 +778,7 @@ tgs_make_reply(astgs_request_t r,
 
 	    ret = _krb5_kdc_pac_sign_ticket(r->context, r->pac, r->client_princ, serverkey,
 					    krbtgtkey, rodc_id, NULL, r->canon_client_princ,
-					    add_ticket_sig, et,
+					    add_ticket_sig, add_ticket_sig, et,
 					    is_tgs ? &r->pac_attributes : NULL);
 	    if (ret)
 		goto out;
@@ -1816,10 +1816,8 @@ server_lookup:
 	} else {
 	    Key *skey;
 
-	    ret = _kdc_find_etype(priv, krb5_principal_is_krbtgt(context, priv->server_princ)
-							     ? KFE_IS_TGS : 0,
-				  b->etype.val, b->etype.len, &etype, NULL,
-				  NULL);
+	    ret = _kdc_find_session_etype(priv, b->etype.val, b->etype.len,
+					  priv->server, &etype);
 	    if(ret) {
 		kdc_log(context, config, 4,
 			"Server (%s) has no support for etypes", spn);
