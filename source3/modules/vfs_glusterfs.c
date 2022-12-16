@@ -626,37 +626,11 @@ static DIR *vfs_gluster_fdopendir(struct vfs_handle_struct *handle,
 				  uint32_t attributes)
 {
 	glfs_fd_t *glfd = NULL;
-	struct smb_filename *full_fname = NULL;
-	struct smb_filename *smb_fname_dot = NULL;
 
-	smb_fname_dot = synthetic_smb_fname(fsp->fsp_name,
-					    ".",
-					    NULL,
-					    NULL,
-					    0,
-					    0);
-
-	if (smb_fname_dot == NULL) {
-		return NULL;
-	}
-
-	full_fname = full_path_from_dirfsp_atname(talloc_tos(),
-						  fsp,
-						  smb_fname_dot);
-	if (full_fname == NULL) {
-		TALLOC_FREE(smb_fname_dot);
-		return NULL;
-	}
-
-	glfd = glfs_opendir(handle->data, full_fname->base_name);
+	glfd = glfs_opendir(handle->data, fsp->fsp_name->base_name);
 	if (glfd == NULL) {
-		TALLOC_FREE(full_fname);
-		TALLOC_FREE(smb_fname_dot);
 		return NULL;
 	}
-
-	TALLOC_FREE(full_fname);
-	TALLOC_FREE(smb_fname_dot);
 
 	return (DIR *)glfd;
 }
@@ -1797,7 +1771,13 @@ static int vfs_gluster_fntimes(struct vfs_handle_struct *handle,
 		return -1;
 	}
 
-	ret = glfs_futimens(glfd, times);
+	if (!fsp->fsp_flags.is_pathref) {
+		ret = glfs_futimens(glfd, times);
+	} else {
+		ret = glfs_utimens(handle->data,
+				   fsp->fsp_name->base_name,
+				   times);
+	}
 	END_PROFILE(syscall_fntimes);
 
 	return ret;
@@ -2266,12 +2246,6 @@ static NTSTATUS vfs_gluster_get_real_filename_at(
 	int ret;
 	char key_buf[GLUSTER_NAME_MAX + 64];
 	char val_buf[GLUSTER_NAME_MAX + 1];
-#ifdef HAVE_GFAPI_VER_7_11
-	glfs_fd_t *pglfd = NULL;
-#else
-	struct smb_filename *smb_fname_dot = NULL;
-	struct smb_filename *full_fname = NULL;
-#endif
 
 	if (strlen(name) >= GLUSTER_NAME_MAX) {
 		return NT_STATUS_OBJECT_NAME_INVALID;
@@ -2280,40 +2254,11 @@ static NTSTATUS vfs_gluster_get_real_filename_at(
 	snprintf(key_buf, GLUSTER_NAME_MAX + 64,
 		 "glusterfs.get_real_filename:%s", name);
 
-#ifdef HAVE_GFAPI_VER_7_11
-	pglfd = vfs_gluster_fetch_glfd(handle, dirfsp);
-	if (pglfd == NULL) {
-		DBG_ERR("Failed to fetch gluster fd\n");
-		return NT_STATUS_OBJECT_NAME_NOT_FOUND;
-	}
-
-	ret = glfs_fgetxattr(pglfd, key_buf, val_buf, GLUSTER_NAME_MAX + 1);
-#else
-	smb_fname_dot = synthetic_smb_fname(mem_ctx,
-					    ".",
-					    NULL,
-					    NULL,
-					    0,
-					    0);
-	if (smb_fname_dot == NULL) {
-		return NT_STATUS_NO_MEMORY;
-	}
-
-	full_fname = full_path_from_dirfsp_atname(talloc_tos(),
-						  dirfsp,
-						  smb_fname_dot);
-	if (full_fname == NULL) {
-		TALLOC_FREE(smb_fname_dot);
-		return NT_STATUS_NO_MEMORY;
-	}
-
-	ret = glfs_getxattr(handle->data, full_fname->base_name,
-			    key_buf, val_buf, GLUSTER_NAME_MAX + 1);
-
-	TALLOC_FREE(smb_fname_dot);
-	TALLOC_FREE(full_fname);
-#endif
-
+	ret = glfs_getxattr(handle->data,
+			    dirfsp->fsp_name->base_name,
+			    key_buf,
+			    val_buf,
+			    GLUSTER_NAME_MAX + 1);
 	if (ret == -1) {
 		if (errno == ENOATTR) {
 			errno = ENOENT;
@@ -2347,7 +2292,21 @@ static ssize_t vfs_gluster_fgetxattr(struct vfs_handle_struct *handle,
 		return -1;
 	}
 
-	return glfs_fgetxattr(glfd, name, value, size);
+	if (!fsp->fsp_flags.is_pathref) {
+		/*
+		 * We can use an io_fd to retrieve xattr value.
+		 */
+		return glfs_fgetxattr(glfd, name, value, size);
+	}
+
+	/*
+	 * This is no longer a handle based call.
+	 */
+	return glfs_getxattr(handle->data,
+			     fsp->fsp_name->base_name,
+			     name,
+			     value,
+			     size);
 }
 
 static ssize_t vfs_gluster_flistxattr(struct vfs_handle_struct *handle,
