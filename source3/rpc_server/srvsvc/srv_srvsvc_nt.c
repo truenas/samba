@@ -657,7 +657,9 @@ static WERROR init_srv_share_info_ctr(struct pipes_struct *p,
 	 *
 	 *  include = /etc/samba/%U.conf
 	 */
-	reload_services(NULL, NULL, false);
+	if (!lp_registry_shares()) {
+		reload_services(NULL, NULL, false);
+	}
 
 	num_services = lp_numservices();
 
