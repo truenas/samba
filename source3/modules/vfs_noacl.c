@@ -51,29 +51,35 @@ static const struct {
 	{ FILE_ATTRIBUTE_REPARSE_POINT, UF_REPARSE },
 };
 
+#define ALLOWED_FLAGS (UF_SPARSE | UF_ARCHIVE | UF_SYSTEM | UF_HIDDEN | UF_OFFLINE)
+
 static int write_dosmode_as_user(struct vfs_handle_struct *handle,
-			 const struct smb_filename *smb_fname,
-			 mode_t new_mode, uint32_t fileflags)
+			         files_struct *fsp,
+				 mode_t new_mode, uint32_t fileflags)
 {
 	int ret;
-	ret = SMB_VFS_FCHMOD(smb_fname->fsp, new_mode);
+	ret = SMB_VFS_FCHMOD(fsp, new_mode);
 	if (ret != 0) {
-		DBG_ERR("Setting dosmode readonly bit failed for %s: %s\n",
-			smb_fname->base_name, strerror(errno));
+		DBG_ERR("%s: setting dosmode readonly bit failed for: %s\n",
+			fsp_str_dbg(fsp), strerror(errno));
 		return ret;
 	}
-	ret = SMB_VFS_FCHFLAGS(smb_fname->fsp, fileflags);
+
+	if (fileflags & UF_REPARSE) {
+		DBG_ERR("%s: attempting to set reparse point on file.\n",
+			fsp_str_dbg(fsp));
+	}
+	ret = SMB_VFS_FCHFLAGS(fsp, fileflags & ALLOWED_FLAGS);
 	if (ret != 0) {
-		DBG_ERR("Setting dosmode failed for %s: %s\n",
-			smb_fname->base_name, strerror(errno));
-		return ret;
+		DBG_ERR("%s: setting file flags [0x%08x] failed: %s\n",
+			fsp_str_dbg(fsp), fileflags, strerror(errno));
 	}
 	return ret;
 }
 
 static NTSTATUS set_dos_attributes_common(struct vfs_handle_struct *handle,
-					 const struct smb_filename *smb_fname,
-					 uint32_t dosmode)
+					  files_struct *fsp,
+					  uint32_t dosmode)
 {
 	/*
 	 * Use DOS READONLY to determine whether to add write bits to posix
@@ -87,8 +93,8 @@ static NTSTATUS set_dos_attributes_common(struct vfs_handle_struct *handle,
 	int ret, i;
 	bool set_dosmode_ok = false;
 	NTSTATUS status;
-	uint32_t fileflags;
-	mode_t new_mode = smb_fname->st.st_ex_mode;
+	uint32_t fileflags = 0;
+	mode_t new_mode = fsp->fsp_name->st.st_ex_mode;
 
 	for (i = 0; i < ARRAY_SIZE(dosmode2flag); i++) {
 		if (dosmode & dosmode2flag[i].dosmode) {
@@ -97,7 +103,7 @@ static NTSTATUS set_dos_attributes_common(struct vfs_handle_struct *handle,
 	}
 
 	DBG_INFO("noacl:set_dos_attributes: set attribute 0x%x, on file %s\n",
-		dosmode, smb_fname->base_name);
+		 dosmode, fsp_str_dbg(fsp));
 
 
 	if (IS_DOS_READONLY(dosmode)) {
@@ -121,7 +127,7 @@ static NTSTATUS set_dos_attributes_common(struct vfs_handle_struct *handle,
 		return NT_STATUS_ACCESS_DENIED;
 	}
 
-	status = smbd_check_access_rights_fsp(handle->conn->cwd_fsp, smb_fname->fsp,
+	status = smbd_check_access_rights_fsp(handle->conn->cwd_fsp, fsp,
 					      false, FILE_WRITE_ATTRIBUTES);
 
 	if (!NT_STATUS_IS_OK(status)) {
@@ -130,11 +136,11 @@ static NTSTATUS set_dos_attributes_common(struct vfs_handle_struct *handle,
 	}
 
 	become_root();
-	ret = write_dosmode_as_user(handle, smb_fname, new_mode, fileflags);
+	ret = write_dosmode_as_user(handle, fsp, new_mode, fileflags);
 	unbecome_root();
 	if (ret == -1) {
 		DBG_WARNING("Setting dosmode failed for %s: %s\n",
-			smb_fname->base_name, strerror(errno));
+			    fsp_str_dbg(fsp), strerror(errno));
 		return map_nt_error_from_unix(errno);
 	}
 
@@ -173,7 +179,7 @@ static NTSTATUS noacl_fget_dos_attributes(struct vfs_handle_struct *handle,
 
 static NTSTATUS noacl_get_nt_acl_common(TALLOC_CTX *ctx,
 					struct vfs_handle_struct *handle,
-					const struct smb_filename *smb_fname,
+					files_struct *fsp,
 					struct security_descriptor **ppdesc)
 {
 	int ret;
@@ -187,22 +193,16 @@ static NTSTATUS noacl_get_nt_acl_common(TALLOC_CTX *ctx,
 	struct security_acl *new_dacl = NULL;
 	int idx = 0;
 
-	if (VALID_STAT(smb_fname->st)) {
-		psbuf = &smb_fname->st;
+	if (VALID_STAT(fsp->fsp_name->st)) {
+		psbuf = &fsp->fsp_name->st;
 	}
 
 	if (psbuf == NULL) {
-		ret = vfs_stat_smb_basename(handle->conn, smb_fname, &sbuf);
-		if (ret != 0) {
-			DBG_INFO("stat [%s]failed: %s\n",
-				smb_fname_str_dbg(smb_fname), strerror(errno));
-			return map_nt_error_from_unix(errno);
-		}
-		psbuf = &sbuf;
+		smb_panic("fuck");
 	}
 	mode = psbuf->st_ex_mode;
 
-	DBG_DEBUG("file %s mode = 0%o\n",smb_fname->base_name, (int)mode);
+	DBG_DEBUG("file %s mode = 0%o\n", fsp_str_dbg(fsp), (int)mode);
 
 	uid_to_sid(&owner_sid, psbuf->st_ex_uid);
 	gid_to_sid(&group_sid, psbuf->st_ex_gid);
@@ -221,7 +221,7 @@ static NTSTATUS noacl_get_nt_acl_common(TALLOC_CTX *ctx,
 		}
 	}
 	if (mode & S_IWUSR) {
-		access_mask |= SEC_RIGHTS_FILE_WRITE | SEC_STD_DELETE;
+		access_mask |= SEC_RIGHTS_FILE_WRITE | SEC_STD_DELETE | SEC_FILE_APPEND_DATA;
 	}
 
 	init_sec_ace(&aces[idx],
@@ -236,7 +236,7 @@ static NTSTATUS noacl_get_nt_acl_common(TALLOC_CTX *ctx,
 		access_mask |= SEC_RIGHTS_FILE_READ | SEC_FILE_EXECUTE;
 	}
 	if (mode & S_IWGRP) {
-		access_mask |= SEC_RIGHTS_FILE_WRITE | SEC_STD_DELETE;
+		access_mask |= SEC_RIGHTS_FILE_WRITE | SEC_STD_DELETE | SEC_FILE_APPEND_DATA;
 	}
 	if (lp_dos_filemode(SNUM(handle->conn))) {
 		access_mask |= SEC_FILE_WRITE_ATTRIBUTE;
@@ -255,7 +255,7 @@ static NTSTATUS noacl_get_nt_acl_common(TALLOC_CTX *ctx,
 		access_mask |= SEC_RIGHTS_FILE_READ | SEC_FILE_EXECUTE;
 	}
 	if (mode & S_IWOTH) {
-		access_mask |= SEC_RIGHTS_FILE_WRITE | SEC_STD_DELETE;
+		access_mask |= SEC_RIGHTS_FILE_WRITE | SEC_STD_DELETE | SEC_FILE_APPEND_DATA;
 	}
 	if (lp_dos_filemode(SNUM(handle->conn))) {
 		access_mask |= SEC_FILE_WRITE_ATTRIBUTE;
@@ -299,20 +299,9 @@ static NTSTATUS noacl_fget_nt_acl(struct vfs_handle_struct *handle,
 				  struct security_descriptor **ppdesc)
 {
 	return noacl_get_nt_acl_common(mem_ctx,
-				       handle,
-				       fsp->fsp_name,
-				       ppdesc);
-}
-
-static NTSTATUS noacl_set_dos_attributes(struct vfs_handle_struct *handle,
-                                           const struct smb_filename *smb_fname,
-                                           uint32_t dosmode)
-{
-	NTSTATUS ret;
-
-	ret = set_dos_attributes_common(handle, smb_fname, dosmode);
-
-	return ret;
+				         handle,
+				         fsp,
+				         ppdesc);
 }
 
 static NTSTATUS noacl_fset_dos_attributes(struct vfs_handle_struct *handle,
@@ -321,7 +310,7 @@ static NTSTATUS noacl_fset_dos_attributes(struct vfs_handle_struct *handle,
 {
 	NTSTATUS ret;
 
-	ret = set_dos_attributes_common(handle, fsp->fsp_name, dosmode);
+	ret = set_dos_attributes_common(handle, fsp, dosmode);
 
 	return ret;
 }
