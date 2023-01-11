@@ -728,7 +728,6 @@ static void init_globals(struct loadparm_context *lp_ctx, bool reinit_globals)
 	Globals.log_writeable_files_on_exit = false;
 	Globals.create_krb5_conf = true;
 	Globals.include_system_krb5_conf = true;
-	Globals.winbind_netbios_alias_spn = true;
 	Globals.ads_dns_update = 1;
 	Globals.allow_dataset_creation = true;
 	Globals._winbind_max_domain_connections = 1;
