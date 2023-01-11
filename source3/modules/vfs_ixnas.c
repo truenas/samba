@@ -126,12 +126,20 @@ static bool ixnas_get_native_dosmode(struct files_struct *fsp, uint64_t *_dosmod
 		err = ioctl(fsp_get_io_fd(fsp), ZFS_IOC_GETDOSFLAGS, _dosmode);
 	} else {
 		int fd;
+
 		fd = ixnas_pathref_reopen(fsp, O_RDONLY);
+		if ((fd == -1) && (errno == EPERM)) {
+			become_root();
+			fd = ixnas_pathref_reopen(fsp, O_RDONLY);
+			unbecome_root();
+		}
+
 		if (fd == -1) {
 			DBG_WARNING("%s: open() failed: %s\n",
 				    fsp_str_dbg(fsp), strerror(errno));
 			return false;
 		}
+
 		err = ioctl(fd, ZFS_IOC_GETDOSFLAGS, _dosmode);
 		close(fd);
 	}
