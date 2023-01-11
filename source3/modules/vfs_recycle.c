@@ -305,6 +305,11 @@ static bool make_bin_from_mount(vfs_handle_struct *handle,
 		return ok;
 	}
 
+	/*
+	 * The mountpoint for the filesystem we're recycling to should
+	 * be within the share's connectpath
+	 */
+	SMB_ASSERT(strncmp(mp, handle->conn->connectpath, strlen(mp)) == 0);
 	ok = make_new_bin(handle, config, dirfsp, mp);
 	if (!ok) {
 		DBG_ERR("%s: add to pathrefs failed\n", mp);
