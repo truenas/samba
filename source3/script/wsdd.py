@@ -26,6 +26,7 @@ import platform
 import ctypes.util
 import collections
 import xml.etree.ElementTree as ElementTree
+import defusedxml.ElementTree as DefusedElementTree
 import http
 import http.server
 import urllib.request
@@ -37,6 +38,7 @@ import grp
 import datetime
 
 WSDD_VERSION = '0.6.4'
+WSDD_LOG_FILE = '/var/log/wsdd.log'
 
 
 class MulticastHandler:
@@ -370,7 +372,13 @@ class WSDMessageHandler(object):
         """
         handle a WSD message that might be received by a MulticastHandler
         """
-        tree = ElementTree.fromstring(msg)
+        try:
+            tree = DefusedElementTree.fromstring(msg)
+        except Exception:
+            logger.warning('Failed to parse msg: %s from source: %s',
+                           msg, src_address, exc_info=True)
+            return None
+
         header = tree.find('./soap:Header', namespaces)
         msg_id_tag = header.find('./wsa:MessageID', namespaces)
         if msg_id_tag is None:
@@ -1472,7 +1480,7 @@ def parse_args():
     parser.add_argument(
         '-i', '--interface',
         help='interface or address to use',
-        action='append', default=[])
+        action='append', default=get_parm('interfaces'))
     parser.add_argument(
         '-H', '--hoplimit',
         help='hop limit for multicast packets (default = 1)', type=int,
@@ -1562,7 +1570,7 @@ def parse_args():
         fmt = ('%(asctime)s:%(name)s %(levelname)s(pid %(process)d): '
                '%(message)s')
 
-    logging.basicConfig(level=log_level, format=fmt)
+    logging.basicConfig(filename=WSDD_LOG_FILE, level=log_level, format=fmt)
     logger = logging.getLogger('wsdd')
 
     if not args.interface:
