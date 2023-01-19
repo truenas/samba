@@ -668,6 +668,7 @@ typedef struct files_struct {
  */
 #define TCON_FLAG_STAT_FAILED		0x01
 #define TCON_FLAG_RESOLVE_BENEATH	0x02
+#define TCON_FLAG_INIT_STAT		0x04
 
 #define FSP_POSIX_FLAGS_OPEN		0x01
 #define FSP_POSIX_FLAGS_RENAME		0x02

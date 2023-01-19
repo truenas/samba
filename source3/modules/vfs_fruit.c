@@ -3285,7 +3285,9 @@ static int fruit_stat(vfs_handle_struct *handle,
 
 	if (!is_named_stream(smb_fname)) {
 		rc = SMB_VFS_NEXT_STAT(handle, smb_fname);
-		if (rc == 0) {
+		// We may be in early validation of share path
+		if ((rc == 0) &&
+		    (handle->conn->internal_tcon_flags & TCON_FLAG_INIT_STAT)) {
 			update_btime(handle, smb_fname);
 		}
 		return rc;
