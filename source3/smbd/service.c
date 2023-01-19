@@ -824,6 +824,9 @@ static NTSTATUS make_connection_snum(struct smbXsrv_connection *xconn,
 		conn->internal_tcon_flags |= TCON_FLAG_STAT_FAILED;
 	}
 
+	conn->internal_tcon_flags |= TCON_FLAG_INIT_STAT;
+
+
 #ifdef WITH_FAKE_KASERVER
 	if (lp_afs_share(snum)) {
 		afs_login(conn);
