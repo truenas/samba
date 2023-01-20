@@ -128,7 +128,7 @@ static bool ixnas_get_native_dosmode(struct files_struct *fsp, uint64_t *_dosmod
 		int fd;
 
 		fd = ixnas_pathref_reopen(fsp, O_RDONLY);
-		if ((fd == -1) && (errno == EPERM)) {
+		if ((fd == -1) && ((errno == EACCES) || (errno == EPERM))) {
 			become_root();
 			fd = ixnas_pathref_reopen(fsp, O_RDONLY);
 			unbecome_root();
