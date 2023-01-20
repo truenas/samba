@@ -668,7 +668,11 @@ static NTSTATUS process_symlink_open(const struct files_struct *dirfsp,
 	if (oldwd_fname != NULL) {
 		int ret = vfs_ChDir(conn, oldwd_fname);
 		if (ret == -1) {
-			smb_panic("unable to get back to old directory\n");
+			if (conn->base_share_dev != 0) {
+				smb_panic("unable to get back to old directory\n");
+			} else {
+				status = map_nt_error_from_unix(errno);
+			}
 		}
 		TALLOC_FREE(oldwd_fname);
 	}
