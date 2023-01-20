@@ -3417,7 +3417,10 @@ static int fruit_stat(vfs_handle_struct *handle,
 
 	if (!is_named_stream(smb_fname)) {
 		rc = SMB_VFS_NEXT_STAT(handle, smb_fname);
-		if (rc == 0) {
+		// base_share_dev will be zero if we haven't
+		// fully initialized share
+		if ((rc == 0) &&
+		    (handle->conn->base_share_dev != 0)) {
 			update_btime(handle, smb_fname);
 		}
 		return rc;
