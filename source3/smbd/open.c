@@ -493,6 +493,7 @@ static NTSTATUS chdir_below_conn(
 	bool ok;
 
 	if (!ISDOT(dir_fname->base_name)) {
+
 		oldwd_fname = vfs_GetWd(talloc_tos(), conn);
 		if (oldwd_fname == NULL) {
 			status = map_nt_error_from_unix(errno);

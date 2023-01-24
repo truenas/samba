@@ -512,6 +512,9 @@ _nss_winbind_getpwuid_r(uid_t uid, struct passwd *result, char *buffer,
 #ifdef DEBUG_NSS
 	fprintf(stderr, "[%5d]: getpwuid_r %d\n", getpid(), (unsigned int)uid);
 #endif
+	if ((uid == ROOT_ID) || (uid == TRUENAS_ADMIN_ID)) {
+		return NSS_STATUS_NOTFOUND;
+	}
 
 	/* If our static buffer needs to be expanded we are called again */
 	if (!keep_response || uid != response.data.pw.pw_uid) {
@@ -583,6 +586,11 @@ _nss_winbind_getpwnam_r(const char *name, struct passwd *result, char *buffer,
 #ifdef DEBUG_NSS
 	fprintf(stderr, "[%5d]: getpwnam_r %s\n", getpid(), name);
 #endif
+
+	if ((strcmp(name, ROOT_USER) == 0) ||
+	    (strcmp(name, TRUENAS_ADMIN_NAME) == 0)) {
+		return NSS_STATUS_NOTFOUND;
+	}
 
 	/* If our static buffer needs to be expanded we are called again */
 
@@ -837,6 +845,11 @@ _nss_winbind_getgrnam_r(const char *name,
 	fprintf(stderr, "[%5d]: getgrnam %s\n", getpid(), name);
 #endif
 
+	if ((strcmp(name, ROOT_GROUP) == 0) ||
+	    (strcmp(name, TRUENAS_ADMIN_NAME) == 0)) {
+		return NSS_STATUS_NOTFOUND;
+	}
+
 	/* If our static buffer needs to be expanded we are called again */
 	/* Or if the stored response group name differs from the request. */
 
@@ -917,6 +930,10 @@ _nss_winbind_getgrgid_r(gid_t gid,
 	fprintf(stderr, "[%5d]: getgrgid %d\n", getpid(), gid);
 #endif
 
+	if ((gid == ROOT_ID) || (gid == TRUENAS_ADMIN_ID)) {
+		return NSS_STATUS_NOTFOUND;
+	}
+
 	/* If our static buffer needs to be expanded we are called again */
 	/* Or if the stored response group name differs from the request. */
 
@@ -991,6 +1008,11 @@ _nss_winbind_initgroups_dyn(const char *user, gid_t group, long int *start,
 	struct winbindd_request request;
 	struct winbindd_response response;
 	int i;
+
+	if ((strcmp(user, ROOT_USER) == 0) ||
+	    (strcmp(user, TRUENAS_ADMIN_NAME) == 0)) {
+		return NSS_STATUS_NOTFOUND;
+	}
 
 #ifdef DEBUG_NSS
 	fprintf(stderr, "[%5d]: initgroups %s (%d)\n", getpid(),
