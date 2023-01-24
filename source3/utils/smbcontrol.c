@@ -1158,7 +1158,7 @@ static bool do_winbind_offline(struct tevent_context *ev_ctx,
 		return False;
 	}
 
-	db_path = state_path(talloc_tos(), "winbindd_cache.tdb");
+	db_path = cache_path(talloc_tos(), "winbindd_cache.tdb");
 	if (db_path == NULL) {
 		return false;
 	}
