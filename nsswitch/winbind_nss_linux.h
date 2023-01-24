@@ -31,6 +31,13 @@
 #define _PUBLIC_ON_LINUX_ _PRIVATE_
 #endif
 
+#define ROOT_USER "root"
+#define ROOT_GROUP "root"
+#define ROOT_ID 0
+
+#define TRUENAS_ADMIN_NAME "admin"
+#define TRUENAS_ADMIN_ID 950
+
 NSS_STATUS _nss_winbind_setpwent(void);
 NSS_STATUS _nss_winbind_endpwent(void);
 NSS_STATUS _nss_winbind_getpwent_r(struct passwd *result, char *buffer,
