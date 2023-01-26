@@ -376,9 +376,9 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 		DBG_ERR("get_syntehntic_fsp() failed: %s\n", strerror(errno));
 		return false;
 	}
-	idx--;
 
-	for (; idx != 0; idx--) {
+	while (idx > 0) {
+		idx--;
 		ds = config->created[idx];
 		struct files_struct *c_fsp = NULL;
 		NTSTATUS status;
@@ -550,7 +550,7 @@ static int zfs_core_chdir(vfs_handle_struct *handle,
 
 		lp_do_parameter(
 			SNUM(handle->conn),
-			"inherit owner", "window and unix"
+			"inherit owner", "yes"
 		);
 
 		lp_do_parameter(
@@ -571,7 +571,7 @@ static int zfs_core_chdir(vfs_handle_struct *handle,
 		case INHERIT_OWNER_WINDOWS_AND_UNIX:
 			lp_do_parameter(
 				SNUM(handle->conn),
-				"inherit owner", "window and unix"
+				"inherit owner", "yes"
 			);
 			break;
 		case INHERIT_OWNER_UNIX_ONLY:
