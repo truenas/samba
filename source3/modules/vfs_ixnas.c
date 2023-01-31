@@ -128,7 +128,7 @@ static bool ixnas_get_native_dosmode(struct files_struct *fsp, uint64_t *_dosmod
 		int fd;
 
 		fd = ixnas_pathref_reopen(fsp, O_RDONLY);
-		if ((fd == -1) && ((errno == EACCES) || (errno == EPERM))) {
+		if ((fd == -1) && (errno == EACCES)) {
 			become_root();
 			fd = ixnas_pathref_reopen(fsp, O_RDONLY);
 			unbecome_root();
@@ -174,7 +174,7 @@ static bool ixnas_set_native_dosmode(struct files_struct *fsp, uint64_t dosmode)
 
 #endif /* FREEBSD */
 	if (err) {
-		if (errno != EPERM) {
+		if ((errno != EACCES) && (errno != EPERM)) {
 			DBG_WARNING("Setting dosmode failed for %s: %s\n",
 				    fsp_str_dbg(fsp), strerror(errno));
 		} else {
@@ -301,7 +301,7 @@ static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
 	ok = ixnas_set_native_dosmode(fsp, flags);
 	if (ok) {
 		return NT_STATUS_OK;
-	} else if (errno != EPERM) {
+	} else if ((errno != EACCES) && (errno != EPERM)) {
 		return map_nt_error_from_unix(errno);
 	}
 
@@ -1573,6 +1573,7 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 	config->dosattrib_xattr = lp_parm_bool(SNUM(handle->conn),
 			"ixnas", "dosattrib_xattr", false);
 
+#if defined (FREEBSD)
 	if (!config->dosattrib_xattr) {
 		if ((lp_map_readonly(SNUM(handle->conn))) == MAP_READONLY_YES) {
 			DBG_INFO("ixnas:dosmode to file flag mapping enabled,"
@@ -1596,6 +1597,7 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 		}
 		lp_do_parameter(SNUM(handle->conn), "kernel dosmodes", "yes");
 	}
+#endif
 
 	ok = set_acl_parameters(handle, config);
 	if (!ok) {
