@@ -66,6 +66,7 @@
 	torture_local_string_case,
 	torture_local_compression,
 	torture_local_event, 
+	torture_local_event_aio,
 	torture_local_tevent_req,
 	torture_local_torture,
 	torture_local_dbspeed, 
