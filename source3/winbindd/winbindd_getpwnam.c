@@ -21,6 +21,7 @@
 #include "winbindd.h"
 #include "passdb/lookup_sid.h" /* only for LOOKUP_NAME_NO_NSS flag */
 #include "libcli/security/dom_sid.h"
+#include "passdb/machine_sid.h"
 
 struct winbindd_getpwnam_state {
 	struct tevent_context *ev;
@@ -108,7 +109,10 @@ static void winbindd_getpwnam_lookupname_done(struct tevent_req *subreq)
 	if (tevent_req_nterror(req, status)) {
 		return;
 	}
-
+	if (dom_sid_compare_domain(&state->sid, get_global_sam_sid()) == 0) {
+		tevent_req_nterror(req, NT_STATUS_NO_SUCH_USER);
+		return;
+	}
 	subreq = wb_getpwsid_send(state, state->ev, &state->sid, &state->pw);
 	if (tevent_req_nomem(subreq, req)) {
 		return;
