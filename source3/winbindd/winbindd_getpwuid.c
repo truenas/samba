@@ -20,6 +20,7 @@
 #include "includes.h"
 #include "winbindd.h"
 #include "libcli/security/dom_sid.h"
+#include "passdb/machine_sid.h"
 
 struct winbindd_getpwuid_state {
 	struct tevent_context *ev;
@@ -78,7 +79,8 @@ static void winbindd_getpwuid_uid2sid_done(struct tevent_req *subreq)
 		D_WARNING("Failed with %s.\n", nt_errstr(status));
 		return;
 	}
-	if (is_null_sid(state->sid)) {
+	if (is_null_sid(state->sid) ||
+	    (dom_sid_compare_domain(state->sid, get_global_sam_sid()) == 0)) {
 		tevent_req_nterror(req, NT_STATUS_NO_SUCH_USER);
 		D_WARNING("Failed with NT_STATUS_NO_SUCH_USER.\n");
 		return;
