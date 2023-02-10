@@ -1333,19 +1333,6 @@ static inline uint64_t gen_id_comp(uint64_t p) {
 	return out;
 };
 
-static uint64_t ixnas_fs_file_id(struct vfs_handle_struct *handle,
-				 const SMB_STRUCT_STAT *psbuf)
-{
-	uint64_t file_id;
-	if (!(psbuf->st_ex_iflags & ST_EX_IFLAG_CALCULATED_FILE_ID)) {
-		return psbuf->st_ex_file_id;
-	}
-
-	file_id = gen_id_comp(psbuf->st_ex_ino);
-	file_id |= gen_id_comp(psbuf->st_ex_gen) << 32;
-	return file_id;
-}
-
 static int fsp_set_times(files_struct *fsp, struct timespec *times, bool set_btime)
 {
 	int flag = set_btime ? AT_UTIMENSAT_BTIME : 0;
@@ -1594,7 +1581,7 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 	 * Ensure other alternate methods of mapping dosmodes are disabled.
 	 */
 	config->dosattrib_xattr = lp_parm_bool(SNUM(handle->conn),
-			"ixnas", "dosattrib_xattr", false);
+			"ixnas", "dosattrib_xattr", true);
 
 	if (!config->dosattrib_xattr) {
 		if ((lp_map_readonly(SNUM(handle->conn))) == MAP_READONLY_YES) {
@@ -1644,7 +1631,6 @@ static struct vfs_fn_pointers ixnas_fns = {
 	.openat_fn = ixnas_openat,
 	.fntimes_fn = ixnas_ntimes,
 	.file_id_create_fn = ixnas_file_id_create,
-	.fs_file_id_fn = ixnas_fs_file_id,
 #endif /* FREEBSD */
 	.fget_nt_acl_fn = ixnas_fget_nt_acl,
 	.fset_nt_acl_fn = ixnas_fset_nt_acl,
