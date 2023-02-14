@@ -47,6 +47,7 @@
 #include "libcli/smb/smbXcli_base.h"
 #include "lib/util/time_basic.h"
 #include "source3/lib/substitute.h"
+#include <jemalloc/jemalloc.h>
 
 /* Internal message queue for deferred opens. */
 struct pending_message_list {
@@ -1746,6 +1747,11 @@ static void smbd_tevent_trace_callback(enum tevent_trace_point point,
 /****************************************************************************
  Process commands from the client
 ****************************************************************************/
+static int setup_mallctl(void)
+{
+	bool enable = true;
+	return mallctl("background_thread", NULL, 0, &enable, sizeof(enable));
+}
 
 void smbd_process(struct tevent_context *ev_ctx,
 		  struct messaging_context *msg_ctx,
@@ -1780,6 +1786,8 @@ void smbd_process(struct tevent_context *ev_ctx,
 	 * TODO: remove this...:-)
 	 */
 	global_smbXsrv_client = client;
+
+	SMB_ASSERT(setup_mallctl() == 0);
 
 	sconn = talloc_zero(client, struct smbd_server_connection);
 	if (sconn == NULL) {
