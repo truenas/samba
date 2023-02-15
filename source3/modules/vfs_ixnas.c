@@ -1430,7 +1430,7 @@ static bool generate_beneath_path(const char *connectpath,
 			smb_panic("failed to generate beneath path");
 		}
 	} else {
-		if (snprintf(buf, sizeof(buf), "%s/%s",
+		if (snprintf(buf, bufsz, "%s/%s",
 			     dirfsp->fsp_name->base_name,
 			     at_name->base_name) >= bufsz) {
 			smb_panic("failed to generate beneath path");
