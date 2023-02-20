@@ -730,39 +730,40 @@ static NTSTATUS non_widelink_open(const struct files_struct *dirfsp,
 			goto out;
 		}
 
-		if (!ISDOT(parent_dir_fname->base_name)) {
-			oldwd_fname = vfs_GetWd(talloc_tos(), conn);
-			if (oldwd_fname == NULL) {
-				status = map_nt_error_from_unix(errno);
+		if (lp_follow_symlinks(SNUM(conn))) {
+			if (!ISDOT(parent_dir_fname->base_name)) {
+				oldwd_fname = vfs_GetWd(talloc_tos(), conn);
+				if (oldwd_fname == NULL) {
+					status = map_nt_error_from_unix(errno);
+					goto out;
+				}
+
+				/* Pin parent directory in place. */
+				if (vfs_ChDir(conn, parent_dir_fname) == -1) {
+					status = map_nt_error_from_unix(errno);
+					goto out;
+				}
+			}
+
+			smb_fname_dot = synthetic_smb_fname(
+				parent_dir_fname,
+				".",
+				NULL,
+				NULL,
+				0,
+				smb_fname->flags);
+			if (smb_fname_dot == NULL) {
+				status = NT_STATUS_NO_MEMORY;
 				goto out;
 			}
 
-			/* Pin parent directory in place. */
-			if (vfs_ChDir(conn, parent_dir_fname) == -1) {
-				status = map_nt_error_from_unix(errno);
+			/* Ensure the relative path is below the share. */
+			status = check_reduced_name(conn, parent_dir_fname, smb_fname_dot);
+			TALLOC_FREE(smb_fname_dot);
+			if (!NT_STATUS_IS_OK(status)) {
 				goto out;
 			}
 		}
-
-		smb_fname_dot = synthetic_smb_fname(
-			parent_dir_fname,
-			".",
-			NULL,
-			NULL,
-			0,
-			smb_fname->flags);
-		if (smb_fname_dot == NULL) {
-			status = NT_STATUS_NO_MEMORY;
-			goto out;
-		}
-
-		/* Ensure the relative path is below the share. */
-		status = check_reduced_name(conn, parent_dir_fname, smb_fname_dot);
-		TALLOC_FREE(smb_fname_dot);
-		if (!NT_STATUS_IS_OK(status)) {
-			goto out;
-		}
-
 		/* Setup fsp->fsp_name to be relative to cwd */
 		fsp->fsp_name = smb_fname_rel;
 	} else {
@@ -927,6 +928,10 @@ NTSTATUS fd_openat(const struct files_struct *dirfsp,
 
 	if ((fsp->posix_flags & FSP_POSIX_FLAGS_OPEN) || !lp_follow_symlinks(SNUM(conn))) {
 		how.flags |= O_NOFOLLOW;
+	}
+
+	if (!lp_follow_symlinks(SNUM(conn))) {
+		how.resolve |= VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS;
 	}
 
 	if (fsp_is_stream) {

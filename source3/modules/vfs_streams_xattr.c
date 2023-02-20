@@ -35,7 +35,11 @@ struct streams_xattr_config {
 	const char *prefix;
 	size_t prefix_len;
 	bool store_stream_type;
+	bool seed_builtin_attrs;
 	int xattr_compat_bytes;
+	bool use_streaminfo_xattr;
+	char *afpinfo_name;
+	char *afpresource_name;
 };
 
 struct stream_io {
@@ -45,6 +49,20 @@ struct stream_io {
 	files_struct *fsp;
 	vfs_handle_struct *handle;
 };
+
+const char EMPTY_XATTR[64] = {0};
+
+static bool is_builtin_attr_name(const char *name,
+				 struct streams_xattr_config *config)
+{
+	if ((strcmp(name, SAMBA_XATTR_DOS_ATTRIB) == 0) ||
+	    (strcmp(name, config->afpinfo_name) == 0) ||
+	    (strcmp(name, config->afpresource_name) == 0)) {
+		return true;
+	}
+
+	return false;
+}
 
 static ssize_t get_xattr_size_fsp(vfs_handle_struct *handle,
 				  struct files_struct *fsp,
@@ -713,6 +731,110 @@ static int streams_xattr_renameat(vfs_handle_struct *handle,
 	return ret;
 }
 
+static bool convert_hex_val(const char *to_convert, long *out)
+{
+	long val;
+	char *endptr = NULL;
+
+	errno = 0;
+	val = strtol(to_convert, &endptr, 16); 
+
+	if (endptr == to_convert) {
+		DBG_ERR("%s: no digits found in string\n", to_convert);
+		return false;
+	}
+
+	if (errno != 0) {
+		DBG_ERR("%s: strtol() failed: %s\n", to_convert, strerror(errno));
+		return false;
+	}
+
+	if (*endptr != '\0') {
+		DBG_ERR("%s: unable to fully parse digits\n", to_convert);
+		return false;
+	}
+
+	*out = val;
+	return true;
+}
+
+static NTSTATUS walk_xattr_streaminfo(vfs_handle_struct *handle,
+				files_struct *fsp,
+				const struct smb_filename *smb_fname,
+				bool (*fn)(struct ea_struct *ea,
+					void *private_data),
+				void *private_data)
+{
+	NTSTATUS status = NT_STATUS_OK;
+	char smallbuf[1024];
+	struct streams_xattr_config *config;
+	size_t stream_buf_sz = 1024;
+	char *stream_buf = smallbuf;
+	char *p = NULL;
+	bool must_free = false;
+	ssize_t sizeret; 
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config, struct streams_xattr_config,
+				return NT_STATUS_UNSUCCESSFUL);
+
+	sizeret = SMB_VFS_NEXT_FGETXATTR(handle, fsp, "system.streaminfo", stream_buf, stream_buf_sz);
+	if ((sizeret == -1) && (errno == ERANGE)) {
+		stream_buf_sz = 65536;
+		stream_buf = talloc_array(talloc_tos(), char, stream_buf_sz); 
+
+		if (stream_buf == NULL) {
+			return NT_STATUS_NO_MEMORY;
+		}
+		must_free = true;
+		sizeret = SMB_VFS_NEXT_FGETXATTR(handle, fsp, "system.streaminfo", stream_buf, stream_buf_sz);
+	}
+
+	if (sizeret == -1) {
+		if (must_free) {
+			TALLOC_FREE(stream_buf);
+		}
+		return NT_STATUS_NO_MEMORY;
+	}
+
+        for (p = stream_buf; p - stream_buf < sizeret; p += strlen(p)+1) {
+		char namelen_str[3];
+		char name[256];
+		struct ea_struct ea = { .name = name };
+		long namelen;
+		long datasz;
+
+		strlcpy(namelen_str, p, sizeof(namelen_str));
+		if (!convert_hex_val(namelen_str, &namelen)) {
+			status = NT_STATUS_NO_MEMORY;
+			break;
+		}
+
+		SMB_ASSERT(namelen > config->prefix_len);
+		SMB_ASSERT(strlen(p) > namelen);
+		strlcpy(name, p + 2 + config->prefix_len, namelen - config->prefix_len + 1);
+		if (!convert_hex_val(p + 2 + namelen, &datasz)) {
+			status = NT_STATUS_NO_MEMORY;
+			break;
+		}
+
+		if (datasz == 64) {
+			continue;
+		}
+		ea.value.length = datasz;
+
+		if (!fn(&ea, private_data)) {
+			break;
+		}
+        }
+
+out:
+	if (must_free) {
+		TALLOC_FREE(stream_buf);
+	}
+	
+	return status;
+}
+
 static NTSTATUS walk_xattr_streams(vfs_handle_struct *handle,
 				files_struct *fsp,
 				const struct smb_filename *smb_fname,
@@ -865,11 +987,24 @@ static NTSTATUS streams_xattr_fstreaminfo(vfs_handle_struct *handle,
 	state.handle = handle;
 	state.status = NT_STATUS_OK;
 
+	struct streams_xattr_config *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config, struct streams_xattr_config,
+				return NT_STATUS_NO_MEMORY);
+
+	if (config->use_streaminfo_xattr) {
+	status = walk_xattr_streaminfo(handle,
+				    fsp,
+				    fsp->fsp_name,
+				    collect_one_stream,
+				    &state);
+	} else {
 	status = walk_xattr_streams(handle,
 				    fsp,
 				    fsp->fsp_name,
 				    collect_one_stream,
 				    &state);
+	}
 
 	if (!NT_STATUS_IS_OK(status)) {
 		TALLOC_FREE(state.streams);
@@ -941,6 +1076,33 @@ static int streams_xattr_connect(vfs_handle_struct *handle,
 				    false);
 
         config->xattr_compat_bytes = xattr_compat ? 0 : 1;
+
+	config->use_streaminfo_xattr = lp_parm_bool(SNUM(handle->conn),
+						    "streams_xattr",
+						    "use_special_xattr",
+						    false);
+
+	config->afpinfo_name = talloc_asprintf(config, "%s%s%s",
+		prefix, "AFP_AfpInfo", config->store_stream_type ? ":$DATA" : ""
+	);
+	if (config->afpinfo_name == NULL) {
+		DBG_ERR("talloc_asprintf() failed\n");
+		return -1;
+	}
+
+	config->afpresource_name = talloc_asprintf(config, "%s%s%s",
+		prefix, "AFP_Resource", config->store_stream_type ? ":$DATA" : ""
+	);
+
+	if (config->afpresource_name == NULL) {
+		DBG_ERR("talloc_asprintf() failed\n");
+		return -1;
+	}
+
+	config->seed_builtin_attrs = lp_parm_bool(SNUM(handle->conn),
+						  "streams_xattr",
+						  "seed_builtin_attrs",
+						  false);
 
 	SMB_VFS_HANDLE_SET_DATA(handle, config,
 				NULL, struct stream_xattr_config,
@@ -1372,6 +1534,73 @@ static int streams_xattr_fchmod(vfs_handle_struct *handle,
 	return 0;
 }
 
+static int seed_builtin_attr(struct vfs_handle_struct *handle,
+			     struct files_struct *fsp,
+			     const char *name,
+			     bool as_root)
+{
+	int rv;
+
+	if (!CAN_WRITE(handle->conn)) {
+		errno = EPERM;
+		return -1;
+	}
+
+	rv = SMB_VFS_NEXT_FSETXATTR(handle, fsp, name, EMPTY_XATTR,
+				    sizeof(EMPTY_XATTR), XATTR_CREATE);
+
+	if ((rv == -1) && as_root && ((errno == EPERM) || (errno == EACCES))) {
+		become_root();
+		rv = SMB_VFS_NEXT_FSETXATTR(handle, fsp, name, EMPTY_XATTR,
+					    sizeof(EMPTY_XATTR), XATTR_CREATE);
+		unbecome_root();
+	}
+
+	if (rv == -1) {
+		DBG_INFO("%s: failed to seed builtin xattr on [%s]: %s\n",
+			 name, fsp_str_dbg(fsp), strerror(errno));
+	}
+
+	return rv;
+}
+
+static ssize_t parse_retrieved_xattr(struct vfs_handle_struct *handle,
+				     struct files_struct *fsp,
+				     const char *name,
+				     char *value,
+				     ssize_t xattr_get_rv,
+				     struct streams_xattr_config *config)
+{
+	ssize_t rv = xattr_get_rv;
+
+	if (!is_builtin_attr_name(name, config)) {
+		return rv;
+	}
+
+	if (xattr_get_rv == -1) {
+		if ((errno == ENOATTR) && (config->seed_builtin_attrs)) {
+			seed_builtin_attr(handle, fsp, name, true);
+		}
+	} else if (xattr_get_rv == sizeof(EMPTY_XATTR)) {
+		size_t off;
+		bool has_data = false;
+
+		for (off=0; off < rv; off++) {
+			if (value[off] != '\0') {
+				has_data = true;
+				break;
+			}
+		}
+
+		if (!has_data) {
+			errno = ENOATTR;
+			rv = -1;
+		}
+	}
+
+	return rv;
+}
+
 static ssize_t streams_xattr_fgetxattr(struct vfs_handle_struct *handle,
 				       struct files_struct *fsp,
 				       const char *name,
@@ -1380,13 +1609,19 @@ static ssize_t streams_xattr_fgetxattr(struct vfs_handle_struct *handle,
 {
 	struct stream_io *sio =
 		(struct stream_io *)VFS_FETCH_FSP_EXTENSION(handle, fsp);
+	struct streams_xattr_config *config = NULL;
+	SMB_VFS_HANDLE_GET_DATA(handle, config, struct streams_xattr_config,
+				return -1);
+
+	ssize_t rv = -1;
 
 	if (sio == NULL) {
-		return SMB_VFS_NEXT_FGETXATTR(handle, fsp, name, value, size);
+		rv = SMB_VFS_NEXT_FGETXATTR(handle, fsp, name, value, size);
+		return parse_retrieved_xattr(handle, fsp, name, value, rv, config);
 	}
 
 	errno = ENOTSUP;
-	return -1;
+	return rv;
 }
 
 static ssize_t streams_xattr_flistxattr(struct vfs_handle_struct *handle,
@@ -1411,8 +1646,16 @@ static int streams_xattr_fremovexattr(struct vfs_handle_struct *handle,
 {
 	struct stream_io *sio =
 		(struct stream_io *)VFS_FETCH_FSP_EXTENSION(handle, fsp);
+	struct streams_xattr_config *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config, struct streams_xattr_config,
+				return -1);
 
 	if (sio == NULL) {
+		if (config->seed_builtin_attrs &&
+		    is_builtin_attr_name(sio->xattr_name, config)) {
+			return seed_builtin_attr(handle, fsp, sio->xattr_name, false);
+		}
 		return SMB_VFS_NEXT_FREMOVEXATTR(handle, fsp, name);
 	}
 

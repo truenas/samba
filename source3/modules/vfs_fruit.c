@@ -129,6 +129,7 @@ struct fruit_config_data {
 	bool posix_rename;
 	bool aapl_zero_file_id;
 	const char *model;
+	char *macmeta_streamname;
 	bool time_machine;
 	off_t time_machine_max_size;
 	bool wipe_intentionally_left_blank_rfork;
@@ -280,6 +281,8 @@ static int init_fruit_config(vfs_handle_struct *handle)
 	struct fruit_config_data *config;
 	int enumval;
 	const char *tm_size_str = NULL;
+	const char *prefix = NULL;
+	bool store_stream_type;
 
 	config = talloc_zero(handle->conn, struct fruit_config_data);
 	if (!config) {
@@ -379,6 +382,19 @@ static int init_fruit_config(vfs_handle_struct *handle)
 	config->model = lp_parm_const_string(
 		-1, FRUIT_PARAM_TYPE_NAME, "model", "MacSamba");
 
+        prefix = lp_parm_const_string(SNUM(handle->conn),
+                                      "streams_xattr", "prefix",
+                                      SAMBA_XATTR_DOSSTREAM_PREFIX);
+
+	store_stream_type = lp_parm_bool(SNUM(handle->conn),
+					 "streams_xattr",
+					 "store_stream_type",
+					 true);
+
+	if (lp_parm_bool(SNUM(handle->conn), FRUIT_PARAM_TYPE_NAME, "streamname_optimization", false)) {
+		config->macmeta_streamname = talloc_asprintf(config, "%s%s%s",
+		    prefix, "AFP_AfpInfo", store_stream_type ? ":$DATA" : "");
+	}
 	tm_size_str = lp_parm_const_string(
 		SNUM(handle->conn), FRUIT_PARAM_TYPE_NAME,
 		"time machine max size", NULL);
@@ -942,6 +958,31 @@ static NTSTATUS check_aapl(vfs_handle_struct *handle,
 	return status;
 }
 
+static bool readdir_attr_meta_finderi_xattr(
+	struct vfs_handle_struct *handle,
+	const struct smb_filename *smb_fname,
+	const char *xattr_name,
+	AfpInfo *ai)
+{
+	ssize_t nread;
+	uint8_t buf[AFP_INFO_SIZE + 1]; /* legacy EA API may append extra NULL byte */
+
+	nread = SMB_VFS_FGETXATTR(smb_fname->fsp, xattr_name, buf, sizeof(buf));
+
+	if (nread == -1) {
+		return false;
+	} else if ((nread != (AFP_INFO_SIZE + 1)) && (nread != AFP_INFO_SIZE)) {
+		DBG_ERR("short read [%s] xattr name [%s] [%zd/%d]\n",
+			smb_fname_str_dbg(smb_fname), xattr_name, nread, AFP_INFO_SIZE);
+		return false;
+	}
+
+	memcpy(&ai->afpi_FinderInfo[0], &buf[AFP_OFF_FinderInfo],
+	       AFP_FinderSize);
+
+	return true;
+}
+
 static bool readdir_attr_meta_finderi_stream(
 	struct vfs_handle_struct *handle,
 	const struct smb_filename *smb_fname,
@@ -1059,8 +1100,13 @@ static bool readdir_attr_meta_finderi(struct vfs_handle_struct *handle,
 		break;
 
 	case FRUIT_META_STREAM:
-		ok = readdir_attr_meta_finderi_stream(
-			handle, smb_fname, &ai);
+		if (config->macmeta_streamname != NULL) {
+			ok = readdir_attr_meta_finderi_xattr(
+				handle, smb_fname, config->macmeta_streamname, &ai);
+		} else {
+			ok = readdir_attr_meta_finderi_stream(
+				handle, smb_fname, &ai);
+		}
 		break;
 
 	default:
