@@ -206,23 +206,20 @@ static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
 							dosmode);
 	}
 #else
-	/*
-	 * update timestamps and dosmode from xattr before
-	 * applying the FS dos mode.
-	 *
-	 * This can be removed once we have OS / FS method
-	 * to change file birth time on Linux like on FreeBSD.e
-	 */
 	NTSTATUS status;
-	if (config->dosattrib_xattr) {
-		status = SMB_VFS_NEXT_FGET_DOS_ATTRIBUTES(handle,
-							  fsp,
-							  dosmode);
+	status = SMB_VFS_NEXT_FGET_DOS_ATTRIBUTES(handle,
+						  fsp,
+						  dosmode);
 
-		if (!NT_STATUS_IS_OK(status)) {
-			return status;
-		}
+	if (config->dosattrib_xattr) {
+		return status;
 	}
+
+	if (!NT_STATUS_IS_OK(status) &&
+	    !NT_STATUS_EQUAL(status, NT_STATUS_NOT_FOUND)) {
+		return status;
+	}
+
 #endif /* FREEBSD */
 
 	if (is_named_stream(fsp->fsp_name)) {
