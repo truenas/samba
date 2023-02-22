@@ -193,6 +193,7 @@ static const struct loadparm_service _sDefault =
 	.guest_only = false,
 	.administrative_share = false,
 	.guest_ok = false,
+	.allow_xdev = false,
 	.printable = false,
 	.print_notify_backchannel = false,
 	.map_system = false,

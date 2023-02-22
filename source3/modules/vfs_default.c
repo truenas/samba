@@ -762,6 +762,10 @@ static int vfswrap_openat(vfs_handle_struct *handle,
 			.resolve = RESOLVE_NO_SYMLINKS,
 		};
 
+		if (!lp_allow_xdev()) {
+			linux_how.resolve |= RESOLVE_NO_XDEV;	
+		}
+
 		result = openat2(fsp_get_pathref_fd(dirfsp),
 				 smb_fname->base_name,
 				 &linux_how,

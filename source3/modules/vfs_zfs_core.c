@@ -38,6 +38,7 @@ struct zfs_core_config_data {
 	bool zfs_space_enabled;
 	bool zfs_quota_enabled;
 	bool zfs_auto_create;
+	bool zero_file_id;
 	bool checked;
 	const char *dataset_auto_quota;
 	uint64_t base_user_quota;
@@ -59,8 +60,7 @@ static struct zfs_dataset *smbfname_to_ds(const struct connection_struct *conn,
 	SMB_ASSERT(config->ds != NULL);
 	if (VALID_STAT(smb_fname->st)) {
 		psbuf = &smb_fname->st;
-	}
-	else {
+	} else {
 		ret = vfs_stat_smb_basename(discard_const(conn),
 					    smb_fname, &sbuf);
 		if (ret != 0) {
@@ -620,7 +620,9 @@ static int zfs_core_renameat(vfs_handle_struct *handle,
 	int result = 1;
 	struct zfs_core_config_data *config = NULL;
 	char *tmp_base_name = NULL;
-	uint64_t srcid, dstid;
+	struct file_id srcid, dstid;
+	struct file_id_buf buf;
+	char *file_id_str;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct zfs_core_config_data,
@@ -639,8 +641,8 @@ static int zfs_core_renameat(vfs_handle_struct *handle,
 		return -1;
 	}
 
-	srcid = SMB_VFS_FS_FILE_ID(handle->conn, &srcfsp->fsp_name->st);
-	dstid = SMB_VFS_FS_FILE_ID(handle->conn, &dstfsp->fsp_name->st);
+	srcid = SMB_VFS_FILE_ID_CREATE(handle->conn, &srcfsp->fsp_name->st);
+	dstid = SMB_VFS_FILE_ID_CREATE(handle->conn, &dstfsp->fsp_name->st);
 
 	if (srcid == dstid) {
 		result = strcasecmp_m(smb_fname_src->base_name,
@@ -654,9 +656,11 @@ static int zfs_core_renameat(vfs_handle_struct *handle,
 					     smb_fname_dst);
 	}
 
-	dstid = SMB_VFS_FS_FILE_ID(handle->conn, &smb_fname_src->st);
-	tmp_base_name = talloc_asprintf(talloc_tos(), "%s_%lu",
-					smb_fname_src->base_name, dstid);
+	dstid = SMB_VFS_FILE_ID_CREATE(handle->conn, &smb_fname_src->st);
+	file_id_str = file_id_str_buf(dstid, &buf);
+
+	tmp_base_name = talloc_asprintf(talloc_tos(), "%s_%s",
+					smb_fname_src->base_name, file_id_str);
 	if (tmp_base_name == NULL) {
 		errno = ENOMEM;
 		return -1;
@@ -677,6 +681,23 @@ static int zfs_core_renameat(vfs_handle_struct *handle,
         );
 	TALLOC_FREE(tmp_base_name);
 	return result;
+}
+
+static uint64_t zfs_core_fs_file_id(struct vfs_handle_struct *handle,
+				    const SMB_STRUCT_STAT *psbuf)
+{
+	struct zfs_core_config_data *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct zfs_core_config_data,
+				return 0);
+
+	if (config->zero_file_id)
+	{
+		return 0;
+	}
+
+	return SMB_VFS_NEXT_FS_FILE_ID(handle, psbuf);
 }
 
 static int zfs_core_connect(struct vfs_handle_struct *handle,
@@ -749,6 +770,9 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 
 	config->zfs_quota_enabled = lp_parm_bool(SNUM(handle->conn),
 			"zfs_core", "zfs_quota_enabled", true);
+
+	config->zero_file_id = lp_parm_bool(SNUM(handle->conn),
+			"zfs_core", "zero_file_id", false);
 
 	SMB_VFS_HANDLE_SET_DATA(handle, config,
 				NULL, struct zfs_core_config_data,

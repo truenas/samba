@@ -1,0 +1,14 @@
+<samba:parameter name="allow xdev"
+                 type="boolean"
+                 context="S"
+                 xmlns:samba="http://www.samba.org/samba/DTD/samba-doc">
+<synonym>public</synonym>
+<description>
+    <para>If this parameter is <constant>yes</constant> for 
+    a service, traversing the boundaries of mountpoints is permitted.</para>
+
+    <para>See the section below on <smbconfoption name="security"/> for more information about this option.
+	</para>
+</description>
+<value type="default">no</value>
+</samba:parameter>
