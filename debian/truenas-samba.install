@@ -93,7 +93,6 @@ usr/lib/*/libsamba-util.so
 usr/share/man/man7/libsmbclient.7
 etc/samba/
 usr/share/samba/smb.conf*
-usr/share/samba/mdssvc/*
 usr/lib/*/samba/vfs/*.so
 usr/lib/*/libdcerpc-binding.so.*
 usr/lib/*/libdcerpc-samr.so.*
