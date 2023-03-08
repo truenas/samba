@@ -272,8 +272,36 @@ sub setup_nt4_dc
 	lanman auth = yes
 	ntlm auth = yes
 	raw NTLMv2 auth = yes
-	server schannel = auto
 	rpc start on demand helpers = false
+
+	CVE_2020_1472:warn_about_unused_debug_level = 3
+	server require schannel:schannel0\$ = no
+	server require schannel:schannel1\$ = no
+	server require schannel:schannel2\$ = no
+	server require schannel:schannel3\$ = no
+	server require schannel:schannel4\$ = no
+	server require schannel:schannel5\$ = no
+	server require schannel:schannel6\$ = no
+	server require schannel:schannel7\$ = no
+	server require schannel:schannel8\$ = no
+	server require schannel:schannel9\$ = no
+	server require schannel:schannel10\$ = no
+	server require schannel:schannel11\$ = no
+	server require schannel:torturetest\$ = no
+
+	server schannel require seal:schannel0\$ = no
+	server schannel require seal:schannel1\$ = no
+	server schannel require seal:schannel2\$ = no
+	server schannel require seal:schannel3\$ = no
+	server schannel require seal:schannel4\$ = no
+	server schannel require seal:schannel5\$ = no
+	server schannel require seal:schannel6\$ = no
+	server schannel require seal:schannel7\$ = no
+	server schannel require seal:schannel8\$ = no
+	server schannel require seal:schannel9\$ = no
+	server schannel require seal:schannel10\$ = no
+	server schannel require seal:schannel11\$ = no
+	server schannel require seal:torturetest\$ = no
 
 	vfs_default:VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS = no
 
@@ -528,6 +556,36 @@ sub setup_clusteredmember
 		    no_delete_prefix => 1);
 		if (not $node_ret) {
 			print "Provision node $i failed\n";
+			teardown_env($self, $ctdb_data);
+			return undef;
+		}
+
+		my $registry_share_template = "$node_ret->{SERVERCONFFILE}.registry_share_template";
+		unless (open(REGISTRYCONF, ">$registry_share_template")) {
+			warn("Unable to open $registry_share_template");
+			teardown_env($self, $node_ret);
+			teardown_env($self, $ctdb_data);
+			return undef;
+		}
+
+		print REGISTRYCONF "
+[registry_share]
+	copy = tmp
+	comment = smb username is [%U]
+";
+
+		close(REGISTRYCONF);
+
+		my $net = Samba::bindir_path($self, "net");
+		my $cmd = "";
+
+		$cmd .= "UID_WRAPPER_ROOT=1 ";
+		$cmd .= "$net conf import $node_ret->{CONFIGURATION} ${registry_share_template}";
+
+		my $net_ret = system($cmd);
+		if ($net_ret != 0) {
+			warn("net conf import failed: $net_ret\n$cmd");
+			teardown_env($self, $node_ret);
 			teardown_env($self, $ctdb_data);
 			return undef;
 		}
@@ -1940,6 +1998,7 @@ sub setup_fileserver
 	virusfilter:infected files = *infected*
 	virusfilter:infected file action = rename
 	virusfilter:scan on close = yes
+	vfs_default:VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS = no
 
 [volumeserialnumber]
 	path = $volume_serial_number_sharedir
