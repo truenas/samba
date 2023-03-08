@@ -608,11 +608,11 @@ msg.msg_accrightslen = sizeof(fd);
     conf.CHECK_HEADERS('asm/types.h')
 
     conf.CHECK_CODE('dev_t dev; int i = major(dev); return 0', "HAVE_DEVICE_MAJOR_FN",
-                    headers='unistd.h sys/types.h',
+                    headers='sys/sysmacros.h unistd.h sys/types.h',
                     msg="Checking for major macro")
 
     conf.CHECK_CODE('dev_t dev; int i = minor(dev); return 0', "HAVE_DEVICE_MINOR_FN",
-                    headers='unistd.h sys/types.h',
+                    headers='sys/sysmacros.h unistd.h sys/types.h',
                     msg="Checking for minor macro")
 
     conf.CHECK_STRUCTURE_MEMBER('struct dirent', 'd_off',
@@ -1319,7 +1319,7 @@ syscall(SYS_initgroups, 16, NULL, NULL, 0);
 
     if conf.CHECK_CODE('''
 #include <time.h>
-main() {
+int main() {
         struct tm *tm;
         if (sizeof(time_t) == 8) {
                 time_t max_time = 0x7fffffffffffffffll;
@@ -1350,7 +1350,7 @@ main() {
 #if defined(HAVE_SYS_SYSMACROS_H)
 #include <sys/sysmacros.h>
 #endif
-main() { dev_t dev = makedev(1,2); return 0; }
+int main() { dev_t dev = makedev(1,2); return 0; }
 ''',
         'HAVE_MAKEDEV',
         addmain=False,
@@ -1360,12 +1360,13 @@ main() { dev_t dev = makedev(1,2); return 0; }
 #include <stdio.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdlib.h>
 
 void exit_on_core(int ignored) {
         exit(1);
 }
 
-main() {
+int main() {
         char *newpath;
         signal(SIGSEGV, exit_on_core);
         newpath = realpath("/tmp", NULL);
@@ -1522,9 +1523,9 @@ main() {
     # Check for getcwd allowing a NULL arg.
     conf.CHECK_CODE('''
 #include <unistd.h>
-main() {
+int main() {
         char *s = getcwd(NULL,0);
-        exit(s != NULL ?  0 : 1);
+        return s != NULL ?  0 : 1;
 }''', 'GETCWD_TAKES_NULL', addmain=False, execute=True,
         msg="getcwd takes a NULL argument")
 
