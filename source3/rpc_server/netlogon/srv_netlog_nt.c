@@ -51,6 +51,7 @@
 #include "libsmb/dsgetdcname.h"
 #include "lib/util/util_str_escape.h"
 #include "source3/lib/substitute.h"
+#include "librpc/rpc/server/netlogon/schannel_util.h"
 
 extern userdom_struct current_user_info;
 
@@ -879,7 +880,7 @@ NTSTATUS _netr_ServerAuthenticate3(struct pipes_struct *p,
 	 * so use a copy to avoid destroying the client values. */
 	uint32_t in_neg_flags = *r->in.negotiate_flags;
 	const char *fn;
-	struct loadparm_context *lp_ctx;
+	struct loadparm_context *lp_ctx = p->dce_call->conn->dce_ctx->lp_ctx;
 	struct dom_sid sid;
 	struct samr_Password mach_pwd;
 	struct netlogon_creds_CredentialState *creds;
@@ -1008,19 +1009,10 @@ NTSTATUS _netr_ServerAuthenticate3(struct pipes_struct *p,
 		goto out;
 	}
 
-	lp_ctx = loadparm_init_s3(p->mem_ctx, loadparm_s3_helpers());
-	if (lp_ctx == NULL) {
-		DEBUG(10, ("loadparm_init_s3 failed\n"));
-		status = NT_STATUS_INTERNAL_ERROR;
-		goto out;
-	}
-
 	/* Store off the state so we can continue after client disconnect. */
 	become_root();
 	status = schannel_save_creds_state(p->mem_ctx, lp_ctx, creds);
 	unbecome_root();
-
-	talloc_unlink(p->mem_ctx, lp_ctx);
 
 	if (!NT_STATUS_IS_OK(status)) {
 		ZERO_STRUCTP(r->out.return_credentials);
@@ -1060,140 +1052,6 @@ NTSTATUS _netr_ServerAuthenticate2(struct pipes_struct *p,
 
 	return _netr_ServerAuthenticate3(p, &a);
 }
-
-/*************************************************************************
- *************************************************************************/
-
-static NTSTATUS netr_creds_server_step_check(struct pipes_struct *p,
-					     TALLOC_CTX *mem_ctx,
-					     const char *computer_name,
-					     struct netr_Authenticator *received_authenticator,
-					     struct netr_Authenticator *return_authenticator,
-					     struct netlogon_creds_CredentialState **creds_out)
-{
-	struct dcesrv_call_state *dce_call = p->dce_call;
-	NTSTATUS status;
-	bool schannel_global_required = (lp_server_schannel() == true) ? true:false;
-	bool schannel_required = schannel_global_required;
-	const char *explicit_opt = NULL;
-	struct loadparm_context *lp_ctx;
-	struct netlogon_creds_CredentialState *creds = NULL;
-	enum dcerpc_AuthType auth_type = DCERPC_AUTH_TYPE_NONE;
-	uint16_t opnum = dce_call->pkt.u.request.opnum;
-	const char *opname = "<unknown>";
-	static bool warned_global_once = false;
-
-	if (creds_out != NULL) {
-		*creds_out = NULL;
-	}
-
-	if (opnum < ndr_table_netlogon.num_calls) {
-		opname = ndr_table_netlogon.calls[opnum].name;
-	}
-
-	dcesrv_call_auth_info(dce_call, &auth_type, NULL);
-
-	lp_ctx = loadparm_init_s3(mem_ctx, loadparm_s3_helpers());
-	if (lp_ctx == NULL) {
-		DEBUG(0, ("loadparm_init_s3 failed\n"));
-		return NT_STATUS_INTERNAL_ERROR;
-	}
-
-	status = schannel_check_creds_state(mem_ctx, lp_ctx,
-					    computer_name, received_authenticator,
-					    return_authenticator, &creds);
-	talloc_unlink(mem_ctx, lp_ctx);
-
-	if (!NT_STATUS_IS_OK(status)) {
-		ZERO_STRUCTP(return_authenticator);
-		return status;
-	}
-
-	/*
-	 * We don't use lp_parm_bool(), as we
-	 * need the explicit_opt pointer in order to
-	 * adjust the debug messages.
-	 */
-
-	explicit_opt = lp_parm_const_string(GLOBAL_SECTION_SNUM,
-					    "server require schannel",
-					    creds->account_name,
-					    NULL);
-	if (explicit_opt != NULL) {
-		schannel_required = lp_bool(explicit_opt);
-	}
-
-	if (schannel_required) {
-		if (auth_type == DCERPC_AUTH_TYPE_SCHANNEL) {
-			*creds_out = creds;
-			return NT_STATUS_OK;
-		}
-
-		DBG_ERR("CVE-2020-1472(ZeroLogon): "
-			"%s request (opnum[%u]) without schannel from "
-			"client_account[%s] client_computer_name[%s]\n",
-			opname, opnum,
-			log_escape(mem_ctx, creds->account_name),
-			log_escape(mem_ctx, creds->computer_name));
-		DBG_ERR("CVE-2020-1472(ZeroLogon): Check if option "
-			"'server require schannel:%s = no' is needed! \n",
-			log_escape(mem_ctx, creds->account_name));
-		TALLOC_FREE(creds);
-		ZERO_STRUCTP(return_authenticator);
-		return NT_STATUS_ACCESS_DENIED;
-	}
-
-	if (!schannel_global_required && !warned_global_once) {
-		/*
-		 * We want admins to notice their misconfiguration!
-		 */
-		DBG_ERR("CVE-2020-1472(ZeroLogon): "
-			"Please configure 'server schannel = yes', "
-			"See https://bugzilla.samba.org/show_bug.cgi?id=14497\n");
-		warned_global_once = true;
-	}
-
-	if (auth_type == DCERPC_AUTH_TYPE_SCHANNEL) {
-		DBG_ERR("CVE-2020-1472(ZeroLogon): "
-			"%s request (opnum[%u]) WITH schannel from "
-			"client_account[%s] client_computer_name[%s]\n",
-			opname, opnum,
-			log_escape(mem_ctx, creds->account_name),
-			log_escape(mem_ctx, creds->computer_name));
-		DBG_ERR("CVE-2020-1472(ZeroLogon): "
-			"Option 'server require schannel:%s = no' not needed!?\n",
-			log_escape(mem_ctx, creds->account_name));
-
-		*creds_out = creds;
-		return NT_STATUS_OK;
-	}
-
-	if (explicit_opt != NULL) {
-		DBG_INFO("CVE-2020-1472(ZeroLogon): "
-			 "%s request (opnum[%u]) without schannel from "
-			 "client_account[%s] client_computer_name[%s]\n",
-			 opname, opnum,
-			 log_escape(mem_ctx, creds->account_name),
-			 log_escape(mem_ctx, creds->computer_name));
-		DBG_INFO("CVE-2020-1472(ZeroLogon): "
-			 "Option 'server require schannel:%s = no' still needed!\n",
-			 log_escape(mem_ctx, creds->account_name));
-	} else {
-		DBG_ERR("CVE-2020-1472(ZeroLogon): "
-			"%s request (opnum[%u]) without schannel from "
-			"client_account[%s] client_computer_name[%s]\n",
-			opname, opnum,
-			log_escape(mem_ctx, creds->account_name),
-			log_escape(mem_ctx, creds->computer_name));
-		DBG_ERR("CVE-2020-1472(ZeroLogon): Check if option "
-			"'server require schannel:%s = no' might be needed!\n",
-			log_escape(mem_ctx, creds->account_name));
-	}
-
-	*creds_out = creds;
-	return NT_STATUS_OK;
-}
-
 
 /*************************************************************************
  *************************************************************************/
@@ -1440,11 +1298,12 @@ NTSTATUS _netr_ServerPasswordSet(struct pipes_struct *p,
 	DEBUG(5,("_netr_ServerPasswordSet: %d\n", __LINE__));
 
 	become_root();
-	status = netr_creds_server_step_check(p, p->mem_ctx,
-					      r->in.computer_name,
-					      r->in.credential,
-					      r->out.return_authenticator,
-					      &creds);
+	status = dcesrv_netr_creds_server_step_check(p->dce_call,
+						p->mem_ctx,
+						r->in.computer_name,
+						r->in.credential,
+						r->out.return_authenticator,
+						&creds);
 	unbecome_root();
 
 	if (!NT_STATUS_IS_OK(status)) {
@@ -1504,11 +1363,12 @@ NTSTATUS _netr_ServerPasswordSet2(struct pipes_struct *p,
 	bool ok;
 
 	become_root();
-	status = netr_creds_server_step_check(p, p->mem_ctx,
-					      r->in.computer_name,
-					      r->in.credential,
-					      r->out.return_authenticator,
-					      &creds);
+	status = dcesrv_netr_creds_server_step_check(p->dce_call,
+						p->mem_ctx,
+						r->in.computer_name,
+						r->in.credential,
+						r->out.return_authenticator,
+						&creds);
 	unbecome_root();
 
 	if (!NT_STATUS_IS_OK(status)) {
@@ -1655,11 +1515,12 @@ NTSTATUS _netr_LogonSamLogoff(struct pipes_struct *p,
 	struct netlogon_creds_CredentialState *creds;
 
 	become_root();
-	status = netr_creds_server_step_check(p, p->mem_ctx,
-					      r->in.computer_name,
-					      r->in.credential,
-					      r->out.return_authenticator,
-					      &creds);
+	status = dcesrv_netr_creds_server_step_check(p->dce_call,
+						p->mem_ctx,
+						r->in.computer_name,
+						r->in.credential,
+						r->out.return_authenticator,
+						&creds);
 	unbecome_root();
 
 	return status;
@@ -1762,6 +1623,11 @@ static NTSTATUS _netr_LogonSamLogon_base(struct pipes_struct *p,
 	struct auth_serversupplied_info *server_info = NULL;
 	struct auth_context *auth_context = NULL;
 	const char *fn;
+	enum dcerpc_AuthType auth_type = DCERPC_AUTH_TYPE_NONE;
+	enum dcerpc_AuthLevel auth_level = DCERPC_AUTH_LEVEL_NONE;
+	uint16_t opnum = dce_call->pkt.u.request.opnum;
+
+	dcesrv_call_auth_info(dce_call, &auth_type, &auth_level);
 
 #ifdef DEBUG_PASSWORD
 	logon = netlogon_creds_shallow_copy_logon(p->mem_ctx,
@@ -1772,15 +1638,37 @@ static NTSTATUS _netr_LogonSamLogon_base(struct pipes_struct *p,
 	}
 #endif
 
-	switch (dce_call->pkt.u.request.opnum) {
+	switch (opnum) {
 		case NDR_NETR_LOGONSAMLOGON:
 			fn = "_netr_LogonSamLogon";
+			/*
+			 * Already called netr_check_schannel() via
+			 * netr_creds_server_step_check()
+			 */
 			break;
 		case NDR_NETR_LOGONSAMLOGONWITHFLAGS:
 			fn = "_netr_LogonSamLogonWithFlags";
+			/*
+			 * Already called netr_check_schannel() via
+			 * netr_creds_server_step_check()
+			 */
 			break;
 		case NDR_NETR_LOGONSAMLOGONEX:
 			fn = "_netr_LogonSamLogonEx";
+
+			if (auth_type != DCERPC_AUTH_TYPE_SCHANNEL) {
+				return NT_STATUS_ACCESS_DENIED;
+			}
+
+			status = dcesrv_netr_check_schannel(p->dce_call,
+							    creds,
+							    auth_type,
+							    auth_level,
+							    opnum);
+			if (NT_STATUS_IS_ERR(status)) {
+				return status;
+			}
+
 			break;
 		default:
 			return NT_STATUS_INTERNAL_ERROR;
@@ -2011,10 +1899,6 @@ static NTSTATUS _netr_LogonSamLogon_base(struct pipes_struct *p,
 						r->out.validation->sam3);
 		break;
 	case 6: {
-		enum dcerpc_AuthLevel auth_level = DCERPC_AUTH_LEVEL_NONE;
-
-		dcesrv_call_auth_info(dce_call, NULL, &auth_level);
-
 		/* Only allow this if the pipe is protected. */
 		if (auth_level < DCERPC_AUTH_LEVEL_PRIVACY) {
 			DEBUG(0,("netr_Validation6: client %s not using privacy for netlogon\n",
@@ -2072,11 +1956,12 @@ NTSTATUS _netr_LogonSamLogonWithFlags(struct pipes_struct *p,
 	}
 
 	become_root();
-	status = netr_creds_server_step_check(p, p->mem_ctx,
-					      r->in.computer_name,
-					      r->in.credential,
-					      &return_authenticator,
-					      &creds);
+	status = dcesrv_netr_creds_server_step_check(p->dce_call,
+						p->mem_ctx,
+						r->in.computer_name,
+						r->in.credential,
+						&return_authenticator,
+						&creds);
 	unbecome_root();
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
@@ -2126,11 +2011,9 @@ NTSTATUS _netr_LogonSamLogon(struct pipes_struct *p,
 NTSTATUS _netr_LogonSamLogonEx(struct pipes_struct *p,
 			       struct netr_LogonSamLogonEx *r)
 {
-	struct dcesrv_call_state *dce_call = p->dce_call;
-	enum dcerpc_AuthType auth_type = DCERPC_AUTH_TYPE_NONE;
 	NTSTATUS status;
 	struct netlogon_creds_CredentialState *creds = NULL;
-	struct loadparm_context *lp_ctx;
+	struct loadparm_context *lp_ctx = p->dce_call->conn->dce_ctx->lp_ctx;
 
 	*r->out.authoritative = true;
 
@@ -2139,28 +2022,10 @@ NTSTATUS _netr_LogonSamLogonEx(struct pipes_struct *p,
 		return status;
 	}
 
-	/* Only allow this if the pipe is protected. */
-
-	dcesrv_call_auth_info(dce_call, &auth_type, NULL);
-
-	if (auth_type != DCERPC_AUTH_TYPE_SCHANNEL) {
-		DEBUG(0,("_netr_LogonSamLogonEx: client %s not using schannel for netlogon\n",
-			get_remote_machine_name() ));
-		return NT_STATUS_INVALID_PARAMETER;
-        }
-
-	lp_ctx = loadparm_init_s3(p->mem_ctx, loadparm_s3_helpers());
-	if (lp_ctx == NULL) {
-		DEBUG(0, ("loadparm_init_s3 failed\n"));
-		return NT_STATUS_INTERNAL_ERROR;
-	}
-
 	become_root();
 	status = schannel_get_creds_state(p->mem_ctx, lp_ctx,
 					  r->in.computer_name, &creds);
 	unbecome_root();
-	talloc_unlink(p->mem_ctx, lp_ctx);
-
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
@@ -2422,11 +2287,12 @@ NTSTATUS _netr_LogonGetCapabilities(struct pipes_struct *p,
 	NTSTATUS status;
 
 	become_root();
-	status = netr_creds_server_step_check(p, p->mem_ctx,
-					      r->in.computer_name,
-					      r->in.credential,
-					      r->out.return_authenticator,
-					      &creds);
+	status = dcesrv_netr_creds_server_step_check(p->dce_call,
+						p->mem_ctx,
+						r->in.computer_name,
+						r->in.credential,
+						r->out.return_authenticator,
+						&creds);
 	unbecome_root();
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
@@ -2786,11 +2652,12 @@ NTSTATUS _netr_GetForestTrustInformation(struct pipes_struct *p,
 	/* TODO: check server name */
 
 	become_root();
-	status = netr_creds_server_step_check(p, p->mem_ctx,
-					      r->in.computer_name,
-					      r->in.credential,
-					      r->out.return_authenticator,
-					      &creds);
+	status = dcesrv_netr_creds_server_step_check(p->dce_call,
+						p->mem_ctx,
+						r->in.computer_name,
+						r->in.credential,
+						r->out.return_authenticator,
+						&creds);
 	unbecome_root();
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
@@ -2889,11 +2756,12 @@ NTSTATUS _netr_ServerGetTrustInfo(struct pipes_struct *p,
 	/* TODO: check server name */
 
 	become_root();
-	status = netr_creds_server_step_check(p, p->mem_ctx,
-					      r->in.computer_name,
-					      r->in.credential,
-					      r->out.return_authenticator,
-					      &creds);
+	status = dcesrv_netr_creds_server_step_check(p->dce_call,
+						p->mem_ctx,
+						r->in.computer_name,
+						r->in.credential,
+						r->out.return_authenticator,
+						&creds);
 	unbecome_root();
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
@@ -2995,6 +2863,46 @@ NTSTATUS _netr_DsrUpdateReadOnlyServerDnsRecords(struct pipes_struct *p,
 {
 	p->fault_state = DCERPC_FAULT_OP_RNG_ERROR;
 	return NT_STATUS_NOT_IMPLEMENTED;
+}
+
+/*
+ * Define the bind function that will be used by ndr_netlogon_scompat.c,
+ * included at the bottom of this file.
+ */
+#define DCESRV_INTERFACE_NETLOGON_BIND(context, iface) \
+       dcesrv_interface_netlogon_bind(context, iface)
+
+static NTSTATUS dcesrv_interface_netlogon_bind(struct dcesrv_connection_context *context,
+					       const struct dcesrv_interface *iface)
+{
+	struct loadparm_context *lp_ctx = context->conn->dce_ctx->lp_ctx;
+	int schannel = lpcfg_server_schannel(lp_ctx);
+	bool schannel_global_required = (schannel == true);
+	bool global_require_seal = lpcfg_server_schannel_require_seal(lp_ctx);
+	static bool warned_global_schannel_once = false;
+	static bool warned_global_seal_once = false;
+
+	if (!schannel_global_required && !warned_global_schannel_once) {
+		/*
+		 * We want admins to notice their misconfiguration!
+		 */
+		D_ERR("CVE-2020-1472(ZeroLogon): "
+		      "Please configure 'server schannel = yes' (the default), "
+		      "See https://bugzilla.samba.org/show_bug.cgi?id=14497\n");
+		warned_global_schannel_once = true;
+	}
+
+	if (!global_require_seal && !warned_global_seal_once) {
+		/*
+		 * We want admins to notice their misconfiguration!
+		 */
+		D_ERR("CVE-2022-38023 (and others): "
+		      "Please configure 'server schannel require seal = yes' (the default), "
+		      "See https://bugzilla.samba.org/show_bug.cgi?id=15240\n");
+		warned_global_seal_once = true;
+	}
+
+	return NT_STATUS_OK;
 }
 
 /* include the generated boilerplate */
