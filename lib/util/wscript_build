@@ -126,6 +126,7 @@ bld.SAMBA_SUBSYSTEM('samba-util-core',
 bld.SAMBA_SUBSYSTEM('smb_strtox',
                     source='smb_strtox.c',
                     provide_builtin_linking=True,
+                    deps='replace',
                     local_include=False)
 
 
