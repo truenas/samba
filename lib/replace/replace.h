@@ -404,6 +404,15 @@ unsigned long long int rep_strtoull(const char *str, char **endptr, int base);
 #endif
 #endif
 
+#ifdef HAVE_BSD_STRTOLL
+#define strtoul rep_strtoul
+unsigned long int rep_strtoul(const char *str, char **endptr, int base);
+
+#define strtol rep_strtol
+long int rep_strtol(const char *str, char **endptr, int base);
+#endif
+
+
 #ifndef HAVE_FTRUNCATE
 #define ftruncate rep_ftruncate
 int rep_ftruncate(int,off_t);
