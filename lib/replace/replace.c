@@ -522,6 +522,25 @@ char *rep_strtok_r(char *s, const char *delim, char **save_ptr)
 }
 #endif
 
+#ifdef HAVE_BSD_STRTOLL
+#undef strtol
+long int rep_strtol(const char *str, char **endptr, int base)
+{
+	int saved_errno = errno;
+	long int nb = strtol(str, endptr, base);
+	/* With glibc EINVAL is only returned if base is not ok */
+	if (errno == EINVAL) {
+		if (base == 0 || (base >1 && base <37)) {
+			/* Base was ok so it's because we were not
+			 * able to make the conversion.
+			 * Let's reset errno.
+			 */
+			errno = saved_errno;
+		}
+	}
+	return nb;
+}
+#endif /* HAVE_BSD_STRTOLL */
 
 #ifndef HAVE_STRTOLL
 long long int rep_strtoll(const char *str, char **endptr, int base)
@@ -558,6 +577,25 @@ long long int rep_strtoll(const char *str, char **endptr, int base)
 #endif /* HAVE_BSD_STRTOLL */
 #endif /* HAVE_STRTOLL */
 
+#ifdef HAVE_BSD_STRTOLL
+#undef strtoul
+unsigned long int rep_strtoul(const char *str, char **endptr, int base)
+{
+	int saved_errno = errno;
+	unsigned long int nb = strtoul(str, endptr, base);
+	/* With glibc EINVAL is only returned if base is not ok */
+	if (errno == EINVAL) {
+		if (base == 0 || (base >1 && base <37)) {
+			/* Base was ok so it's because we were not
+			 * able to make the conversion.
+			 * Let's reset errno.
+			 */
+			errno = saved_errno;
+		}
+	}
+	return nb;
+}
+#endif /* HAVE_BSD_STRTOLL */
 
 #ifndef HAVE_STRTOULL
 unsigned long long int rep_strtoull(const char *str, char **endptr, int base)
