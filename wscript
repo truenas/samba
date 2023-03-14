@@ -190,6 +190,7 @@ def configure(conf):
     if sys.platform == 'darwin':
         conf.ADD_LDFLAGS('-framework CoreFoundation')
 
+    conf.ADD_LDFLAGS('-ljemalloc', testflags=True)
     conf.RECURSE('dynconfig')
     conf.RECURSE('selftest')
 
