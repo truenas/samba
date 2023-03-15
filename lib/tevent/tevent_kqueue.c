@@ -855,18 +855,16 @@ static void tevent_aio_waitcomplete(struct tevent_context *ev, struct aiocb *ioc
 			"tevent_aio_waitcomplete(): aio_waitcomplete() failed: %s\n",
 			strerror(errno)
 		);
-		abort();
 	} else if (ret == EINPROGRESS) {
 		tevent_debug(
 			ev, TEVENT_DEBUG_FATAL,
 			"tevent_aio_waitcomplete(): aio_waitcomplete() "
 			"failed to complete after 30 seconds\n"
 		);
-		abort();
 	}
 }
 
-static bool tevent_aio_cancel(struct tevent_aiocb *taiocb)
+static void tevent_aio_cancel(struct tevent_aiocb *taiocb)
 {
 	int ret;
 	struct aiocb *iocbp = taiocb->iocbp;
@@ -894,7 +892,8 @@ static bool tevent_aio_cancel(struct tevent_aiocb *taiocb)
 		abort();
 	case AIO_NOTCANCELED:
 		ret = aio_error(iocbp);
-		if (ret == -1) {
+		if ((ret == -1) &&
+		    (errno != EAGAIN)) {
 			tevent_debug(
 				taiocb->ev, TEVENT_DEBUG_WARNING,
 				"tevent_aio_cancel(): "
