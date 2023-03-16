@@ -1350,13 +1350,14 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 			 entry->createtxg, tmp_file);
 
 		rv = sys_stat(tmp_file, &cur_st, false);
-		TALLOC_FREE(tmp_file);
 		if (rv != 0) {
 			DBG_INFO("%s: stat() failed for [%s] in mp [%s] snap [%s]: %s\n",
 				 tmp_file, fsp_str_dbg(fsp), snapshots->mountpoint, entry->name,
 				 strerror(errno));
+			TALLOC_FREE(tmp_file);
 			continue;
 		}
+		TALLOC_FREE(tmp_file);
 		if (config->filter->ignore_empty_snaps && !S_ISDIR(cur_st.st_ex_mode) &&
 		    (timespec_compare(&cur_st.st_ex_mtime, &prev_st.st_ex_mtime) == 0)) {
 			continue;
@@ -1469,7 +1470,9 @@ static NTSTATUS shadow_copy_zfs_get_real_filename_at(
 	return NT_STATUS_OK;
 }
 
+
 static const char *shadow_copy_zfs_connectpath(struct vfs_handle_struct *handle,
+					    const struct files_struct *dirfsp,
 					    const struct smb_filename *smb_fname)
 {
 	const char *ret;
@@ -1487,27 +1490,20 @@ static const char *shadow_copy_zfs_connectpath(struct vfs_handle_struct *handle,
 
 	if (shadow_copy_zfs_match_name(handle, smb_fname)) {
 		char *out = NULL;
-		struct snapshot_data *data = NULL;
-		data = talloc_zero(handle, struct snapshot_data);
-		if (data == NULL) {
-			errno = ENOMEM;
-			return NULL;
-		}
-		conv = do_convert_shadow_zfs_name(handle, smb_fname, data);
+		struct snapshot_data data = { 0 };
+		conv = do_convert_shadow_zfs_name(handle, smb_fname, &data);
 		if (conv == NULL) {
 			return handle->conn->connectpath;
 		}
 		TALLOC_FREE(conv);
-		if (data->shadow_cp[0] == '\0') {
-			TALLOC_FREE(data);
-			return SMB_VFS_NEXT_CONNECTPATH(handle, smb_fname);
+		if (data.shadow_cp[0] == '\0') {
+			return SMB_VFS_NEXT_CONNECTPATH(handle, dirfsp, smb_fname);
 		}
-		out = talloc_strdup(talloc_tos(), data->shadow_cp);
+		out = talloc_strdup(talloc_tos(), data.shadow_cp);
 
-		TALLOC_FREE(data);
 		return out;
 	}
-	return SMB_VFS_NEXT_CONNECTPATH(handle, smb_fname);
+	return SMB_VFS_NEXT_CONNECTPATH(handle, dirfsp, smb_fname);
 }
 
 static uint64_t shadow_copy_zfs_disk_free(vfs_handle_struct *handle,
