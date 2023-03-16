@@ -680,7 +680,7 @@ static bool add_json_mapping(int idx, struct json_object *entry, void *state)
 
 	if (!NT_STATUS_IS_OK(status)) {
 		d_fprintf(stderr,
-			  _("[%s] failed to add entry for gid %d\n"),
+			  _("[%d] failed to add entry for gid %d\n"),
 			  idx, map->gid);
 		return false;
 	}
@@ -1799,14 +1799,14 @@ static int net_groupmap_listmem_json(struct net_context *c, int argc, const char
 
 	out = json_new_object();
 	if (json_is_invalid(&out)) {
-		d_fprintf(stderr, _("Failed to create JSON object %s\n"));
+		d_fprintf(stderr, _("Failed to create JSON object.\n"));
 		TALLOC_FREE(token);
 		return -1;
 	}
 
 	jsmembers = json_new_array();
 	if (json_is_invalid(&jsmembers)) {
-		d_fprintf(stderr, _("Failed to create JSON object %s\n"));
+		d_fprintf(stderr, _("Failed to create JSON object.\n"));
 		json_free(&out);
 		TALLOC_FREE(token);
 		return -1;
