@@ -1537,7 +1537,7 @@ int json_get_int_value(const struct json_object *object,
 	}
 
 	if (!json_is_integer(to_check)) {
-		DBG_ERR("%d: unexpected JSON type: %d\n",
+		DBG_ERR("%s: unexpected JSON type: %d\n",
 			key, json_typeof(to_check));
 		errno = EINVAL;
 		return -1;
@@ -1569,7 +1569,7 @@ int json_get_array_value(const struct json_object *object,
 	}
 
 	if (!json_is_array(to_check)) {
-		DBG_ERR("%d: unexpected JSON type: %d\n",
+		DBG_ERR("%s: unexpected JSON type: %d\n",
 			key, json_typeof(to_check));
 		errno = EINVAL;
 		valp->valid = false;

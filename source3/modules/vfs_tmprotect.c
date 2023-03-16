@@ -413,7 +413,7 @@ static int tmprotect_connect(struct vfs_handle_struct *handle,
 
 	inclusions = lp_parm_string_list(SNUM(handle->conn),
 					 TMPROTECT_MODULE,
-					 "include", &default_aapl);
+					 "include", default_aapl);
 	if (inclusions != NULL) {
 		config->filter->inclusions = str_list_copy(config, inclusions);
 		if (config->filter->inclusions == NULL) {
