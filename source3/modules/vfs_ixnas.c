@@ -1578,6 +1578,7 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 	int ret;
 	const char *homedir_quota = NULL;
 	bool ok;
+
 	config = talloc_zero(handle->conn, struct ixnas_config_data);
 	if (!config) {
 		DEBUG(0, ("talloc_zero() failed\n"));
