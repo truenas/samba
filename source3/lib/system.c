@@ -282,6 +282,12 @@ void init_stat_ex_from_stat (struct stat_ex *dst,
 #else
 	dst->st_ex_flags = 0;
 #endif
+
+#ifdef HAVE_STAT_ST_GEN
+	dst->st_ex_gen = src->st_gen;
+#else
+	dst->st_ex_gen = 0;
+#endif
 }
 
 /*******************************************************************
