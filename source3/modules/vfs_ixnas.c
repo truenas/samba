@@ -1411,24 +1411,39 @@ static int ixnas_renameat(vfs_handle_struct *handle,
 	return result;
 }
 
-static bool is_robocopy_init(struct smb_file_time *ft)
+static struct file_id ixnas_file_id_create(struct vfs_handle_struct *handle,
+					   const SMB_STRUCT_STAT *sbuf)
 {
-	if (!null_timespec(ft->atime) ||
-	    !null_timespec(ft->create_time)) {
-		return false;
-	}
-	if (ft->mtime.tv_sec == 315619200) {
-		return true;
-	}
-	return false;
+	struct file_id key = (struct file_id) {
+		.devid = sbuf->st_ex_dev,
+		.inode = sbuf->st_ex_ino,
+		.extid = sbuf->st_ex_gen,
+	};
+
+	return key;
 }
 
-static int fsp_set_times(files_struct *fsp, struct timespec *times)
-{
-	if (!fsp->fsp_flags.is_pathref) {
-		return futimens(fsp_get_io_fd(fsp), times);
-        }
+static inline uint64_t gen_id_comp(uint64_t p) {
+	uint64_t out = (p & UINT32_MAX) ^ (p >> 32);
+	return out;
+};
 
+static uint64_t ixnas_fs_file_id(struct vfs_handle_struct *handle,
+				 const SMB_STRUCT_STAT *psbuf)
+{
+	uint64_t file_id;
+	if (!(psbuf->st_ex_iflags & ST_EX_IFLAG_CALCULATED_FILE_ID)) {
+		return psbuf->st_ex_file_id;
+	}
+
+	file_id = gen_id_comp(psbuf->st_ex_ino);
+	file_id |= gen_id_comp(psbuf->st_ex_gen) << 32;
+	return file_id;
+}
+
+static int fsp_set_times(files_struct *fsp, struct timespec *times, bool set_btime)
+{
+	int flag = set_btime ? AT_UTIMENSAT_BTIME : 0;
 	if (fsp->fsp_flags.have_proc_fds) {
 		int fd = fsp_get_pathref_fd(fsp);
 		const char *p = NULL;
@@ -1653,10 +1668,7 @@ static struct vfs_fn_pointers ixnas_fns = {
 	.fchmod_fn = ixnas_fchmod,
 #if defined (FREEBSD)
 	.fntimes_fn = ixnas_ntimes,
-#if 0 /* pending FILEID work */
 	.file_id_create_fn = ixnas_file_id_create,
-	.fs_file_id_fn = ixnas_fs_file_id,
-#endif
 #endif
 	.fget_nt_acl_fn = ixnas_fget_nt_acl,
 	.fset_nt_acl_fn = ixnas_fset_nt_acl,
