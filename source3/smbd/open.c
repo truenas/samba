@@ -1252,7 +1252,7 @@ static NTSTATUS reopen_from_procfd(struct files_struct *fsp,
 				fsp,
 				&proc_fname,
 				fsp,
-				&how);
+				&tmp_how);
 #else
 
 	p = sys_proc_fd_path(old_fd, buf, sizeof(buf));
