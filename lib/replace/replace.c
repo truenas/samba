@@ -37,6 +37,10 @@
 #include <sys/syscall.h>
 #endif
 
+#ifdef O_RESOLVE_BENEATH
+#include <sys/sysctl.h>
+#endif
+
 #ifdef _WIN32
 #define mkdir(d,m) _mkdir(d)
 #endif
@@ -1104,6 +1108,44 @@ ssize_t rep_copy_file_range(int fd_in,
 # endif /* defined(LINUX) && defined(HAVE_SYS_SYSCALL_H) */
 #endif /* !__NR_openat2 */
 
+#ifdef O_RESOLVE_NO_SYMLINKS
+#define RESOLVE_FLAGS_CHECKED 0x1000
+static bool get_supported_flags(int *flagsp)
+{
+	static __thread int supported_flags;
+	int has_it;
+	size_t sz = sizeof(has_it);
+	int error;
+
+	if (supported_flags) {
+		*flagsp = supported_flags & ~RESOLVE_FLAGS_CHECKED;
+		return true;
+	}
+
+	error = sysctlbyname("kern.features.rnosymlink", &has_it, &sz, NULL, 0);
+	if (error) {
+		if (errno != ENOENT) {
+			return false;
+		}
+	} else if (has_it) {
+		supported_flags |= RESOLVE_NO_SYMLINKS;
+	}
+
+	error = sysctlbyname("kern.features.rbeneath", &has_it, &sz, NULL, 0);
+	if (error) {
+		if (errno != ENOENT) {
+			return false;
+		}
+	} else if (has_it) {
+		supported_flags |= RESOLVE_BENEATH;
+	}
+
+	*flagsp = supported_flags;
+	supported_flags |= RESOLVE_FLAGS_CHECKED;
+	return true;
+}
+#endif
+
 #ifdef DISABLE_OPATH
 /*
  * systems without O_PATH also don't have openat2,
@@ -1137,6 +1179,29 @@ long rep_openat2(int dirfd, const char *pathname,
 		       pathname,
 		       how,
 		       size);
+
+#elif defined(O_RESOLVE_NO_SYMLINKS)
+	int supported_flags;
+	int flags = how->flags;
+
+	if (!get_supported_flags(&supported_flags)) {
+		return -1;
+	}
+
+	if ((how->resolve & supported_flags) != how->resolve) {
+		errno = ENOSYS;
+		return -1;
+	}
+
+	if (how->resolve & RESOLVE_NO_SYMLINKS) {
+		flags |= O_RESOLVE_NO_SYMLINKS;
+	}
+
+	if (how->resolve & RESOLVE_BENEATH) {
+		flags |= O_RESOLVE_BENEATH;
+	}
+
+	return openat(dirfd, pathname, flags, how->mode);
 #else
 	errno = ENOSYS;
 	return -1;
