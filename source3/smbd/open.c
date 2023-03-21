@@ -1270,7 +1270,7 @@ static NTSTATUS reopen_from_procfd(struct files_struct *fsp,
 				fsp->conn->cwd_fsp,
 				&proc_fname,
 				fsp,
-				&how);
+				&tmp_how);
 #endif /* O_EMPTY_PATH */
 
 	if (new_fd == -1) {
