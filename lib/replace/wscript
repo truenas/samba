@@ -946,7 +946,7 @@ def build(bld):
         replace_test_cflags += " -Wno-format-truncation"
     bld.SAMBA_SUBSYSTEM('replace-test',
                         source='''tests/testsuite.c tests/strptime.c
-                        tests/os2_delete.c tests/getifaddrs.c''',
+                        tests/os2_delete.c tests/getifaddrs.c tests/openat2.c''',
                         deps='replace',
                         cflags=replace_test_cflags)
 

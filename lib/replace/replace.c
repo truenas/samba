@@ -1137,6 +1137,24 @@ long rep_openat2(int dirfd, const char *pathname,
 		       pathname,
 		       how,
 		       size);
+
+#elif defined(O_RESOLVE_NO_SYMLINKS)
+	int flags = how->flags;
+
+	if (how->resolve & ~(RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH)) {
+		errno = ENOSYS;
+		return -1;
+	}
+
+	if (how->resolve & RESOLVE_NO_SYMLINKS) {
+		flags |= O_RESOLVE_NO_SYMLINKS;
+	}
+
+	if (how->resolve & RESOLVE_BENEATH) {
+		flags |= O_RESOLVE_BENEATH;
+	}
+
+	return openat(dirfd, pathname, flags, how->mode);
 #else
 	errno = ENOSYS;
 	return -1;

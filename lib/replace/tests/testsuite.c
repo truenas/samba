@@ -416,6 +416,16 @@ static int test_opendir(void)
 	return true;
 }
 
+static int test_openat2(void)
+{
+	printf("test: openat2\n");
+	if (test_openat2_impl() != 0) {
+		return false;
+	}
+	printf("success: openat2\n");
+	return true;
+}
+
 static int test_readdir(void)
 {
 	printf("test: readdir\n");
@@ -1222,6 +1232,7 @@ bool torture_local_replace(struct torture_context *ctx)
 	ret &= test_memmem();
 	ret &= test_closefrom();
 	ret &= test_array_del_element();
+	ret &= test_openat2();
 
 	return ret;
 }
