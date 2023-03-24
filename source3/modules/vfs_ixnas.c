@@ -1324,7 +1324,6 @@ failure:
 	return -1;
 }
 
-#if 0 /*pending work on FILE IDs from FreeBSD */
 #if defined (FREEBSD)
 static struct file_id ixnas_file_id_create(struct vfs_handle_struct *handle,
 					   const SMB_STRUCT_STAT *sbuf)
@@ -1338,82 +1337,9 @@ static struct file_id ixnas_file_id_create(struct vfs_handle_struct *handle,
 	return key;
 }
 
-static inline uint64_t gen_id_comp(uint64_t p) {
-	uint64_t out = (p & UINT32_MAX) ^ (p >> 32);
-	return out;
-};
-
-#endif
-
-static uint64_t ixnas_fs_file_id(struct vfs_handle_struct *handle,
-				 const SMB_STRUCT_STAT *psbuf);
-
-static int ixnas_renameat(vfs_handle_struct *handle,
-			  files_struct *srcfsp,
-			  const struct smb_filename *smb_fname_src,
-			  files_struct *dstfsp,
-			  const struct smb_filename *smb_fname_dst)
-{
-	int result = 1;
-	struct ixnas_config_data *config = NULL;
-	char *tmp_base_name = NULL;
-	uint64_t srcid, dstid;
-
-	SMB_VFS_HANDLE_GET_DATA(handle, config,
-				struct ixnas_config_data,
-				return -1);
-
-	if (config->props->casesens != SMBZFS_INSENSITIVE) {
-		return SMB_VFS_NEXT_RENAMEAT(handle,
-					     srcfsp,
-					     smb_fname_src,
-					     dstfsp,
-					     smb_fname_dst);
-	}
-
-	srcid = ixnas_fs_file_id(handle, &srcfsp->fsp_name->st);
-	dstid = ixnas_fs_file_id(handle, &dstfsp->fsp_name->st);
-
-	if (srcid == dstid) {
-		result = strcasecmp_m(smb_fname_src->base_name,
-				      smb_fname_dst->base_name);
-	}
-	if (result != 0) {
-		return SMB_VFS_NEXT_RENAMEAT(handle,
-					     srcfsp,
-					     smb_fname_src,
-					     dstfsp,
-					     smb_fname_dst);
-	}
-
-	dstid = ixnas_fs_file_id(handle, &smb_fname_src->st);
-	tmp_base_name = talloc_asprintf(talloc_tos(), "%s_%lu",
-					smb_fname_src->base_name, dstid);
-	if (tmp_base_name == NULL) {
-		errno = ENOMEM;
-		return -1;
-	}
-	result = renameat(
-		fsp_get_pathref_fd(srcfsp), smb_fname_src->base_name,
-		fsp_get_pathref_fd(dstfsp), tmp_base_name
-        );
-	if (result != 0) {
-		DBG_ERR("Failed to rename %s to intermediate name %s\n",
-			smb_fname_src->base_name, tmp_base_name);
-		TALLOC_FREE(tmp_base_name);
-		return result;
-	}
-	result = renameat(
-		fsp_get_pathref_fd(dstfsp), tmp_base_name,
-		fsp_get_pathref_fd(srcfsp), smb_fname_dst->base_name
-        );
-	TALLOC_FREE(tmp_base_name);
-	return result;
-}
-
 static int fsp_set_times(files_struct *fsp, struct timespec *times, bool set_btime)
 {
-	int flag = set_btime ? AT_UTIMENSAT_FULL : 0;
+	int flag = set_btime ? AT_UTIMENSAT_BTIME : 0;
 	if (fsp->fsp_flags.have_proc_fds) {
 		int fd = fsp_get_pathref_fd(fsp);
 		const char *p = NULL;
@@ -1548,6 +1474,7 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 	int ret;
 	const char *homedir_quota = NULL;
 	bool ok;
+
 	config = talloc_zero(handle->conn, struct ixnas_config_data);
 	if (!config) {
 		DEBUG(0, ("talloc_zero() failed\n"));
@@ -1618,10 +1545,7 @@ static struct vfs_fn_pointers ixnas_fns = {
 	.fchmod_fn = ixnas_fchmod,
 #if defined (FREEBSD)
 	.fntimes_fn = ixnas_ntimes,
-#if 0 /* pending FILEID work */
 	.file_id_create_fn = ixnas_file_id_create,
-	.fs_file_id_fn = ixnas_fs_file_id,
-#endif
 #endif
 	.fget_nt_acl_fn = ixnas_fget_nt_acl,
 	.fset_nt_acl_fn = ixnas_fset_nt_acl,
