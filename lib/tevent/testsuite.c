@@ -2274,11 +2274,11 @@ struct torture_suite *torture_local_event(TALLOC_CTX *mem_ctx)
 	return suite;
 }
 
-#ifdef HAVE_KQUEUE
 struct torture_suite *torture_local_event_aio(TALLOC_CTX *mem_ctx)
 {
         struct torture_suite *suite = torture_suite_create(mem_ctx, "event_aio");
 
+#ifdef HAVE_KQUEUE
         torture_suite_add_simple_tcase_const(suite,
                                              "basic_kqueue_aio",
                                              test_event_kqueue_aio,
@@ -2298,6 +2298,6 @@ struct torture_suite *torture_local_event_aio(TALLOC_CTX *mem_ctx)
                                              "aio_write_cancel_destructor",
                                              test_event_kqueue_aio_pwrite_cancel,
                                              NULL);
+#endif /* HAVE_KQUEUE */
 	return suite;
 }
-#endif /* HAVE_KQUEUE */
