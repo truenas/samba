@@ -40,6 +40,7 @@ typedef struct {
 	char sid_str[WBC_SID_STRING_BUFLEN];
 	uint32_t trust_flags;
 	uint32_t trust_type;
+	bool dom_is_offline;
 	char trust_routing[280];
 } py_wbdomain;
 
@@ -683,10 +684,11 @@ static void populate_domain_info(py_wbdomain *dom,
 			strlcpy(dom->trust_routing, dinfo->trust_routing,
 				sizeof(dom->trust_routing));
 		}
+		dom->dom_is_offline = dinfo->domain_flags & WBC_DOMINFO_DOMAIN_OFFLINE;
 	}
 }
 
-static PyObject *py_domain_info(struct wbcDomainInfo *dinfo)
+static PyObject *py_domain_info(struct wbcDomainInfo *dinfo, bool offline)
 {
 	char sid_str[WBC_SID_STRING_BUFLEN];
 	PyObject *domain_flags = NULL;
@@ -698,14 +700,17 @@ static PyObject *py_domain_info(struct wbcDomainInfo *dinfo)
 		return NULL;
 	}
 
+	if (!offline) {
+		offline = dinfo->domain_flags & WBC_DOMINFO_DOMAIN_OFFLINE;
+	}
+
 	return Py_BuildValue(
 		"{s:s, s:s, s:s, s:N, s:O}",
 		"netbios_domain", dinfo->short_name,
 		"dns_name", dinfo->dns_name,
 		"sid", sid_str,
 		"domain_flags", domain_flags,
-		"online", dinfo->domain_flags &
-		WBC_DOMINFO_DOMAIN_OFFLINE ? Py_False : Py_True
+		"online", offline ? Py_False : Py_True
 	);
 }
 
@@ -727,7 +732,7 @@ static PyObject *wbclient_domain_info(PyObject *obj, PyObject *argsunused)
 	if (self->sid_str[0] == '\0') {
 		populate_domain_info(self, dinfo, false);
 	}
-	out = py_domain_info(dinfo);
+	out = py_domain_info(dinfo, self->dom_is_offline);
 	wbcFreeMemory(dinfo);
 
 	if (out && (self->trust_type != -1)) {
