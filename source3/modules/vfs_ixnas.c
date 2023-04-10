@@ -749,7 +749,7 @@ static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 		return status;
 	}
 
-	status = smb_fget_nt_acl_nfs4(fsp, NULL, security_info, mem_ctx,
+	status = smb_fget_nt_acl_nfs4(fsp, &config->nfs4_params, security_info, mem_ctx,
 				      ppdesc, pacl);
 	TALLOC_FREE(frame);
 	return status;
