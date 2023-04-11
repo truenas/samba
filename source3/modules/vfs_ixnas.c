@@ -345,6 +345,14 @@ static zfsacl_t fsp_get_zfsacl(files_struct *fsp)
 	if (!fsp->fsp_flags.is_pathref) {
 		return zfsacl_get_fd(fsp_get_io_fd(fsp), ZFSACL_BRAND_NFSV4);
 	}
+#if defined (FREEBSD)
+	fd = openat(fsp_get_pathref_fd(fsp), "", O_EMPTY_PATH | O_RDONLY);
+	if (fd != -1) {
+		return zfsacl_get_fd(fd, ZFSACL_BRAND_NFSV4);
+	} else if (errno != EACCES) {
+		return NULL;
+	}
+#endif /* FREEBSD */
 
 	SMB_ASSERT(fsp->fsp_flags.have_proc_fds);
 
