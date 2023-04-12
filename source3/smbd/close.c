@@ -593,6 +593,7 @@ static NTSTATUS close_remove_share_mode(files_struct *fsp,
 	}
 
 	if ((conn->fs_capabilities & FILE_NAMED_STREAMS)
+	    && (conn->internal_tcon_flags & TCON_FLAG_STREAMS_FILE)
 	    && !fsp_is_alternate_stream(fsp)) {
 
 		status = delete_all_streams(fsp,
@@ -1279,6 +1280,7 @@ static NTSTATUS close_directory(struct smb_request *req, files_struct *fsp,
 		goto done;
 	}
 	if ((fsp->conn->fs_capabilities & FILE_NAMED_STREAMS)
+	    && (conn->internal_tcon_flags & TCON_FLAG_STREAMS_FILE)
 	    && !is_ntfs_stream_smb_fname(fsp->fsp_name)) {
 
 		status = delete_all_streams(fsp,
