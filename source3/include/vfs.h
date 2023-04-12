@@ -696,6 +696,8 @@ typedef struct files_struct {
  * In any other case use fsp_get_io_fd().
  */
 #define TCON_FLAG_STAT_FAILED		0x01
+#define TCON_FLAG_STREAMS_XATTR		0x02
+#define TCON_FLAG_STREAMS_FILE		0x04
 
 struct vuid_cache_entry {
 	struct auth_session_info *session_info;
