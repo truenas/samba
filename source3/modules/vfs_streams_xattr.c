@@ -911,6 +911,8 @@ static int streams_xattr_connect(vfs_handle_struct *handle,
 		return rc;
 	}
 
+	handle->conn->internal_tcon_flags |= TCON_FLAG_STREAMS_XATTR;
+
 	config = talloc_zero(handle->conn, struct streams_xattr_config);
 	if (config == NULL) {
 		DEBUG(1, ("talloc_zero() failed\n"));

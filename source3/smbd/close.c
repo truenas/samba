@@ -441,6 +441,7 @@ static NTSTATUS close_remove_share_mode(files_struct *fsp,
 	}
 
 	if ((conn->fs_capabilities & FILE_NAMED_STREAMS)
+	    && (conn->internal_tcon_flags & TCON_FLAG_STREAMS_FILE)
 	    && !fsp_is_alternate_stream(fsp)) {
 
 		status = delete_all_streams(conn, fsp->fsp_name);
