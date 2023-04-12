@@ -307,6 +307,9 @@ static int init_fruit_config(vfs_handle_struct *handle)
 		return -1;
 	}
 	config->rsrc = (enum fruit_rsrc)enumval;
+	if (config->rsrc == FRUIT_RSRC_ADFILE) {
+		handle->conn->internal_tcon_flags |= TCON_FLAG_STREAMS_FILE;
+	}
 
 	enumval = lp_parm_enum(SNUM(handle->conn), FRUIT_PARAM_TYPE_NAME,
 			       "resource", fruit_rsrc, enumval);
