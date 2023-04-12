@@ -291,6 +291,17 @@ static int init_fruit_config(vfs_handle_struct *handle)
 			  FRUIT_PARAM_TYPE_NAME));
 		return -1;
 	}
+
+	config->rsrc = (enum fruit_rsrc)enumval;
+	if (config->rsrc == FRUIT_RSRC_ADFILE) {
+		handle->conn->internal_tcon_flags |= TCON_FLAG_STREAMS_FILE;
+	}
+
+	if (enumval == -1) {
+		DEBUG(1, ("value for %s: resource type unknown\n",
+			  FRUIT_PARAM_TYPE_NAME));
+		return -1;
+	}
 	config->rsrc = (enum fruit_rsrc)enumval;
 
 	enumval = lp_parm_enum(SNUM(handle->conn), FRUIT_PARAM_TYPE_NAME,
