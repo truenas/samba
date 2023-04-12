@@ -685,6 +685,8 @@ typedef struct files_struct {
  * In any other case use fsp_get_io_fd().
  */
 #define TCON_FLAG_STAT_FAILED		0x01
+#define TCON_FLAG_STREAMS_XATTR		0x02
+#define TCON_FLAG_STREAMS_FILE		0x04
 
 #define FSP_POSIX_FLAGS_OPEN		0x01
 #define FSP_POSIX_FLAGS_RENAME		0x02
