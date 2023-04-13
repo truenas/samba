@@ -394,7 +394,7 @@ static int init_fruit_config(vfs_handle_struct *handle)
 					 "store_stream_type",
 					 true);
 
-	if (lp_parm_bool(SNUM(handle->conn), FRUIT_PARAM_TYPE_NAME, "streamname_optimization", false)) {
+	if (lp_parm_bool(SNUM(handle->conn), FRUIT_PARAM_TYPE_NAME, "streamname_optimization", true)) {
 		config->macmeta_streamname = talloc_asprintf(config, "%s%s%s",
 		    prefix, "AFP_AfpInfo", store_stream_type ? ":$DATA" : "");
 	}
