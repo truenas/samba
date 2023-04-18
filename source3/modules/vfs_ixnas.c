@@ -1587,8 +1587,6 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 		return -1;
 	}
 
-	config->dp.fd = -1;
-
 	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
 	if (ret < 0) {
 		TALLOC_FREE(config);
@@ -1634,6 +1632,7 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 	if (config->dirent_optimization) {
 		config->dirent_pool = talloc_pool(config, 4 * sizeof(bsd_dirent_t));
 		config->fake_ctime = lp_fake_directory_create_times(SNUM(handle->conn));
+		config->dp.fd = -1;
 	}
 #endif
 
