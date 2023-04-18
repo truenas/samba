@@ -29,13 +29,45 @@ static int vfs_ixnas_debug_level = DBGC_VFS;
 #undef DBGC_CLASS
 #define DBGC_CLASS vfs_ixnas_debug_level
 
+#if defined (FREEBSD)
+typedef struct dirent_pathref {
+	int fd;
+	dev_t dev;
+	ino_t ino;
+	dev_t parent_dev;
+	ino_t parent_ino;
+} dirent_pathref_t;
+#endif
+
 struct ixnas_config_data {
 	struct smbacl4_vfs_params nfs4_params;
 	bool posix_rename;
 	bool dosattrib_xattr;
 	bool zfs_acl_enabled;
 	bool zfs_acl_chmod_enabled;
+#if defined (FREEBSD)
+	bool dirent_optimization;
+	dirent_pathref_t dp;
+	bool fake_ctime;
+	TALLOC_CTX *dirent_pool;
+#endif
 };
+
+#if defined (FREEBSD)
+#define DIRENT_BUF_SZ 8196
+typedef struct fbsd_dirent {
+	files_struct *fsp;
+	char dbuf[DIRENT_BUF_SZ];
+	int fd;
+	off_t base;
+	off_t current_token;
+	off_t previous_token;
+	ssize_t byte_pos;
+	ssize_t previous_byte_pos;
+	ssize_t read;
+	int idx;
+} bsd_dirent_t;
+#endif /* FREEBSD */
 
 #ifndef FREEBSD
 #define	UF_READONLY		0x0000000100000000ull
@@ -1555,6 +1587,8 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 		return -1;
 	}
 
+	config->dp.fd = -1;
+
 	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
 	if (ret < 0) {
 		TALLOC_FREE(config);
@@ -1594,6 +1628,13 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 		}
 		lp_do_parameter(SNUM(handle->conn), "kernel dosmodes", "yes");
 	}
+	config->dirent_optimization = lp_parm_bool(SNUM(handle->conn),
+		"ixnas", "dirent_optimization", false);
+
+	if (config->dirent_optimization) {
+		config->dirent_pool = talloc_pool(config, 4 * sizeof(bsd_dirent_t));
+		config->fake_ctime = lp_fake_directory_create_times(SNUM(handle->conn));
+	}
 #endif
 
 	ok = set_acl_parameters(handle, config);
@@ -1609,6 +1650,264 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 	return 0;
 }
 
+#if defined (FREEBSD)
+static DIR *ixnas_fdopendir(vfs_handle_struct *handle,
+			    files_struct *fsp, const char *mask, uint32_t attr)
+{
+	bsd_dirent_t *result = NULL;
+	struct ixnas_config_data *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct ixnas_config_data,
+				smb_panic("ixnas_fdopendir(): failed to get config"));
+
+	if (!config->dirent_optimization) {
+		return SMB_VFS_NEXT_FDOPENDIR(handle, fsp, mask, attr);
+	}
+
+	result = talloc_zero(config->dirent_pool, bsd_dirent_t);
+	if (result == NULL) {
+		DBG_ERR("Failed to allocate new directory entry\n");
+		return NULL;
+	}
+	result->fd = openat(fsp_get_pathref_fd(fsp), "", O_EMPTY_PATH | O_DIRECTORY);
+	if (result->fd == -1) {
+		DBG_ERR("%s: failed to open directory: %s\n",
+			fsp_str_dbg(fsp), strerror(errno));
+
+		TALLOC_FREE(result);
+		return NULL;
+	}
+	result->fsp = fsp;
+
+	return (DIR *)result;
+}
+
+static int get_dirent_pathref(bsd_dirent_t *bd,
+			      struct dirent *dent,
+			      dirent_pathref_t *dp,
+			      SMB_STRUCT_STAT *st,
+			      bool fake_ctime)
+{
+	int fd, error;
+	fd = openat(bd->fd, dent->d_name, O_PATH | O_NONBLOCK | O_NOFOLLOW);
+	if (fd == -1) {
+		DBG_ERR("%s: failed to open file: %s\n",
+			dent->d_name, strerror(errno));
+		return -1;
+	}
+
+	error = sys_fstat(fd, st, fake_ctime);
+	if (error) {
+		DBG_ERR("%s: fstat() failed: %s\n",
+			dent->d_name, strerror(errno));
+		close(fd);
+		return -1;
+	}
+
+	if (dent->d_fileno != st->st_ex_ino) {
+		/*
+		 * This can happen if filesystem is mounted on d_name.
+		 * dirent->d_fileno refers to the mountpoint, but st_ino
+		 * refers to mounted filesystem.
+		 */
+		DBG_INFO("%s: dirent inode %ld does not match stat value: %ld\n",
+			 dent->d_name, dent->d_fileno, st->st_ex_ino);
+		close(fd);
+		return -1;
+	}
+
+	dp->fd = fd;
+	dp->dev = st->st_ex_dev;
+	dp->ino = st->st_ex_ino;
+	dp->parent_dev = bd->fsp->fsp_name->st.st_ex_dev;
+	dp->parent_ino = bd->fsp->fsp_name->st.st_ex_dev;
+
+	return 0;
+}
+
+static struct dirent *ixnas_readdir(vfs_handle_struct *handle,
+				    struct files_struct *dirfsp,
+				    DIR *dirp,
+				    SMB_STRUCT_STAT *sbuf)
+{
+	bsd_dirent_t *d = (bsd_dirent_t *)dirp;
+	int ret;
+	SMB_STRUCT_STAT st;
+	struct dirent *result = NULL;
+	struct ixnas_config_data *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct ixnas_config_data,
+				smb_panic("ixnas_readdir(): failed to get config"));
+
+	if (!config->dirent_optimization) {
+		return SMB_VFS_NEXT_READDIR(handle, dirfsp, dirp, sbuf);
+	}
+
+	if (config->dp.fd != -1) {
+		close(config->dp.fd);
+		config->dp.fd = -1;
+	}
+
+	if (d->byte_pos >= d->read) {
+		d->read = getdirentries(d->fd, d->dbuf, DIRENT_BUF_SZ, &d->base);
+		if (d->read == -1) {
+			DBG_ERR("getdirentries failed: %s\n", strerror(errno));
+			return NULL;
+		}
+		if (d->read == 0) {
+			return NULL;
+		}
+		d->byte_pos = 0;
+	}
+
+	result = (struct dirent *)(d->dbuf + d->byte_pos);
+	d->previous_byte_pos = d->byte_pos;
+	d->byte_pos += result->d_reclen;
+	d->previous_token = d->current_token;
+	d->current_token = result->d_off;
+
+	if (sbuf == NULL) {
+		return result;
+	}
+
+	SET_STAT_INVALID(*sbuf);
+
+	switch (result->d_type) {
+	case DT_LNK:
+		if (!(dirfsp->fsp_name->flags & SMB_FILENAME_POSIX_PATH)) {
+			return result;
+		}
+		ret = sys_fstatat(d->fd,
+				  result->d_name,
+				  &st,
+				  AT_SYMLINK_NOFOLLOW,
+				  config->fake_ctime);
+		break;
+	default:
+		ret = get_dirent_pathref(d,
+					 result,
+					 &config->dp,
+					 &st,
+					 config->fake_ctime);
+		break;
+	}
+
+	if (ret != 0) {
+		return result;
+	}
+
+	*sbuf = st;
+
+	return result;
+}
+
+static void ixnas_seekdir(vfs_handle_struct *handle,
+			  DIR *dirp, long offset)
+{
+	bsd_dirent_t *d = (bsd_dirent_t *)dirp;
+	struct ixnas_config_data *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct ixnas_config_data,
+				smb_panic("ixnas_seekdir(): failed to get config"));
+
+	if (!config->dirent_optimization) {
+		return SMB_VFS_NEXT_SEEKDIR(handle, dirp, offset);
+	}
+
+	SMB_ASSERT((offset == d->current_token) || (offset == d->previous_token));
+	if (offset == d->previous_token) {
+		d->current_token = d->previous_token;
+		d->byte_pos = d->previous_byte_pos;
+	}
+	return;
+}
+
+static long ixnas_telldir(vfs_handle_struct *handle,
+			  DIR *dirp)
+{
+	bsd_dirent_t *d = (bsd_dirent_t *)dirp;
+	struct ixnas_config_data *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct ixnas_config_data,
+				smb_panic("ixnas_telldir(): failed to get config"));
+
+	if (!config->dirent_optimization) {
+		return SMB_VFS_NEXT_TELLDIR(handle, dirp);
+	}
+
+	return d->current_token;
+}
+
+static void ixnas_rewinddir(vfs_handle_struct *handle,
+			    DIR *dirp)
+{
+	bsd_dirent_t *d = (bsd_dirent_t *)dirp;
+	struct ixnas_config_data *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct ixnas_config_data,
+				smb_panic("ixnas_rewinddir(): failed to get config"));
+
+	if (!config->dirent_optimization) {
+		return SMB_VFS_NEXT_REWINDDIR(handle, dirp);
+	}
+
+	d->base = 0;
+	d->byte_pos = 0;
+	d->read = 0;
+}
+
+static int ixnas_closedir(vfs_handle_struct *handle,
+			  DIR *dirp)
+{
+	int result;
+	bsd_dirent_t *d = (bsd_dirent_t *)dirp;
+	struct ixnas_config_data *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct ixnas_config_data,
+				smb_panic("ixnas_closedir(): failed to get config"));
+
+	if (!config->dirent_optimization) {
+		return SMB_VFS_NEXT_CLOSEDIR(handle, dirp);
+	}
+
+	result = close(d->fd);
+	TALLOC_FREE(d);
+
+	return result;
+}
+
+static int ixnas_openat(vfs_handle_struct *handle,
+			const struct files_struct *dirfsp,
+			const struct smb_filename *smb_fname,
+			files_struct *fsp,
+			const struct vfs_open_how *how)
+{
+	int fd;
+	struct ixnas_config_data *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct ixnas_config_data,
+				smb_panic("ixnas_openat(): failed to get config"));
+
+	if ((!config->dirent_optimization) || (!fsp->fsp_flags.is_pathref) ||
+	    (config->dp.fd == -1)) {
+		return SMB_VFS_NEXT_OPENAT(handle, dirfsp, smb_fname, fsp, how);
+	}
+
+	SMB_ASSERT(smb_fname->st.st_ex_ino == config->dp.ino);
+
+	fd = config->dp.fd;
+	config->dp.fd = -1;
+	return fd;
+}
+#endif
+
 static struct vfs_fn_pointers ixnas_fns = {
 	.connect_fn = ixnas_connect,
 	/* dosmode_enabled */
@@ -1617,11 +1916,14 @@ static struct vfs_fn_pointers ixnas_fns = {
 	/* zfs_acl_enabled = true */
 	.fchmod_fn = ixnas_fchmod,
 #if defined (FREEBSD)
+	.openat_fn = ixnas_openat,
 	.fntimes_fn = ixnas_ntimes,
-#if 0 /* pending FILEID work */
-	.file_id_create_fn = ixnas_file_id_create,
-	.fs_file_id_fn = ixnas_fs_file_id,
-#endif
+	.fdopendir_fn = ixnas_fdopendir,
+	.readdir_fn = ixnas_readdir,
+	.seekdir_fn = ixnas_seekdir,
+	.telldir_fn = ixnas_telldir,
+	.rewind_dir_fn = ixnas_rewinddir,
+	.closedir_fn = ixnas_closedir,
 #endif
 	.fget_nt_acl_fn = ixnas_fget_nt_acl,
 	.fset_nt_acl_fn = ixnas_fset_nt_acl,
