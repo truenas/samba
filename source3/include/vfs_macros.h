@@ -142,6 +142,11 @@
 	smb_vfs_call_closedir((handle)->next, (dir))
 
 /* File operations */
+#define SMB_VFS_FHANDLE_CACHE_LOOKUP(conn, smb_fname, flags, mode, op) \
+	smb_vfs_call_fhandle_cache_lookup((conn)->vfs_handles, (smb_fname), (flags), (mode), (op))
+#define SMB_VFS_NEXT_FHANDLE_CACHE_LOOKUP(conn, smb_fname, flags, op) \
+	smb_vfs_call_fhandle_cache_lookup((conn)->vfs_handles->next, (smb_fname), (flags), (op))
+
 #define SMB_VFS_OPENAT(conn, dirfsp, smb_fname, fsp, flags, mode) \
 	smb_vfs_call_openat((conn)->vfs_handles, (dirfsp), (smb_fname), (fsp), (flags), (mode))
 #define SMB_VFS_NEXT_OPENAT(handle, dirfsp, smb_fname, fsp, flags, mode) \
