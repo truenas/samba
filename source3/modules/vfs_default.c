@@ -3987,6 +3987,7 @@ static struct vfs_fn_pointers vfs_default_fns = {
 
 	/* File operations */
 
+	.fhandle_cache_lookup_fn = vfs_not_implemented_fhandle_cache_lookup,
 	.openat_fn = vfswrap_openat,
 	.create_file_fn = vfswrap_create_file,
 	.close_fn = vfswrap_close,

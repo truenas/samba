@@ -395,6 +395,12 @@ enum acl_brand {
         SMB_ACL_BRAND_NONE,
 };
 
+enum fhandle_cache_op {
+	FHANDLE_GET_DEFAULT,
+	FHANDLE_GET_PATHREF,
+	FHANDLE_IS_CACHED,
+};
+
 struct fd_handle;
 
 struct fsp_lease {
@@ -976,6 +982,11 @@ struct vfs_fn_pointers {
 
 	/* File operations */
 
+	int (*fhandle_cache_lookup_fn)(struct vfs_handle_struct *handle,
+				       struct smb_filename *smb_fname,
+				       int flags,
+				       mode_t mode,
+				       enum fhandle_cache_op op);
 	int (*openat_fn)(struct vfs_handle_struct *handle,
 			 const struct files_struct *dirfsp,
 			 const struct smb_filename *smb_fname,
@@ -1457,6 +1468,11 @@ int smb_vfs_call_openat(struct vfs_handle_struct *handle,
 			struct files_struct *fsp,
 			int flags,
 			mode_t mode);
+int smb_vfs_call_fhandle_cache_lookup(struct vfs_handle_struct *handle,
+				      struct smb_filename *smb_fname,
+				      int flags,
+				      mode_t mode,
+				      enum fhandle_cache_op op);
 NTSTATUS smb_vfs_call_create_file(struct vfs_handle_struct *handle,
 				  struct smb_request *req,
 				  struct smb_filename *smb_fname,
@@ -1892,6 +1908,11 @@ int vfs_not_implemented_openat(vfs_handle_struct *handle,
 			       struct files_struct *fsp,
 			       int flags,
 			       mode_t mode);
+int vfs_not_implemented_fhandle_cache_lookup(struct vfs_handle_struct *handle,
+					     struct smb_filename *smb_fname,
+					     int flags,
+					     mode_t mode,
+					     enum fhandle_cache_op op);
 NTSTATUS vfs_not_implemented_create_file(struct vfs_handle_struct *handle,
 				struct smb_request *req,
 				struct smb_filename *smb_fname,

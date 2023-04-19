@@ -724,10 +724,12 @@ NTSTATUS parent_pathref(TALLOC_CTX *mem_ctx,
 	 */
 	parent->flags &= ~SMB_FILENAME_POSIX_PATH;
 
-	ret = vfs_stat(dirfsp->conn, parent);
-	if (ret != 0) {
-		TALLOC_FREE(parent);
-		return map_nt_error_from_unix(errno);
+	if (!VALID_STAT(parent->st)) {
+		ret = vfs_stat(dirfsp->conn, parent);
+		if (ret != 0) {
+			TALLOC_FREE(parent);
+			return map_nt_error_from_unix(errno);
+		}
 	}
 
 	status = openat_pathref_fsp(dirfsp, parent);

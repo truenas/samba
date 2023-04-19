@@ -190,6 +190,16 @@ int vfs_not_implemented_closedir(vfs_handle_struct *handle, DIR *dir)
 	return -1;
 }
 
+int vfs_not_implemented_fhandle_cache_lookup(vfs_handle_struct *handle,
+					     struct smb_filename *smb_fname,
+					     int flags,
+					     mode_t mode,
+					     enum fhandle_cache_op op)
+{
+	errno = ENOSYS;
+	return -1;
+}
+
 int vfs_not_implemented_openat(vfs_handle_struct *handle,
 			       const struct files_struct *dirfsp,
 			       const struct smb_filename *smb_fname,
@@ -984,6 +994,7 @@ static struct vfs_fn_pointers vfs_not_implemented_fns = {
 
 	/* File operations */
 
+	.fhandle_cache_lookup_fn = vfs_not_implemented_fhandle_cache_lookup,
 	.openat_fn = vfs_not_implemented_openat,
 	.create_file_fn = vfs_not_implemented_create_file,
 	.close_fn = vfs_not_implemented_close_fn,

@@ -1150,6 +1150,15 @@ NTSTATUS check_reduced_name(connection_struct *conn,
 
 	DBG_DEBUG("check_reduced_name [%s] [%s]\n", fname, conn->connectpath);
 
+	if (VALID_STAT(smb_fname->st)) {
+		int rv;
+
+		rv = SMB_VFS_FHANDLE_CACHE_LOOKUP(conn, smb_fname, 0, 0, FHANDLE_IS_CACHED);
+		if (rv == 0) {
+			return NT_STATUS_OK;
+		}
+	}
+
 	resolved_fname = SMB_VFS_REALPATH(conn, ctx, smb_fname);
 
 	if (resolved_fname == NULL) {
@@ -1727,6 +1736,20 @@ int smb_vfs_call_closedir(struct vfs_handle_struct *handle,
 {
 	VFS_FIND(closedir);
 	return handle->fns->closedir_fn(handle, dir);
+}
+
+int smb_vfs_call_fhandle_cache_lookup(struct vfs_handle_struct *handle,
+				      struct smb_filename *smb_fname,
+				      int flags,
+				      mode_t mode,
+				      enum fhandle_cache_op op)
+{
+	VFS_FIND(fhandle_cache_lookup);
+	return handle->fns->fhandle_cache_lookup_fn(handle,
+						    smb_fname,
+						    flags,
+						    mode,
+						    op);
 }
 
 int smb_vfs_call_openat(struct vfs_handle_struct *handle,
