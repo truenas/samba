@@ -1687,6 +1687,10 @@ static struct dirent *ixnas_readdir(vfs_handle_struct *handle,
 		return result;
 	}
 
+	if (result == NULL) {
+		return NULL;
+	}
+
 	SET_STAT_INVALID(*sbuf);
 
 	switch (result->d_type) {
