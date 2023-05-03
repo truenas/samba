@@ -120,7 +120,18 @@ static NTSTATUS generate_synthetic_fsp(vfs_handle_struct *handle,
 	mode_t mode = 0;
 
 	SMB_ASSERT(sizeof(tp) > target->fts_pathlen);
-	strlcpy(tp, target->fts_path + dirfsp_offset, target->fts_pathlen - dirfsp_offset + 1);
+
+	if (target->fts_pointer == NULL) {
+		/* This is a faked-up FTSENT for when we rename within same directory */
+		strlcpy(tp, target->fts_path, sizeof(tp));
+	} else {
+		if (strstr(dirfsp->fsp_name->base_name, target->fts_path) == NULL) {
+			DBG_ERR("Invalid path: %s not within %s\n",
+				target->fsp_path, fsp_str_dbg(dirfsp));
+			return NT_STATUS_NOT_FOUND;
+		}
+		strlcpy(tp, target->fts_path + dirfsp_offset, target->fts_pathlen - dirfsp_offset + 1);
+	}
 
 	tmp_fname = (struct smb_filename) {
 		.base_name = tp,
