@@ -183,6 +183,50 @@ void set_current_case_sensitive(connection_struct *conn, uint16_t flags)
 	return;
 }
 
+bool fchdir_current_service(connection_struct *conn)
+{
+	int fd, error;
+	struct smb_filename *new_cwd = NULL;
+
+	if (conn->connectpath_fsp == NULL) {
+		return false;
+	}
+
+	fd = fsp_get_pathref_fd(conn->connectpath_fsp);
+	if ((fd == -1) || (fd == AT_FDCWD)) {
+		return false;
+	}
+
+	new_cwd = cp_smb_filename(conn, conn->connectpath_fsp->fsp_name);
+	if (new_cwd == NULL) {
+		DBG_ERR("%s: failed to copy connectpath fname: %s\n",
+			smb_fname_str_dbg(conn->connectpath_fsp->fsp_name),
+			strerror(errno));
+		return false;
+	}
+
+	error = fchdir(fd);
+	if (error) {
+		DBG_ERR("%s: fchdir() failed: %s\n",
+			fsp_str_dbg(conn->connectpath_fsp),
+			strerror(errno));
+		TALLOC_FREE(new_cwd);
+		return false;
+	}
+
+	fsp_set_fd(conn->cwd_fsp, AT_FDCWD);
+
+	SAFE_FREE(LastDir);
+	LastDir = SMB_STRDUP(new_cwd->base_name);
+
+	talloc_move(talloc_tos(), &conn->cwd_fsp->fsp_name);
+
+	conn->cwd_fsp->fsp_name = talloc_move(conn->cwd_fsp, &new_cwd);
+
+	DBG_INFO("%s: fchdir_current_service - new cwd\n", fsp_str_dbg(conn->cwd_fsp));
+	return true;
+}
+
 bool chdir_current_service(connection_struct *conn)
 {
 	const struct smb_filename connectpath_fname = {
@@ -193,6 +237,10 @@ bool chdir_current_service(connection_struct *conn)
 	int ret;
 
 	conn->lastused_count++;
+
+	if (fchdir_current_service(conn)) {
+		return true;
+	}
 
 	ret = vfs_ChDir(conn, &connectpath_fname);
 	if (ret == 0) {

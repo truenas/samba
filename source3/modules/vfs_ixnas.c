@@ -19,6 +19,7 @@
  */
 #include "includes.h"
 #include "libcli/security/security.h"
+#include "lib/util/memcache.h"
 #include "smbd/smbd.h"
 #include "system/filesys.h"
 #include "nfs4_acls.h"
@@ -30,6 +31,12 @@ static int vfs_ixnas_debug_level = DBGC_VFS;
 #define DBGC_CLASS vfs_ixnas_debug_level
 
 #if defined (FREEBSD)
+typedef struct fhandle_cache_entry {
+	fhandle_t fh;
+	int fd;
+	struct fhandle_cache_entry *next, *prev;
+} fhc_ent_t;
+
 typedef struct dirent_pathref {
 	int fd;
 	dev_t dev;
@@ -37,17 +44,30 @@ typedef struct dirent_pathref {
 	dev_t parent_dev;
 	ino_t parent_ino;
 } dirent_pathref_t;
+
+typedef struct fhandle_cache {
+	fhc_ent_t *mru;
+	size_t mru_size;
+	struct memcache *hdl_cache;
+	size_t hits;
+	size_t misses;
+	bool enabled;
+} fhandle_cache_t;
 #endif
 
 struct ixnas_config_data {
 	struct smbacl4_vfs_params nfs4_params;
-	bool use_resolve_beneath;
 	bool dosattrib_xattr;
 	bool zfs_acl_enabled;
 	bool zfs_acl_chmod_enabled;
 #if defined (FREEBSD)
 	bool dirent_optimization;
+	struct {
+		char last_parent[PATH_MAX];
+		SMB_STRUCT_STAT st;
+	} lpp;
 	dirent_pathref_t dp;
+	fhandle_cache_t fhc;
 	bool fake_ctime;
 	TALLOC_CTX *dirent_pool;
 #endif
@@ -1445,92 +1465,6 @@ static int ixnas_ntimes(vfs_handle_struct *handle,
 	}
 	return result;
 }
-
-static bool generate_beneath_path(const char *connectpath,
-				  const struct files_struct *dirfsp,
-				  const struct smb_filename *at_name,
-				  char *buf,
-				  size_t bufsz)
-{
-	if (at_name->base_name[0] == '/') {
-		if (strncmp(connectpath, at_name->base_name, strlen(connectpath)) != 0) {
-			smb_panic("absolute path not within connectpath");
-		}
-		strlcpy(buf, at_name->base_name + strlen(connectpath), bufsz);
-	} else if (ISDOT(dirfsp->fsp_name->base_name)) {
-		strlcpy(buf, at_name->base_name, bufsz);
-	} else if (dirfsp->fsp_name->base_name[0] == '/') {
-		if (strncmp(connectpath, dirfsp->fsp_name->base_name, strlen(connectpath)) != 0) {
-			/*
-			 * vfs_fruit attempts to open paths outside of share root
-			 * any time we chdir to different service
-			 */
-			return false;
-		}
-		if (snprintf(buf, bufsz, "%s/%s",
-			     dirfsp->fsp_name->base_name + strlen(connectpath),
-			     at_name->base_name) >= bufsz) {
-			smb_panic("failed to generate beneath path");
-		}
-	} else {
-		if (snprintf(buf, bufsz, "%s/%s",
-			     dirfsp->fsp_name->base_name,
-			     at_name->base_name) >= bufsz) {
-			smb_panic("failed to generate beneath path");
-		}
-	}
-	if (buf[0] == '/') {
-		memmove(buf, buf+1, bufsz -1);
-	}
-	if (buf[0] == '\0') {
-		strlcpy(buf, ".", bufsz);
-	}
-	return true;
-}
-
-static int resolve_beneath_openat(vfs_handle_struct *handle,
-			struct ixnas_config_data *config,
-			const struct files_struct *dirfsp,
-			const struct smb_filename *smb_fname_in,
-			files_struct *fsp,
-			int flags, mode_t mode)
-{
-	/*
-	 * O_EMPTY_PATH means that we're re-opening the dirfd using
-	 * and so we don't have to worry about symlinks.
-	 */
-	if (config->use_resolve_beneath &&
-	    ((flags & O_EMPTY_PATH) == 0) &&
-	    (handle->conn->connectpath_fsp != NULL) &&
-	    !ISDOTDOT(smb_fname_in->base_name)) {
-		char full_name[PATH_MAX] = { 0 };
-		struct smb_filename full_fname = {
-			.base_name = full_name,
-			.st = smb_fname_in->st,
-			.twrp = smb_fname_in->twrp,
-			.flags = smb_fname_in->flags
-		};
-
-		if (!generate_beneath_path(handle->conn->connectpath,
-					   dirfsp,
-					   smb_fname_in,
-					   full_name,
-					   sizeof(full_name)- 1)) {
-			return -1;
-		}
-
-		handle->conn->internal_tcon_flags |= TCON_FLAG_RESOLVE_BENEATH;
-		flags |= O_RESOLVE_BENEATH;
-
-		return SMB_VFS_NEXT_OPENAT(handle, handle->conn->connectpath_fsp,
-					   &full_fname, fsp, flags, mode);
-	}
-
-	return SMB_VFS_NEXT_OPENAT(handle,
-				   dirfsp,
-				   smb_fname_in,
-				   fsp, flags, mode);
-}
 #endif /* FREEBSD */
 
 static bool set_acl_parameters(struct vfs_handle_struct *handle,
@@ -1606,16 +1540,11 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 		return -1;
 	}
 
-	config->dp.fd = -1;
-
 	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
 	if (ret < 0) {
 		TALLOC_FREE(config);
 		return ret;
 	}
-
-	config->use_resolve_beneath = lp_parm_bool(SNUM(handle->conn),
-			"ixnas", "use_resolve_beneath", false);
 
 	/*
 	 * Ensure other alternate methods of mapping dosmodes are disabled.
@@ -1646,12 +1575,17 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 		}
 		lp_do_parameter(SNUM(handle->conn), "kernel dosmodes", "yes");
 	}
+
 	config->dirent_optimization = lp_parm_bool(SNUM(handle->conn),
 		"ixnas", "dirent_optimization", false);
 
 	if (config->dirent_optimization) {
+		DBG_INFO("Enabling dirent optimizations\n");
 		config->dirent_pool = talloc_pool(config, 4 * sizeof(bsd_dirent_t));
 		config->fake_ctime = lp_fake_directory_create_times(SNUM(handle->conn));
+		config->fhc.enabled = lp_parm_bool(SNUM(handle->conn),
+			"ixnas", "fhandle_cache_enabled", true);
+		config->dp.fd = -1;
 	}
 
 	ok = set_acl_parameters(handle, config);
@@ -1743,6 +1677,51 @@ static int get_dirent_pathref(bsd_dirent_t *bd,
 	return 0;
 }
 
+static bool cache_pathref(TALLOC_CTX *ctx, fhandle_cache_t *fhc, int fd, SMB_STRUCT_STAT *sbuf)
+{
+	DATA_BLOB value;
+	fhandle_t fh;
+	int ret;
+
+	struct file_id fid = (struct file_id) {
+		.devid = sbuf->st_ex_dev,
+		.inode = sbuf->st_ex_ino,
+		.extid = sbuf->st_ex_gen,
+	};
+
+	DATA_BLOB key = (DATA_BLOB) {
+		.data = (uint8_t *)&fid,
+		.length = sizeof(struct file_id)
+	};
+
+	if (!fhc->enabled) {
+		return true;
+	}
+
+	if (fhc->hdl_cache == NULL) {
+		fhc->hdl_cache = memcache_init(ctx, 0);
+		if (fhc->hdl_cache == NULL) {
+			DBG_ERR("Failed to initialize memcache: %s\n", strerror(errno));
+			return false;
+		}
+	}
+	if (memcache_lookup(fhc->hdl_cache, FDHANDLE_CACHE, key, &value)) {
+		// Already in cache. Lookup op promotes it in MRU
+		return true;
+	}
+
+	ret = getfhat(fd, "", &fh, AT_EMPTY_PATH);
+	if (ret == -1) {
+		DBG_ERR("Failed to convert fd to fhandle_t: %s\n", strerror(errno));
+		return false;
+	}
+
+	value = (DATA_BLOB) { .data = (uint8_t *)&fh, .length = sizeof(fhandle_t) };
+
+	memcache_add(fhc->hdl_cache, FDHANDLE_CACHE, key, value);
+	return true;
+}
+
 static struct dirent *ixnas_readdir(vfs_handle_struct *handle,
 				    struct files_struct *dirfsp,
 				    DIR *dirp,
@@ -1815,6 +1794,7 @@ static struct dirent *ixnas_readdir(vfs_handle_struct *handle,
 		return result;
 	}
 
+	cache_pathref(config, &config->fhc, config->dp.fd, &st);
 	*sbuf = st;
 
 	return result;
@@ -1899,29 +1879,289 @@ static int ixnas_closedir(vfs_handle_struct *handle,
 	return result;
 }
 
-static int ixnas_openat(vfs_handle_struct *handle,
-			const struct files_struct *dirfsp,
-			const struct smb_filename *smb_fname,
-			files_struct *fsp,
-			int flags, mode_t mode)
+static int get_hdl_fd(TALLOC_CTX *mem_ctx, fhandle_t *fh, fhandle_cache_t *fhc)
 {
-	int fd;
+	fhc_ent_t *entry = NULL;
+	int hdl_fd;
+
+	if (fhc->mru != NULL) {
+		for (entry = fhc->mru; entry != NULL; entry = entry->next) {
+			if (memcmp(fh, &entry->fh, sizeof(fhandle_t)) == 0) {
+				break;
+			}
+		}
+	}
+
+	if (entry) {
+		DLIST_PROMOTE(fhc->mru, entry);
+		return entry->fd;
+	}
+
+	become_root();
+	hdl_fd = fhopen(fh, O_PATH);
+	unbecome_root();
+
+	if (hdl_fd == -1) {
+		return -1;
+	}
+
+	if (fhc->mru_size <= 10) {
+		entry = talloc_zero(mem_ctx, fhc_ent_t);
+		if (entry == NULL) {
+			DBG_ERR("Memory allocation failure\n");
+			return hdl_fd;
+		}
+		DLIST_ADD(fhc->mru, entry);
+		fhc->mru_size += 1;
+	} else {
+		entry = DLIST_TAIL(fhc->mru);
+		close(entry->fd);
+	}
+
+	memcpy(&entry->fh, fh, sizeof(fhandle_t));
+	entry->fd = hdl_fd;
+
+	DLIST_PROMOTE(fhc->mru, entry);
+	return hdl_fd;
+}
+
+static int fhandle_cache_lookup(vfs_handle_struct *handle,
+				struct smb_filename *smb_fname,
+				int flags_in,
+				mode_t mode,
+				enum fhandle_cache_op op)
+{
+	struct ixnas_config_data *config = NULL;
+	DATA_BLOB value;
+	int fd, hdl_fd;
+	int flags = flags_in | O_EMPTY_PATH;
+
+	SMB_STRUCT_STAT *sbuf = &smb_fname->st;
+	fhandle_cache_t *fhc;
+
+	struct file_id fid = (struct file_id) {
+		.devid = sbuf->st_ex_dev,
+		.inode = sbuf->st_ex_ino,
+		.extid = sbuf->st_ex_gen,
+	};
+
+	DATA_BLOB key = (DATA_BLOB) {
+		.data = (uint8_t *)&fid,
+		.length = sizeof(struct file_id)
+	};
+
+	if (is_named_stream(smb_fname)) {
+		return -1;
+	}
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct ixnas_config_data,
+				smb_panic("ixnas_fhandle_cach_lookup(): failed to get config"));
+
+	if (!config->dirent_optimization) {
+		return -1;
+	}
+
+	if ((op == FHANDLE_GET_PATHREF) && (config->dp.fd != -1)) {
+		config->fhc.hits += 1;
+		SMB_ASSERT(smb_fname->st.st_ex_ino == config->dp.ino);
+		fd = config->dp.fd;
+		config->dp.fd = -1;
+		return fd;
+	}
+
+	fhc = &config->fhc;
+
+	if (!fhc->enabled || fhc->hdl_cache == NULL) {
+		return -1;
+	}
+
+	if (!memcache_lookup(fhc->hdl_cache, FDHANDLE_CACHE, key, &value)) {
+		config->fhc.misses += 1;
+		return -1;
+	}
+
+	if (op == FHANDLE_IS_CACHED) {
+		config->fhc.hits += 1;
+		return 0;
+	}
+
+	hdl_fd = get_hdl_fd(config, (fhandle_t *)value.data, fhc);
+	if (hdl_fd == -1) {
+		config->fhc.misses += 1;
+		if (errno == ESTALE) {
+			memcache_delete(fhc->hdl_cache, FDHANDLE_CACHE, key);
+		}
+		DBG_ERR("fhopen() failed: %s\n", strerror(errno));
+		return -1;
+	}
+
+	if (op == FHANDLE_GET_PATHREF) {
+		flags |= O_PATH;
+	}
+
+	config->fhc.hits += 1;
+	fd = openat(hdl_fd, "", flags, mode);
+	if (fd == -1) {
+		DBG_ERR("Failed to reopen from handle: %s\n", strerror(errno));
+	}
+
+	return fd;
+}
+
+static NTSTATUS ixnas_parent_pathname(struct vfs_handle_struct *handle,
+				      TALLOC_CTX *mem_ctx,
+				      const struct smb_filename *smb_fname_in,
+				      struct smb_filename **parent_dir_out,
+				      struct smb_filename **atname_out)
+{
+	NTSTATUS status;
+	struct ixnas_config_data *config = NULL;
+	struct smb_filename *parent;
+	int ret;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct ixnas_config_data,
+				smb_panic("ixnas_openat(): failed to get config"));
+
+	status = SMB_VFS_NEXT_PARENT_PATHNAME(handle, mem_ctx, smb_fname_in, parent_dir_out, atname_out);
+	if (!config->dirent_optimization) {
+		return status;
+	}
+
+	if (!NT_STATUS_IS_OK(status) |
+	    ISDOT((*parent_dir_out)->base_name) ||
+	    ISDOTDOT((*parent_dir_out)->base_name)) {
+		*config->lpp.last_parent = '\0';
+		return status;
+	}
+
+	parent = *parent_dir_out;
+
+	if (strcmp(config->lpp.last_parent, parent->base_name) == 0) {
+		memcpy(&parent->st, &config->lpp.st, sizeof(SMB_STRUCT_STAT));
+	} else {
+		ret = vfs_stat(handle->conn, parent);
+		if (ret != 0) {
+			SET_STAT_INVALID(parent->st);
+			return status;
+		}
+		memcpy(&config->lpp.st, &parent->st, sizeof(SMB_STRUCT_STAT));
+		strlcpy(config->lpp.last_parent, parent->base_name, sizeof(config->lpp.last_parent));
+	}
+
+	return status;
+}
+
+static void ixnas_disconnect(vfs_handle_struct *handle)
+{
 	struct ixnas_config_data *config = NULL;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct ixnas_config_data,
 				smb_panic("ixnas_openat(): failed to get config"));
 
-	if ((!config->dirent_optimization) || (!fsp->fsp_flags.is_pathref) ||
-	    (config->dp.fd == -1)) {
-		return resolve_beneath_openat(handle, config, dirfsp, smb_fname, fsp, flags, mode);
+	DBG_INFO("CACHE: hits - %zu, misses - %zu\n", config->fhc.hits, config->fhc.misses);
+}
+
+static ssize_t ixnas_fgetxattr(struct vfs_handle_struct *handle,
+			       struct files_struct *fsp,
+			       const char *name,
+			       void *value,
+			       size_t size)
+{
+	int fd = fsp_get_pathref_fd(fsp);
+	int tmp_fd;
+	ssize_t xattr_size;
+
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
+
+	if (!fsp->fsp_flags.is_pathref) {
+		return fgetxattr(fd, name, value, size);
 	}
 
-	SMB_ASSERT(smb_fname->st.st_ex_ino == config->dp.ino);
+	tmp_fd = openat(fd, "", O_EMPTY_PATH | O_RDONLY);
+	if (tmp_fd == -1) {
+		DBG_ERR("%s: failed to reopen O_PATH descriptor: %s\n",
+			fsp_str_dbg(fsp), strerror(errno));
+		return -1;
+	}
 
-	fd = config->dp.fd;
-	config->dp.fd = -1;
-	return fd;
+	xattr_size = fgetxattr(tmp_fd, name, value, size);
+	close(tmp_fd);
+	return xattr_size;
+}
+
+static ssize_t ixnas_flistxattr(struct vfs_handle_struct *handle, struct files_struct *fsp, char *list, size_t size)
+{
+	int fd = fsp_get_pathref_fd(fsp);
+	int tmp_fd;
+	ssize_t xattr_size;
+
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
+
+	if (!fsp->fsp_flags.is_pathref) {
+		return flistxattr(fd, list, size);
+	}
+
+	tmp_fd = openat(fd, "", O_EMPTY_PATH | O_RDONLY);
+	if (tmp_fd == -1) {
+		DBG_ERR("%s: failed to reopen O_PATH descriptor: %s\n",
+			fsp_str_dbg(fsp), strerror(errno));
+		return -1;
+	}
+
+	xattr_size = flistxattr(tmp_fd, list, size);
+	close(tmp_fd);
+	return xattr_size;
+}
+
+static int ixnas_fremovexattr(struct vfs_handle_struct *handle, struct files_struct *fsp, const char *name)
+{
+	int fd = fsp_get_pathref_fd(fsp);
+	int tmp_fd;
+	int error;
+
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
+
+	if (!fsp->fsp_flags.is_pathref) {
+		return fremovexattr(fd, name);
+	}
+
+	tmp_fd = openat(fd, "", O_EMPTY_PATH | O_RDWR);
+	if (tmp_fd == -1) {
+		DBG_ERR("%s: failed to reopen O_PATH descriptor: %s\n",
+			fsp_str_dbg(fsp), strerror(errno));
+		return -1;
+	}
+
+	error = fremovexattr(tmp_fd, name);
+	close(tmp_fd);
+	return error;
+}
+
+static int ixnas_fsetxattr(struct vfs_handle_struct *handle, struct files_struct *fsp, const char *name, const void *value, size_t size, int flags)
+{
+	int fd = fsp_get_pathref_fd(fsp);
+	int tmp_fd;
+	int error;
+
+	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
+
+	if (!fsp->fsp_flags.is_pathref) {
+		return fsetxattr(fd, name, value, size, flags);
+	}
+
+	tmp_fd = openat(fd, "", O_EMPTY_PATH | O_RDWR);
+	if (tmp_fd == -1) {
+		DBG_ERR("%s: failed to reopen O_PATH descriptor: %s\n",
+			fsp_str_dbg(fsp), strerror(errno));
+		return -1;
+	}
+
+	error = fsetxattr(tmp_fd, name, value, size, flags);
+	close(tmp_fd);
+	return error;
 }
 #endif
 
@@ -1933,7 +2173,7 @@ static struct vfs_fn_pointers ixnas_fns = {
 	/* zfs_acl_enabled = true */
 	.fchmod_fn = ixnas_fchmod,
 #if defined (FREEBSD)
-	.openat_fn = ixnas_openat,
+	.fhandle_cache_lookup_fn = fhandle_cache_lookup,
 	.fntimes_fn = ixnas_ntimes,
 	.file_id_create_fn = ixnas_file_id_create,
 	.fdopendir_fn = ixnas_fdopendir,
@@ -1942,6 +2182,12 @@ static struct vfs_fn_pointers ixnas_fns = {
 	.telldir_fn = ixnas_telldir,
 	.rewind_dir_fn = ixnas_rewinddir,
 	.closedir_fn = ixnas_closedir,
+	.disconnect_fn = ixnas_disconnect,
+	.parent_pathname_fn = ixnas_parent_pathname,
+	.fgetxattr_fn = ixnas_fgetxattr,
+	.flistxattr_fn = ixnas_flistxattr,
+	.fremovexattr_fn = ixnas_fremovexattr,
+	.fsetxattr_fn = ixnas_fsetxattr,
 #endif
 	.fget_nt_acl_fn = ixnas_fget_nt_acl,
 	.fset_nt_acl_fn = ixnas_fset_nt_acl,

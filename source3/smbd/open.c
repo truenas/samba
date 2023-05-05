@@ -650,6 +650,34 @@ static NTSTATUS process_symlink_open(const struct files_struct *dirfsp,
 /****************************************************************************
  Non-widelink open.
 ****************************************************************************/
+static NTSTATUS non_widelink_open_cached(const struct files_struct *dirfsp,
+					 files_struct *fsp,
+					 struct smb_filename *smb_fname,
+					 int flags,
+					 mode_t mode,
+					 unsigned int link_depth)
+{
+	struct connection_struct *conn = fsp->conn;
+	NTSTATUS status;
+	int fd;
+	enum fhandle_cache_op op;
+
+	op = fsp->fsp_flags.is_pathref ? FHANDLE_GET_PATHREF : FHANDLE_GET_DEFAULT;
+
+	fd = SMB_VFS_FHANDLE_CACHE_LOOKUP(conn, smb_fname, flags, mode, op);
+	if (fd == -1) {
+		return non_widelink_open(dirfsp, fsp, smb_fname, flags, mode, link_depth);
+	}
+
+	fsp_set_fd(fsp, fd);
+	fsp->fsp_flags.have_proc_fds = fsp->conn->have_proc_fds;
+	status = vfs_stat_fsp(fsp);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("%s: failed to stat fsp\n", fsp_str_dbg(fsp));
+	}
+
+	return status;
+}
 
 static NTSTATUS non_widelink_open(const struct files_struct *dirfsp,
 			     files_struct *fsp,
@@ -674,8 +702,7 @@ static NTSTATUS non_widelink_open(const struct files_struct *dirfsp,
 	have_opath = true;
 #endif
 
-	if ((!(conn->internal_tcon_flags & TCON_FLAG_RESOLVE_BENEATH) || is_named_stream(smb_fname))
-	     && dirfsp == conn->cwd_fsp) {
+	if (dirfsp == conn->cwd_fsp) {
 		if (fsp->fsp_flags.is_directory) {
 			parent_dir_fname = cp_smb_filename(talloc_tos(), smb_fname);
 			if (parent_dir_fname == NULL) {
@@ -918,7 +945,7 @@ NTSTATUS fd_openat(const struct files_struct *dirfsp,
 	 * Only follow symlinks within a share
 	 * definition.
 	 */
-	status = non_widelink_open(dirfsp, fsp, smb_fname, flags, mode, 0);
+	status = non_widelink_open_cached(dirfsp, fsp, smb_fname, flags, mode, 0);
 	if (!NT_STATUS_IS_OK(status)) {
 		if (NT_STATUS_EQUAL(status, NT_STATUS_TOO_MANY_OPENED_FILES)) {
 			static time_t last_warned = 0L;

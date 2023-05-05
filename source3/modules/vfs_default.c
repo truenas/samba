@@ -702,13 +702,6 @@ static int vfswrap_openat(vfs_handle_struct *handle,
 
 	SMB_ASSERT(!is_named_stream(smb_fname));
 
-#ifdef O_RESOLVE_BENEATH
-	if ((handle->conn->internal_tcon_flags & TCON_FLAG_RESOLVE_BENEATH) &&
-	    !ISDOTDOT(smb_fname->base_name)) {
-		SMB_ASSERT(flags & (O_RESOLVE_BENEATH | O_EMPTY_PATH));
-	}
-#endif
-
 #ifdef O_PATH
 	have_opath = true;
 	if (fsp->fsp_flags.is_pathref) {
@@ -3987,6 +3980,7 @@ static struct vfs_fn_pointers vfs_default_fns = {
 
 	/* File operations */
 
+	.fhandle_cache_lookup_fn = vfs_not_implemented_fhandle_cache_lookup,
 	.openat_fn = vfswrap_openat,
 	.create_file_fn = vfswrap_create_file,
 	.close_fn = vfswrap_close,

@@ -48,6 +48,7 @@ enum memcache_number {
 	VIRUSFILTER_SCAN_RESULTS_CACHE_TALLOC, /* talloc */
 	DFREE_CACHE,
 	ZFS_CACHE,
+	FDHANDLE_CACHE,
 };
 
 /*
