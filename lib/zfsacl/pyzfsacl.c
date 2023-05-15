@@ -1157,6 +1157,8 @@ static PyObject *py_native_data(PyObject *obj, PyObject *args, PyObject *kwargs)
 	return out;
 }
 
+static PyObject *py_acl_inherit(PyObject *obj, PyObject *args, PyObject *kwargs);
+
 static PyMethodDef acl_object_methods[] = {
 	{
 		.ml_name = "setacl",
@@ -1187,6 +1189,12 @@ static PyMethodDef acl_object_methods[] = {
 		.ml_meth = py_native_data,
 		.ml_flags = METH_VARARGS,
 		.ml_doc = "Returns bytes of native ACL"
+	},
+	{
+		.ml_name = "calculate_inherited_acl",
+		.ml_meth = py_acl_inherit,
+		.ml_flags = METH_VARARGS|METH_KEYWORDS,
+		.ml_doc = "calculate an inherited ACL"
 	},
 	{ NULL, NULL, 0, NULL }
 };
@@ -1225,6 +1233,38 @@ static PyTypeObject PyZfsACL = {
 	.tp_iter = (getiterfunc)py_acl_iter,
 	.tp_flags = Py_TPFLAGS_DEFAULT|Py_TPFLAGS_BASETYPE|Py_TPFLAGS_HAVE_ITER,
 };
+
+static PyObject *py_acl_inherit(PyObject *obj, PyObject *args, PyObject *kwargs)
+{
+	py_acl *self = (py_acl *)obj, *out = NULL;
+	bool ok, isdir = true;
+	zfsacl_t parent, result;
+
+	const char *kwnames [] = { "is_dir", NULL };
+
+	ok = PyArg_ParseTupleAndKeywords(
+		args, kwargs, "|bO", kwnames, &isdir
+	);
+
+	if (!ok) {
+		return NULL;
+	}
+
+	parent = self->theacl;
+
+	result = zfsacl_calculate_inherited_acl(parent, NULL, isdir);
+	if (result == NULL) {
+		return NULL;
+	}
+
+	out = (py_acl *)PyObject_CallFunction((PyObject *)&PyZfsACL, NULL);
+	if (out == NULL) {
+		return NULL;
+	}
+
+	out->theacl = result;
+	return (PyObject *)out;
+}
 
 static PyMethodDef acl_module_methods[] = {
 	{ .ml_name = NULL }

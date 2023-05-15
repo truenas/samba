@@ -292,7 +292,7 @@ bld.SAMBA3_MODULE('vfs_zfsacl',
 bld.SAMBA3_MODULE('vfs_winmsa',
                  subsystem='vfs',
                  source='vfs_winmsa.c',
-                 deps='NFS4_ACLS sunacl',
+                 deps='zfsacl',
                  init_function='',
                  internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_winmsa'),
                  enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_winmsa'))
