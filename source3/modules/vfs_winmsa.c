@@ -18,12 +18,9 @@
  */
 
 #include "includes.h"
-#include "system/filesys.h"
 #include "smbd/smbd.h"
-#include "libcli/security/security.h"
-#include "libcli/security/dom_sid.h"
-#include "passdb/lookup_sid.h"
-#include "librpc/gen_ndr/ndr_security.h"
+#include "system/filesys.h"
+#include "zfsacl.h"
 #include <fts.h>
 
 #define MODNAME "winmsa"
@@ -34,136 +31,22 @@ static int vfs_winmsa_debug_level = DBGC_VFS;
 #define DBGC_CLASS vfs_winmsa_debug_level
 #define WINMSA_DBGLVL debuglevel_get_class(vfs_winmsa_debug_level)
 
-static NTSTATUS set_inherited_acl(vfs_handle_struct *handle,
-				  files_struct *parent_fsp,
-				  files_struct *target_fsp)
+static void dump_acl_info(zfsacl_t theacl, const char *fn)
 {
-	NTSTATUS status;
-	TALLOC_CTX *frame = talloc_stackframe();
-	struct security_descriptor *parent_desc = NULL;
-	struct security_descriptor *psd = NULL;
-	size_t size = 0;
-	bool inheritable_components, ok;
-	struct dom_sid sid_owner, sid_group;
-	bool isdir = S_ISDIR(target_fsp->fsp_name->st.st_ex_mode);
+	char *acltext = NULL;
 
-	status = SMB_VFS_FGET_NT_ACL(parent_fsp,
-				     SECINFO_DACL | SECINFO_OWNER | SECINFO_GROUP,
-				     frame, &parent_desc);
-	if (!NT_STATUS_IS_OK(status)) {
-		DBG_ERR("Failed to get NT ACL on [%s]: %s\n",
-			 fsp_str_dbg(parent_fsp), strerror(errno));
-		TALLOC_FREE(frame);
-		return status;
+	if (!CHECK_DEBUGLVL(DBGLVL_DEBUG)) {
+		return;
 	}
 
-	if (WINMSA_DBGLVL > 10) {
-		DBG_DEBUG("parent: %s\n", fsp_str_dbg(parent_fsp));
-		NDR_PRINT_DEBUG(security_descriptor, parent_desc);
+	acltext = zfsacl_to_text(theacl);
+	if (acltext == NULL) {
+		DBG_ERR("zfsacl_to_text() failed: %s\n", strerror(errno));
+		return;
 	}
 
-	ok = sd_has_inheritable_components(parent_desc, true);
-	if (!ok) {
-		TALLOC_FREE(frame);
-		/* Nothing to inherit and not setting owner. */
-		DBG_ERR("Parent ACL in destination directory [%s] has no inheritable "
-			"components. Maintaining ACL from source.",
-			fsp_str_dbg(parent_fsp));
-		return NT_STATUS_OK;
-	}
-
-	uid_to_sid(&sid_owner, target_fsp->fsp_name->st.st_ex_uid);
-	gid_to_sid(&sid_group, target_fsp->fsp_name->st.st_ex_gid);
-
-	status = se_create_child_secdesc(frame,
-					 &psd,
-					 &size,
-					 parent_desc,
-					 &sid_owner,
-					 &sid_group,
-					 isdir);
-	if (!NT_STATUS_IS_OK(status)) {
-			DBG_ERR("Failed to create child secdesc\n");
-			TALLOC_FREE(frame);
-			return status;
-	}
-
-	if (WINMSA_DBGLVL > 10) {
-		DBG_DEBUG("ACL to set on [%s]\n", fsp_str_dbg(target_fsp));
-		NDR_PRINT_DEBUG(security_descriptor, psd);
-	}
-
-	status = SMB_VFS_FSET_NT_ACL(target_fsp,
-				     SECINFO_DACL,
-				     psd);
-
-	TALLOC_FREE(frame);
-	return status;
-}
-
-static NTSTATUS generate_synthetic_fsp(vfs_handle_struct *handle,
-				       files_struct *dirfsp,
-				       FTSENT *target,
-				       files_struct **fsp_out)
-{
-	NTSTATUS status;
-	struct smb_filename tmp_fname;
-	files_struct *fsp = NULL;
-	int fd;
-	char tp[PATH_MAX] = {0};
-	size_t dirfsp_offset = strlen(dirfsp->fsp_name->base_name) + 1;
-#ifdef O_RESOLVE_BENEATH
-	int flags = O_RESOLVE_BENEATH;
-#else
-	smb_panic("WINMSA IS NOT SUPPORTED ON THIS PLATFORM\n");
-#endif
-	mode_t mode = 0;
-
-	SMB_ASSERT(sizeof(tp) > target->fts_pathlen);
-	strlcpy(tp, target->fts_path + dirfsp_offset, target->fts_pathlen - dirfsp_offset + 1);
-
-	tmp_fname = (struct smb_filename) {
-		.base_name = tp,
-	};
-
-	tmp_fname.st = (SMB_STRUCT_STAT) {
-		.st_ex_mode = target->fts_statp->st_mode,
-		.st_ex_nlink = target->fts_statp->st_nlink,
-		.st_ex_uid = target->fts_statp->st_uid,
-		.st_ex_gid = target->fts_statp->st_gid,
-		.st_ex_dev = target->fts_statp->st_dev,
-		.st_ex_ino = target->fts_statp->st_ino,
-		.st_ex_size = target->fts_statp->st_size,
-	};
-
-	status = create_internal_fsp(handle->conn, &tmp_fname, &fsp);
-	if (!NT_STATUS_IS_OK(status)) {
-		DBG_ERR("Failed to create internal FSP for %s: %s\n",
-			smb_fname_str_dbg(&tmp_fname), nt_errstr(status));
-		return status;
-	}
-
-	if (S_ISDIR(tmp_fname.st.st_ex_mode)) {
-		flags |= O_DIRECTORY;
-		fsp->fsp_flags.is_directory = true;
-		mode = (0777 & lp_directory_mask(SNUM(handle->conn)));
-	} else {
-		flags |= O_RDWR;
-		mode = (0777 & lp_create_mask(SNUM(handle->conn)));
-	}
-
-	fd = SMB_VFS_OPENAT(handle->conn, dirfsp, &tmp_fname, fsp, flags, mode);
-	if (fd == -1) {
-		DBG_ERR("%s: openat failed: %s\n", smb_fname_str_dbg(&tmp_fname), strerror(errno));
-		file_free(NULL, fsp);
-		return map_nt_error_from_unix(errno);
-	}
-
-	fsp->fsp_flags.is_pathref = false;
-	fsp_set_fd(fsp, fd);
-
-	*fsp_out = fsp;
-	return NT_STATUS_OK;
+	DBG_ERR("%s():\n%s\n", fn, acltext);
+	free(acltext);
 }
 
 static bool must_inherit(vfs_handle_struct *handle,
@@ -183,54 +66,68 @@ static bool must_inherit(vfs_handle_struct *handle,
 	return true;
 }
 
-static int handle_file(vfs_handle_struct *handle,
-		       FTS *ftsp,  files_struct *dirfsp,
-		       FTSENT *entry)
+static bool _inherit_acl(int parent_fd,
+			 char *victim,
+			 ino_t ino,
+			 bool isdir,
+			 const char *location)
 {
-	struct smb_filename *tmp_fname = NULL;
-	files_struct *parent = NULL, *target = NULL;
-	int error;
-	NTSTATUS status;
+	zfsacl_t parent, payload;
+	int flags = isdir ? O_DIRECTORY : O_RDWR;
 	struct stat st;
+	int fd;
 
-	DBG_INFO("%s: processing fts entry\n", entry->fts_path);
-
-	if (entry->fts_level != FTS_ROOTLEVEL) {
-		status = generate_synthetic_fsp(handle, dirfsp, entry->fts_parent, &parent);
-		if (!NT_STATUS_IS_OK(status)) {
-			DBG_ERR("%s: failed to open parent: %s\n", entry->fts_path, strerror(errno));
-			return -1;
-		}
+	if (parent_fd == AT_FDCWD) {
+		parent = zfsacl_get_file(".", ZFSACL_BRAND_NFSV4);
 	} else {
-		parent = dirfsp;
+		parent = zfsacl_get_fd(parent_fd, ZFSACL_BRAND_NFSV4);
 	}
 
-	status = generate_synthetic_fsp(handle, dirfsp, entry, &target);
-	if (!NT_STATUS_IS_OK(status)) {
-		DBG_ERR("%s: failed to open target: %s\n", entry->fts_path, strerror(errno));
-		fd_close(parent);
-		file_free(NULL, parent);
-		return -1;
+	if (parent == NULL) {
+		return false;
 	}
 
+	DBG_DEBUG("Printing ACL for parent path\n");
+	dump_acl_info(parent, location);
 
-	status = set_inherited_acl(handle, parent, target);
+	payload = zfsacl_calculate_inherited_acl(parent, NULL, isdir);
+	zfsacl_free(&parent);
 
-	if (entry->fts_level != FTS_ROOTLEVEL) {
-		fd_close(parent);
-		file_free(NULL, parent);
+	if (payload == NULL) {
+		DBG_ERR("zfsacl_calculate_inherited_acl() failed: %s\n",
+			strerror(errno));
+		return false;
 	}
 
-	fd_close(target);
-	file_free(NULL, target);
+	DBG_DEBUG("Calculated ACL to set on %s\n", victim);
+	dump_acl_info(payload, location);
 
-	if (!NT_STATUS_IS_OK(status)) {
-		DBG_ERR("%s: set_inherited_acl() failed: %s\n", entry->fts_path, nt_errstr(status));
-		return -1;
+	fd = openat(parent_fd, victim, flags | O_NOFOLLOW);
+	if (fd == -1) {
+		DBG_ERR("%s: open() failed: %s\n", victim, strerror(errno));
+		return false;
 	}
 
-	return 0;
+	if (fstat(fd, &st)) {
+		DBG_ERR("%s: fstat() failed: %s\n", victim, strerror(errno));
+		close(fd);
+		return false;
+	}
+
+	SMB_ASSERT(ino == st.st_ino);
+
+	if (!zfsacl_set_fd(fd, payload)) {
+		DBG_ERR("%s: zfsacl_set_fd() failed: %s\n", victim, strerror(errno));
+		close(fd);
+		return false;
+	}
+
+	close(fd);
+	return true;
 }
+
+#define	inherit_acl(parent_fd, victim, ino, isdir) \
+	_inherit_acl(parent_fd, victim, ino, isdir, __location__)
 
 static int do_fts_walk(vfs_handle_struct *handle,
 		       files_struct *dstfsp,
@@ -238,9 +135,11 @@ static int do_fts_walk(vfs_handle_struct *handle,
 {
 	FTS *ftsp = NULL;
 	FTSENT *entry = NULL;
-	struct smb_filename *smb_fname = NULL;
 	char *paths[2] = { NULL, NULL};
 	int error = 0;
+	bool ok;
+	struct stat *pst = NULL;
+	struct smb_filename *smb_fname = NULL;
 
 	smb_fname = full_path_from_dirfsp_atname(talloc_tos(),
 						 dstfsp,
@@ -253,25 +152,31 @@ static int do_fts_walk(vfs_handle_struct *handle,
 
 	paths[0] = smb_fname->base_name;
 
-	ftsp = fts_open(paths, (FTS_PHYSICAL | FTS_NOCHDIR), NULL);
+	ftsp = fts_open(paths, (FTS_PHYSICAL), NULL);
 	if (ftsp == NULL) {
 		DBG_ERR("%s: fts_open() failed: %s\n",
-			smb_fname_str_dbg(smb_fname), strerror(errno));
+			fsp_str_dbg(dstfsp), strerror(errno));
 		TALLOC_FREE(smb_fname);
 		return -1;
 	}
 
-	DBG_INFO("%s: fts_open() succeeded\n", smb_fname_str_dbg(smb_fname));
 	while ((entry = fts_read(ftsp)) != NULL) {
+		if (entry->fts_level == FTS_ROOTLEVEL) {
+			continue;
+		}
 		switch(entry->fts_info) {
 		case FTS_D:
 		case FTS_F:
-			error += handle_file(handle, ftsp, dstfsp, entry);
+			pst = entry->fts_statp;
+			if (!inherit_acl(AT_FDCWD, entry->fts_accpath,
+			    pst->st_ino, S_ISDIR(pst->st_mode))) {
+				error++;
+			}
 			break;
 		case FTS_ERR:
 			DBG_ERR("fts_read() [%s]: %s\n",
 				entry->fts_path, strerror(entry->fts_errno));
-			error += entry->fts_errno;
+			error ++;
 			break;
 		}
 	}
@@ -288,11 +193,8 @@ static int winmsa_renameat(vfs_handle_struct *handle,
 			   const struct smb_filename *dst)
 {
 
-	int error = 0;
+	int error = 0, tmpfd;
 	bool do_inherit;
-	NTSTATUS status;
-	struct stat st;
-	files_struct *tmp_fsp = NULL;
 
 	DBG_INFO("renaming %s %s -> %s %s\n",
 		 fsp_str_dbg(srcfsp), smb_fname_str_dbg(src),
@@ -329,47 +231,23 @@ static int winmsa_renameat(vfs_handle_struct *handle,
 		return 0;
 	}
 
+	tmpfd = openat(fsp_get_pathref_fd(dstfsp), "", O_RDONLY | O_EMPTY_PATH);
+	if (tmpfd == -1) {
+		DBG_ERR("%s: failed to reopen fd: %s\n",
+			fsp_str_dbg(dstfsp), strerror(errno));
+		return 0;
+	}
+
+	if (!inherit_acl(tmpfd, dst->base_name, src->st.st_ex_ino, S_ISDIR(src->st.st_ex_mode))) {
+		DBG_ERR("%s: failed to inherit acl: %s\n", smb_fname_str_dbg(dst), strerror(errno));
+	}
+	close(tmpfd);
+
 	if (S_ISDIR(src->st.st_ex_mode)) {
 		error = do_fts_walk(handle, dstfsp, dst);
 		if (error) {
 			DBG_ERR("%s, %s: fts_walk() failed: %s\n",
 				fsp_str_dbg(dstfsp), smb_fname_str_dbg(dst), strerror(errno));
-			return 0;
-		}
-	} else {
-		files_struct *tmp_fsp = NULL;
-		struct stat st = {
-			.st_uid = src->st.st_ex_uid,
-			.st_gid = src->st.st_ex_gid,
-			.st_mode = src->st.st_ex_mode,
-			.st_nlink = src->st.st_ex_nlink,
-			.st_ino = src->st.st_ex_ino,
-			.st_dev = src->st.st_ex_dev,
-			.st_size = src->st.st_ex_size,
-		};
-
-		FTSENT fake = (FTSENT){
-			.fts_path = dst->base_name,
-			.fts_pathlen = strlen(dst->base_name),
-			.fts_statp = &st,
-		};
-
-
-		status = generate_synthetic_fsp(handle, dstfsp, &fake, &tmp_fsp);
-		if (!NT_STATUS_IS_OK(status)) {
-			DBG_ERR("%s: failed to create temporary open: %s\n",
-				fake.fts_path, nt_errstr(status));
-			return 0;
-		}
-
-		status = set_inherited_acl(handle, dstfsp, tmp_fsp);
-		fd_close(tmp_fsp);
-		file_free(NULL, tmp_fsp);
-
-		if (!NT_STATUS_IS_OK(status)) {
-			DBG_ERR("%s: set_inherited_acl() failed: %s\n",
-				fake.fts_path, nt_errstr(status));
-			return 0;
 		}
 	}
 
