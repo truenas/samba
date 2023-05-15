@@ -37,11 +37,12 @@ def configure(conf):
 
 def build(bld):
     bld.RECURSE('lib/replace')
+    SRC = 'zfsacl_impl_common.c'
 
     if not bld.CHECK_HEADERS('sunacl.h'):
-        SRC = 'zfsacl_impl_linux.c'
+        SRC += ' zfsacl_impl_linux.c'
     else:
-        SRC = 'zfsacl_impl_freebsd.c'
+        SRC += ' zfsacl_impl_freebsd.c'
 
     zfsacl_cflags = ''
     if bld.CONFIG_SET('FREEBSD'):
