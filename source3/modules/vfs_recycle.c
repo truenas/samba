@@ -51,6 +51,7 @@ struct recycle_config_data {
 	size_t bin_array_len;
 	size_t next_entry;
 	bool preserve_acl;
+	bool busy;
 	char *repository;
 	mode_t mode;
 };
@@ -873,12 +874,14 @@ static int recycle_unlinkat(vfs_handle_struct *handle,
 	return ret;
 }
 
-static int recycle_chdir(vfs_handle_struct *handle,
-			 const struct smb_filename *smb_fname)
+static int recycle_openat(vfs_handle_struct *handle,
+			  const struct files_struct *dirfsp,
+			  const struct smb_filename *smb_fname,
+			  files_struct *fsp,
+			  int flags,
+			  mode_t mode)
 {
 	struct recycle_config_data *config = NULL;
-	files_struct *tmp_dirfsp = NULL;
-	NTSTATUS status;
 	int ret;
 	bool ok;
 
@@ -886,33 +889,23 @@ static int recycle_chdir(vfs_handle_struct *handle,
 				struct recycle_config_data,
 				return -1);
 
-	ret = SMB_VFS_NEXT_CHDIR(handle, smb_fname);
+	ret = SMB_VFS_NEXT_OPENAT(handle, dirfsp, smb_fname, fsp, flags, mode);
 	if ((ret == -1) ||
 	    (config->bins[0] != NULL) ||
+	    (config->busy) ||
 	    (strcmp(smb_fname->base_name, "/") == 0)) {
 		return ret;
 	}
 
-	SMB_ASSERT(strcmp(handle->conn->connectpath, smb_fname->base_name) == 0);
+	config->busy = true;
 
-	status = create_internal_fsp(handle->conn, smb_fname, &tmp_dirfsp);
-	if (!NT_STATUS_IS_OK(status)) {
-		DBG_ERR("Failed to create internal FSP for %s: %s\n",
-			handle->conn->connectpath, nt_errstr(status));
-		return -1;
-	}
-	tmp_dirfsp->fsp_flags.is_pathref = true;
-	tmp_dirfsp->fsp_flags.is_directory = true;
-	fsp_set_fd(tmp_dirfsp, AT_FDCWD);
-
-	ok = make_new_bin(handle, config, tmp_dirfsp, handle->conn->connectpath);
+	ok = make_new_bin(handle, config, handle->conn->connectpath_fsp, handle->conn->connectpath);
 	if (!ok) {
 		DBG_ERR("%s: add to pathrefs failed\n", handle->conn->connectpath);
 		ret = -1;
 	}
 
-	fd_close(tmp_dirfsp);
-	file_free(NULL, tmp_dirfsp);
+	config->busy = false;
 	return ret;
 }
 
@@ -979,7 +972,7 @@ static int recycle_connect(struct vfs_handle_struct *handle,
 
 static struct vfs_fn_pointers vfs_recycle_fns = {
 	.unlinkat_fn = recycle_unlinkat,
-	.chdir_fn = recycle_chdir,
+	.openat_fn = recycle_openat,
 	.connect_fn = recycle_connect
 };
 

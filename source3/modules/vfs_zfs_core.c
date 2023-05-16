@@ -376,9 +376,9 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 		DBG_ERR("get_syntehntic_fsp() failed: %s\n", strerror(errno));
 		return false;
 	}
-	idx--;
 
-	for (; idx != 0; idx--) {
+	while (idx > 0) {
+		idx--;
 		ds = config->created[idx];
 		struct files_struct *c_fsp = NULL;
 		NTSTATUS status;
@@ -529,8 +529,12 @@ static int set_base_user_quota(vfs_handle_struct *handle,
 	return ret;
 }
 
-static int zfs_core_chdir(vfs_handle_struct *handle,
-			  const struct smb_filename *smb_fname)
+static int zfs_core_openat(vfs_handle_struct *handle,
+			   const struct files_struct *dirfsp,
+			   const struct smb_filename *smb_fname,
+			   files_struct *fsp,
+			   int flags,
+			   mode_t mode)
 {
 	struct zfs_core_config_data *config = NULL;
 
@@ -550,7 +554,7 @@ static int zfs_core_chdir(vfs_handle_struct *handle,
 
 		lp_do_parameter(
 			SNUM(handle->conn),
-			"inherit owner", "window and unix"
+			"inherit owner", "yes"
 		);
 
 		lp_do_parameter(
@@ -571,7 +575,7 @@ static int zfs_core_chdir(vfs_handle_struct *handle,
 		case INHERIT_OWNER_WINDOWS_AND_UNIX:
 			lp_do_parameter(
 				SNUM(handle->conn),
-				"inherit owner", "window and unix"
+				"inherit owner", "yes"
 			);
 			break;
 		case INHERIT_OWNER_UNIX_ONLY:
@@ -597,7 +601,7 @@ static int zfs_core_chdir(vfs_handle_struct *handle,
 
 	config->checked = true;
 
-	return SMB_VFS_NEXT_CHDIR(handle, smb_fname);
+	return SMB_VFS_NEXT_OPENAT(handle, dirfsp, smb_fname, fsp, flags, mode);
 }
 
 /*
@@ -754,7 +758,7 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 
 static struct vfs_fn_pointers zfs_core_fns = {
 	.fs_capabilities_fn = zfs_core_fs_capabilities,
-	.chdir_fn = zfs_core_chdir,
+	.openat_fn = zfs_core_openat,
 	.connect_fn = zfs_core_connect,
 	.renameat_fn = zfs_core_renameat,
 	.get_quota_fn = zfs_core_get_quota,
