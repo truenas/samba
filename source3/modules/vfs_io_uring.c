@@ -483,6 +483,8 @@ static void vfs_io_uring_pread_submit(struct vfs_io_uring_pread_state *state)
 			    fsp_get_io_fd(state->fsp),
 			    &state->iov, 1,
 			    state->offset);
+
+	io_uring_sqe_set_flags(&state->ur.sqe, IOSQE_ASYNC);
 	vfs_io_uring_request_submit(&state->ur);
 }
 
