@@ -51,7 +51,8 @@ struct recycle_config_data {
 	size_t bin_array_len;
 	size_t next_entry;
 	bool preserve_acl;
-	bool busy;
+	bool checked;
+	bool disabled;
 	char *repository;
 	mode_t mode;
 };
@@ -256,6 +257,11 @@ static recycle_bin *get_recycle_bin(vfs_handle_struct *handle,
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct recycle_config_data,
 				return NULL);
+
+	if (config->disabled) {
+		errno = EACCES;
+		return NULL;
+	}
 
 	for (thebin = config->bins[i]; thebin; thebin = config->bins[i++]) {
 		SMB_STRUCT_STAT sbuf = thebin->mnt_path_ref->st;
@@ -695,7 +701,8 @@ static int recycle_unlink_internal(vfs_handle_struct *handle,
 
 	the_bin = get_recycle_bin(handle, smb_fname);
 	if (the_bin == NULL) {
-		DBG_ERR("Failed to get recycle bin for file\n");
+		DBG_ERR("%s: failed to get recycle bin for file: %s\n",
+			smb_fname_str_dbg(smb_fname), strerror(errno));
 		goto done;
 	}
 	repository = the_bin->recycle_path;
@@ -892,20 +899,26 @@ static int recycle_openat(vfs_handle_struct *handle,
 	ret = SMB_VFS_NEXT_OPENAT(handle, dirfsp, smb_fname, fsp, flags, mode);
 	if ((ret == -1) ||
 	    (config->bins[0] != NULL) ||
-	    (config->busy) ||
+	    (config->checked) ||
 	    (strcmp(smb_fname->base_name, "/") == 0)) {
 		return ret;
 	}
 
-	config->busy = true;
+	config->checked = true;
 
 	ok = make_new_bin(handle, config, handle->conn->connectpath_fsp, handle->conn->connectpath);
 	if (!ok) {
-		DBG_ERR("%s: add to pathrefs failed\n", handle->conn->connectpath);
-		ret = -1;
+		if ((errno == EACCES) || (errno == EROFS)) {
+			DBG_INFO("%s: failed to generate recycle bin: %s\n",
+				 handle->conn->connectpath, strerror(errno));
+			config->disabled = true;
+		} else {
+			DBG_ERR("%s: failed to generate recycle bin: %s\n",
+				handle->conn->connectpath, strerror(errno));
+			ret = -1;
+		}
 	}
 
-	config->busy = false;
 	return ret;
 }
 
