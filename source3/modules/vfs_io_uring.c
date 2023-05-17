@@ -48,6 +48,10 @@ struct open_how;
 #include "smbprofile.h"
 #include <liburing.h>
 
+#define	IO_URING_ASYNC_READ	0x01
+#define	IO_URING_ASYNC_WRITE	0x02
+#define	IO_URING_ASYNC_FSYNC	0x04
+
 struct vfs_io_uring_request;
 
 struct vfs_io_uring_config {
@@ -57,6 +61,7 @@ struct vfs_io_uring_config {
 	bool busy;
 	/* recursion guard. See comment above vfs_io_uring_queue_run() */
 	bool need_retry;
+	int async_ops;
 	struct vfs_io_uring_request *queue;
 	struct vfs_io_uring_request *pending;
 };
@@ -70,6 +75,7 @@ struct vfs_io_uring_request {
 			      const char *location);
 	struct timespec start_time;
 	struct timespec end_time;
+	unsigned sqe_flags;
 	SMBPROFILE_BYTES_ASYNC_STATE(profile_bytes);
 	struct io_uring_sqe sqe;
 	struct io_uring_cqe cqe;
@@ -180,6 +186,7 @@ static int vfs_io_uring_connect(vfs_handle_struct *handle, const char *service,
 	struct vfs_io_uring_config *config;
 	unsigned num_entries;
 	bool sqpoll;
+	bool force_aio_fsync, force_aio_read, force_aio_write;
 	unsigned flags = 0;
 
 	config = talloc_zero(handle->conn, struct vfs_io_uring_config);
@@ -209,6 +216,30 @@ static int vfs_io_uring_connect(vfs_handle_struct *handle, const char *service,
 			     false);
 	if (sqpoll) {
 		flags |= IORING_SETUP_SQPOLL;
+	}
+
+	force_aio_fsync = lp_parm_bool(SNUM(handle->conn),
+				       "io_uring",
+				       "iosqe_async_fsync",
+				       false);
+	if (force_aio_fsync) {
+		config->async_ops |= IO_URING_ASYNC_FSYNC;
+	}
+
+	force_aio_read = lp_parm_bool(SNUM(handle->conn),
+				      "io_uring",
+				      "iosqe_async_read",
+				      false);
+	if (force_aio_read) {
+		config->async_ops |= IO_URING_ASYNC_READ;
+	}
+
+	force_aio_write = lp_parm_bool(SNUM(handle->conn),
+				       "io_uring",
+				       "iosqe_async_write",
+				       false);
+	if (force_aio_write) {
+		config->async_ops |= IO_URING_ASYNC_WRITE;
 	}
 
 	ret = io_uring_queue_init(num_entries, &config->uring, flags);
@@ -394,6 +425,9 @@ static void vfs_io_uring_request_submit(struct vfs_io_uring_request *cur)
 {
 	struct vfs_io_uring_config *config = cur->config;
 
+	if (cur->sqe_flags) {
+		io_uring_sqe_set_flags(&cur->sqe, cur->sqe_flags);
+	}
 	io_uring_sqe_set_data(&cur->sqe, cur);
 	DLIST_ADD_END(config->queue, cur);
 	cur->list_head = &config->queue;
@@ -448,6 +482,9 @@ static struct tevent_req *vfs_io_uring_pread_send(struct vfs_handle_struct *hand
 				struct vfs_io_uring_pread_state);
 	if (req == NULL) {
 		return NULL;
+	}
+	if (config->async_ops & IO_URING_ASYNC_READ) {
+		state->ur.sqe_flags |= IOSQE_ASYNC;
 	}
 	state->ur.config = config;
 	state->ur.req = req;
@@ -597,6 +634,9 @@ static struct tevent_req *vfs_io_uring_pwrite_send(struct vfs_handle_struct *han
 	if (req == NULL) {
 		return NULL;
 	}
+	if (config->async_ops & IO_URING_ASYNC_WRITE) {
+		state->ur.sqe_flags |= IOSQE_ASYNC;
+	}
 	state->ur.config = config;
 	state->ur.req = req;
 	state->ur.completion_fn = vfs_io_uring_pwrite_completion;
@@ -736,6 +776,9 @@ static struct tevent_req *vfs_io_uring_fsync_send(struct vfs_handle_struct *hand
 				struct vfs_io_uring_fsync_state);
 	if (req == NULL) {
 		return NULL;
+	}
+	if (config->async_ops & IO_URING_ASYNC_FSYNC) {
+		state->ur.sqe_flags |= IOSQE_ASYNC;
 	}
 	state->ur.config = config;
 	state->ur.req = req;
