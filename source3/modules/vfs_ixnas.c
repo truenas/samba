@@ -51,6 +51,7 @@ typedef struct fhandle_cache {
 	struct memcache *hdl_cache;
 	size_t hits;
 	size_t misses;
+	size_t max_cache_size;
 	bool enabled;
 } fhandle_cache_t;
 #endif
@@ -1585,7 +1586,13 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 		config->fake_ctime = lp_fake_directory_create_times(SNUM(handle->conn));
 		config->fhc.enabled = lp_parm_bool(SNUM(handle->conn),
 			"ixnas", "fhandle_cache_enabled", true);
+		config->fhc.max_cache_size = lp_parm_int(SNUM(handle->conn),
+			"ixnas", "fhandle_cache_size", 0) * 1024;
 		config->dp.fd = -1;
+		if (config->fhc.max_cache_size) {
+			DBG_INFO("Setting max dirent cache to %zu\n",
+				 config->fhc.max_cache_size);
+		}
 	}
 
 	ok = set_acl_parameters(handle, config);
@@ -1699,7 +1706,7 @@ static bool cache_pathref(TALLOC_CTX *ctx, fhandle_cache_t *fhc, int fd, SMB_STR
 	}
 
 	if (fhc->hdl_cache == NULL) {
-		fhc->hdl_cache = memcache_init(ctx, 0);
+		fhc->hdl_cache = memcache_init(ctx, fhc->max_cache_size);
 		if (fhc->hdl_cache == NULL) {
 			DBG_ERR("Failed to initialize memcache: %s\n", strerror(errno));
 			return false;
