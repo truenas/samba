@@ -366,6 +366,26 @@ struct dom_sid *samdb_result_dom_sid(TALLOC_CTX *mem_ctx, const struct ldb_messa
 }
 
 /*
+  pull a dom_sid structure from a objectSid in a result set.
+*/
+int samdb_result_dom_sid_buf(const struct ldb_message *msg,
+			     const char *attr,
+			     struct dom_sid *sid)
+{
+	ssize_t ret;
+	const struct ldb_val *v = NULL;
+	v = ldb_msg_find_ldb_val(msg, attr);
+	if (v == NULL) {
+		return LDB_ERR_NO_SUCH_ATTRIBUTE;
+	}
+	ret = sid_parse(v->data, v->length, sid);
+	if (ret == -1) {
+		return LDB_ERR_OPERATIONS_ERROR;
+	}
+	return LDB_SUCCESS;
+}
+
+/*
   pull a guid structure from a objectGUID in a result set.
 */
 struct GUID samdb_result_guid(const struct ldb_message *msg, const char *attr)
@@ -4856,6 +4876,10 @@ int dsdb_request_add_controls(struct ldb_request *req, uint32_t dsdb_flags)
 		if (ret != LDB_SUCCESS) {
 			return ret;
 		}
+	}
+
+	if (dsdb_flags & DSDB_MARK_REQ_UNTRUSTED) {
+		ldb_req_mark_untrusted(req);
 	}
 
 	return LDB_SUCCESS;

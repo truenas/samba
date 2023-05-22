@@ -119,6 +119,11 @@ struct ldb_context {
 		struct ldb_extended_match_entry *prev, *next;
 	} *extended_match_rules;
 
+	struct {
+		struct ldb_module *module;
+		ldb_redact_fn callback;
+	} redact;
+
 	/* custom utf8 functions */
 	struct ldb_utf8_fns utf8_fns;
 
@@ -316,6 +321,22 @@ int ldb_match_message(struct ldb_context *ldb,
 		      const struct ldb_message *msg,
 		      const struct ldb_parse_tree *tree,
 		      enum ldb_scope scope, bool *matched);
+
+/*
+  check if the scope matches in a search result
+*/
+int ldb_match_scope(struct ldb_context *ldb,
+		    struct ldb_dn *base,
+		    struct ldb_dn *dn,
+		    enum ldb_scope scope);
+
+/* Reallocate elements to drop any excess capacity. */
+void ldb_msg_shrink_to_fit(struct ldb_message *msg);
+
+/*
+  add the special distinguishedName element
+*/
+int ldb_msg_add_distinguished_name(struct ldb_message *msg);
 
 /**
  * @brief Convert a character to uppercase with ASCII precedence.

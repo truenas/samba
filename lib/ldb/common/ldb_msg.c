@@ -795,6 +795,32 @@ int ldb_msg_element_compare_name(struct ldb_message_element *el1,
 	return ldb_attr_cmp(el1->name, el2->name);
 }
 
+void ldb_msg_element_mark_inaccessible(struct ldb_message_element *el)
+{
+	el->flags |= LDB_FLAG_INTERNAL_INACCESSIBLE_ATTRIBUTE;
+}
+
+bool ldb_msg_element_is_inaccessible(const struct ldb_message_element *el)
+{
+	return (el->flags & LDB_FLAG_INTERNAL_INACCESSIBLE_ATTRIBUTE) != 0;
+}
+
+void ldb_msg_remove_inaccessible(struct ldb_message *msg)
+{
+	unsigned i;
+	unsigned num_del = 0;
+
+	for (i = 0; i < msg->num_elements; ++i) {
+		if (ldb_msg_element_is_inaccessible(&msg->elements[i])) {
+			++num_del;
+		} else if (num_del) {
+			msg->elements[i - num_del] = msg->elements[i];
+		}
+	}
+
+	msg->num_elements -= num_del;
+}
+
 /*
   convenience functions to return common types from a message
   these return the first value if the attribute is multi-valued
@@ -1468,6 +1494,22 @@ void ldb_msg_remove_attr(struct ldb_message *msg, const char *attr)
 
 	while ((el = ldb_msg_find_element(msg, attr)) != NULL) {
 		ldb_msg_remove_element(msg, el);
+	}
+}
+
+/* Reallocate elements to drop any excess capacity. */
+void ldb_msg_shrink_to_fit(struct ldb_message *msg)
+{
+	if (msg->num_elements > 0) {
+		struct ldb_message_element *elements = talloc_realloc(msg,
+								      msg->elements,
+								      struct ldb_message_element,
+								      msg->num_elements);
+		if (elements != NULL) {
+			msg->elements = elements;
+		}
+	} else {
+		TALLOC_FREE(msg->elements);
 	}
 }
 

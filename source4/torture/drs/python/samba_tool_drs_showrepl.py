@@ -50,6 +50,21 @@ class SambaToolDrsShowReplTests(drs_base.DrsBaseTestCase):
     def test_samba_tool_showrepl(self):
         """Tests 'samba-tool drs showrepl' command.
         """
+        nc_list = [self.config_dn, self.domain_dn, self.schema_dn]
+        dns_name = self.ldb_dc1.domain_dns_name()
+
+        # Manually run kcc to create a "Connection" object, so we can find
+        # this for the expected output below.
+        kcc_out = self.check_output("samba-tool drs kcc %s %s" % (self.dc1,
+                                                                  self.cmdline_creds))
+        self.assertIn(b"successful", kcc_out)
+
+        # Run replicate to ensure there are incoming and outgoing partners
+        # exist, so we can expect these in the output below.
+        for nc in nc_list:
+            self._net_drs_replicate(DC=self.dnsname_dc2, fromDC=self.dnsname_dc1, nc_dn=nc, forced=True)
+            self._net_drs_replicate(DC=self.dnsname_dc1, fromDC=self.dnsname_dc2, nc_dn=nc, forced=True)
+
         # Output should be like:
         #      <site-name>/<domain-name>
         #      DSA Options: <hex-options>
@@ -78,23 +93,21 @@ class SambaToolDrsShowReplTests(drs_base.DrsBaseTestCase):
         self.assertEqual(_outbound, ' OUTBOUND NEIGHBORS ')
         self.assertEqual(_conn, ' KCC CONNECTION OBJECTS ')
 
-        self.assertRegexpMatches(header,
-                                 r'^Default-First-Site-Name\\LOCALDC\s+'
-                                 r"DSA Options: %s\s+"
-                                 r"DSA object GUID: %s\s+"
-                                 r"DSA invocationId: %s" %
-                                 (HEX8_RE, GUID_RE, GUID_RE))
+        self.assertRegex(header,
+                         r'^Default-First-Site-Name\\%s\s+'
+                         r"DSA Options: %s\s+"
+                         r"DSA object GUID: %s\s+"
+                         r"DSA invocationId: %s" %
+                         (self.dc1.upper(), HEX8_RE, GUID_RE, GUID_RE))
 
         # We don't assert the DomainDnsZones and ForestDnsZones are
         # there because we don't know that they have been set up yet.
 
-        for p in ['CN=Configuration,DC=samba,DC=example,DC=com',
-                  'DC=samba,DC=example,DC=com',
-                  'CN=Schema,CN=Configuration,DC=samba,DC=example,DC=com']:
-            self.assertRegexpMatches(
+        for p in nc_list:
+            self.assertRegex(
                 inbound,
                 r'%s\n'
-                r'\tDefault-First-Site-Name\\[A-Z]+ via RPC\n'
+                r'\tDefault-First-Site-Name\\[A-Z0-9]+ via RPC\n'
                 r'\t\tDSA object GUID: %s\n'
                 r'\t\tLast attempt @ [^\n]+\n'
                 r'\t\t\d+ consecutive failure\(s\).\n'
@@ -102,10 +115,10 @@ class SambaToolDrsShowReplTests(drs_base.DrsBaseTestCase):
                 r'\n' % (p, GUID_RE),
                 msg="%s inbound missing" % p)
 
-            self.assertRegexpMatches(
+            self.assertRegex(
                 outbound,
                 r'%s\n'
-                r'\tDefault-First-Site-Name\\[A-Z]+ via RPC\n'
+                r'\tDefault-First-Site-Name\\[A-Z0-9]+ via RPC\n'
                 r'\t\tDSA object GUID: %s\n'
                 r'\t\tLast attempt @ [^\n]+\n'
                 r'\t\t\d+ consecutive failure\(s\).\n'
@@ -113,17 +126,18 @@ class SambaToolDrsShowReplTests(drs_base.DrsBaseTestCase):
                 r'\n' % (p, GUID_RE),
                 msg="%s outbound missing" % p)
 
-        self.assertRegexpMatches(conn,
-                                 r'Connection --\n'
-                                 r'\tConnection name: %s\n'
-                                 r'\tEnabled        : TRUE\n'
-                                 r'\tServer DNS name : \w+.samba.example.com\n'
-                                 r'\tServer DN name  : %s'
-                                 r'\n' % (GUID_RE, DN_RE))
+        self.assertRegex(conn,
+                         r'Connection --\n'
+                         r'\tConnection name: %s\n'
+                         r'\tEnabled        : TRUE\n'
+                         r'\tServer DNS name : \w+.%s\n'
+                         r'\tServer DN name  : %s'
+                         r'\n' % (GUID_RE, dns_name, DN_RE))
 
     def test_samba_tool_showrepl_json(self):
         """Tests 'samba-tool drs showrepl --json' command.
         """
+        dns_name = self.ldb_dc1.domain_dns_name()
         out = self.check_output("samba-tool drs showrepl %s %s --json" %
                                 (self.dc1, self.cmdline_creds))
         d = json.loads(get_string(out))
@@ -134,30 +148,29 @@ class SambaToolDrsShowReplTests(drs_base.DrsBaseTestCase):
 
         # dsa
         for k in ["objectGUID", "invocationId"]:
-            self.assertRegexpMatches(d['dsa'][k], '^%s$' % GUID_RE)
+            self.assertRegex(d['dsa'][k], '^%s$' % GUID_RE)
         self.assertTrue(isinstance(d['dsa']["options"], int))
 
         # repsfrom and repsto
         for reps in (d['repsFrom'], d['repsTo']):
             for r in reps:
                 for k in ('NC dn', "NTDS DN"):
-                    self.assertRegexpMatches(r[k], '^%s$' % DN_RE)
+                    self.assertRegex(r[k], '^%s$' % DN_RE)
                 for k in ("last attempt time",
                           "last attempt message",
                           "last success"):
                     self.assertTrue(isinstance(r[k], str))
-                self.assertRegexpMatches(r["DSA objectGUID"], '^%s$' % GUID_RE)
+                self.assertRegex(r["DSA objectGUID"], '^%s$' % GUID_RE)
                 self.assertTrue(isinstance(r["consecutive failures"], int))
 
         # ntdsconnection
         for n in d["NTDSConnections"]:
-            self.assertRegexpMatches(n["dns name"],
-                                     r'^[\w]+\.samba\.example\.com$')
-            self.assertRegexpMatches(n["name"], "^%s$" % GUID_RE)
+            self.assertTrue(n["dns name"].endswith(dns_name))
+            self.assertRegex(n["name"], "^%s$" % GUID_RE)
             self.assertTrue(isinstance(n['enabled'], bool))
             self.assertTrue(isinstance(n['options'], int))
             self.assertTrue(isinstance(n['replicates NC'], list))
-            self.assertRegexpMatches(n["remote DN"], "^%s$" % DN_RE)
+            self.assertRegex(n["remote DN"], "^%s$" % DN_RE)
 
     def _force_all_reps(self, samdb, dc, direction):
         if direction == 'inbound':
@@ -354,7 +367,7 @@ class SambaToolDrsShowReplTests(drs_base.DrsBaseTestCase):
                                                             e.returncode,
                                                             e.msg,
                                                             e.cmd))
-            self.assertRegexpMatches(
+            self.assertRegex(
                 e_stdout,
                 r'result 845[67] '
                 r'\(WERR_DS_DRA_(SINK|SOURCE)_DISABLED\)',
