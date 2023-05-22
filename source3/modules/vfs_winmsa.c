@@ -117,7 +117,7 @@ static bool _inherit_acl(int parent_fd,
 	SMB_ASSERT(ino == st.st_ino);
 
 	if (!zfsacl_set_fd(fd, payload)) {
-		DBG_ERR("%s: zfsacl_set_fd() failed: %s\n", victim, strerror(errno));
+		DBG_INFO("%s: zfsacl_set_fd() failed: %s\n", victim, strerror(errno));
 		close(fd);
 		return false;
 	}
@@ -129,15 +129,14 @@ static bool _inherit_acl(int parent_fd,
 #define	inherit_acl(parent_fd, victim, ino, isdir) \
 	_inherit_acl(parent_fd, victim, ino, isdir, __location__)
 
-static int do_fts_walk(vfs_handle_struct *handle,
-		       files_struct *dstfsp,
-		       const struct smb_filename *dst)
+static bool do_fts_walk(vfs_handle_struct *handle,
+			files_struct *dstfsp,
+			const struct smb_filename *dst)
 {
 	FTS *ftsp = NULL;
 	FTSENT *entry = NULL;
 	char *paths[2] = { NULL, NULL};
-	int error = 0;
-	bool ok;
+	bool ok = true;
 	struct stat *pst = NULL;
 	struct smb_filename *smb_fname = NULL;
 
@@ -160,7 +159,7 @@ static int do_fts_walk(vfs_handle_struct *handle,
 		return -1;
 	}
 
-	while ((entry = fts_read(ftsp)) != NULL) {
+	while (((entry = fts_read(ftsp)) != NULL) && ok) {
 		if (entry->fts_level == FTS_ROOTLEVEL) {
 			continue;
 		}
@@ -168,22 +167,22 @@ static int do_fts_walk(vfs_handle_struct *handle,
 		case FTS_D:
 		case FTS_F:
 			pst = entry->fts_statp;
-			if (!inherit_acl(AT_FDCWD, entry->fts_accpath,
-			    pst->st_ino, S_ISDIR(pst->st_mode))) {
-				error++;
-			}
+			ok = inherit_acl(AT_FDCWD,
+					 entry->fts_accpath,
+					 pst->st_ino,
+					 S_ISDIR(pst->st_mode));
 			break;
 		case FTS_ERR:
 			DBG_ERR("fts_read() [%s]: %s\n",
 				entry->fts_path, strerror(entry->fts_errno));
-			error ++;
+			ok = false;
 			break;
 		}
 	}
 
 	fts_close(ftsp);
 	TALLOC_FREE(smb_fname);
-	return error;
+	return ok;
 }
 
 static int winmsa_renameat(vfs_handle_struct *handle,
@@ -193,8 +192,8 @@ static int winmsa_renameat(vfs_handle_struct *handle,
 			   const struct smb_filename *dst)
 {
 
-	int error = 0, tmpfd;
-	bool do_inherit;
+	int tmpfd, error;
+	bool do_inherit, ok;
 
 	DBG_INFO("renaming %s %s -> %s %s\n",
 		 fsp_str_dbg(srcfsp), smb_fname_str_dbg(src),
@@ -244,10 +243,10 @@ static int winmsa_renameat(vfs_handle_struct *handle,
 	close(tmpfd);
 
 	if (S_ISDIR(src->st.st_ex_mode)) {
-		error = do_fts_walk(handle, dstfsp, dst);
-		if (error) {
-			DBG_ERR("%s, %s: fts_walk() failed: %s\n",
-				fsp_str_dbg(dstfsp), smb_fname_str_dbg(dst), strerror(errno));
+		ok = do_fts_walk(handle, dstfsp, dst);
+		if (!ok) {
+			DBG_INFO("%s, %s: fts_walk() failed: %s\n",
+				 fsp_str_dbg(dstfsp), smb_fname_str_dbg(dst), strerror(errno));
 		}
 	}
 
