@@ -244,6 +244,8 @@ struct dsdb_control_calculated_default_sd {
 	bool specified_sacl:1;
 };
 
+#define DSDB_CONTROL_ACL_READ_OID "1.3.6.1.4.1.7165.4.3.37"
+
 #define DSDB_EXTENDED_REPLICATED_OBJECTS_OID "1.3.6.1.4.1.7165.4.4.1"
 struct dsdb_extended_replicated_object {
 	struct ldb_message *msg;
@@ -369,6 +371,8 @@ struct dsdb_extended_dn_store_format {
 };
 
 #define DSDB_OPAQUE_PARTITION_MODULE_MSG_OPAQUE_NAME "DSDB_OPAQUE_PARTITION_MODULE_MSG"
+
+#define DSDB_FULL_JOIN_REPLICATION_COMPLETED_OPAQUE_NAME "DSDB_FULL_JOIN_REPLICATION_COMPLETED"
 
 #define DSDB_ACL_CHECKS_DIRSYNC_FLAG 0x1
 #define DSDB_SAMDB_MINIMUM_ALLOWED_RID   1000

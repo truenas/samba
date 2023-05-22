@@ -2106,6 +2106,7 @@ sub setup_fileserver_smb1
 [global]
 	client min protocol = CORE
 	server min protocol = LANMAN1
+	check parent directory delete on close = yes
 
 [hidenewfiles]
 	path = $prefix_abs/share
@@ -3403,6 +3404,11 @@ sub provision($$)
 	shadow:mountpoint = $shadow_tstdir
 	shadow:fixinodes = yes
 	smbd async dosmode = yes
+
+[shadow_depot]
+	path = $shadow_shrdir
+	comment = previous versions with streams_depot
+	vfs objects = streams_depot shadow_copy2
 
 [dfq]
 	path = $shrdir/dfree
