@@ -666,6 +666,17 @@ plantestsuite("samba4.blackbox.client_etypes_strong(ad_dc:client)", "ad_dc:clien
 plantestsuite("samba4.blackbox.net_ads_dns(ad_member:local)", "ad_member:local", [os.path.join(bbdir, "test_net_ads_dns.sh"), '$DC_SERVER', '$DC_USERNAME', '$DC_PASSWORD', '$REALM', '$USERNAME', '$PASSWORD'])
 plantestsuite("samba4.blackbox.samba-tool_ntacl(ad_member:local)", "ad_member:local", [os.path.join(bbdir, "test_samba-tool_ntacl.sh"), '$PREFIX', '$DOMSID'])
 
+env = "ad_member:local"
+plantestsuite("samba4.blackbox.net_ads_search_server_P.primary", env,
+              [os.path.join(bbdir, "test_net_ads_search_server.sh"),
+              '$DC_SERVER', '$REALM'])
+plantestsuite("samba4.blackbox.net_ads_search_server_P.trust_e_both", env,
+              [os.path.join(bbdir, "test_net_ads_search_server.sh"),
+              '$TRUST_E_BOTH_SERVER', '$TRUST_E_BOTH_REALM'])
+plantestsuite("samba4.blackbox.net_ads_search_server_P.trust_f_both", env,
+              [os.path.join(bbdir, "test_net_ads_search_server.sh"),
+              '$TRUST_F_BOTH_SERVER', '$TRUST_F_BOTH_REALM'])
+
 if have_gnutls_fips_mode_support:
     plantestsuite("samba4.blackbox.weak_crypto.client", "ad_dc", [os.path.join(bbdir, "test_weak_crypto.sh"), '$SERVER', '$USERNAME', '$PASSWORD', '$REALM', '$DOMAIN', "$PREFIX/ad_dc"])
     plantestsuite("samba4.blackbox.test_weak_disable_ntlmssp_ldap", "ad_member:local", [os.path.join(bbdir, "test_weak_disable_ntlmssp_ldap.sh"),'$DC_USERNAME', '$DC_PASSWORD'])
@@ -840,6 +851,11 @@ for env in ["nt4_dc", "nt4_member", "ad_dc", "ad_member", "chgdcpass", "rodc"]:
         [os.path.join(samba3srcdir, "script/tests/test_wbinfo_sids2xids.sh")])
 
     planpythontestsuite(env + ":local", "samba.tests.ntlm_auth")
+
+plantestsuite(
+    "samba.wbinfo_u_large_ad.(ad_dc:local)",
+    "ad_dc:local",
+    [os.path.join(samba3srcdir, "script/tests/test_wbinfo_u_large_ad.sh")])
 
 for env in ["ktest"]:
     planpythontestsuite(env + ":local", "samba.tests.ntlm_auth_krb5")
@@ -1322,6 +1338,7 @@ for env in ['ad_dc_default:local', 'schema_dc:local']:
 plantestsuite_loadlist("samba4.urgent_replication.python(ad_dc_ntvfs)", "ad_dc_ntvfs:local", [python, os.path.join(DSDB_PYTEST_DIR, "urgent_replication.py"), '$PREFIX_ABS/ad_dc_ntvfs/private/sam.ldb', '$LOADLIST', '$LISTOPT'])
 plantestsuite_loadlist("samba4.ldap.dirsync.python(ad_dc_ntvfs)", "ad_dc_ntvfs", [python, os.path.join(DSDB_PYTEST_DIR, "dirsync.py"), '$SERVER', '-U"$USERNAME%$PASSWORD"', '--workgroup=$DOMAIN', '$LOADLIST', '$LISTOPT'])
 plantestsuite_loadlist("samba4.ldap.match_rules.python", "ad_dc_ntvfs", [python, os.path.join(srcdir(), "lib/ldb-samba/tests/match_rules.py"), '$PREFIX_ABS/ad_dc_ntvfs/private/sam.ldb', '-U"$USERNAME%$PASSWORD"', '--workgroup=$DOMAIN', '$LOADLIST', '$LISTOPT'])
+plantestsuite_loadlist("samba4.ldap.match_rules.python", "ad_dc_ntvfs", [python, os.path.join(srcdir(), "lib/ldb-samba/tests/match_rules_remote.py"), '$SERVER', '-U"$USERNAME%$PASSWORD"', '--workgroup=$DOMAIN', '$LOADLIST', '$LISTOPT'])
 plantestsuite("samba4.ldap.index.python", "none", [python, os.path.join(srcdir(), "lib/ldb-samba/tests/index.py")])
 plantestsuite_loadlist("samba4.ldap.notification.python(ad_dc_ntvfs)", "ad_dc_ntvfs", [python, os.path.join(DSDB_PYTEST_DIR, "notification.py"), '$SERVER', '-U"$USERNAME%$PASSWORD"', '--workgroup=$DOMAIN', '$LOADLIST', '$LISTOPT'])
 plantestsuite_loadlist("samba4.ldap.sites.python(ad_dc_default)", "ad_dc_default", [python, os.path.join(DSDB_PYTEST_DIR, "sites.py"), '$SERVER', '-U"$USERNAME%$PASSWORD"', '--workgroup=$DOMAIN', '$LOADLIST', '$LISTOPT'])
@@ -1417,6 +1434,7 @@ for env in all_fl_envs + ["schema_dc"]:
     plantestsuite("samba4.ldap.possibleInferiors.python(%s)" % env, env, [python, os.path.join(samba4srcdir, "dsdb/samdb/ldb_modules/tests/possibleinferiors.py"), "ldap://$SERVER", '-U"$USERNAME%$PASSWORD"', "-W$DOMAIN"])
     plantestsuite_loadlist("samba4.ldap.secdesc.python(%s)" % env, env, [python, os.path.join(DSDB_PYTEST_DIR, "sec_descriptor.py"), '$SERVER', '-U"$USERNAME%$PASSWORD"', '--workgroup=$DOMAIN', '$LOADLIST', '$LISTOPT'])
     plantestsuite_loadlist("samba4.ldap.acl.python(%s)" % env, env, ["STRICT_CHECKING=0", python, os.path.join(DSDB_PYTEST_DIR, "acl.py"), '$SERVER', '-U"$USERNAME%$PASSWORD"', '--workgroup=$DOMAIN', '$LOADLIST', '$LISTOPT'])
+    plantestsuite_loadlist("samba4.ldap.acl_modify.python(%s)" % env, env, ["STRICT_CHECKING=0", python, os.path.join(DSDB_PYTEST_DIR, "acl_modify.py"), '$SERVER', '-U"$USERNAME%$PASSWORD"', '--workgroup=$DOMAIN', '$LOADLIST', '$LISTOPT'])
 
 for env in all_fl_envs + ["schema_dc", "ad_dc_no_ntlm"]:
     if env != "fl2000dc":
