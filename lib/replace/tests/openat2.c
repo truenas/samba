@@ -125,7 +125,7 @@ static bool open_symlink_nofollow_fail(int dirfd)
 
 int test_openat2_impl(void)
 {
-	int dirfd;
+	int dirfd, ret = -1;
 
 	if (!cleanup()) {
 		fprintf(stderr, "cleanup failed\n");
@@ -148,9 +148,10 @@ int test_openat2_impl(void)
 		goto error_out;
 	}
 	printf("success: openat2_symlink_nofollow_eloop\n");
+	ret = 0;
 
 error_out:
 	close(dirfd);
 	cleanup();
-	return -1;
+	return ret;
 }
