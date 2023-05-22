@@ -840,7 +840,7 @@ static NTSTATUS openat_pathref_fsp_case_insensitive(
 	if (IS_VETO_PATH(dirfsp->conn, smb_fname_rel->base_name)) {
 		DBG_DEBUG("veto files rejecting last component %s\n",
 			  smb_fname_str_dbg(smb_fname_rel));
-		return NT_STATUS_OBJECT_NAME_NOT_FOUND;
+		return NT_STATUS_NETWORK_OPEN_RESTRICTION;
 	}
 
 	status = openat_pathref_fsp(dirfsp, smb_fname_rel);
@@ -906,7 +906,7 @@ static NTSTATUS openat_pathref_fsp_case_insensitive(
 			DBG_DEBUG("veto files rejecting last component %s\n",
 				  smb_fname_str_dbg(smb_fname_rel));
 			TALLOC_FREE(cache_key.data);
-			return NT_STATUS_OBJECT_NAME_NOT_FOUND;
+			return NT_STATUS_NETWORK_OPEN_RESTRICTION;
 		}
 
 		status = openat_pathref_fsp(dirfsp, smb_fname_rel);
@@ -936,7 +936,7 @@ lookup:
 		if (IS_VETO_PATH(dirfsp->conn, smb_fname_rel->base_name)) {
 			DBG_DEBUG("veto files rejecting last component %s\n",
 				smb_fname_str_dbg(smb_fname_rel));
-			return NT_STATUS_OBJECT_NAME_NOT_FOUND;
+			return NT_STATUS_NETWORK_OPEN_RESTRICTION;
 		}
 
 		status = openat_pathref_fsp(dirfsp, smb_fname_rel);
@@ -1153,6 +1153,14 @@ static NTSTATUS filename_convert_dirfsp_nosymlink(
 		char *substitute = NULL;
 		size_t unparsed = 0;
 
+		status = normalize_filename_case(conn, dirname, ucf_flags);
+		if (!NT_STATUS_IS_OK(status)) {
+			DBG_ERR("normalize_filename_case %s failed: %s\n",
+				dirname,
+				nt_errstr(status));
+			goto fail;
+		}
+
 		status = openat_pathref_dirfsp_nosymlink(
 			mem_ctx,
 			conn,
@@ -1341,6 +1349,10 @@ static NTSTATUS filename_convert_dirfsp_nosymlink(
 		goto done;
 	}
 
+	if (NT_STATUS_EQUAL(status, NT_STATUS_NETWORK_OPEN_RESTRICTION)) {
+		/* A vetoed file, pretend it's not there  */
+		status = NT_STATUS_OBJECT_NAME_NOT_FOUND;
+	}
 	if (!NT_STATUS_IS_OK(status)) {
 		goto fail;
 	}
@@ -1412,6 +1424,16 @@ static NTSTATUS filename_convert_dirfsp_nosymlink(
 			status = NT_STATUS_NO_MEMORY;
 			goto fail;
 		}
+		/*
+		 * When open_stream_pathref_fsp() returns
+		 * NT_STATUS_OBJECT_NAME_NOT_FOUND, smb_fname_rel->fsp
+		 * has been set to NULL, so we must free base_fsp separately
+		 * to prevent fd-leaks when opening a stream that doesn't
+		 * exist.
+		 */
+		fd_close(base_fsp);
+		file_free(NULL, base_fsp);
+		base_fsp = NULL;
 		goto done;
 	}
 
@@ -1428,6 +1450,17 @@ done:
 	return NT_STATUS_OK;
 
 fail:
+	/*
+	 * If open_stream_pathref_fsp() returns an error, smb_fname_rel->fsp
+	 * has been set to NULL, so we must free base_fsp separately
+	 * to prevent fd-leaks when opening a stream that doesn't
+	 * exist.
+	 */
+	if (base_fsp != NULL) {
+		fd_close(base_fsp);
+		file_free(NULL, base_fsp);
+		base_fsp = NULL;
+	}
 	TALLOC_FREE(dirname);
 	TALLOC_FREE(smb_dirname);
 	TALLOC_FREE(smb_fname_rel);

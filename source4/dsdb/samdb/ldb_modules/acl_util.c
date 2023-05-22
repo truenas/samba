@@ -97,8 +97,8 @@ int dsdb_module_check_access_on_dn(struct ldb_module *module,
 
 int acl_check_access_on_attribute(struct ldb_module *module,
 				  TALLOC_CTX *mem_ctx,
-				  struct security_descriptor *sd,
-				  struct dom_sid *rp_sid,
+				  const struct security_descriptor *sd,
+				  const struct dom_sid *rp_sid,
 				  uint32_t access_mask,
 				  const struct dsdb_attribute *attr,
 				  const struct dsdb_class *objectclass)
@@ -298,7 +298,7 @@ uint32_t dsdb_request_sd_flags(struct ldb_request *req, bool *explicit)
 
 	sd_control = ldb_request_get_control(req, LDB_CONTROL_SD_FLAGS_OID);
 	if (sd_control != NULL && sd_control->data != NULL) {
-		struct ldb_sd_flags_control *sdctr = (struct ldb_sd_flags_control *)sd_control->data;
+		struct ldb_sd_flags_control *sdctr = talloc_get_type_abort(sd_control->data, struct ldb_sd_flags_control);
 
 		sd_flags = sdctr->secinfo_flags;
 

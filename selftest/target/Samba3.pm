@@ -1974,6 +1974,10 @@ sub setup_fileserver
 	path = $veto_sharedir
 	delete veto files = yes
 
+[veto_files_nohidden]
+	path = $veto_sharedir
+	veto files = /.*/
+
 [veto_files]
 	path = $veto_sharedir
 	veto files = /veto_name*/
@@ -3432,6 +3436,11 @@ sub provision($$)
 
 [streams_xattr]
 	copy = tmp
+	vfs objects = streams_xattr xattr_tdb
+
+[streams_xattr_nostrict]
+	copy = tmp
+	strict rename = no
 	vfs objects = streams_xattr xattr_tdb
 
 [acl_streams_xattr]

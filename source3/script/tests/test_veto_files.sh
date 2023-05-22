@@ -22,12 +22,20 @@ SHAREPATH=${5}
 SMBCLIENT=${6}
 shift 6
 SMBCLIENT="$VALGRIND ${SMBCLIENT}"
+# Used by test_smbclient()
+# shellcheck disable=2034
+smbclient="$VALGRIND ${SMBCLIENT}"
 ADDARGS="$@"
 
 incdir=$(dirname "$0")/../../../testprogs/blackbox
 . "$incdir"/subunit.sh
+. "${incdir}/common_test_fns.inc"
 
 failed=0
+
+TMPDIR=${PREFIX_ABS}/$(basename "${0}")
+mkdir -p "${TMPDIR}" || exit 1
+cd "${TMPDIR}" || exit 1
 
 #
 # Cleanup function.
@@ -41,6 +49,8 @@ do_cleanup()
 		rm -rf "$SHAREPATH/veto_name_dir\"mangle"
 		rm -f "$SHAREPATH/veto_name_file"
 		rm -f "$SHAREPATH/veto_name_file\"mangle"
+		rm -f "${SHAREPATH}/regular_file"
+		rm -f "${SHAREPATH}/.hidden_file"
 	)
 }
 
@@ -51,7 +61,7 @@ smbclient_get_expect_error()
 {
 	filename1="$1"
 	expected_error="$2"
-	tmpfile=$PREFIX/smbclient_interactive_prompt_commands
+	tmpfile=${TMPDIR}/smbclient_interactive_prompt_commands
 	cat >"$tmpfile" <<EOF
 get $filename1 got_file
 quit
@@ -80,6 +90,42 @@ EOF
 	if [ $ret != 0 ]; then
 		printf "%s\n" "$out"
 		printf "failed - should get %s doing \"get %s got_file\"\n" "$expected_error" "$filename1"
+		return 1
+	fi
+}
+
+smbclient_create_expect_error()
+{
+	filename="$1.$$"
+	expected_error="$2"
+	tmpfile=${TMPDIR}/smbclient_interactive_prompt_commands
+	cat >"$tmpfile" <<EOF
+put $tmpfile $filename
+quit
+EOF
+
+	cmd='CLI_FORCE_INTERACTIVE=yes $SMBCLIENT -U$USERNAME%$PASSWORD //$SERVER/veto_files -I$SERVER_IP < $tmpfile 2>&1'
+	eval echo "$cmd"
+	out=$(eval "$cmd")
+	ret=$?
+	rm -f "$tmpfile"
+	rm -f "$SHAREPATH/$filename"
+
+	if [ $ret != 0 ]; then
+		printf "%s\n" "$out"
+		printf "failed accessing veto_files share with error %s\n" "$ret"
+		return 1
+	fi
+
+	if [ "$expected_error" = "NT_STATUS_OK" ]; then
+		printf "%s" "$out" | grep -c "NT_STATUS_" && false
+	else
+		printf "%s" "$out" | grep "$expected_error"
+	fi
+	ret=$?
+	if [ $ret != 0 ]; then
+		printf "%s\n" "$out"
+		printf "failed - should get %s doing \"put %s\"\n" "$expected_error" "$filename"
 		return 1
 	fi
 }
@@ -132,6 +178,35 @@ test_get_veto_file()
 
 	return 0
 }
+
+test_create_veto_file()
+{
+	# Test creating files
+	smbclient_create_expect_error "veto_name_file" "NT_STATUS_OBJECT_NAME_NOT_FOUND" || return 1
+	smbclient_create_expect_error "veto_name_dir/file_inside_dir" "NT_STATUS_OBJECT_PATH_NOT_FOUND" || return 1
+	smbclient_create_expect_error "dir1/veto_name_file" "NT_STATUS_OBJECT_NAME_NOT_FOUND" || return 1
+
+	return 0
+}
+
+do_cleanup
+
+echo "regular_file" > "${SHAREPATH}/regular_file"
+echo "hidden_file" > "${SHAREPATH}/.hidden_file"
+
+test_smbclient "download regular file" \
+	"get regular_file" "//${SERVER}/veto_files_nohidden" \
+	-U"${USERNAME}%${PASSWORD}" ||
+	failed=$((failed + 1))
+rm -f regular_file
+test_smbclient_expect_failure "hidden file can't be downloaded" \
+	"get .hidden_file" "//${SERVER}/veto_files_nohidden" \
+	-U"${USERNAME}%${PASSWORD}" ||
+	failed=$((failed + 1))
+test_smbclient "list files" \
+	"ls" "//${SERVER}/veto_files_nohidden" \
+	-U"${USERNAME}%${PASSWORD}" ||
+	failed=$((failed + 1))
 
 do_cleanup
 
@@ -194,8 +269,11 @@ touch "$SHAREPATH/dir1/dir2/dir3/veto_name_dir\"mangle/file_inside_dir"
 mkdir "$SHAREPATH/dir1/dir2/dir3/veto_name_dir\"mangle/testdir"
 touch "$SHAREPATH/dir1/dir2/dir3/veto_name_dir\"mangle/testdir/file_inside_dir"
 
+testit "create_veto_file" test_create_veto_file || failed=$((failed + 1))
 testit "get_veto_file" test_get_veto_file || failed=$(("$failed" + 1))
 
 do_cleanup
+
+cd "${PREFIX_ABS}" && rm -rf ${TMPDIR}
 
 exit "$failed"

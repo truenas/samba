@@ -1,4 +1,214 @@
                    ==============================
+                   Release Notes for Samba 4.17.8
+                            May 11, 2023
+                   ==============================
+
+
+This is the latest stable release of the Samba 4.17 release series.
+
+
+Changes since 4.17.7
+--------------------
+
+o  Jeremy Allison <jra@samba.org>
+   * BUG 15302: log flood: smbd_calculate_access_mask_fsp: Access denied:
+     message level should be lower.
+   * BUG 15306: Floating point exception (FPE) via cli_pull_send at
+     source3/libsmb/clireadwrite.c.
+
+o  Andrew Bartlett <abartlet@samba.org>
+   * BUG 15328: test_tstream_more_tcp_user_timeout_spin fails intermittently on
+     Rackspace GitLab runners.
+   * BUG 15329: Reduce flapping of ridalloc test.
+   * BUG 15351: large_ldap test is unreliable.
+
+o  Ralph Boehme <slow@samba.org>
+   * BUG 15143: New filename parser doesn't check veto files smb.conf parameter.
+   * BUG 15354: mdssvc may crash when initializing.
+
+o  Volker Lendecke <vl@samba.org>
+   * BUG 15313: Large directory optimization broken for non-lcomp path elements.
+   * BUG 15357: streams_depot fails to create streams.
+   * BUG 15358: shadow_copy2 and streams_depot don't play well together.
+   * BUG 15366: wbinfo -u fails on ad dc with >1000 users.
+
+o  Stefan Metzmacher <metze@samba.org>
+   * BUG 15317: winbindd idmap child contacts the domain controller without a
+     need.
+   * BUG 15318: idmap_autorid may fail to map sids of trusted domains for the
+     first time.
+   * BUG 15319: idmap_hash doesn't use ID_TYPE_BOTH for reverse mappings.
+   * BUG 15323: net ads search -P doesn't work against servers in other domains.
+   * BUG 15338: DS ACEs might be inherited to unrelated object classes.
+   * BUG 15353: Temporary smbXsrv_tcon_global.tdb can't be parsed.
+
+o  Andreas Schneider <asn@samba.org>
+   * BUG 15360: Setting veto files = /.*/ break listing directories.
+
+o  Joseph Sutton <josephsutton@catalyst.net.nz>
+   * BUG 14810: CVE-2020-25720 [SECURITY] Create Child permission should not
+     allow full write to all attributes (additional changes).
+   * BUG 15329: Reduce flapping of ridalloc test.
+
+o  Nathaniel W. Turner <nturner@exagrid.com>
+   * BUG 15325: dsgetdcname: assumes local system uses IPv4.
+
+
+#######################################
+Reporting bugs & Development Discussion
+#######################################
+
+Please discuss this release on the samba-technical mailing list or by
+joining the #samba-technical:matrix.org matrix room, or
+#samba-technical IRC channel on irc.libera.chat.
+
+If you do report problems then please try to send high quality
+feedback. If you don't provide vital information to help us track down
+the problem then you will probably be ignored.  All bug reports should
+be filed under the Samba 4.1 and newer product in the project's Bugzilla
+database (https://bugzilla.samba.org/).
+
+
+======================================================================
+== Our Code, Our Bugs, Our Responsibility.
+== The Samba Team
+======================================================================
+
+
+Release notes for older releases follow:
+----------------------------------------
+                   ==============================
+                   Release Notes for Samba 4.17.7
+                           March 29, 2023
+                   ==============================
+
+
+This is a security release in order to address the following defects:
+
+o CVE-2023-0225: An incomplete access check on dnsHostName allows authenticated
+                 but otherwise unprivileged users to delete this attribute from
+                 any object in the directory.
+                 https://www.samba.org/samba/security/CVE-2023-0225.html
+
+o CVE-2023-0922: The Samba AD DC administration tool, when operating against a
+                 remote LDAP server, will by default send new or reset
+                 passwords over a signed-only connection.
+                 https://www.samba.org/samba/security/CVE-2023-0922.html
+
+o CVE-2023-0614: The fix in 4.6.16, 4.7.9, 4.8.4 and 4.9.7 for CVE-2018-10919
+                 Confidential attribute disclosure via LDAP filters was
+                 insufficient and an attacker may be able to obtain
+                 confidential BitLocker recovery keys from a Samba AD DC.
+                 Installations with such secrets in their Samba AD should
+                 assume they have been obtained and need replacing.
+                 https://www.samba.org/samba/security/CVE-2023-0614.html
+
+
+Changes since 4.17.6
+--------------------
+
+o  Douglas Bagnall <douglas.bagnall@catalyst.net.nz>
+   * BUG 15276: CVE-2023-0225.
+
+o  Andrew Bartlett <abartlet@samba.org>
+   * BUG 15270: CVE-2023-0614.
+   * BUG 15331: ldb wildcard matching makes excessive allocations.
+   * BUG 15332: large_ldap test is inefficient.
+
+o  Rob van der Linde <rob@catalyst.net.nz>
+   * BUG 15315: CVE-2023-0922.
+
+o  Joseph Sutton <josephsutton@catalyst.net.nz>
+   * BUG 14810: CVE-2020-25720 [SECURITY] Create Child permission should not
+     allow full write to all attributes (additional changes).
+   * BUG 15270: CVE-2023-0614.
+   * BUG 15276: CVE-2023-0225.
+
+
+#######################################
+Reporting bugs & Development Discussion
+#######################################
+
+Please discuss this release on the samba-technical mailing list or by
+joining the #samba-technical:matrix.org matrix room, or
+#samba-technical IRC channel on irc.libera.chat.
+
+If you do report problems then please try to send high quality
+feedback. If you don't provide vital information to help us track down
+the problem then you will probably be ignored.  All bug reports should
+be filed under the Samba 4.1 and newer product in the project's Bugzilla
+database (https://bugzilla.samba.org/).
+
+
+======================================================================
+== Our Code, Our Bugs, Our Responsibility.
+== The Samba Team
+======================================================================
+
+
+----------------------------------------------------------------------
+                   ==============================
+                   Release Notes for Samba 4.17.6
+                           March 09, 2023
+                   ==============================
+
+
+This is the latest stable release of the Samba 4.17 release series.
+
+
+Changes since 4.17.5
+--------------------
+
+o  Jeremy Allison <jra@samba.org>
+   * BUG 15314: streams_xattr is creating unexpected locks on folders.
+
+o  Andrew Bartlett <abartlet@samba.org>
+   * BUG 10635: Use of the Azure AD Connect cloud sync tool is now supported for
+     password hash synchronisation, allowing Samba AD Domains to synchronise
+     passwords with this popular cloud environment.
+
+o  Ralph Boehme <slow@samba.org>
+   * BUG 15299: Spotlight doesn't work with latest macOS Ventura.
+
+o  Volker Lendecke <vl@samba.org>
+   * BUG 15310: New samba-dcerpc architecture does not scale gracefully.
+
+o  John Mulligan <jmulligan@redhat.com>
+   * BUG 15307: vfs_ceph incorrectly uses fsp_get_io_fd() instead of
+     fsp_get_pathref_fd() in close and fstat.
+
+o  Noel Power <noel.power@suse.com>
+   * BUG 15293: With clustering enabled samba-bgqd can core dump due to use
+     after free.
+
+o  baixiangcpp <baixiangcpp@gmail.com>
+   * BUG 15311: fd_load() function implicitly closes the fd where it should not.
+
+
+#######################################
+Reporting bugs & Development Discussion
+#######################################
+
+Please discuss this release on the samba-technical mailing list or by
+joining the #samba-technical:matrix.org matrix room, or
+#samba-technical IRC channel on irc.libera.chat.
+
+
+If you do report problems then please try to send high quality
+feedback. If you don't provide vital information to help us track down
+the problem then you will probably be ignored.  All bug reports should
+be filed under the Samba 4.1 and newer product in the project's Bugzilla
+database (https://bugzilla.samba.org/).
+
+
+======================================================================
+== Our Code, Our Bugs, Our Responsibility.
+== The Samba Team
+======================================================================
+
+
+----------------------------------------------------------------------
+                   ==============================
                    Release Notes for Samba 4.17.5
                           January 26, 2023
                    ==============================
@@ -78,8 +288,7 @@ database (https://bugzilla.samba.org/).
 ======================================================================
 
 
-Release notes for older releases follow:
-----------------------------------------
+----------------------------------------------------------------------
                    ==============================
                    Release Notes for Samba 4.17.4
                          December 15, 2022
