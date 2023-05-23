@@ -1713,7 +1713,31 @@ static PyTypeObject PyWbclient = {
 	.tp_flags = Py_TPFLAGS_DEFAULT|Py_TPFLAGS_BASETYPE,
 };
 
+static PyObject *py_validate_sid(PyObject *obj, PyObject *args)
+{
+	wbcErr wbc_status;
+	const char *sid = NULL;
+	struct wbcDomainSid domsid = { 0 };
+
+	if (!PyArg_ParseTuple(args, "s", &sid)) {
+		return NULL;
+	}
+
+	wbc_status = wbcStringToSid(sid, &domsid);
+	if (!WBC_ERROR_IS_OK(wbc_status)) {
+		Py_RETURN_FALSE;
+	}
+
+	Py_RETURN_TRUE;
+}
+
 static PyMethodDef wbclient_module_methods[] = {
+	{
+		.ml_name = "sid_is_valid",
+		.ml_meth = (PyCFunction)py_validate_sid,
+		.ml_flags = METH_VARARGS,
+		.ml_doc = "Validate SID"
+	},
 	{ .ml_name = NULL }
 };
 #define MODULE_DOC "Winbind client python bindings."
