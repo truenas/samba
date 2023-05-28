@@ -290,6 +290,15 @@ static void _vfs_io_uring_queue_run(struct vfs_io_uring_config *config)
 	} else if (ret < 0) {
 		vfs_io_uring_config_destroy(config, ret, __location__);
 		return;
+	} else {
+		/*
+		 * Waiting for page fault debugging to align synchronous behavior
+		 * with asynchronous behavior.
+		 */
+		for (int i=0; i<ret; i++) {
+			struct io_uring_cqe *cqe_temp = NULL;
+			ret = io_uring_wait_cqe(&config->uring, &cqe_temp);
+		}
 	}
 
 	PROFILE_TIMESTAMP(&end_time);
