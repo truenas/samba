@@ -37,6 +37,50 @@ bool aio_write_through_requested(struct aio_extra *aio_ex)
  Create the extended aio struct we must keep around for the lifetime
  of the aio call.
 *****************************************************************************/
+struct aio_pool_link {
+	uint8_t *to_free;
+};
+
+
+static int aio_buffer_destroy(struct aio_pool_link *lnk)
+{
+	TALLOC_FREE(lnk->to_free);
+	return 0;
+}
+
+bool link_aio_buffer(TALLOC_CTX *mem_ctx, DATA_BLOB *buf)
+{
+	struct aio_pool_link *lnk = NULL;
+
+	lnk = talloc_zero(mem_ctx, struct aio_pool_link);
+	if (lnk == NULL) {
+		return false;
+	}
+	lnk->to_free = buf->data;
+	talloc_set_destructor(lnk, aio_buffer_destroy);
+	return true;
+}
+
+bool io_pool_alloc(struct connection_struct *conn,
+		   size_t buflen,
+		   DATA_BLOB *out)
+{
+	DATA_BLOB buf = { 0 };
+	if (conn->io_memory_pool == NULL) {
+		conn->io_memory_pool = talloc_pool(conn, 16 * (1024 * 1024));
+		if (!conn->io_memory_pool) {
+			return false;
+		}
+	}
+
+	buf = data_blob_talloc(conn->io_memory_pool, NULL, buflen);
+	if (buf.data == NULL) {
+		return false;
+	}
+
+	*out = buf;
+	return true;
+}
 
 struct aio_extra *create_aio_extra(TALLOC_CTX *mem_ctx,
 				   files_struct *fsp,
@@ -330,8 +374,8 @@ NTSTATUS schedule_smb2_aio_read(connection_struct *conn,
 	}
 
 	/* Create the out buffer. */
-	*preadbuf = data_blob_talloc(ctx, NULL, smb_maxcnt);
-	if (preadbuf->data == NULL) {
+
+	if (!io_pool_alloc(conn, smb_maxcnt, preadbuf)) {
 		return NT_STATUS_NO_MEMORY;
 	}
 
