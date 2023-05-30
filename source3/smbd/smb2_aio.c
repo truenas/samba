@@ -324,6 +324,8 @@ NTSTATUS schedule_smb2_aio_read(connection_struct *conn,
 	*preadbuf = data_blob_talloc(ctx, NULL, smb_maxcnt);
 	if (preadbuf->data == NULL) {
 		return NT_STATUS_NO_MEMORY;
+	} else {
+		memset(preadbuf->data, 0, preadbuf->length);
 	}
 
 	if (!(aio_ex = create_aio_extra(smbreq->smb2req, fsp, 0))) {
