@@ -55,6 +55,10 @@ struct dcesrv_context;
 bool srv_init_signing(struct smbXsrv_connection *conn);
 
 /* The following definitions come from smbd/aio.c  */
+bool link_aio_buffer(TALLOC_CTX *mem_ctx, DATA_BLOB *buf);
+bool io_pool_alloc(connection_struct *conn,
+		   size_t buflen,
+		   DATA_BLOB *out);
 
 struct aio_extra;
 bool aio_write_through_requested(struct aio_extra *aio_ex);
