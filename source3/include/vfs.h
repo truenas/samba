@@ -735,6 +735,7 @@ typedef struct connection_struct {
 	/* iXsystems additions */
 	enum acl_brand aclbrand;
 	uint32_t internal_tcon_flags;
+	TALLOC_CTX *io_memory_pool;
 	/* end iXsystems additions */
 
 	char *connectpath;

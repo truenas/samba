@@ -575,7 +575,10 @@ static struct tevent_req *smbd_smb2_read_send(TALLOC_CTX *mem_ctx,
 	}
 
 	/* Ok, read into memory. Allocate the out buffer. */
-	state->out_data = data_blob_talloc(state, NULL, in_length);
+	if (!io_pool_alloc(fsp->conn, in_length, &state->out_data)) {
+		smb_panic("memory error");
+	}
+	//state->out_data = data_blob_talloc(state, NULL, in_length);
 	if (in_length > 0 && tevent_req_nomem(state->out_data.data, req)) {
 		return tevent_req_post(req, ev);
 	}
@@ -655,7 +658,10 @@ static NTSTATUS smbd_smb2_read_recv(struct tevent_req *req,
 	}
 
 	*out_data = state->out_data;
-	talloc_steal(mem_ctx, out_data->data);
+	if (!link_aio_buffer(mem_ctx, out_data)) {
+		smb_panic("Failed to link aio buffer\n");
+	}
+
 	*out_remaining = state->out_remaining;
 
 	if (state->out_headers.length > 0) {
