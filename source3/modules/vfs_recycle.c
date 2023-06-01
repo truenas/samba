@@ -52,7 +52,7 @@ struct recycle_config_data {
 	size_t next_entry;
 	bool preserve_acl;
 	bool checked;
-	bool disabled;
+	bool enabled;
 	char *repository;
 	mode_t mode;
 };
@@ -61,14 +61,14 @@ static bool recycle_create_dir(vfs_handle_struct *handle, const files_struct *di
 
 static bool make_new_bin(vfs_handle_struct *handle,
 			 struct recycle_config_data *config,
-                         const files_struct *dirfsp,
-			 const char *mntpath)
+			 char *mntpath)
 {
 	int ret;
 	NTSTATUS status;
-	bool ok, is_connectpath;
+	bool ok = false;
 	struct smb_filename *smb_fname = NULL;
-	char fname[PATH_MAX];
+	struct smb_filename *oldwd = NULL, mntpath_fname = { .base_name = mntpath };
+	char *fname = NULL;
 	struct recycle_bin *to_add = NULL;
 
 	if (config->next_entry == config->bin_array_len) {
@@ -83,29 +83,69 @@ static bool make_new_bin(vfs_handle_struct *handle,
 		config->bin_array_len += BIN_INCREMENT;
 	}
 
-	switch(mntpath[strlen(handle->conn->connectpath)]) {
-	case '\0':
-		snprintf(fname, sizeof(fname), "%c", '.');
-		break;
-	case '/':
-		snprintf(fname, sizeof(fname), "%s", mntpath + strlen(handle->conn->connectpath) + 1);
-		break;
-	default:
-		smb_panic("Mountpath is incorrect");	
+	ret = strcmp(mntpath, handle->conn->connectpath);
+	if (ret > 0) {
+		if (!strstr(mntpath, handle->conn->connectpath)) {
+			/*
+			 * In theory this should never happen as Samba's symlink
+			 * safety code would prevent opening the file and we
+			 * disallow users from enabling widelinks
+			 */
+			smb_panic("Mountpoint lies outside of share connectpath");
+		}
+		/*
+		 * This is a volume mounted within the share's connectpath
+		 * We'll need to create a new recyclebin within it to preserve
+		 * atomicity of unlink
+		 */
+		fname = mntpath + strlen(handle->conn->connectpath) + 1;
+	} else if (ret < 0) {
+		if (!strstr(handle->conn->connectpath, mntpath)) {
+			/*
+			 * In theory this should never happen as Samba's symlink
+			 * safety code would prevent opening the file and we
+			 * disallow users from enabling widelinks
+			 */
+			smb_panic("Mountpoint lies outside of share connectpath");
+		}
+		/*
+		 * Share connectpath is a subdirectory of a dataset mountpoint
+		 * Set the recycle bin to the connectpath
+		 */
+		mntpath_fname.base_name = handle->conn->connectpath;
+	}
+
+	/*
+	 * synthetic_pathref will fail if the path is not within
+	 * the current working directory of smbd process, and so we
+	 * get our cwd and then chdir into the mountpoint
+	 */
+	oldwd = vfs_GetWd(talloc_tos(), handle->conn);
+	if (oldwd == NULL) {
+		DBG_ERR("failed to retrieve current working directory\n");
+		goto cleanup;
+	}
+
+	ret = vfs_ChDir(handle->conn, &mntpath_fname);
+	if (ret == -1) {
+		DBG_ERR("Failed to chdir to volume mount path while "
+			"creating recycle bin.\n");
+		goto cleanup;
 	}
 
 	status = synthetic_pathref(config,
-				   dirfsp,
-				   fname,
+				   handle->conn->cwd_fsp,
+				   ".",
 				   NULL,
 				   NULL,
 				   0,
 				   0,
 				   &smb_fname);
+
 	if (!NT_STATUS_IS_OK(status)) {
 		DBG_ERR("%s: synthetic_pathref() failed: %s\n",
-			fname, nt_errstr(status));
-		return false;
+			mntpath, nt_errstr(status));
+		goto cleanup;
 	}
 
 	to_add = talloc_zero(config, struct recycle_bin);
@@ -113,10 +153,10 @@ static bool make_new_bin(vfs_handle_struct *handle,
 		errno = ENOMEM;
 		DBG_ERR("talloc failure\n");
 		TALLOC_FREE(smb_fname);
-		return false;
+		goto cleanup;
 	}
 
-	if (strcmp(handle->conn->connectpath, mntpath) == 0) {
+	if (fname == NULL) {
 		to_add->mp_len = 0;
 		to_add->recycle_path = talloc_strdup(config, config->repository);
 	} else {
@@ -129,10 +169,15 @@ static bool make_new_bin(vfs_handle_struct *handle,
 	config->next_entry++;
 
 	ok = recycle_create_dir(handle, smb_fname->fsp, config->repository);
-	if (!ok) {
-		return false;
+cleanup:
+	if (oldwd != NULL) {
+		ret = vfs_ChDir(handle->conn, oldwd);
+		if (ret == -1) {
+			smb_panic("unable to get back to original directory\n");
+		}
+		TALLOC_FREE(oldwd);
 	}
-	return true;
+	return ok;
 }
 
 #ifdef FREEBSD
@@ -236,7 +281,7 @@ static bool make_bin_from_mount(vfs_handle_struct *handle,
 		return ok;
 	}
 
-	ok = make_new_bin(handle, config, dirfsp, mp);
+	ok = make_new_bin(handle, config, mp);
 	if (!ok) {
 		DBG_ERR("%s: add to pathrefs failed\n", mp);
 	}
@@ -258,7 +303,7 @@ static recycle_bin *get_recycle_bin(vfs_handle_struct *handle,
 				struct recycle_config_data,
 				return NULL);
 
-	if (config->disabled) {
+	if (!config->enabled) {
 		errno = EACCES;
 		return NULL;
 	}
@@ -890,7 +935,6 @@ static int recycle_openat(vfs_handle_struct *handle,
 {
 	struct recycle_config_data *config = NULL;
 	int ret;
-	bool ok;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct recycle_config_data,
@@ -904,14 +948,24 @@ static int recycle_openat(vfs_handle_struct *handle,
 		return ret;
 	}
 
+	if (!handle->conn->tcon_done) {
+		DBG_INFO("Tree connect has not been completed. Delaying "
+			 "recycle bin creation\n");
+		return ret;
+	}
+
 	config->checked = true;
 
-	ok = make_new_bin(handle, config, handle->conn->connectpath_fsp, handle->conn->connectpath);
-	if (!ok) {
+	config->enabled = make_new_bin(handle, config, handle->conn->connectpath);
+	if (!config->enabled) {
+		/*
+		 * If share is readonly or connectapth is not writable by user
+		 * this should not prevent access to the share, but we should disable
+		 * recycling (unlink op with fail with ACCESS_DENIED)
+		 */
 		if ((errno == EACCES) || (errno == EROFS)) {
 			DBG_INFO("%s: failed to generate recycle bin: %s\n",
 				 handle->conn->connectpath, strerror(errno));
-			config->disabled = true;
 		} else {
 			DBG_ERR("%s: failed to generate recycle bin: %s\n",
 				handle->conn->connectpath, strerror(errno));
