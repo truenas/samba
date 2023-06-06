@@ -288,6 +288,7 @@ static int py_uid_gid_init(PyObject *obj,
 
 	strlcpy(self->sid, sid, sizeof(self->sid));
 	self->id = id;
+	self->idtype = id_type;
 
 	self->wbclient = (py_wbclient *)pyclient;
 	Py_INCREF(self->wbclient);
