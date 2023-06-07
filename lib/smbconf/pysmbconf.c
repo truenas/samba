@@ -23,6 +23,8 @@
 #include "python/py3compat.h"
 
 #include "lib/smbconf/smbconf.h"
+#include "lib/smbconf/smbconf_init.h"
+#include "lib/smbconf/smbconf_reg.h"
 #include "lib/smbconf/smbconf_txt.h"
 #include "lib/smbconf/pysmbconf.h"
 
@@ -717,6 +719,27 @@ static PyObject *py_init_txt(PyObject * module, PyObject * args)
 	return (PyObject *) obj;
 }
 
+static PyObject *py_init_reg(PyObject * module, PyObject * args)
+{
+	py_SMBConf_Object *obj;
+	sbcErr err;
+	struct smbconf_ctx *conf_ctx = NULL;
+
+	obj = (py_SMBConf_Object *) obj_new(&py_SMBConf_Type, NULL, NULL);
+	if (obj == NULL) {
+		return NULL;
+	}
+
+	err = smbconf_init_txt(obj->mem_ctx, &conf_ctx, path);
+	if (err != SBC_ERR_OK) {
+		Py_DECREF(obj);
+		py_raise_SMBConfError(err);
+		return NULL;
+	}
+	obj->conf_ctx = conf_ctx;
+	return (PyObject *) obj;
+}
+
 static PyObject *py_smbconf_error(PyObject * module, PyObject * args)
 {
 	sbcErr errcode;
@@ -733,6 +756,8 @@ static PyObject *py_smbconf_error(PyObject * module, PyObject * args)
 static PyMethodDef pysmbconf_methods[] = {
 	{ "init_txt", (PyCFunction) py_init_txt, METH_VARARGS,
 	 "Return an SMBConf object for the given text config file." },
+	{ "init_registry", (pyCFunction) py_int_reg, METH_NOARGS,
+	 "Return an SMBConf object initialized from registry." },
 	{ "_smbconf_error", (PyCFunction) py_smbconf_error, METH_VARARGS,
 	 "Raise an SMBConfError based on the given error code." },
 	{ 0 },
