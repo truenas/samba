@@ -2151,6 +2151,7 @@ static int ixnas_fsetxattr(struct vfs_handle_struct *handle, struct files_struct
 {
 	int fd = fsp_get_pathref_fd(fsp);
 	int tmp_fd;
+	int open_flags = O_EMPTY_PATH;
 	int error;
 
 	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
@@ -2159,7 +2160,8 @@ static int ixnas_fsetxattr(struct vfs_handle_struct *handle, struct files_struct
 		return fsetxattr(fd, name, value, size, flags);
 	}
 
-	tmp_fd = openat(fd, "", O_EMPTY_PATH | O_RDWR);
+	open_flags |= S_ISDIR(fsp->fsp_name->st.st_ex_mode) ? O_DIRECTORY : O_RDWR;
+	tmp_fd = openat(fd, "", open_flags);
 	if (tmp_fd == -1) {
 		DBG_ERR("%s: failed to reopen O_PATH descriptor: %s\n",
 			fsp_str_dbg(fsp), strerror(errno));
