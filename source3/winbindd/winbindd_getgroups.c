@@ -90,7 +90,7 @@ struct tevent_req *winbindd_getgroups_send(TALLOC_CTX *mem_ctx,
 				    state->namespace,
 				    state->domname,
 				    state->username,
-				    LOOKUP_NAME_NO_NSS);
+				    LOOKUP_NAME_NO_NSS | LOOKUP_NAME_REMOTE);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
