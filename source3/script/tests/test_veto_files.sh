@@ -22,12 +22,20 @@ SHAREPATH=${5}
 SMBCLIENT=${6}
 shift 6
 SMBCLIENT="$VALGRIND ${SMBCLIENT}"
+# Used by test_smbclient()
+# shellcheck disable=2034
+smbclient="$VALGRIND ${SMBCLIENT}"
 ADDARGS="$@"
 
 incdir=$(dirname "$0")/../../../testprogs/blackbox
 . "$incdir"/subunit.sh
+. "${incdir}/common_test_fns.inc"
 
 failed=0
+
+TMPDIR=${PREFIX_ABS}/$(basename "${0}")
+mkdir -p "${TMPDIR}" || exit 1
+cd "${TMPDIR}" || exit 1
 
 #
 # Cleanup function.
@@ -41,6 +49,8 @@ do_cleanup()
 		rm -rf "$SHAREPATH/veto_name_dir\"mangle"
 		rm -f "$SHAREPATH/veto_name_file"
 		rm -f "$SHAREPATH/veto_name_file\"mangle"
+		rm -f "${SHAREPATH}/regular_file"
+		rm -f "${SHAREPATH}/.hidden_file"
 	)
 }
 
@@ -51,7 +61,7 @@ smbclient_get_expect_error()
 {
 	filename1="$1"
 	expected_error="$2"
-	tmpfile=$PREFIX/smbclient_interactive_prompt_commands
+	tmpfile=${TMPDIR}/smbclient_interactive_prompt_commands
 	cat >"$tmpfile" <<EOF
 get $filename1 got_file
 quit
@@ -88,7 +98,7 @@ smbclient_create_expect_error()
 {
 	filename="$1.$$"
 	expected_error="$2"
-	tmpfile=$PREFIX/smbclient_interactive_prompt_commands
+	tmpfile=${TMPDIR}/smbclient_interactive_prompt_commands
 	cat >"$tmpfile" <<EOF
 put $tmpfile $filename
 quit
@@ -181,6 +191,25 @@ test_create_veto_file()
 
 do_cleanup
 
+echo "regular_file" > "${SHAREPATH}/regular_file"
+echo "hidden_file" > "${SHAREPATH}/.hidden_file"
+
+test_smbclient "download regular file" \
+	"get regular_file" "//${SERVER}/veto_files_nohidden" \
+	-U"${USERNAME}%${PASSWORD}" ||
+	failed=$((failed + 1))
+rm -f regular_file
+test_smbclient_expect_failure "hidden file can't be downloaded" \
+	"get .hidden_file" "//${SERVER}/veto_files_nohidden" \
+	-U"${USERNAME}%${PASSWORD}" ||
+	failed=$((failed + 1))
+test_smbclient "list files" \
+	"ls" "//${SERVER}/veto_files_nohidden" \
+	-U"${USERNAME}%${PASSWORD}" ||
+	failed=$((failed + 1))
+
+do_cleanup
+
 # Using hash2, veto_name_file\"mangle == VHXE5P~M
 # Using hash2, veto_name_dir\"mangle == VF5SKC~B
 
@@ -244,5 +273,7 @@ testit "create_veto_file" test_create_veto_file || failed=$((failed + 1))
 testit "get_veto_file" test_get_veto_file || failed=$(("$failed" + 1))
 
 do_cleanup
+
+cd "${PREFIX_ABS}" && rm -rf ${TMPDIR}
 
 exit "$failed"

@@ -437,6 +437,9 @@ NTSTATUS sid_array_from_info3(TALLOC_CTX *mem_ctx,
 			      struct dom_sid **user_sids,
 			      uint32_t *num_user_sids,
 			      bool include_user_group_rid);
+bool security_token_find_npa_flags(const struct security_token *token,
+				   uint32_t *_flags);
+void security_token_del_npa_flags(struct security_token *token);
 
 /* The following definitions come from lib/util_sock.c  */
 
