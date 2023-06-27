@@ -1,3 +1,10 @@
+samba (2:4.18.3+ix-0) unstable; urgency=medium
+
+  * Update to Samba 4.18.3
+
+ -- Andrew Walker <awalker@ixsystems.com>  Tue, 27 Jun 2023 17:00:00 +0000
+
+
 samba (2:4.18.0+ix-0) unstable; urgency=medium
 
   * Update to Samba 4.18.0
@@ -6,15 +13,15 @@ samba (2:4.18.0+ix-0) unstable; urgency=medium
 
 samba (2:4.17.4+ix-0) unstable; urgency=medium
 
- * Update to Samba 4.17.4
+  * Update to Samba 4.17.4
 
  -- Andrew Walker <awalker@ixsystems.com>  Fri, 16 Dec 2022 17:00:00 +0000
 
 samba (2:4.17.2+ix-1) unstable; urgency=medium
 
- * Fix SMB_ASSERT in vfs_recycle chdir to slash
+  * Fix SMB_ASSERT in vfs_recycle chdir to slash
 
- * Fix symlink safety checks where timewarp token present
+  * Fix symlink safety checks where timewarp token present
 
  -- Andrew Walker <awalker@ixsystems.com>  Wed, 09 Nov 2022 17:00:00 +0000
 
