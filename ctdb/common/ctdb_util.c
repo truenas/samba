@@ -538,6 +538,12 @@ struct ctdb_node_map_old *ctdb_read_nodes_file(TALLOC_CTX *mem_ctx,
 		if (len == 0) {
 			continue;
 		}
+		if (len > 2) {
+			char *comment = strstr(node + 1, "#");
+			if (comment) {
+				*comment = '\0';
+			}
+		}
 		if (*node == '#') {
 			/* A "deleted" node is a node that is
 			   commented out in the nodes file.  This is
