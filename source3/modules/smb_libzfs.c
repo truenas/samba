@@ -61,6 +61,7 @@ struct mntent
 #include "lib/util/dlinklist.h"
 #include "lib/util/fault.h"
 #include "lib/util/memcache.h"
+#include "lib/util/memory.h"
 #include "lib/util/unix_match.h"
 #include "smb_macros.h"
 #include "modules/smb_libzfs.h"
@@ -356,6 +357,60 @@ static zfs_handle_t *get_zhandle(libzfs_handle_t *lz, const char *path,
 	return zfsp;
 }
 
+static bool mp_to_dataset_name(const char *mp, char *name_out, size_t bufsz)
+{
+	/*
+	 * Depending on what Samba's VFS is doing we may receive a request
+	 * for snapshot enumeration on a VSS path (within snapdir). In this case
+	 * we should determine whether the path is legitimately a snapdir or
+	 * something a person has just named ".zfs/snapshot" and if it is
+	 * one, strip off the path components within the ZFS ctldir so that
+	 * we can retrieve a regular ZFS dataset handle for it.
+	 */
+#if defined (FREEBSD)
+	// TODO - write FreeBSD implementation for statfs output
+	return false;
+#else
+	char buf[PATH_MAX + 1];
+	char *ptr = NULL;
+	size_t cnt;
+	struct stat st;
+
+	cnt = readlink(mp, buf, sizeof(buf) - 1);
+	if (cnt == -1) {
+		DBG_ERR("%s: readlink() failed: %s\n", mp, strerror(errno));
+		return false;
+	}
+
+	// readlink() does not NULL-terminate
+	buf[cnt] = '\0';
+	strlcpy(name_out, buf, bufsz);
+
+	ptr = strstr(name_out, ".zfs/snapshot");
+	if (ptr == NULL) {
+		return true;
+	}
+
+	/*
+	 * Trim off everything after .zfs in our temporary
+	 * buffer so that we can check its inode number to be
+	 * extra sure this is the ZFS ctldir
+	 */
+	buf[PTR_DIFF(ptr + 4, name_out)] = '\0';
+	if (stat(buf, &st) != 0) {
+		return false;
+	}
+
+	if (!inode_is_ctldir(st.st_ino)) {
+		return true;
+	}
+
+	// trim off the ctldir
+	*ptr = '\0';
+	return true;
+#endif
+}
+
 static zfs_handle_t *fget_zhandle(libzfs_handle_t *lz, dev_t *dev_id, int fd)
 {
 	zfs_handle_t *zfsp = NULL;
@@ -388,12 +443,18 @@ static zfs_handle_t *fget_zhandle(libzfs_handle_t *lz, dev_t *dev_id, int fd)
 	}
 #else
 	char procfd_path[PATH_MAX] = {0};
+	char ds_name[ZFS_MAX_DATASET_NAME_LEN];
 	snprintf(procfd_path, sizeof(procfd_path), "/proc/self/fd/%d", fd);
 
-	zfsp = zfs_path_to_zhandle(lz, procfd_path, ZFS_TYPE_FILESYSTEM);
+	if (!mp_to_dataset_name(procfd_path, ds_name, ZFS_MAX_DATASET_NAME_LEN)) {
+		DBG_ERR("%s: failed to convert to dataset name\n");
+		strlcpy(ds_name, procfd_path, ZFS_MAX_DATASET_NAME_LEN);
+	}
+
+	zfsp = zfs_path_to_zhandle(lz, ds_name, ZFS_TYPE_FILESYSTEM);
 	if (zfsp == NULL) {
 		DBG_ERR("%s zfs_open() failed: %s\n",
-			procfd_path, libzfs_error_description(lz));
+			ds_name, libzfs_error_description(lz));
 		goto out;
 	}
 #endif
