@@ -24,6 +24,9 @@
 #include "libcli/named_pipe_auth/tstream_u32_read.h"
 #include "lib/util/tevent_unix.h"
 #include "auth/auth_util.h"
+#include "libcli/security/dom_sid.h"
+#include "libcli/security/security_token.h"
+#include "nsswitch/winbind_client.h"
 
 /**
  * @file local_np.c
@@ -272,18 +275,17 @@ static void np_sock_connect_read_done(struct tevent_req *subreq)
 		tevent_req_error(req, ndr_map_error2errno(ndr_err));
 		return;
 	}
-	if (state->npa_rep->level != 5) {
-		DBG_DEBUG("npa level = %"PRIu32", expected 5\n",
+	if (state->npa_rep->level != 7) {
+		DBG_DEBUG("npa level = %" PRIu32 ", expected 7\n",
 			  state->npa_rep->level);
 		tevent_req_error(req, EIO);
 		return;
 	}
 
-	ret = tstream_npa_existing_stream(
-		state,
-		&state->transport,
-		state->npa_rep->info.info5.file_type,
-		&state->npa_stream);
+	ret = tstream_npa_existing_stream(state,
+					  &state->transport,
+					  state->npa_rep->info.info7.file_type,
+					  &state->npa_stream);
 	if (ret == -1) {
 		ret = errno;
 		DBG_DEBUG("tstream_npa_existing_stream failed: %s\n",
@@ -496,9 +498,15 @@ struct tevent_req *local_np_connect_send(
 {
 	struct tevent_req *req = NULL, *subreq = NULL;
 	struct local_np_connect_state *state = NULL;
-	struct named_pipe_auth_req_info5 *i5 = NULL;
+	struct named_pipe_auth_req_info7 *i7 = NULL;
 	const char *socket_dir = NULL;
 	char *lower_case_pipename = NULL;
+	struct dom_sid npa_sid = global_sid_Samba_NPA_Flags;
+	uint32_t npa_flags = 0;
+	struct security_token *token = NULL;
+	NTSTATUS status;
+	size_t num_npa_sids;
+	bool ok;
 
 	req = tevent_req_create(
 		mem_ctx, &state, struct local_np_connect_state);
@@ -506,6 +514,19 @@ struct tevent_req *local_np_connect_send(
 		return NULL;
 	}
 	state->ev = ev;
+
+	num_npa_sids =
+		security_token_count_flag_sids(session_info->security_token,
+					       &npa_sid,
+					       1,
+					       NULL);
+	if (num_npa_sids != 0) {
+		DBG_ERR("ERROR: %zu NPA Flags SIDs have already been "
+			"detected in the security token!\n",
+			num_npa_sids);
+		tevent_req_error(req, EACCES);
+		return tevent_req_post(req, ev);
+	}
 
 	socket_dir = lp_parm_const_string(
 		GLOBAL_SECTION_SNUM, "external_rpc_pipe", "socket_dir",
@@ -532,14 +553,14 @@ struct tevent_req *local_np_connect_send(
 	if (tevent_req_nomem(state->npa_req, req)) {
 		return tevent_req_post(req, ev);
 	}
-	state->npa_req->level = 5;
+	state->npa_req->level = 7;
 
-	i5 = &state->npa_req->info.info5;
+	i7 = &state->npa_req->info.info7;
 
-	i5->transport = transport;
+	i7->transport = transport;
 
 	/* we don't have "int" in IDL, make sure we don't overflow */
-	SMB_ASSERT(i5->transport == transport);
+	SMB_ASSERT(i7->transport == transport);
 
 	if (remote_client_name == NULL) {
 		remote_client_name = get_myname(state->npa_req);
@@ -548,7 +569,7 @@ struct tevent_req *local_np_connect_send(
 			return tevent_req_post(req, ev);
 		}
 	}
-	i5->remote_client_name = remote_client_name;
+	i7->remote_client_name = remote_client_name;
 
 	if (remote_client_addr == NULL) {
 		struct tsocket_address *addr = NULL;
@@ -560,18 +581,19 @@ struct tevent_req *local_np_connect_send(
 		}
 		remote_client_addr = addr;
 	}
-	i5->remote_client_addr = tsocket_address_inet_addr_string(
-		remote_client_addr, state->npa_req);
-	if (i5->remote_client_addr == NULL) {
+	i7->remote_client_addr =
+		tsocket_address_inet_addr_string(remote_client_addr,
+						 state->npa_req);
+	if (i7->remote_client_addr == NULL) {
 		tevent_req_error(req, errno);
 		return tevent_req_post(req, ev);
 	}
-	i5->remote_client_port = tsocket_address_inet_port(remote_client_addr);
+	i7->remote_client_port = tsocket_address_inet_port(remote_client_addr);
 
 	if (local_server_name == NULL) {
 		local_server_name = remote_client_name;
 	}
-	i5->local_server_name = local_server_name;
+	i7->local_server_name = local_server_name;
 
 	if (local_server_addr == NULL) {
 		struct tsocket_address *addr = NULL;
@@ -583,27 +605,52 @@ struct tevent_req *local_np_connect_send(
 		}
 		local_server_addr = addr;
 	}
-	i5->local_server_addr = tsocket_address_inet_addr_string(
-		local_server_addr, state->npa_req);
-	if (i5->local_server_addr == NULL) {
+	i7->local_server_addr =
+		tsocket_address_inet_addr_string(local_server_addr,
+						 state->npa_req);
+	if (i7->local_server_addr == NULL) {
 		tevent_req_error(req, errno);
 		return tevent_req_post(req, ev);
 	}
-	i5->local_server_port = tsocket_address_inet_port(local_server_addr);
+	i7->local_server_port = tsocket_address_inet_port(local_server_addr);
 
-	i5->session_info = talloc_zero(
-		state->npa_req, struct auth_session_info_transport);
-	if (tevent_req_nomem(i5->session_info, req)) {
+	i7->session_info = talloc_zero(state->npa_req,
+				       struct auth_session_info_transport);
+	if (tevent_req_nomem(i7->session_info, req)) {
 		return tevent_req_post(req, ev);
 	}
 
-	i5->session_info->session_info = copy_session_info(
-		i5->session_info, session_info);
-	if (tevent_req_nomem(i5->session_info->session_info, req)) {
+	i7->session_info->session_info =
+		copy_session_info(i7->session_info, session_info);
+	if (tevent_req_nomem(i7->session_info->session_info, req)) {
 		return tevent_req_post(req, ev);
 	}
 
-	i5->need_idle_server = need_idle_server;
+	if (need_idle_server) {
+		npa_flags |= SAMBA_NPA_FLAGS_NEED_IDLE;
+	}
+
+	ok = winbind_env_set();
+	if (ok) {
+		npa_flags |= SAMBA_NPA_FLAGS_WINBIND_OFF;
+	}
+
+	ok = sid_append_rid(&npa_sid, npa_flags);
+	if (!ok) {
+		tevent_req_error(req, EINVAL);
+		return tevent_req_post(req, ev);
+	}
+
+	token = i7->session_info->session_info->security_token;
+
+	status = add_sid_to_array_unique(token,
+					 &npa_sid,
+					 &token->sids,
+					 &token->num_sids);
+	if (!NT_STATUS_IS_OK(status)) {
+		tevent_req_oom(req);
+		return tevent_req_post(req, ev);
+	}
 
 	subreq = np_sock_connect_send(
 		state, state->ev, state->socketpath, state->npa_req);
