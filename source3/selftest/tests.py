@@ -34,6 +34,7 @@ from selftesthelpers import valgrindify, smbtorture4_testsuites
 from selftesthelpers import smbtorture4_options
 from selftesthelpers import smbcontrol
 from selftesthelpers import smbstatus
+from selftesthelpers import timelimit
 smbtorture4_options.extend([
     '--option=torture:sharedelay=100000',
    '--option=torture:writetimeupdatedelay=500000',
@@ -822,6 +823,11 @@ for env in ["fileserver"]:
                   '$SERVER', 'fruit_resource_stream', '$USERNAME', '$PASSWORD',
                   '$LOCAL_PATH/fruit_resource_stream', smbclient3])
 
+plantestsuite("samba3.blackbox.smbclient_old_dir", "fileserver_smb1",
+              [os.path.join(samba3srcdir,
+                            "script/tests/test_old_dirlisting.sh"),
+               timelimit, smbclient3])
+
 for env in ["fileserver:local"]:
     plantestsuite("samba3.blackbox.net_usershare", env, [os.path.join(samba3srcdir, "script/tests/test_net_usershare.sh"), '$SERVER', '$SERVER_IP', '$USERNAME', '$PASSWORD', smbclient3])
 
@@ -1069,6 +1075,8 @@ for t in tests:
         # Certain tests fail when run against ad_member with MIT kerberos because the private krb5.conf overrides the provisioned lib/krb5.conf,
         # ad_member_idmap_rid sets "create krb5.conf = no"
         plansmbtorture4testsuite(t, "ad_member_idmap_rid", '//$SERVER/tmp -k yes -U$DC_USERNAME@$REALM%$DC_PASSWORD', 'krb5')
+    elif t == "smb2.session-require-signing":
+        plansmbtorture4testsuite(t, "ad_member_idmap_rid", '//$SERVER_IP/tmp -U$DC_USERNAME@$REALM%$DC_PASSWORD')
     elif t == "rpc.lsa":
         plansmbtorture4testsuite(t, "nt4_dc", '//$SERVER_IP/tmp -U$USERNAME%$PASSWORD', 'over ncacn_np ')
         plansmbtorture4testsuite(t, "nt4_dc", 'ncacn_ip_tcp:$SERVER_IP -U$USERNAME%$PASSWORD', 'over ncacn_ip_tcp ')
@@ -1413,6 +1421,13 @@ plantestsuite("samba3.blackbox.chdir-cache", "simpleserver:local",
                "error_inject",
                '$PREFIX',
                'simpleserver'])
+
+plantestsuite("samba3.blackbox.rofs_error", "simpleserver",
+              [os.path.join(samba3srcdir, "script/tests/test_rofs.sh"),
+               configuration,
+               os.path.join(bindir(), "smbclient"),
+               '$SERVER_IP',
+               "error_inject"])
 
 plantestsuite("samba3.blackbox.zero_readsize",
               "simpleserver:local",

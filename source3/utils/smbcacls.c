@@ -1795,6 +1795,11 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
+	if (strncmp(path, "\\\\", 2) && strncmp(path, "//", 2)) {
+		printf("Invalid argument: %s\n", path);
+		return -1;
+	}
+
 	if(!poptPeekArg(pc)) {
 		poptPrintUsage(pc, stderr, 0);
 		return -1;
