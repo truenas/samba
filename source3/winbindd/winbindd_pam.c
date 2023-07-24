@@ -1637,6 +1637,7 @@ static NTSTATUS winbind_samlogon_retry_loop(struct winbindd_domain *domain,
 	int attempts = 0;
 	int netr_attempts = 0;
 	bool retry = false;
+	bool valid_result = false;
 	NTSTATUS result;
 	enum netr_LogonInfoClass logon_type_i;
 	enum netr_LogonInfoClass logon_type_n;
@@ -1648,6 +1649,15 @@ static NTSTATUS winbind_samlogon_retry_loop(struct winbindd_domain *domain,
 	do {
 		struct rpc_pipe_client *netlogon_pipe;
 		struct netlogon_creds_cli_context *netlogon_creds_ctx = NULL;
+
+		/*
+		 * We should always reset authoritative to 1
+		 * before calling a server again.
+		 *
+		 * Otherwise we could treat a local problem as
+		 * non-authoritative.
+		 */
+		*authoritative = 1;
 
 		retry = false;
 
@@ -1668,6 +1678,8 @@ static NTSTATUS winbind_samlogon_retry_loop(struct winbindd_domain *domain,
 			DEBUG(3,("Could not open handle to NETLOGON pipe "
 				 "(error: %s, attempts: %d)\n",
 				  nt_errstr(result), netr_attempts));
+
+			reset_cm_connection_on_error(domain, NULL, result);
 
 			/* After the first retry always close the connection */
 			if (netr_attempts > 0) {
@@ -1791,26 +1803,22 @@ static NTSTATUS winbind_samlogon_retry_loop(struct winbindd_domain *domain,
 		   might not yet have noticed that the DC has killed
 		   our connection. */
 
-		if (!rpccli_is_connected(netlogon_pipe)) {
-			retry = true;
+		retry = reset_cm_connection_on_error(domain,
+						     netlogon_pipe->binding_handle,
+						     result);
+		if (retry) {
+			DBG_PREFIX(attempts > 1 ? DBGLVL_NOTICE : DBGLVL_INFO, (
+				   "This is problem %d for this "
+				   "particular call,"
+				   "DOMAIN[%s] DC[%s] - %s\n",
+				   attempts,
+				   domain->name,
+				   domain->dcname,
+				   nt_errstr(result)));
 			continue;
 		}
 
-		/* if we get access denied, a possible cause was that we had
-		   an open connection to the DC, but someone changed our
-		   machine account password out from underneath us using 'net
-		   rpc changetrustpw' */
-
-		if ( NT_STATUS_EQUAL(result, NT_STATUS_ACCESS_DENIED) ) {
-			DEBUG(1,("winbind_samlogon_retry_loop: sam_logon returned "
-				 "ACCESS_DENIED.  Maybe the DC has Restrict "
-				 "NTLM set or the trust account "
-				"password was changed and we didn't know it. "
-				 "Killing connections to domain %s\n",
-				domainname));
-			invalidate_cm_connection(domain);
-			retry = true;
-		}
+		valid_result = true;
 
 		if (NT_STATUS_EQUAL(result, NT_STATUS_RPC_PROCNUM_OUT_OF_RANGE)) {
 			/*
@@ -1836,14 +1844,25 @@ static NTSTATUS winbind_samlogon_retry_loop(struct winbindd_domain *domain,
 			break;
 		}
 
-	} while ( (attempts < 2) && retry );
+	} while ( (attempts < 3) && retry );
 
-	if (NT_STATUS_EQUAL(result, NT_STATUS_IO_TIMEOUT)) {
-		DEBUG(3,("winbind_samlogon_retry_loop: sam_network_logon(ex) "
-				"returned NT_STATUS_IO_TIMEOUT after the retry. "
-				"Killing connections to domain %s\n",
-			domainname));
-		invalidate_cm_connection(domain);
+	if (!valid_result) {
+		/*
+		 * This matches what windows does. In a chain of transitive
+		 * trusts the ACCESS_DENIED/authoritative=0 is not propagated
+		 * instead of NT_STATUS_NO_LOGON_SERVERS/authoritative=1 is
+		 * passed along the chain if there's no other DC is available.
+		 */
+		DBG_WARNING("Mapping %s/authoritative=%u to "
+			    "NT_STATUS_NO_LOGON_SERVERS/authoritative=1 for"
+			    "USERNAME[%s] USERDOMAIN[%s] REMOTE-DOMAIN[%s] \n",
+			    nt_errstr(result),
+			    *authoritative,
+			    username,
+			    domainname,
+			    domain->name);
+		*authoritative = 1;
+		return NT_STATUS_NO_LOGON_SERVERS;
 	}
 
 	if (!NT_STATUS_IS_OK(result)) {
