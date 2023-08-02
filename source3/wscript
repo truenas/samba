@@ -1940,7 +1940,7 @@ int main() {
                                       'vfs_expand_msdfs', 'vfs_shadow_copy', 'vfs_shadow_copy2',
                                       'vfs_readahead', 'vfs_xattr_tdb',
                                       'vfs_streams_xattr', 'vfs_streams_depot', 'vfs_acl_xattr', 'vfs_acl_tdb',
-                                      'vfs_preopen', 'vfs_catia',
+                                      'vfs_preopen', 'vfs_catia', 'vfs_truenas_audit',
                                       'vfs_media_harmony', 'vfs_unityed_media', 'vfs_fruit', 'vfs_shell_snap',
                                       'vfs_commit', 'vfs_worm', 'vfs_crossrename', 'vfs_linux_xfs_sgid',
                                       'vfs_time_audit', 'vfs_offline', 'vfs_virusfilter', 'vfs_widelinks'])
