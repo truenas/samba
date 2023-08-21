@@ -736,14 +736,6 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 		set_base_user_quota(handle, config, user);
         }
 
-	if (config->ds->properties->casesens == SMBZFS_INSENSITIVE) {
-		DBG_INFO("zfs_core: case insensitive dataset detected, "
-			 "automatically adjusting case sensitivity settings.\n");
-		lp_do_parameter(SNUM(handle->conn),
-				"case sensitive", "yes");
-		handle->conn->case_sensitive = True;
-	}
-
 	config->zfs_space_enabled = lp_parm_bool(SNUM(handle->conn),
 			"zfs_core", "zfs_space_enabled", false);
 
