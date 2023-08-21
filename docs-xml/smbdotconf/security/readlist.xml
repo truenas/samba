@@ -2,6 +2,7 @@
                  context="S"
                  type="cmdlist"
                  xmlns:samba="http://www.samba.org/samba/DTD/samba-doc">
+<synonym>rolist</synonym>
 <description>
     <para>
 	This is a list of users that are given read-only access to a service. If the connecting user is in this list
