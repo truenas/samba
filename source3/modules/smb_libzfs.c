@@ -1688,7 +1688,7 @@ smb_zfs_delete_snapshots(struct snapshot_list *snaps)
 	int ret;
 	nvlist_t *to_delete = NULL;
 	struct snapshot_entry *entry = NULL;
-	char snapname[ZFS_MAX_DATASET_NAME_LEN];
+	char snapname[ZFSDS_NAMELEN + ZFSDS_NAMELEN + 2];
 	libzfs_handle_t *lz = NULL;
 
 	lz = get_global_smblibzfs_handle();
