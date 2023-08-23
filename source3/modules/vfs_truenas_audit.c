@@ -32,11 +32,19 @@
 
 #include <jansson.h>
 #include "audit_logging.h"
+#include "libsmbjson/smb_json.h"
 #include "vfs_truenas_audit.h"
 
 int vfs_tnaudit_debug_level = DBGC_VFS;
 
-static int audit_syslog_priority(vfs_handle_struct *handle)
+enum tn_audit_backend {TN_BACKEND_SYSLOG, TN_BACKEND_DEBUG};
+static const struct enum_list tn_audit_backends[] = {
+	{TN_BACKEND_SYSLOG, "syslog"}, /* send audit messages to syslog */
+	{TN_BACKEND_DEBUG, "debug"}, /* write audit messages via DBG_WARNING */
+	{ -1, NULL}
+};
+
+static int tn_audit_syslog_priority(vfs_handle_struct *handle)
 {
 	static const struct enum_list enum_log_priorities[] = {
 		{ LOG_EMERG, "EMERG" },
@@ -52,13 +60,124 @@ static int audit_syslog_priority(vfs_handle_struct *handle)
 
 	int priority;
 
-	priority = lp_parm_enum(SNUM(handle->conn), MODULE_NAME, "priority",
+	priority = lp_parm_enum(SNUM(handle->conn), MODULE_NAME,
+				"syslog_priority",
 				enum_log_priorities, LOG_NOTICE);
 	if (priority == -1) {
+		// We don't know what user wanted so put it high
+		// lp_parm_enum will already complain about invalid
+		// value
 		priority = LOG_WARNING;
 	}
 
 	return priority;
+}
+
+static int tn_audit_syslog_facility(vfs_handle_struct *handle)
+{
+	static const struct enum_list enum_log_facilities[] = {
+		{ LOG_AUTH, "AUTH" },
+		{ LOG_AUTHPRIV, "AUTHPRIV" },
+		{ LOG_CRON, "CRON" },
+		{ LOG_DAEMON, "DAEMON" },
+		{ LOG_FTP, "FTP" },
+		{ LOG_KERN, "KERN" },
+		{ LOG_LPR, "LPR" },
+		{ LOG_MAIL, "MAIL" },
+		{ LOG_SYSLOG, "SYSLOG" },
+		{ LOG_USER, "USER" },
+		{ LOG_UUCP, "UUCP" },
+		{ LOG_LOCAL0, "LOCAL0" },
+		{ LOG_LOCAL1, "LOCAL1" },
+		{ LOG_LOCAL2, "LOCAL2" },
+		{ LOG_LOCAL3, "LOCAL3" },
+		{ LOG_LOCAL4, "LOCAL4" },
+		{ LOG_LOCAL5, "LOCAL5" },
+		{ LOG_LOCAL6, "LOCAL6" },
+		{ LOG_LOCAL7, "LOCAL7" },
+		{ -1, NULL }
+	};
+
+	int facility = -1;
+
+	facility = lp_parm_enum(SNUM(handle->conn), MODULE_NAME,
+				"syslog_facility",
+				enum_log_facilities, LOG_USER);
+	if (facility == -1) {
+		facility = LOG_USER;
+	}
+
+	return facility;
+}
+
+
+static int tn_audit_debug_dbglvl(vfs_handle_struct *handle)
+{
+	static const struct enum_list enum_dbg_levels[] = {
+		{ DBGLVL_WARNING, "WARNING" },
+		{ DBGLVL_NOTICE, "NOTICE" },
+		{ DBGLVL_INFO, "INFO" },
+		{ -1, NULL }
+	};
+
+	int tn_dbglvl = -1;
+
+
+	tn_dbglvl = lp_parm_enum(SNUM(handle->conn), MODULE_NAME,
+				 "debug_level",
+				 enum_dbg_levels, DBGLVL_WARNING);
+	if (tn_dbglvl == -1) {
+		tn_dbglvl = DBGLVL_WARNING;
+	}
+
+	return tn_dbglvl;
+}
+
+static bool tn_audit_do_syslog(struct json_object *audit_msg,
+			       union tn_backend_config *config,
+			       const char *location)
+{
+	char *msg = NULL;
+
+	if (json_is_invalid(audit_msg)) {
+		DBG_ERR("%s: received invalid JSON audit object.\n",
+			location);
+		return false;
+	}
+
+	msg = json_dumps(audit_msg->root, 0);
+	if (msg == NULL) {
+		DBG_ERR("%s: unable to convert JSON audit message to string\n",
+			location);
+		return false;
+	}
+
+	syslog(LOG_MAKEPRI(config->syslog.facility, config->syslog.priority),
+	       "@cee:{\"TNAUDIT\": %s}", msg);
+
+	free(msg);
+	return true;
+}
+
+static bool tn_audit_do_debug(struct json_object *audit_msg,
+			      union tn_backend_config *config,
+			      const char *location)
+{
+	if (json_is_invalid(audit_msg)) {
+		DBG_ERR("%s: received invalid JSON audit object.\n",
+			location);
+		return false;
+	}
+
+	audit_log_json(audit_msg, vfs_tnaudit_debug_level, config->debug.dbglvl);
+	return true;
+}
+
+static bool tn_audit_do_noop(struct json_object *audit_msg,
+			     union tn_backend_config *config,
+			     const char *location)
+{
+	return true;
 }
 
 enum tn_audit_filter {WATCH_LIST, IGNORE_LIST};
@@ -102,58 +221,45 @@ static bool tn_audit_check_group_list(const char *user,
 	return false;
 }
 
-static int tn_audit_connect(vfs_handle_struct *handle,
-			    const char *svc,
-			    const char *user)
+static bool tn_audit_backend_init(vfs_handle_struct *handle,
+				  const char *svc,
+				  const char *user,
+				  tn_audit_conf_t *config)
 {
-	/*
-	 * Sample `event_data`
-	 *
-	 * {
-	 *   "host": "127.0.0.1",
-	 *   "unix_token": {
-	 *     "username": "smbuser",
-	 *     "uid": 3000,
-	 *     "gid": 3000
-         *     "groups": [545, 3000, 90000005, 90000012, 90000017],
-	 *   },
-	 *   "result": {
-	 *     "type": "UNIX",
-	 *     "value_raw": 0,
-	 *     "value_parsed": "SUCCESS"
-	 *   },
-	 *   "vers": {"major": 0, "minor": 1}
-	 * }
-	 */
-	int result;
-	tn_audit_conf_t *config = NULL;
-	struct json_object msg, entry, js_conn;
-	bool ok;
+	bool enabled = true;
+	int enumval;
 	const char **watch_list = NULL;
 	const char **ignore_list = NULL;
+	union tn_backend_config *backend = &config->backend_config;
 
-	result = SMB_VFS_NEXT_CONNECT(handle, svc, user);
-	if (result < 0) {
-		return result;
-	}
-
-	config = talloc_zero(handle->conn, tn_audit_conf_t);
-	if (config == NULL) {
-		DBG_ERR("talloc_zero() failed\n");
-		errno = ENOMEM;
+	enumval = lp_parm_enum(SNUM(handle->conn), MODULE_NAME,
+			       "backend", tn_audit_backends, TN_BACKEND_SYSLOG);
+	if (enumval == -1) {
+                DBG_ERR("value for %s:backend type unknown\n",
+			MODULE_NAME);
 		return -1;
-	}
+        }
 
-	config->do_syslog = lp_parm_bool(SNUM(handle->conn),
-					 MODULE_NAME,
-					 "use_syslog",
-					 true);
-	if (config->do_syslog) {
-		config->syslog_priority = audit_syslog_priority(handle);
+	switch ((enum tn_audit_backend)enumval) {
+	case TN_BACKEND_SYSLOG:
+		config->audit_fn = tn_audit_do_syslog;
+		backend->syslog.priority = tn_audit_syslog_priority(handle);
+		backend->syslog.facility = tn_audit_syslog_facility(handle);
+		//openlog(SYSLOG_IDENT, 0, backend.syslog.facility);
 		openlog(SYSLOG_IDENT, 0, LOG_USER);
-	}
+		break;
+	case TN_BACKEND_DEBUG:
+		config->audit_fn = tn_audit_do_debug;
+		backend->debug.dbglvl = tn_audit_debug_dbglvl(handle);
+		break;
+	default:
+		smb_panic("Unknown audit backend type\n");
+	};
 
-	config->enabled = true;
+	config->rw_interval = lp_parm_int(SNUM(handle->conn),
+					  MODULE_NAME,
+					  "rw_log_interval",
+					  60);
 
 	/*
 	 * Prefer to err on the side of caution (auditing session)
@@ -173,13 +279,85 @@ static int tn_audit_connect(vfs_handle_struct *handle,
 					  "ignore_list", NULL);
 
 	if (tn_audit_check_group_list(user, ignore_list, IGNORE_LIST)) {
-		config->enabled = false;
+		enabled = false;
 	}
 
 	if (watch_list) {
-		config->enabled = tn_audit_check_group_list(user,
-							    watch_list,
-							    WATCH_LIST);
+		enabled = tn_audit_check_group_list(user,
+						    watch_list,
+						    WATCH_LIST);
+	}
+
+	if (!enabled) {
+		config->audit_fn = tn_audit_do_noop;
+	}
+
+	return true;
+}
+
+static bool tn_add_client_info_to_obj(const struct smbd_server_connection *sconn,
+				      struct json_object *jsobj)
+{
+	int error;
+
+	error = json_add_string(jsobj, "host", sconn->remote_hostname);
+
+	return error ? false : true;
+}
+
+static int tn_audit_connect(vfs_handle_struct *handle,
+			    const char *svc,
+			    const char *user)
+{
+	/*
+	 * Sample `event_data`
+	 *
+	 * {
+	 *   "host": "127.0.0.1",
+	 *   "unix_token": {
+	 *     "uid": 3000,
+	 *     "gid": 3000
+         *     "groups": [545, 3000, 90000005, 90000012, 90000017],
+	 *   },
+	 *   "result": {
+	 *     "type": "UNIX",
+	 *     "value_raw": 0,
+	 *     "value_parsed": "SUCCESS"
+	 *   },
+	 *   "vers": {"major": 0, "minor": 1}
+	 * }
+	 */
+	int result, enumval;
+	tn_audit_conf_t *config = NULL;
+	struct json_object msg, entry, js_conn;
+	bool ok;
+	bool enabled;
+	const char **watch_list = NULL;
+	const char **ignore_list = NULL;
+
+	if (!handle->conn->sconn->using_smb2) {
+		DBG_ERR("%s: user connected to service [%s] via SMB1 protocol. "
+			"SMB1 connections are not permitted to shares where "
+			"auditing is enabled.\n", user, svc);
+		return -1;
+	}
+
+	result = SMB_VFS_NEXT_CONNECT(handle, svc, user);
+	if (result < 0) {
+		return result;
+	}
+
+	config = talloc_zero(handle->conn, tn_audit_conf_t);
+	if (config == NULL) {
+		DBG_ERR("talloc_zero() failed\n");
+		errno = ENOMEM;
+		return -1;
+	}
+
+	ok = tn_audit_backend_init(handle, svc, user, config);
+	if (!ok) {
+		TALLOC_FREE(config);
+		return -1;
 	}
 
 	// If we fail to generate our connection info, then
@@ -205,9 +383,10 @@ static int tn_audit_connect(vfs_handle_struct *handle,
 		return -1;
 	}
 
-	ok = add_connection_info_to_obj(svc, handle->conn,
-					&js_conn);
+	ok = tn_add_connection_info_to_obj(svc, handle->conn,
+					   &js_conn);
 	if (!ok) {
+		json_free(&js_conn);
 		TALLOC_FREE(config);
 		return -1;
 	}
@@ -221,27 +400,30 @@ static int tn_audit_connect(vfs_handle_struct *handle,
 				tn_audit_conf_t, return -1);
 
 	// After this point, we unilaterally succeed (just log message is potentially lost)
-	ok = init_json_msg(&msg, &entry);
+	ok = tn_init_json_msg(&msg, &entry);
 	if (!ok) {
 		return result;
 	}
 
-	ok = add_client_info_to_obj(handle->conn->sconn, &entry);
+	ok = tn_add_client_info_to_obj(handle->conn->sconn, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
 
-	ok = add_unix_token_to_obj(handle->conn->session_info, &entry);
+	ok = json_add_auth_session_info(
+		handle->conn->session_info, &entry,
+		SMB_JSON_UTOK_ALL
+	);
 	if (!ok) {
 		goto cleanup;
 	}
 
-	ok = add_result_unix(0, &msg, &entry);
+	ok = tn_add_result_unix(0, &msg, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
 
-	ok = format_log_entry(handle, config, TN_OP_CONNECT, &msg, &entry);
+	ok = tn_format_log_entry(handle, config, TN_OP_CONNECT, &msg, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
@@ -299,7 +481,6 @@ static void tn_audit_disconnect(vfs_handle_struct *handle)
 	 * {
 	 *   "host": "127.0.0.1",
 	 *   "unix_token": {
-	 *     "username": "smbuser",
 	 *     "uid": 3000,
 	 *     "gid": 3000
          *     "groups": [545, 3000, 90000005, 90000012, 90000017],
@@ -332,17 +513,20 @@ static void tn_audit_disconnect(vfs_handle_struct *handle)
 		return;
 	}
 
-	ok = init_json_msg(&msg, &entry);
+	ok = tn_init_json_msg(&msg, &entry);
 	if (!ok) {
 		return;
 	}
 
-	ok = add_client_info_to_obj(handle->conn->sconn, &entry);
+	ok = tn_add_client_info_to_obj(handle->conn->sconn, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
 
-	ok = add_unix_token_to_obj(handle->conn->session_info, &entry);
+	ok = json_add_auth_session_info(
+		handle->conn->session_info, &entry,
+		SMB_JSON_UTOK_ALL
+	);
 	if (!ok) {
 		goto cleanup;
 	}
@@ -357,18 +541,17 @@ static void tn_audit_disconnect(vfs_handle_struct *handle)
 		goto cleanup;
 	}
 
-	ok = add_result_unix(0, &msg, &entry);
+	ok = tn_add_result_unix(0, &msg, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
 
-	ok = format_log_entry(handle, config, TN_OP_DISCONNECT, &msg, &entry);
+	ok = tn_format_log_entry(handle, config, TN_OP_DISCONNECT, &msg, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
 
 	tn_audit_do_log(config, &msg);
-	json_free(&msg);
 
 cleanup:
 	json_free(&msg);
@@ -386,8 +569,8 @@ static tn_audit_ext_t *init_fsp_extension(vfs_handle_struct *handle,
 	tn_audit_ext_t *fsp_ext = NULL;
 
 	fsp_ext = (tn_audit_ext_t *)VFS_FETCH_FSP_EXTENSION(handle, fsp);
-	if (fsp_ext != NULL) {
-		return NULL;
+	if (fsp_ext) {
+		return fsp_ext;
 	}
 
 	fsp_ext = VFS_ADD_FSP_EXTENSION(handle, fsp, tn_audit_ext_t,
@@ -483,7 +666,7 @@ static NTSTATUS tn_audit_create_file(vfs_handle_struct *handle,
 		return result;
 	}
 
-	ok = init_json_msg(&msg, &entry);
+	ok = tn_init_json_msg(&msg, &entry);
 	if (!ok) {
 		return result;
 	}
@@ -491,34 +674,30 @@ static NTSTATUS tn_audit_create_file(vfs_handle_struct *handle,
 
 	if (NT_STATUS_IS_OK(result)) {
 		fsp_ext = init_fsp_extension(handle, *result_fsp, &entry);
-		if (fsp_ext == NULL) {
-			// We're reusing an existing handle. Reduce spam.
-			goto cleanup;
-		}
 		fname = (*result_fsp)->fsp_name;
 		js_flags |= FILE_ADD_HANDLE;
 	}
 
-	ok = add_create_payload(fname,
-				fsp_ext,
-				js_flags,
-				access_mask,
-				share_access,
-				create_disposition,
-				create_options,
-				file_attributes,
-				sd,
-				&entry);
+	ok = tn_add_create_payload(fname,
+				   fsp_ext,
+				   js_flags,
+				   access_mask,
+				   share_access,
+				   create_disposition,
+				   create_options,
+				   file_attributes,
+				   sd,
+				   &entry);
 	if (!ok) {
 		goto cleanup;
 	}
 
-	ok = add_result_ntstatus(result, &msg, &entry);
+	ok = tn_add_result_ntstatus(result, &msg, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
 
-	ok = format_log_entry(handle, config, TN_OP_CREATE, &msg, &entry);
+	ok = tn_format_log_entry(handle, config, TN_OP_CREATE, &msg, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
@@ -611,43 +790,41 @@ static int tn_audit_close(vfs_handle_struct *handle, files_struct *fsp)
 		return result;
 	}
 
-	ok = init_json_msg(&msg, &entry);
+	ok = tn_init_json_msg(&msg, &entry);
 	if (!ok) {
+		json_free(&counters);
 		return result;
 	}
 
-	ok = add_file_to_object(fsp->fsp_name, fsp_ext, "file", FILE_ADD_HANDLE, &entry);
+	ok = tn_add_file_to_object(fsp->fsp_name, fsp_ext, "file", FILE_ADD_HANDLE, &entry);
 	if (!ok) {
-		json_free(&entry);
 		goto cleanup;
 	}
 
 	ok = add_fsp_operations(fsp_ext, &counters);
 	if (!ok) {
-		json_free(&entry);
 		goto cleanup;
 	}
 
 	error = json_add_object(&entry, "operations", &counters);
 	if (error) {
-		json_free(&entry);
 		goto cleanup;
 	}
 
-	ok = add_result_unix(result, &msg, &entry);
+	ok = tn_add_result_unix(result, &msg, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
 
-	ok = format_log_entry(handle, config, TN_OP_CLOSE, &msg, &entry);
+	ok = tn_format_log_entry(handle, config, TN_OP_CLOSE, &msg, &entry);
 	if (!ok) {
-		json_free(&entry);
 		goto cleanup;
 	}
 
 	tn_audit_do_log(config, &msg);
 
 cleanup:
+	json_free(&entry);
 	json_free(&msg);
 	return result;
 }
@@ -691,7 +868,7 @@ static int tn_audit_unlinkat(vfs_handle_struct *handle,
 		return -1;
 	}
 
-	ok = init_json_msg(&msg, &entry);
+	ok = tn_init_json_msg(&msg, &entry);
 	if (!ok) {
 		TALLOC_FREE(full_fname);
 		return -1;
@@ -702,17 +879,17 @@ static int tn_audit_unlinkat(vfs_handle_struct *handle,
 				       smb_fname,
 				       flags);
 
-	ok = add_file_to_object(full_fname, NULL, "file", js_flags, &entry);
+	ok = tn_add_file_to_object(full_fname, NULL, "file", js_flags, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
 
-	ok = add_result_unix(result, &msg, &entry);
+	ok = tn_add_result_unix(result, &msg, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
 
-	ok = format_log_entry(handle, config, TN_OP_UNLINK, &msg, &entry);
+	ok = tn_format_log_entry(handle, config, TN_OP_UNLINK, &msg, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
@@ -732,13 +909,38 @@ static int tn_audit_renameat(vfs_handle_struct *handle,
 			     files_struct *dstfsp,
 			     const struct smb_filename *smb_fname_dst)
 {
+	/*
+	 * Sample `event_data`
+	 *
+	 * {
+	 *   "src_file": {
+	 *     "type": "REGULAR",
+	 *     "path": "bob.log",
+	 *     "stream": null,
+	 *     "snap": null
+	 *   },
+	 *   "dst_file": {
+	 *     "path": "larry.log",
+	 *     "stream": null,
+	 *     "snap": null
+	 *   },
+	 *   "result": {
+	 *     "type": "UNIX",
+	 *     "value_raw": 0,
+	 *     "value_parsed": "SUCCESS"
+	 *   },
+	 *   "vers": { "major": 0, "minor": 1 }
+	 * }
+	 */
 	int result;
 	struct smb_filename *full_fname_src = NULL;
 	struct smb_filename *full_fname_dst = NULL;
 	tn_audit_conf_t *config = NULL;
 	struct json_object msg, entry;
-	uint32_t js_flags = FILE_ADD_NAME | FILE_NAME_IS_PATH | FILE_ADD_TYPE;
+	uint32_t js_flags = FILE_ADD_NAME | FILE_NAME_IS_PATH;
 	bool ok;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config, tn_audit_conf_t, return -1);
 
 	full_fname_src = full_path_from_dirfsp_atname(talloc_tos(),
 						      srcfsp,
@@ -766,23 +968,23 @@ static int tn_audit_renameat(vfs_handle_struct *handle,
 		return -1;
 	}
 
-	ok = init_json_msg(&msg, &entry);
+	ok = tn_init_json_msg(&msg, &entry);
 	if (!ok) {
 		TALLOC_FREE(full_fname_src);
 		TALLOC_FREE(full_fname_dst);
 		return -1;
 	}
 
-	ok = add_file_to_object(full_fname_src,
+	ok = tn_add_file_to_object(full_fname_src,
 				NULL,
 				"src_file",
-				js_flags,
+				js_flags | FILE_ADD_TYPE,
 				&entry);
 	if (!ok) {
 		goto cleanup;
 	}
 
-	ok = add_file_to_object(full_fname_dst,
+	ok = tn_add_file_to_object(full_fname_dst,
 				NULL,
 				"dst_file",
 				js_flags,
@@ -791,12 +993,12 @@ static int tn_audit_renameat(vfs_handle_struct *handle,
 		goto cleanup;
 	}
 
-	ok = add_result_unix(result, &msg, &entry);
+	ok = tn_add_result_unix(result, &msg, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
 
-	ok = format_log_entry(handle, config, TN_OP_RENAME, &msg, &entry);
+	ok = tn_format_log_entry(handle, config, TN_OP_RENAME, &msg, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
@@ -822,6 +1024,26 @@ static NTSTATUS tn_audit_fsctl(struct vfs_handle_struct *handle,
 			       uint32_t max_out_len,
 			       uint32_t *out_len)
 {
+	/*
+	 * {
+	 *   "function": {
+	 *     "raw": "0x000900c0",
+	 *     "parsed": "CREATE_OR_GET_OBJECT_ID"
+	 *   },
+	 *   "file": {
+	 *     "handle": {
+	 *       "type": "DEV_INO",
+	 *       "value": "41:135:0"
+	 *     }
+	 *   },
+	 *   "result": {
+	 *     "type": "NTSTATUS",
+	 *     "value_raw": 0,
+	 *     "value_parsed": "SUCCESS",
+	 *   },
+	 *   "vers": { "major": 0, "minor": 1 }
+	 * }
+	 */
 	static const struct enum_list fn_types[] = {
 		{ FSCTL_SET_SPARSE,
 		  "SPARSE" },
@@ -885,13 +1107,7 @@ static NTSTATUS tn_audit_fsctl(struct vfs_handle_struct *handle,
 		return result;
 	}
 
-	for (i = 0; i < ARRAY_SIZE(fn_types); i++) {
-		if (fn_types[i].value == function) {
-			parsed = fn_types[i].name;
-		}
-	}
-
-	ok = init_json_msg(&msg, &entry);
+	ok = tn_init_json_msg(&msg, &entry);
 	if (!ok) {
 		return result;
 	}
@@ -901,35 +1117,38 @@ static NTSTATUS tn_audit_fsctl(struct vfs_handle_struct *handle,
 		goto cleanup;
 	}
 
-	ok = add_map_to_object(function, "raw", &jsfn);
+	ok = json_add_map_to_object(&jsfn, "raw", function);
 	if (!ok) {
 		json_free(&jsfn);
 		goto cleanup;
 	}
 
-	error = json_add_string(&jsfn, "parsed", parsed);
-	if (error) {
+	ok = json_add_enum_list_find(&jsfn, "parsed",
+				     function,
+				     ARRAY_SIZE(fn_types),
+				     fn_types,
+				     "UNKNOWN");
+	if (!ok) {
 		json_free(&jsfn);
 		goto cleanup;
 	}
 
 	error = json_add_object(&entry, "function", &jsfn);
 	if (error) {
-		json_free(&jsfn);
 		goto cleanup;
 	}
 
-	ok = add_file_to_object(fsp->fsp_name, fsp_ext, "file", FILE_ADD_HANDLE, &entry);
+	ok = tn_add_file_to_object(fsp->fsp_name, fsp_ext, "file", FILE_ADD_HANDLE, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
 
-	ok = add_result_ntstatus(result, &msg, &entry);
+	ok = tn_add_result_ntstatus(result, &msg, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
 
-	ok = format_log_entry(handle, config, TN_OP_FSCTL, &msg, &entry);
+	ok = tn_format_log_entry(handle, config, TN_OP_FSCTL, &msg, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
@@ -967,7 +1186,7 @@ static void log_setattr_common(vfs_handle_struct *handle,
 		return;
 	}
 
-	ok = init_json_msg(&msg, &entry);
+	ok = tn_init_json_msg(&msg, &entry);
 	if (!ok) {
 		return;
 	}
@@ -979,7 +1198,7 @@ static void log_setattr_common(vfs_handle_struct *handle,
 			goto cleanup;
 		}
 
-		ok = add_map_to_object(dosmode, "dosmode", &entry);
+		ok = json_add_map_to_object(&entry, "dosmode", dosmode);
 		if (!ok) {
 			goto cleanup;
 		}
@@ -988,7 +1207,7 @@ static void log_setattr_common(vfs_handle_struct *handle,
 		if (error) {
 			goto cleanup;
 		}
-		ok = add_result_unix(rv.error ? errno : 0, &msg, &entry);
+		ok = tn_add_result_unix(rv.error ? errno : 0, &msg, &entry);
 		if (!ok) {
 			goto cleanup;
 		}
@@ -1010,42 +1229,57 @@ static void log_setattr_common(vfs_handle_struct *handle,
 			goto cleanup;
 		}
 
-		tval = convert_timespec_to_timeval(ft->create_time);
-		ok = add_timestamp(&jsts, "btime", &tval);
-		if (!ok) {
-			json_free(&jsts);
-			goto cleanup;
+		if (!is_omit_timespec(&ft->create_time)) {
+			tval = convert_timespec_to_timeval(ft->create_time);
+			ok = json_add_time(&jsts, "btime", &tval,
+					   SMB_JSON_TIME_LOCAL);
+			if (!ok) {
+				json_free(&jsts);
+				goto cleanup;
+			}
 		}
 
-		tval = convert_timespec_to_timeval(ft->atime);
-		ok = add_timestamp(&jsts, "atime", &tval);
-		if (!ok) {
-			json_free(&jsts);
-			goto cleanup;
+		if (!is_omit_timespec(&ft->atime) &&
+		    timespec_compare(&ft->atime,
+		    &fsp->fsp_name->st.st_ex_atime)) {
+			tval = convert_timespec_to_timeval(ft->atime);
+			ok = json_add_time(&jsts, "atime", &tval,
+					   SMB_JSON_TIME_LOCAL);
+			if (!ok) {
+				json_free(&jsts);
+				goto cleanup;
+			}
 		}
 
-		tval = convert_timespec_to_timeval(ft->mtime);
-		ok = add_timestamp(&jsts, "mtime", &tval);
-		if (!ok) {
-			json_free(&jsts);
-			goto cleanup;
+		if (!is_omit_timespec(&ft->mtime) &&
+		    timespec_compare(&ft->mtime,
+		    &fsp->fsp_name->st.st_ex_mtime)) {
+			tval = convert_timespec_to_timeval(ft->mtime);
+			ok = json_add_time(&jsts, "mtime", &tval,
+					   SMB_JSON_TIME_LOCAL);
+			if (!ok) {
+				json_free(&jsts);
+				goto cleanup;
+			}
 		}
 
-		tval = convert_timespec_to_timeval(ft->ctime);
-		ok = add_timestamp(&jsts, "ctime", &tval);
-		if (!ok) {
-			json_free(&jsts);
-			goto cleanup;
+		if (!is_omit_timespec(&ft->ctime)) {
+			tval = convert_timespec_to_timeval(ft->ctime);
+			ok = json_add_time(&jsts, "ctime", &tval,
+					   SMB_JSON_TIME_LOCAL);
+			if (!ok) {
+				json_free(&jsts);
+				goto cleanup;
+			}
 		}
 
 		error = json_add_object(&entry, "ts", &jsts);
 		if (error) {
-			json_free(&jsts);
 			goto cleanup;
 		}
 
-		ok = add_result_ntstatus(rv.status, &msg, &entry);
-		if (ok) {
+		ok = tn_add_result_ntstatus(rv.status, &msg, &entry);
+		if (!ok) {
 			goto cleanup;
 		}
 		break;
@@ -1053,12 +1287,22 @@ static void log_setattr_common(vfs_handle_struct *handle,
 		smb_panic("unexpected attr_type");
 	};
 
-	ok = add_file_to_object(fsp->fsp_name, fsp_ext, "file", FILE_ADD_HANDLE, &entry);
-	if (!ok) {
-		goto cleanup;
+	if (fsp_ext) {
+		ok = tn_add_file_to_object(fsp->fsp_name, fsp_ext, "file", FILE_ADD_HANDLE, &entry);
+		if (!ok) {
+			goto cleanup;
+		}
+	} else {
+		ok = tn_add_file_to_object(fsp->fsp_name,
+					   NULL, "file",
+					   FILE_ADD_NAME | FILE_ADD_TYPE,
+					   &entry);
+		if (!ok) {
+			goto cleanup;
+		}
 	}
 
-	ok = format_log_entry(handle, config, TN_OP_SET_ATTR, &msg, &entry);
+	ok = tn_format_log_entry(handle, config, TN_OP_SET_ATTR, &msg, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
@@ -1075,6 +1319,28 @@ static NTSTATUS tn_audit_fset_dos_attributes(struct vfs_handle_struct *handle,
 					     struct files_struct *fsp,
 					     uint32_t dosmode)
 {
+	/*
+	 * These are logged as "SET_ATTR" event types.
+	 *
+	 * Sample event data
+	 * {
+	 *   "attr_type": "DOSMODE",
+	 *   "dosmode": "0x00000022",
+	 *   "ts": null,
+	 *   "result": {
+	 *     "type": "UNIX",
+	 *     "value_raw": 0,
+	 *     "value_parsed": "SUCCESS",
+	 *   },
+	 *   "file": {
+	 *      "handle": {
+	 *        "type": "DEV_INO",
+	 *        "value": "41:135:0"
+	 *      }
+	 *   },
+	 *   "vers": {"major": 0, "minor": 1}
+	 * }
+	 */
 	tn_rval_t rv;
 
 	rv.status = SMB_VFS_NEXT_FSET_DOS_ATTRIBUTES(handle, fsp, dosmode);
@@ -1086,6 +1352,30 @@ static int tn_audit_fntimes(vfs_handle_struct *handle,
 			    files_struct *fsp,
 			    struct smb_file_time *ft)
 {
+	/*
+	 * These are logged as "SET_ATTR" event types.
+	 *
+	 * Sample event data
+	 * {
+	 *   "attr_type": "DOSMODE",
+	 *   "dosmode": null,
+	 *   "ts": {
+	 *     "btime": "2020-01-01 01:01:01.000000-0800",
+	 *   },
+	 *   "result": {
+	 *     "type": "UNIX",
+	 *     "value_raw": 0,
+	 *     "value_parsed": "SUCCESS",
+	 *   },
+	 *   "file": {
+	 *      "handle": {
+	 *        "type": "DEV_INO",
+	 *        "value": "41:135:0"
+	 *      }
+	 *   },
+	 *   "vers": {"major": 0, "minor": 1}
+	 * }
+	 */
 	tn_rval_t rv;
 
 	rv.error = SMB_VFS_NEXT_FNTIMES(handle, fsp, ft);
@@ -1141,20 +1431,20 @@ static NTSTATUS tn_audit_fset_nt_acl(vfs_handle_struct *handle,
 		return result;
 	}
 
-	ok = init_json_msg(&msg, &entry);
+	ok = tn_init_json_msg(&msg, &entry);
 	if (!ok) {
 		DBG_ERR("Failed to generate audit message.\n");
 		return result;
 	}
 
 	if (fsp_ext == NULL) {
-		ok = add_file_to_object(fsp->fsp_name,
+		ok = tn_add_file_to_object(fsp->fsp_name,
 					fsp_ext,
 					"file",
 					FILE_ADD_NAME | FILE_ADD_TYPE,
 					&entry);
 	} else {
-		ok = add_file_to_object(fsp->fsp_name,
+		ok = tn_add_file_to_object(fsp->fsp_name,
 					fsp_ext,
 					"file",
 					FILE_ADD_HANDLE,
@@ -1165,7 +1455,7 @@ static NTSTATUS tn_audit_fset_nt_acl(vfs_handle_struct *handle,
 		goto cleanup;
 	}
 
-	ok = add_map_to_object(secinfo_sent, "secinfo", &entry);
+	ok = json_add_map_to_object(&entry, "secinfo", secinfo_sent);
 	if (!ok) {
 		DBG_ERR("Failed to add secinfo_sent to audit message\n");
 		goto cleanup;
@@ -1178,8 +1468,8 @@ static NTSTATUS tn_audit_fset_nt_acl(vfs_handle_struct *handle,
 	}
 
 	result = SMB_VFS_NEXT_FSET_NT_ACL(handle, fsp, secinfo_sent, psd);
-	SMB_ASSERT(add_result_ntstatus(result, &msg, &entry));
-	SMB_ASSERT(format_log_entry(handle,
+	SMB_ASSERT(tn_add_result_ntstatus(result, &msg, &entry));
+	SMB_ASSERT(tn_format_log_entry(handle,
 				    config,
 				    TN_OP_SET_ACL,
 				    &msg,
@@ -1224,16 +1514,16 @@ static int tn_audit_set_quota(struct vfs_handle_struct *handle,
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config, tn_audit_conf_t, return result);
 
-	ok = init_json_msg(&msg, &entry);
+	ok = tn_init_json_msg(&msg, &entry);
 	if (!ok) {
 		return result;
 	}
 
 	result = SMB_VFS_NEXT_SET_QUOTA(handle, qtype, id, qt);
 
-	SMB_ASSERT(add_smb_quota_to_obj(qtype, id, qt, &entry));
-	SMB_ASSERT(add_result_unix(result, &msg, &entry));
-	SMB_ASSERT(format_log_entry(handle,
+	SMB_ASSERT(tn_add_smb_quota_to_obj(qtype, id, qt, &entry));
+	SMB_ASSERT(tn_add_result_unix(result, &msg, &entry));
+	SMB_ASSERT(tn_format_log_entry(handle,
 				    config,
 				    TN_OP_SET_QUOTA,
 				    &msg,

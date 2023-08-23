@@ -102,7 +102,7 @@ bld.SAMBA3_MODULE('vfs_truenas_audit',
                      vfs_truenas_audit_rw.c
                      vfs_truenas_audit_utils.c
                  ''',
-                 deps='samba-util jansson',
+                 deps='samba-util jansson libsmbjson',
                  init_function='',
                  internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_truenas_audit'),
                  enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_truenas_audit'))
