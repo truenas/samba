@@ -454,6 +454,19 @@ bld.SAMBA3_LIBRARY('libsmb',
                         ''',
                    private_library=True)
 
+bld.SAMBA3_LIBRARY('libsmbjson',
+                   deps='''MESSAGING_SEND
+                           jansson
+                           samba-debug
+                           smbd_base
+                           audit_logging
+                           LIBTSOCKET''',
+                   source='''
+                           libsmbjson/js_utils.c
+                           libsmbjson/js_session.c
+                          ''',
+                   private_library=True)
+
 bld.SAMBA3_SUBSYSTEM('CLDAP',
                     source='libads/cldap.c',
                     deps='cli-ldap-common cli_cldap LIBTSOCKET')

@@ -146,12 +146,12 @@ static bool tn_log_rw_common(vfs_handle_struct *handle,
 
 	clock_gettime_mono(&now);
 
-	ok = init_json_msg(&msg, &entry);
+	ok = tn_init_json_msg(&msg, &entry);
 	if (!ok) {
 		return false;
 	}
 
-	ok = add_file_to_object(fsp->fsp_name, fsp_ext, "file", FILE_ADD_HANDLE, &entry);
+	ok = tn_add_file_to_object(fsp->fsp_name, fsp_ext, "file", FILE_ADD_HANDLE, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
@@ -159,11 +159,11 @@ static bool tn_log_rw_common(vfs_handle_struct *handle,
 	switch (op) {
 	case TN_OP_READ_DATA:
 	case TN_OP_WRITE_DATA:
-		ok = add_result_unix(result.error, &msg, &entry);
+		ok = tn_add_result_unix(result.error, &msg, &entry);
 		break;
 	case TN_OP_OFFLOAD_READ_DATA:
 	case TN_OP_OFFLOAD_WRITE_DATA:
-		ok = add_result_ntstatus(result.status, &msg, &entry);
+		ok = tn_add_result_ntstatus(result.status, &msg, &entry);
 		break;
 	default:
 		smb_panic("Unexpected op");
@@ -173,7 +173,7 @@ static bool tn_log_rw_common(vfs_handle_struct *handle,
 		goto cleanup;
 	}
 
-	ok = format_log_entry(handle, config, op, &msg, &entry);
+	ok = tn_format_log_entry(handle, config, op, &msg, &entry);
 	if (!ok) {
 		goto cleanup;
 	}

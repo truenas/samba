@@ -34,13 +34,43 @@ extern int vfs_tnaudit_debug_level;
 #undef DBGC_CLASS
 #define DBGC_CLASS vfs_tnaudit_debug_level
 
+typedef struct tn_syslog_config {
+	int priority;
+	int facility;
+} tn_syslog_conf_t;
+
+typedef struct tn_debug_config {
+	int dbglvl;
+} tn_debug_conf_t;
+
+union tn_backend_config {
+	tn_syslog_conf_t syslog;
+	tn_debug_conf_t debug;
+};
+
+typedef bool tn_audit_log_fn_t(struct json_object *msg, union tn_backend_config *conf,
+			       const char *loc);
+
+/*
+ * TrueNAS audit module configuration is generated during SMB tree connect VFS
+ * operation and stores configuration of the module as well as operation
+ * counters for the tree connect and the JSON string that is printed for
+ * svc_data in each audit message.
+ *
+ * `rw_interval` - number of seconds to wait between generating audit messages
+ *     for read / write operations on a file handle.
+ * `js_connection` - JSON dumps of TCON data. This is already dumped to save
+ *     on per-op memory allocations (info should be static for TCON).
+ * `backend_config` - auditing backend-specific configuration information
+ * `audit_fn` - function that sends the generated audit message
+ * `conn_info` - static connection info for audit message
+ * `op_cnt` - operation counters that are printed on TDIS.
+ */
 typedef struct truenas_audit_config {
-	int syslog_facility;
-	int syslog_priority;
 	int rw_interval;
-	bool do_syslog;
-	bool enabled;
 	char *js_connection;
+	union tn_backend_config backend_config;
+	tn_audit_log_fn_t *audit_fn;
 	struct {
 		char *user;
 		char *sess;
@@ -53,6 +83,14 @@ typedef struct truenas_audit_config {
 	} op_cnt;
 } tn_audit_conf_t;
 
+/*
+ * The FSP extension in this module keeps counts for bytes and op count that
+ * aggregates all types of reads and writes (for example synchronous reads,
+ * asyncronous reads, and server-side reads are all tracked under a single set
+ * of counters). We have separate timespecs for each of the op types though
+ * so that we can implement limits on how frequently we generate audit
+ * messages.
+ */
 typedef struct truenas_audit_vfs_extension {
 	struct {
 		size_t read_cnt;
@@ -74,7 +112,6 @@ typedef enum tn_audit_op {
 	TN_OP_DISCONNECT,
 	TN_OP_CREATE,
 	TN_OP_CLOSE,
-	TN_OP_LISTDIR,
 	TN_OP_READ_DATA,
 	TN_OP_OFFLOAD_READ_DATA,
 	TN_OP_WRITE_DATA,
@@ -83,7 +120,6 @@ typedef enum tn_audit_op {
 	TN_OP_RENAME,
 	TN_OP_FSCTL,
 	TN_OP_UNLINK,
-	TN_OP_COPY,
 	TN_OP_SET_ATTR,
 	TN_OP_SET_QUOTA,
 } tn_op_t;
@@ -115,7 +151,6 @@ static struct {
 	{ TN_OP_DISCONNECT, "DISCONNECT", DEF_MAJ_VER, DEF_MIN_VER },
 	{ TN_OP_CREATE, "CREATE", DEF_MAJ_VER, DEF_MIN_VER },
 	{ TN_OP_CLOSE, "CLOSE", DEF_MAJ_VER, DEF_MIN_VER },
-	{ TN_OP_LISTDIR, "QUERY_DIRECTORY", DEF_MAJ_VER, DEF_MIN_VER },
 	{ TN_OP_READ_DATA, "READ", DEF_MAJ_VER, DEF_MIN_VER },
 	{ TN_OP_WRITE_DATA, "WRITE", DEF_MAJ_VER, DEF_MIN_VER },
 	{ TN_OP_OFFLOAD_READ_DATA, "OFFLOAD_READ", DEF_MAJ_VER, DEF_MIN_VER },
@@ -123,24 +158,10 @@ static struct {
 	{ TN_OP_SET_ACL, "SET_ACL", DEF_MAJ_VER, DEF_MIN_VER },
 	{ TN_OP_RENAME, "RENAME", DEF_MAJ_VER, DEF_MIN_VER },
 	{ TN_OP_UNLINK, "UNLINK", DEF_MAJ_VER, DEF_MIN_VER },
-	{ TN_OP_COPY, "COPY", DEF_MAJ_VER, DEF_MIN_VER },
 	{ TN_OP_FSCTL, "FSCTL", DEF_MAJ_VER, DEF_MIN_VER },
 	{ TN_OP_SET_ATTR, "SET_ATTR", DEF_MAJ_VER, DEF_MIN_VER },
 	{ TN_OP_SET_QUOTA, "SET_QUOTA", DEF_MAJ_VER, DEF_MIN_VER },
 };
-
-/**
- * @brief Perform deep copy of JSON object and insert in specfied object
- *
- * @param[in] src     Source object that will be copied
- * @param[in] key     Key to use for newly created JSON object
- * @param[in] dst     Target for new copy
- *
- * @return            boolean True on success False on failure
- */
-bool dup_json_object(struct json_object *src,
-		     const char *key,
-		     struct json_object *dst);
 
 /**
  * @brief Initialize JSON objects to be used in log message
@@ -150,21 +171,8 @@ bool dup_json_object(struct json_object *src,
  *
  * @return            boolean True on success False on failure
  */
-bool init_json_msg(struct json_object *wrapper,
-		   struct json_object *data);
-
-/**
- * @brief Add ISO 8601 timestamp to specified JSON object
- *
- * @param[in] object  JSON object to which to add timestamp
- * @param[in] key     Key to use to attach timestamp
- * @param[in] tvp     Timeval struct to convert into timestamp
- *
- * @return            boolean True on success False on failure
- */
-bool add_timestamp(struct json_object *object,
-		   const char *key,
-		   struct timeval *tvp);
+bool tn_init_json_msg(struct json_object *wrapper,
+		      struct json_object *data);
 
 /**
  * @brief Add connection information to specified JSON object
@@ -183,69 +191,9 @@ bool add_timestamp(struct json_object *object,
  *
  * @return            boolean True on success False on failure
  */
-bool add_connection_info_to_obj(const char *service,
-				const connection_struct *conn,
-				struct json_object *jsobj);
-
-/**
- * @brief Add unix token to JSON object
- *
- * "unix_token": {
- *   "username": <string>,
- *   "uid": <int>,
- *   "gid": <int>,
- *   "groups": [<int>, <int>, ..]
- * }
- *
- * @param[in] sess    Session information to add to JSON object
- * @param[in] jsobj   JSON object to which to add session info
- *
- * @return            boolean True on success False on failure
- */
-bool add_unix_token_to_obj(const struct auth_session_info *sess,
-			   struct json_object *jsobj);
-
-/**
- * @brief Add SMB client information to JSON object
- *
- * Currently this adds hostname string as `host` key. More
- * information may be added in future revision
- *
- * "host": <string>
- *
- * @param[in] sess    Server connection information to add to JSON object
- * @param[in] jsobj   JSON object to which to add SMB client info
- *
- * @return            boolean True on success False on failure
- */
-bool add_client_info_to_obj(const struct smbd_server_connection *sconn,
-			    struct json_object *jsobj);
-
-/**
- * @brief Convert NTTIME to string and insert in object with specified key.
- *
- * @param[in] jsobj   JSON object to which to add snapshot timestamp
- * @param[in] key     Key to use to attach snapshot timestamp
- * @param[in] twrp    NTTIME-converted TWRP token
- *
- * @return            boolean True on success False on failure
- */
-bool add_snapshot_to_object(struct json_object *jsobj,
-			    const char *key,
-			    NTTIME twrp);
-
-/**
- * @brief Convert file type to a string and attach using specified key.
- *
- * @param[in] jsobj   JSON object to which to add file type
- * @param[in] key     Key to use to attach file type
- * @param[in] mode_t  S_IFMT c.f. stat.h
- *
- * @return            boolean True on success False on failure
- */
-bool add_file_type_to_object(struct json_object *jsobj,
-			     const char *key,
-			     mode_t ftype);
+bool tn_add_connection_info_to_obj(const char *service,
+				   const connection_struct *conn,
+				   struct json_object *jsobj);
 
 #define FILE_ADD_HANDLE 0x00000001
 #define FILE_ADD_NAME 0x00000002
@@ -313,42 +261,19 @@ bool add_file_type_to_object(struct json_object *jsobj,
  *
  * @endcode
  */
-bool add_file_to_object(const struct smb_filename *fname,
-			const tn_audit_ext_t *fsp_ext,
-			const char *key,
-			uint32_t flags,
-			struct json_object *jsobj);
+bool _tn_add_file_to_object(const struct smb_filename *fname,
+			    const tn_audit_ext_t *fsp_ext,
+			    const char *key,
+			    uint32_t flags,
+			    struct json_object *jsobj,
+			    const char *location);
+#define tn_add_file_to_object(fname, fsp_ext, key, flags, jsobj) \
+	_tn_add_file_to_object(fname, fsp_ext, key, flags, jsobj, __location__)
 
-/**
- * @brief convert bitmask into hex string and attach as key.
- *
- * @param[in] uint32_t attribute to convert to hex string
- * @param[in] name     Key to use to attach bitmask
- * @param[in] jsobj    JSON object to which to add the bitmask.
- *
- * @return             boolean True on success False on failure
- */
-bool add_map_to_object(uint32_t attr,
-		       const char *name,
-		       struct json_object *jsobj);
-
-/**
- * @brief Convert uint64_t to string and attach as key.
- *
- * @param[in] uint64_t value to convert to string
- * @param[in] name     Key to use to attach integer
- * @param[in] jsobj    JSON object to which to string.
- *
- * @return             boolean True on success False on failure
- */
-bool add_u64_to_object(uint64_t val,
-		       const char *name,
-		       struct json_object *jsobj);
-
-bool add_smb_quota_to_obj(enum SMB_QUOTA_TYPE qtype,
-			  unid_t id,
-			  SMB_DISK_QUOTA *qt,
-			  struct json_object *jsobj);
+bool tn_add_smb_quota_to_obj(enum SMB_QUOTA_TYPE qtype,
+			     unid_t id,
+			     SMB_DISK_QUOTA *qt,
+			     struct json_object *jsobj);
 
 /*
  * Convert SMB_VFS_CREATE payload into a JSON object
@@ -364,16 +289,16 @@ bool add_smb_quota_to_obj(enum SMB_QUOTA_TYPE qtype,
  * "file": <JSON object c.f. add_file_to_object()>,
  * "sd": <SDDL string if SD specified during file creation>
  */
-bool add_create_payload(struct smb_filename *smb_fname,
-			tn_audit_ext_t *fsp_ext,
-		        uint32_t js_flags,
-		        uint32_t access_mask,
-		        uint32_t share_access,
-		        uint32_t create_disposition,
-		        uint32_t create_options,
-		        uint32_t file_attributes,
-		        struct security_descriptor *psd,
-		        struct json_object *jsobj);
+bool tn_add_create_payload(struct smb_filename *smb_fname,
+			   tn_audit_ext_t *fsp_ext,
+			   uint32_t js_flags,
+			   uint32_t access_mask,
+			   uint32_t share_access,
+			   uint32_t create_disposition,
+			   uint32_t create_options,
+			   uint32_t file_attributes,
+			   struct security_descriptor *psd,
+			   struct json_object *jsobj);
 
 /**
  * @brief Add UNIX result to JSON message.
@@ -387,9 +312,12 @@ bool add_create_payload(struct smb_filename *smb_fname,
  *
  * @return             boolean True on success False on failure
  */
-bool add_result_unix(const int err,
-		     struct json_object *root,
-		     struct json_object *body);
+bool _tn_add_result_unix(const int err,
+			 struct json_object *root,
+			 struct json_object *body,
+			 const char *location);
+#define tn_add_result_unix(err, root, body) \
+	_tn_add_result_unix(err, root, body, __location__)
 
 /**
  * @brief Add NTSTATUS result to JSON message.
@@ -403,10 +331,17 @@ bool add_result_unix(const int err,
  *
  * @return             boolean True on success False on failure
  */
-bool add_result_ntstatus(const NTSTATUS status,
-			 struct json_object *root,
-			 struct json_object *body);
+bool _tn_add_result_ntstatus(const NTSTATUS status,
+			     struct json_object *root,
+			     struct json_object *body,
+			     const char *location);
+#define tn_add_result_ntstatus(status, root, body) \
+	_tn_add_result_ntstatus(status, root, body, __location__)
 
+/*
+ * Functions below this point are samba VFS functions and hence lack detailed
+ * descriptions of arguments and output
+ */
 ssize_t tn_audit_pread(vfs_handle_struct *handle, files_struct *fsp,
 		       void *data, size_t n, off_t offset);
 
@@ -454,20 +389,16 @@ NTSTATUS tn_audit_offload_write_recv(struct vfs_handle_struct *handle,
 				     struct tevent_req *req,
 				     off_t *copied);
 
-bool _format_log_entry(vfs_handle_struct *handle,
-		      tn_audit_conf_t *conf,
-		      tn_op_t op,
-		      struct json_object *root,
-		      struct json_object *entry_data,
-		      const char *location);
+bool _tn_format_log_entry(vfs_handle_struct *handle,
+			  tn_audit_conf_t *conf,
+			  tn_op_t op,
+			  struct json_object *root,
+			  struct json_object *entry_data,
+			  const char *location);
 
-#define format_log_entry(hdl, conf, op, root, entry_data)\
-	_format_log_entry(hdl, conf, op, root, entry_data, __location__)
-
-bool _tn_audit_do_log(tn_audit_conf_t *config,
-		      struct json_object *jsobj,
-		      const char *location);
+#define tn_format_log_entry(hdl, conf, op, root, entry_data)\
+	_tn_format_log_entry(hdl, conf, op, root, entry_data, __location__)
 
 #define tn_audit_do_log(config, jsobj)\
-	_tn_audit_do_log(config, jsobj, __location__)
+	config->audit_fn(jsobj, &config->backend_config, __location__)
 #endif  /* __TRUENAS_AUDIT_H */
