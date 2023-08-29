@@ -188,8 +188,10 @@ static bool add_filemeta(struct mds_ctx *mds_ctx,
 			if (result != 0) {
 				return false;
 			}
-		} else if (strcmp(attribute, "kMDItemFSContentChangeDate") == 0) {
-			sl_time.tv_sec = sp->st_ex_mtime.tv_sec;
+		} else if (strcmp(attribute, "kMDItemFSContentChangeDate") == 0 ||
+			strcmp(attribute, "kMDItemContentModificationDate") == 0)
+		{
+			sl_time = convert_timespec_to_timeval(sp->st_ex_mtime);
 			result = dalloc_add_copy(meta, &sl_time, sl_time_t);
 			if (result != 0) {
 				return false;
@@ -306,9 +308,20 @@ static bool create_result_handle(struct sl_query *slq)
 static bool add_results(sl_array_t *array, struct sl_query *slq)
 {
 	sl_filemeta_t *fm;
-	uint64_t status = 0;
+	uint64_t status;
 	int result;
 	bool ok;
+
+	/*
+	 * Taken from a network trace against a macOS SMB Spotlight server. If
+	 * the first fetch-query-results has no results yet because the search
+	 * is still running, macOS returns 0x23, otherwise 0x0.
+	 */
+	if (slq->state >= SLQ_STATE_RESULTS ) {
+		status = 0;
+	} else {
+		status = 0x23;
+	}
 
 	/* FileMeta */
 	fm = dalloc_zero(array, sl_filemeta_t);
@@ -1126,7 +1139,7 @@ static bool slrpc_fetch_query_results(struct mds_ctx *mds_ctx,
 			goto error;
 		}
 		if (slq->state == SLQ_STATE_FULL) {
-			slq->state = SLQ_STATE_RESULTS;
+			slq->state = SLQ_STATE_RUNNING;
 			slq->mds_ctx->backend->search_cont(slq);
 		}
 		break;

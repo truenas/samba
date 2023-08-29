@@ -86,7 +86,7 @@ static void reply_sesssetup_and_X_spnego(struct smb_request *req)
 	DATA_BLOB in_blob;
 	DATA_BLOB out_blob = data_blob_null;
 	size_t bufrem;
-	char *tmp;
+	char *tmp = NULL;
 	const char *native_os;
 	const char *native_lanman;
 	const char *primary_domain;
@@ -581,7 +581,7 @@ void reply_sesssetup_and_X(struct smb_request *req)
 	struct reply_sesssetup_and_X_state *state = NULL;
 	uint64_t sess_vuid;
 	uint16_t smb_bufsize;
-	char *tmp;
+	char *tmp = NULL;
 	fstring sub_user; /* Sanitised username for substitution */
 	const char *native_os;
 	const char *native_lanman;
