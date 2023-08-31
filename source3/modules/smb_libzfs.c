@@ -447,7 +447,7 @@ static zfs_handle_t *fget_zhandle(libzfs_handle_t *lz, dev_t *dev_id, int fd)
 	snprintf(procfd_path, sizeof(procfd_path), "/proc/self/fd/%d", fd);
 
 	if (!mp_to_dataset_name(procfd_path, ds_name, ZFS_MAX_DATASET_NAME_LEN)) {
-		DBG_ERR("%s: failed to convert to dataset name\n");
+		DBG_ERR("%s: failed to convert to dataset name\n", procfd_path);
 		strlcpy(ds_name, procfd_path, ZFS_MAX_DATASET_NAME_LEN);
 	}
 
@@ -1049,7 +1049,7 @@ smb_zfs_get_user_prop(struct smbzhandle *hdl,
 	zfs_handle_t *zfsp = NULL;
 	nvlist_t *userprops = NULL;
 	nvlist_t *propval = NULL;
-	char *propstr = NULL;
+	const char *propstr = NULL;
 	char prefixed_prop[ZFS_MAXPROPLEN] = {0};
 
 	snprintf(prefixed_prop, sizeof(prefixed_prop),
@@ -1688,7 +1688,7 @@ smb_zfs_delete_snapshots(struct snapshot_list *snaps)
 	int ret;
 	nvlist_t *to_delete = NULL;
 	struct snapshot_entry *entry = NULL;
-	char snapname[ZFS_MAX_DATASET_NAME_LEN];
+	char snapname[ZFSDS_NAMELEN + ZFSDS_NAMELEN + 2];
 	libzfs_handle_t *lz = NULL;
 
 	lz = get_global_smblibzfs_handle();
