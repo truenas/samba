@@ -93,32 +93,7 @@ typedef struct shadow_copy_fsp_ext {
 	struct shadow_copy_zfs_config *config;
 } shadow_fsp_ext_t;
 
-static void cp_snapshot_data(struct snapshot_data *in,
-			     struct snapshot_data *out)
-{
-	strlcpy(out->mountpoint,
-		in->mountpoint,
-		sizeof(out->mountpoint));
-
-	strlcpy(out->shadow_cp,
-		in->shadow_cp,
-		sizeof(out->shadow_cp));
-
-	strlcpy(out->shadow_cp,
-		in->shadow_cp,
-		sizeof(out->shadow_cp));
-
-	out->snap.nt_time = in->snap.nt_time;
-	out->snap.cr_time = in->snap.cr_time;
-	out->sens = in->sens;
-
-	strlcpy(out->snap.name,
-		in->snap.name,
-		sizeof(out->snap.name));
-	strlcpy(out->snap.label,
-		in->snap.label,
-		sizeof(out->snap.label));
-}
+#define cp_snapshot_data(in, out) memcpy(out, in, sizeof(struct snapshot_data))
 
 static snapdir_open_t *check_for_open(snapdir_open_t *opens, const char *mp)
 {
@@ -774,15 +749,12 @@ static bool zfs_lookup_snapshot_list(vfs_handle_struct *handle,
 		return false;
 	}
 
-	// shadow connecpath has not been determined yet
+	// shadow connectpath has not been determined yet
 	data->shadow_cp[0] = '\0';
 	data->sens = sens;
-	data->snap.cr_time = entry->cr_time;
-	data->snap.nt_time = entry->nt_time;
-
-	strlcpy(data->snap.name, entry->name, sizeof(data->snap.name));
-	strlcpy(data->snap.label, entry->label, sizeof(data->snap.label));
-
+	memcpy(&data->snap, entry, sizeof(struct snapshot_entry));
+	data->snap.next = NULL;
+	data->snap.prev = NULL;
 	return true;
 }
 
@@ -1076,10 +1048,20 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 		fsp_ext->fsp_name_ptr = fsp->fsp_name;
 		fsp_ext->config = config;
 		config->refcnt++;
-		SMB_ASSERT(open_snapdir(fsp_ext) == true);
+		/*
+		 * O_PATH open is not sufficient to maintain dynamic mount of ZFS
+		 * snapshot. We need to pin it down with an O_DIRECTORY open, which may
+		 * fail due to permissions or TOCTOU issues. If it fails, then close
+		 * our O_PATH open and pass error back up stack.
+		 */
+		if (!open_snapdir(fsp_ext)) {
+			close(ret);
+			ret = -1;
+		}
 	}
 
 	TALLOC_FREE(smb_fname);
+	TALLOC_FREE(conv);
 	return ret;
 }
 
