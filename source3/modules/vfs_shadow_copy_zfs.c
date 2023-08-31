@@ -61,6 +61,16 @@ struct snapshot_data {
 	struct snapshot_entry snap;
 };
 
+/*
+ * Pathref fds (O_PATH opens) are insufficient to maintain the ZFS snapdir
+ * temparary mountpoint. This means that we keep a per-snapshot refcounted
+ * open of its root to prevent ops from periodically failing. The refcount
+ * increases as more files within snapshot are opened and decreases as part
+ * of FSP destructor for files in snapdir. When refcnt hits zero the file
+ * is closed, but the snapdir_open_t is not freed. These are allocated under
+ * the module's VFS handle private data and freed during session teardown, and
+ * are stored as a linked-list `opens` in shadow_copy_zfs_config struct.
+ */
 typedef struct open_snapdir {
 	struct snapshot_data data;
 	int mp_fd;
@@ -81,7 +91,6 @@ struct shadow_copy_zfs_config {
 	struct snapshot_data	*shadow_connectpath;
 
 	snapdir_open_t		*opens;
-	int refcnt;
 };
 
 typedef struct shadow_copy_fsp_ext {
@@ -94,6 +103,14 @@ typedef struct shadow_copy_fsp_ext {
 } shadow_fsp_ext_t;
 
 #define cp_snapshot_data(in, out) memcpy(out, in, sizeof(struct snapshot_data))
+#define SHADOW_ZFS_INCREF(x) do { \
+	SMB_ASSERT(x->refcnt >= 0); \
+	x->refcnt++;\
+} while (0)
+#define SHADOW_ZFS_DECREF(x) do { \
+	SMB_ASSERT(x->refcnt > 0); \
+	x->refcnt--;\
+} while (0)
 
 static snapdir_open_t *check_for_open(snapdir_open_t *opens, const char *mp)
 {
@@ -121,46 +138,28 @@ static snapdir_open_t *check_for_open(snapdir_open_t *opens, const char *mp)
 
 static int snapdir_open_destructor(snapdir_open_t *entry)
 {
-	SMB_ASSERT(entry->refcnt >= 0);
-	int ret = 0;
-	switch (entry->refcnt) {
-	case 1:
-		DBG_DEBUG("%s: destructor called: %d\n",
-			  entry->data.shadow_cp, entry->refcnt);
-		entry->refcnt--;
-		DLIST_REMOVE(entry->config->opens, entry);
-		break;
-	case 0:
-		break;
-	default:
-		DBG_DEBUG("%s: destructor called: %d\n",
-			  entry->data.shadow_cp, entry->refcnt);
-		entry->refcnt--;
-		/*
-		 * There are still references to this
-		 * decrement refcnt but don't free it
-		 */
-		ret = -1;
-		break;
+	if (entry->refcnt > 0) {
+		DBG_ERR("%s: snapdir open is still referenced by [%d] open "
+			"files. %zu bytes leaked.\n",
+			entry->data.mountpoint,
+			entry->refcnt,
+			sizeof(snapdir_open_t));
+		return -1;
 	}
 
-	if (ret == 0) {
-		if (entry->mp_fd > 0) {
-			close(entry->mp_fd);
-			entry->mp_fd = 0;
-		}
-		entry->config->refcnt--;
-	}
-	return ret;
+	return 0;
 }
 
 static void destroy_fsp_ext_snapshot_data(void *p_data)
 {
 	shadow_fsp_ext_t *data = (shadow_fsp_ext_t *)p_data;
 	if (data->open) {
-		TALLOC_FREE(data->open);
+		SHADOW_ZFS_DECREF(data->open);
+		if (data->open->refcnt == 0) {
+			close(data->open->mp_fd);
+			data->open->mp_fd = -1;
+		}
 	}
-	data->config->refcnt--;
 }
 
 static bool open_snapdir(struct shadow_copy_fsp_ext *ext)
@@ -169,31 +168,36 @@ static bool open_snapdir(struct shadow_copy_fsp_ext *ext)
 	snapdir_open_t *snapdir= NULL;
 
 	snapdir = check_for_open(ext->config->opens, ext->data.shadow_cp);
-	if (snapdir != NULL) {
+	if ((snapdir != NULL) && (snapdir->refcnt)) {
 		goto out;
+	} else if (snapdir == NULL) {
+		snapdir = talloc_zero(ext->config, snapdir_open_t);
+		if (snapdir == NULL) {
+			return false;
+		}
+		snapdir->config = ext->config;
+		snapdir->mp_fd = -1;
+		cp_snapshot_data(&ext->data, &snapdir->data);
+		DLIST_ADD(snapdir->config->opens, snapdir);
+		talloc_set_destructor(snapdir, snapdir_open_destructor);
 	}
 
-	snapdir = talloc_zero(ext->config, snapdir_open_t);
-	if (snapdir == NULL) {
-		return false;
+	if (snapdir->mp_fd -1) {
+		/*
+		 * If we fail to open, keep struct around so that we can
+		 * avoid list churn / memory allocations
+		 */
+		snapdir->mp_fd = open(ext->data.shadow_cp, O_DIRECTORY);
+		if (snapdir->mp_fd == -1) {
+			DBG_ERR("%s: snapdir open failed: %s\n",
+				snapdir->data.shadow_cp, strerror(errno));
+			return false;
+		}
 	}
-
-	snapdir->config = ext->config;
-	cp_snapshot_data(&ext->data, &snapdir->data);
-	snapdir->mp_fd = open(ext->data.shadow_cp, O_DIRECTORY);
-	if (snapdir->mp_fd == -1) {
-		DBG_ERR("%s: snapdir open failed: %s\n",
-			snapdir->data.shadow_cp, strerror(errno));
-		TALLOC_FREE(snapdir);
-		return false;
-	}
-	talloc_set_destructor(snapdir, snapdir_open_destructor);
-	DLIST_ADD(snapdir->config->opens, snapdir);
-	snapdir->config->refcnt++;
 
 out:
 	ext->open = snapdir;
-	snapdir->refcnt++;
+	SHADOW_ZFS_INCREF(snapdir);
 	DBG_DEBUG("%s: added reference: %d\n",
 		  snapdir->data.shadow_cp,
 		  snapdir->refcnt);
@@ -1047,7 +1051,6 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 		fsp_ext->fsp = fsp;
 		fsp_ext->fsp_name_ptr = fsp->fsp_name;
 		fsp_ext->config = config;
-		config->refcnt++;
 		/*
 		 * O_PATH open is not sufficient to maintain dynamic mount of ZFS
 		 * snapshot. We need to pin it down with an O_DIRECTORY open, which may
@@ -1055,6 +1058,7 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 		 * our O_PATH open and pass error back up stack.
 		 */
 		if (!open_snapdir(fsp_ext)) {
+			TALLOC_FREE(fsp_ext);
 			close(ret);
 			ret = -1;
 		}
@@ -1601,17 +1605,6 @@ static NTSTATUS zfs_parent_pathname(struct vfs_handle_struct *handle,
 	return status;
 }
 
-static void shadow_copy_data_destroy(void **pdatap)
-{
-	struct shadow_copy_zfs_config *config = (struct shadow_copy_zfs_config *)*pdatap;
-	if (config->refcnt) {
-		DBG_ERR("Refusing to free configuration information "
-			"due to unfreed refrences: %d\n", config->refcnt);
-		return;
-	}
-	TALLOC_FREE(config);
-}
-
 static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 				const char *service, const char *user)
 {
@@ -1681,8 +1674,7 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 
 	config->zcache = memcache_init(handle->conn, (memcache_sz * 1024));
 
-	SMB_VFS_HANDLE_SET_DATA(handle, config,
-				shadow_copy_data_destroy,
+	SMB_VFS_HANDLE_SET_DATA(handle, config, NULL,
 				struct shadow_copy_zfs_config,
 				return -1);
 
