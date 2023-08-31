@@ -61,8 +61,8 @@ struct snapshot_list
 struct snap_filter
 {
 	bool ignore_empty_snaps;
-	const char **inclusions;
-	const char **exclusions;
+	char **inclusions;
+	char **exclusions;
 	time_t start;
 	time_t end;
 	uint64_t start_txg;
