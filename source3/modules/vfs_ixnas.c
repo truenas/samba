@@ -764,7 +764,6 @@ static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 
 	to_check = fsp->base_fsp ? fsp->base_fsp : fsp;
 	zfsacl = fsp_get_zfsacl(to_check);
-	dump_acl_info(zfsacl);
 	if (zfsacl == NULL) {
 		if ((errno == EINVAL) &&
 		    (fsp_get_acl_brand(fsp) == ACL_BRAND_POSIX)) {
@@ -777,6 +776,7 @@ static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 			return map_nt_error_from_unix(errno);
 		}
 	}
+	dump_acl_info(zfsacl);
 
 	frame = talloc_stackframe();
 	status = ixnas_get_nt_acl_nfs4_common(handle->conn,
