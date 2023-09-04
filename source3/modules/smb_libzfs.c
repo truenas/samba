@@ -568,6 +568,65 @@ static struct zfs_dataset *copy_to_external(TALLOC_CTX *mem_ctx,
 	return out;
 }
 
+struct zfs_quota_singleton_cache
+{
+	struct zfs_quota qt;
+	dev_t dev_id;
+	uint64_t xid;
+	time_t ts;
+};
+
+struct zfs_quota_singleton_cache cached_quota[SMBZFS_GROUP_QUOTA + 1];
+#define ZFS_QUOTA_TIMEOUT 10
+
+static bool
+smb_zfs_get_cached_quota(dev_t dev_id,
+			 uint64_t xid,
+			 enum zfs_quotatype quota_type,
+			 struct zfs_quota *qt)
+{
+	struct zfs_quota_singleton_cache *cache = NULL;
+	double seconds;
+	time_t now;
+
+	SMB_ASSERT((quota_type == SMBZFS_USER_QUOTA) ||
+		   (quota_type == SMBZFS_GROUP_QUOTA));
+	cache = &cached_quota[quota_type];
+	if ((cache->dev_id != dev_id) ||
+	    (cache->xid != xid)) {
+		return false;
+	}
+
+	time(&now);
+
+	seconds = difftime(now, cache->ts);
+	if (seconds > ZFS_QUOTA_TIMEOUT) {
+		return false;
+	}
+
+	memcpy(qt, &cache->qt, sizeof(struct zfs_quota));
+	return true;
+}
+
+static void
+smb_zfs_set_cached_quota(dev_t dev_id,
+			 uint64_t xid,
+			 enum zfs_quotatype quota_type,
+			 struct zfs_quota *qt)
+{
+	struct zfs_quota_singleton_cache *cache = NULL;
+	SMB_ASSERT((quota_type == SMBZFS_USER_QUOTA) ||
+		   (quota_type == SMBZFS_GROUP_QUOTA));
+
+	cache = &cached_quota[quota_type];
+	*cache = (struct zfs_quota_singleton_cache) {
+		.dev_id = dev_id,
+		.xid = xid,
+	};
+	memcpy(&cache->qt, qt, sizeof(struct zfs_quota));
+	time(&cache->ts);
+}
+
 int
 smb_zfs_get_quota(smbzhandle_t hdl,
 		  uint64_t xid,
@@ -575,12 +634,19 @@ smb_zfs_get_quota(smbzhandle_t hdl,
 		  struct zfs_quota *qt)
 {
 	int i;
+	bool cached;
 	size_t blocksize = 1024;
 	zfs_handle_t *zfsp = NULL;
 	char req[ZFS_MAXPROPLEN] = { 0 };
 	uint64_t rv[4] = { 0 };
 
 	zfsp = get_zhandle_from_smbzhandle(hdl);
+	ZFS_LOCK();
+	cached = smb_zfs_get_cached_quota(hdl->dev_id, xid, quota_type, qt);
+	ZFS_UNLOCK();
+	if (cached) {
+		return 0;
+	}
 
 	switch (quota_type) {
 	case SMBZFS_USER_QUOTA:
@@ -601,13 +667,9 @@ smb_zfs_get_quota(smbzhandle_t hdl,
 			ZFS_UNLOCK();
 		}
 		break;
-	case SMBZFS_DATASET_QUOTA:
-		errno = EINVAL;
-		DBG_ERR("Retrieving dataset quotas is not yet supported\n");
-		return -1;
 	default:
 		DBG_ERR("Received unknown quota type (%d)\n", quota_type);
-		return (-1);
+		return -1;
 	}
 
 	qt->bytes = rv[0] / blocksize;
@@ -615,6 +677,9 @@ smb_zfs_get_quota(smbzhandle_t hdl,
 	qt->obj = rv[2];
 	qt->obj_used = rv[3];
 	qt->quota_type = quota_type;
+	ZFS_LOCK();
+	smb_zfs_set_cached_quota(hdl->dev_id, xid, quota_type, qt);
+	ZFS_UNLOCK();
 	return 0;
 }
 
@@ -650,10 +715,6 @@ smb_zfs_set_quota(smbzhandle_t hdl, uint64_t xid, struct zfs_quota qt)
 		snprintf(qr_obj, sizeof(qr_obj), "groupobj@%lu", xid);
 #endif
 		break;
-	case SMBZFS_DATASET_QUOTA:
-		errno = EINVAL;
-		DBG_ERR("Setting dataset quotas is not yet supported\n");
-		return -1;
 	default:
 		DBG_ERR("Received unknown quota type (%d)\n", qt.quota_type);
 		return -1;
@@ -661,6 +722,7 @@ smb_zfs_set_quota(smbzhandle_t hdl, uint64_t xid, struct zfs_quota qt)
 
 	snprintf(quota, sizeof(quota), "%lu", qt.bytes);
 	ZFS_LOCK();
+	smb_zfs_set_cached_quota(hdl->dev_id, xid, qt.quota_type, &qt);
 	rv = zfs_prop_set(zfsp, qr, quota);
 	ZFS_UNLOCK();
 	if (rv != 0) {
