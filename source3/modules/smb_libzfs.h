@@ -72,9 +72,8 @@ struct snap_filter
 enum casesensitivity {SMBZFS_SENSITIVE, SMBZFS_INSENSITIVE, SMBZFS_MIXED};
 
 enum zfs_quotatype {
-	SMBZFS_USER_QUOTA,
+	SMBZFS_USER_QUOTA = 0,
 	SMBZFS_GROUP_QUOTA,
-	SMBZFS_DATASET_QUOTA
 };
 
 struct zfs_quota {
