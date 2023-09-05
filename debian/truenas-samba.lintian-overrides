@@ -8,4 +8,4 @@ truenas-samba: package-name-doesnt-match-sonames libdcerpc-binding0 libdcerpc-sa
 #samba: embedded-library usr/lib/*/samba/libgssapi-samba4.so.*: heimdal
 # False positives, see #896012
 truenas-samba: no-shlibs-control-file lib/libnss_winbind.so.2
-trueans-samba: binary-or-shlib-defines-rpath
+truenas-samba: binary-or-shlib-defines-rpath
