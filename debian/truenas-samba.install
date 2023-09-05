@@ -52,6 +52,7 @@ usr/bin/samba-tool
 usr/bin/tdbbackup
 usr/bin/ldbsearch
 usr/bin/smbcontrol
+usr/bin/samba-log-parser
 usr/bin/samba-regedit
 usr/bin/ldbedit
 usr/bin/smb.delshare.py
