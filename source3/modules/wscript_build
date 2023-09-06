@@ -95,6 +95,18 @@ bld.SAMBA3_MODULE('vfs_full_audit',
                  internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_full_audit'),
                  enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_full_audit'))
 
+bld.SAMBA3_MODULE('vfs_truenas_audit',
+                 subsystem='vfs',
+                 source='''
+                     vfs_truenas_audit.c
+                     vfs_truenas_audit_rw.c
+                     vfs_truenas_audit_utils.c
+                 ''',
+                 deps='samba-util jansson libsmbjson',
+                 init_function='',
+                 internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_truenas_audit'),
+                 enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_truenas_audit'))
+
 bld.SAMBA3_BINARY('test_vfs_full_audit',
                   source='test_vfs_full_audit.c',
                   deps='smbd_base cmocka',
