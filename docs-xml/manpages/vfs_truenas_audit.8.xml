@@ -1,0 +1,273 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE refentry PUBLIC "-//Samba-Team//DTD DocBook V4.2-Based Variant V1.0//EN" "http://www.samba.org/samba/DTD/samba-doc">
+<refentry id="vfs_truenas_audit.8">
+
+<refmeta>
+	<refentrytitle>vfs_truenas_audit</refentrytitle>
+	<manvolnum>8</manvolnum>
+	<refmiscinfo class="source">Samba</refmiscinfo>
+	<refmiscinfo class="manual">System Administration tools</refmiscinfo>
+	<refmiscinfo class="version">&doc.version;</refmiscinfo>
+</refmeta>
+
+
+<refnamediv>
+	<refname>vfs_truenas_audit</refname>
+	<refpurpose>JSON log of Samba VFS operations</refpurpose>
+</refnamediv>
+
+<refsynopsisdiv>
+	<cmdsynopsis>
+		<command>vfs objects = truenas_audit</command>
+	</cmdsynopsis>
+</refsynopsisdiv>
+
+<refsect1>
+	<title>DESCRIPTION</title>
+
+	<para>This VFS module is part of the
+	<citerefentry><refentrytitle>samba</refentrytitle>
+	<manvolnum>7</manvolnum></citerefentry> suite.</para>
+
+	<para>The <command>vfs_truenas_audit</command> VFS module records
+	client operations to the system log using
+	<citerefentry><refentrytitle>syslog</refentrytitle>
+	<manvolnum>3</manvolnum></citerefentry>.</para>
+
+	<para><command>vfs_truenas_audit</command> generates audit records for
+	the following events (which roughly correspond to Samba VFS operations):</para>
+
+	<simplelist>
+	<member>CONNECT</member>
+	<member>DISCONNECT</member>
+	<member>CREATE</member>
+	<member>CLOSE</member>
+	<member>READ_DATA</member>
+	<member>WRITE_DATA</member>
+	<member>OFFLOAD_READ_DATA</member>
+	<member>OFFLOAD_WRITE_DATA</member>
+	<member>SET_ACL</member>
+	<member>RENAME</member>
+	<member>UNLINK</member>
+	<member>SET_ATTR</member>
+	<member>SET_QUOTA</member>
+	</simplelist>
+
+	<para><command>vfs_truenas_audit</command> records audit events in fixed
+	format consisting of string <command>"@cee:{"TNAUDIT": JSON object / event}"</command>
+	Contents of the JSON object are as follows: </para>
+	<programlisting>
+	{
+	  "aid": GUID,
+	  "vers": {"major": INT, "minor": INT},
+	  "time": STRING,
+	  "addr": STRING,
+	  "svc": "SMB",
+	  "event": STRING,
+	  "success": BOOLEAN,
+	  "sess": GUID,
+	  "svc_data": STRING - JSON dumps,
+	  "event_data": STRING - JSON dumps,
+	}
+	</programlisting>
+
+	<para>The event fields are as follows. Ordering of keys in not guaranteed.</para>
+
+	<itemizedlist>
+	<listitem><para><command>aid</command>
+	- GUID uniquely identifying the audit event
+	</para></listitem>
+	<listitem><para><command>vers</command>
+	- JSON object containing version info for event object structure
+	</para></listitem>
+	<listitem><para><command>time</command>
+	- Timestamp in UTC indicating when event occurred (not same as when logged).
+	</para></listitem>
+	<listitem><para><command>addr</command>
+	- String indicating IP address of SMB client.
+	</para></listitem>
+	<listitem><para><command>svc</command>
+	- String identifying service generating audit message. This will always be "SMB".
+	</para></listitem>
+	<listitem><para><command>event</command>
+	- String identifying event type audit message. This will be one of events names
+	listed above.
+	</para></listitem>
+	<listitem><para><command>success</command>
+	- JSON boolean value indicating whether the operation succeeded or failed.
+	</para></listitem>
+	<listitem><para><command>sess</command>
+	- GUID uniquely identifying the SMB session.
+	</para></listitem>
+	<listitem><para><command>svc_data</command>
+	- JSON object containing TCON-specific data. This is standardized for all events.
+	with fields defined below.
+	</para></listitem>
+	<listitem><para><command>event_data</command>
+	- JSON object containing event-specific data. This will vary based on event type.
+	</para></listitem>
+	</itemizedlist>
+
+	<para>svc_data JSON object contains the following information
+	<programlisting>
+	{
+	  "vers": {"major": INT, "minor": INT},
+	  "service": STRING,
+	  "session_id": "STRING",
+	  "tcon_id": STRING,
+	}
+	</programlisting>
+	</para>
+
+	<itemizedlist>
+	<listitem><para><command>vers</command>
+	- JSON object containing version info for event object structure
+	</para></listitem>
+	<listitem><para><command>service</command>
+	- Name of SMB share
+	</para></listitem>
+	<listitem><para><command>session_id</command>
+	- Numeric SMB session ID. This is a JSON string to prevent overflow of JSON number.
+	</para></listitem>
+	<listitem><para><command>tcon_id</command>
+	- Numeric SMB Tree Connection ID. This is a JSON string to prevent overflow of JSON number.
+	</para></listitem>
+	</itemizedlist>
+
+	<para>WARNING: this module is only supported for SMB sessions negotiated at SMB2
+	protocol or higher. SMB1 connections to shares with auditing enabled will be rejected.
+	</para>
+	<para>This module is stackable.</para>
+
+</refsect1>
+
+
+<refsect1>
+	<title>OPTIONS</title>
+
+	<variablelist>
+		<varlistentry>
+		<term>truenas_audit:backend = [ syslog | debug ]</term>
+		<listitem>
+		<para>Specify the backend used for audit messages. Currently
+		supported options are "syslog" and "debug". The former option
+		sends messages via explicit syslog call with configurable
+		priority and facility. The latter option sends message via
+		samba's debug library with a configurable severity. Default is
+		"syslog".
+		</para>
+
+		</listitem>
+		</varlistentry>
+
+		<varlistentry>
+		<term>truenas_audit:syslog_facility = FACILITY</term>
+		<listitem>
+		<para>Log messages to the named
+		<citerefentry><refentrytitle>syslog</refentrytitle>
+		<manvolnum>3</manvolnum></citerefentry> facility.
+		Facility name should be specified in upper-case letters.
+		Default is "USER" (LOG_USER).
+		NOTE: this setting is only evaluated for "syslog" backend.
+		</para>
+
+		</listitem>
+		</varlistentry>
+
+		<varlistentry>
+		<term>truenas_audit:syslog_priority = PRIORITY</term>
+		<listitem>
+		<para>Log messages with the named
+		<citerefentry><refentrytitle>syslog</refentrytitle>
+		<manvolnum>3</manvolnum></citerefentry> priority.
+		Priority name should be specified in upper-case letters.
+		Default is "WARNING" (LOG_WARNING).
+		NOTE: this setting is only evaluated for "syslog" backend.
+		</para>
+
+		</listitem>
+		</varlistentry>
+
+		<varlistentry>
+		<term>truenas_audit:debug_level = [ WARNING | NOTICE | INFO ]</term>
+		<listitem>
+		<para>Log messages with the named priority level.
+		NOTE: this setting is only evaluated for "debug" backend.
+		</para>
+
+		</listitem>
+		</varlistentry>
+
+		<varlistentry>
+		<term>truenas_audit:watch_list = LIST</term>
+		<listitem>
+		<para>List of group names for which to generate audit messages.
+		The default is all groups.
+		</para>
+
+		</listitem>
+		</varlistentry>
+
+		<varlistentry>
+		<term>truenas_audit:ignore_list = LIST</term>
+		<listitem>
+		<para>List of group names for which to explicitly not generate audit
+		messages. The default is all groups.
+		NOTE: if user is member of group in watch_list and ignore_list, then
+		SMB operations will be audited.
+		</para>
+
+		</listitem>
+		</varlistentry>
+
+		<varlistentry>
+		<term>truenas_audit:rw_log_interval = INTEGER</term>
+		<listitem>
+		<para>Generating an audit message for every read and write request would
+		quickly inundate almost any system log implementation with relatively
+		useless information. This parameter specifies the minimum amount of time
+		to wait before generating another event of this particular sort for a
+		give file handle. For example, if this parameter is set to 5 and a client
+		is doing constant writes to a file, only 12 events will be generated
+		per minute. The default value for this is 60, e.g. one event per handle
+		per minute.
+		</para>
+
+		</listitem>
+		</varlistentry>
+	</variablelist>
+</refsect1>
+
+<refsect1>
+	<title>EXAMPLES</title>
+
+	<para>Generate audit log of SMB operations on the [records]
+	by members of the marketing and sales groups.</para>
+
+<programlisting>
+	<smbconfsection name="[records]"/>
+	<smbconfoption name="path">/mnt/dozer/records</smbconfoption>
+	<smbconfoption name="vfs objects">truenas_audit</smbconfoption>
+	<smbconfoption name="truenas_audit:watch_list">marketing sales</smbconfoption>
+	<smbconfoption name="truenas_audit:rw_log_interval">5</smbconfoption>
+</programlisting>
+
+</refsect1>
+
+<refsect1>
+	<title>VERSION</title>
+	<para>This man page is part of version &doc.version; of the Samba suite.
+	</para>
+</refsect1>
+
+<refsect1>
+	<title>AUTHOR</title>
+
+	<para>The original Samba software and related utilities
+	were created by Andrew Tridgell. Samba is now developed
+	by the Samba Team as an Open Source project similar
+	to the way the Linux kernel is developed.</para>
+
+</refsect1>
+
+</refentry>
