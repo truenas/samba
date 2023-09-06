@@ -301,16 +301,6 @@ bool _json_add_auth_user_info(const struct auth_user_info *info,
 		}
 	}
 
-	if (flags & SMB_JSON_AUTH_INFO_AUTHD) {
-		error = json_add_bool(jsobj, "authenticated",
-				      info->authenticated);
-		if (error) {
-			DBG_ERR("%s: failed to add authenticated to "
-				"JSON object\n", location);
-			return false;
-		}
-	}
-
 	return true;
 }
 
