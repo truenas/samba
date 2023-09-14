@@ -574,6 +574,7 @@ struct zfs_quota_singleton_cache
 	dev_t dev_id;
 	uint64_t xid;
 	time_t ts;
+	bool valid;
 };
 
 struct zfs_quota_singleton_cache cached_quota[SMBZFS_GROUP_QUOTA + 1];
@@ -592,7 +593,7 @@ smb_zfs_get_cached_quota(dev_t dev_id,
 	SMB_ASSERT((quota_type == SMBZFS_USER_QUOTA) ||
 		   (quota_type == SMBZFS_GROUP_QUOTA));
 	cache = &cached_quota[quota_type];
-	if ((cache->dev_id != dev_id) ||
+	if (!cache->valid || (cache->dev_id != dev_id) ||
 	    (cache->xid != xid)) {
 		return false;
 	}
@@ -612,7 +613,8 @@ static void
 smb_zfs_set_cached_quota(dev_t dev_id,
 			 uint64_t xid,
 			 enum zfs_quotatype quota_type,
-			 struct zfs_quota *qt)
+			 struct zfs_quota *qt,
+			 bool valid)
 {
 	struct zfs_quota_singleton_cache *cache = NULL;
 	SMB_ASSERT((quota_type == SMBZFS_USER_QUOTA) ||
@@ -622,6 +624,7 @@ smb_zfs_set_cached_quota(dev_t dev_id,
 	*cache = (struct zfs_quota_singleton_cache) {
 		.dev_id = dev_id,
 		.xid = xid,
+		.valid = valid
 	};
 	memcpy(&cache->qt, qt, sizeof(struct zfs_quota));
 	time(&cache->ts);
@@ -678,7 +681,7 @@ smb_zfs_get_quota(smbzhandle_t hdl,
 	qt->obj_used = rv[3];
 	qt->quota_type = quota_type;
 	ZFS_LOCK();
-	smb_zfs_set_cached_quota(hdl->dev_id, xid, quota_type, qt);
+	smb_zfs_set_cached_quota(hdl->dev_id, xid, quota_type, qt, true);
 	ZFS_UNLOCK();
 	return 0;
 }
@@ -722,7 +725,7 @@ smb_zfs_set_quota(smbzhandle_t hdl, uint64_t xid, struct zfs_quota qt)
 
 	snprintf(quota, sizeof(quota), "%lu", qt.bytes);
 	ZFS_LOCK();
-	smb_zfs_set_cached_quota(hdl->dev_id, xid, qt.quota_type, &qt);
+	smb_zfs_set_cached_quota(hdl->dev_id, xid, qt.quota_type, &qt, false);
 	rv = zfs_prop_set(zfsp, qr, quota);
 	ZFS_UNLOCK();
 	if (rv != 0) {
