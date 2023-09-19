@@ -31,6 +31,10 @@ static int vfs_winmsa_debug_level = DBGC_VFS;
 #define DBGC_CLASS vfs_winmsa_debug_level
 #define WINMSA_DBGLVL debuglevel_get_class(vfs_winmsa_debug_level)
 
+typedef struct winmsa_config {
+	bool as_root;
+} winmsa_conf_t;
+
 static void dump_acl_info(zfsacl_t theacl, const char *fn)
 {
 	char *acltext = NULL;
@@ -131,7 +135,8 @@ static bool _inherit_acl(int parent_fd,
 
 static bool do_fts_walk(vfs_handle_struct *handle,
 			files_struct *dstfsp,
-			const struct smb_filename *dst)
+			const struct smb_filename *dst,
+			bool as_root)
 {
 	FTS *ftsp = NULL;
 	FTSENT *entry = NULL;
@@ -159,6 +164,9 @@ static bool do_fts_walk(vfs_handle_struct *handle,
 		return -1;
 	}
 
+	if (as_root) {
+		become_root();
+	}
 	while (((entry = fts_read(ftsp)) != NULL) && ok) {
 		if (entry->fts_level == FTS_ROOTLEVEL) {
 			continue;
@@ -180,6 +188,10 @@ static bool do_fts_walk(vfs_handle_struct *handle,
 		}
 	}
 
+	if (as_root) {
+		unbecome_root();
+	}
+
 	fts_close(ftsp);
 	TALLOC_FREE(smb_fname);
 	return ok;
@@ -194,6 +206,10 @@ static int winmsa_renameat(vfs_handle_struct *handle,
 
 	int tmpfd, error;
 	bool do_inherit, ok;
+	winmsa_conf_t *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config, winmsa_conf_t,
+				smb_panic("Failed to get winmsa config"));
 
 	DBG_INFO("renaming %s %s -> %s %s\n",
 		 fsp_str_dbg(srcfsp), smb_fname_str_dbg(src),
@@ -237,13 +253,19 @@ static int winmsa_renameat(vfs_handle_struct *handle,
 		return 0;
 	}
 
+	if (config->as_root) {
+		become_root();
+	}
 	if (!inherit_acl(tmpfd, dst->base_name, src->st.st_ex_ino, S_ISDIR(src->st.st_ex_mode))) {
 		DBG_ERR("%s: failed to inherit acl: %s\n", smb_fname_str_dbg(dst), strerror(errno));
+	}
+	if (config->as_root) {
+		unbecome_root();
 	}
 	close(tmpfd);
 
 	if (S_ISDIR(src->st.st_ex_mode)) {
-		ok = do_fts_walk(handle, dstfsp, dst);
+		ok = do_fts_walk(handle, dstfsp, dst, config->as_root);
 		if (!ok) {
 			DBG_INFO("%s, %s: fts_walk() failed: %s\n",
 				 fsp_str_dbg(dstfsp), smb_fname_str_dbg(dst), strerror(errno));
@@ -253,8 +275,36 @@ static int winmsa_renameat(vfs_handle_struct *handle,
 	return 0;
 }
 
+static int winmsa_connect(struct vfs_handle_struct *handle,
+			  const char *service, const char *user)
+{
+	winmsa_conf_t *config = NULL;
+	int ret;
+
+	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
+	if (ret < 0) {
+		return ret;
+	}
+
+	config = talloc_zero(handle->conn, winmsa_conf_t);
+	if (config == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+
+	config->as_root = lp_parm_bool(SNUM(handle->conn), MODNAME,
+				       "insecure_perform_acl_change_as_root", false);
+
+	SMB_VFS_HANDLE_SET_DATA(handle, config,
+				NULL, winmsa_conf_t,
+				smb_panic("Failed to set winmsa config\n"));
+
+	return ret;
+}
+
 static struct vfs_fn_pointers winmsa_fns = {
 	.renameat_fn = winmsa_renameat,
+	.connect_fn = winmsa_connect,
 };
 
 NTSTATUS vfs_winmsa_init(TALLOC_CTX *ctx)
