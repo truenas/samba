@@ -203,6 +203,39 @@ plantestsuite("samba3.smbtorture_s3.hidenewfiles(fileserver_smb1)",
                "",
                "-l $LOCAL_PATH"])
 
+plantestsuite("samba3.smbtorture_s3.smb1.SMB1-TRUNCATED-SESSSETUP",
+                "fileserver_smb1",
+                [os.path.join(samba3srcdir,
+                              "script/tests/test_smbtorture_s3.sh"),
+                'SMB1-TRUNCATED-SESSSETUP',
+                '//$SERVER_IP/tmp',
+                '$USERNAME',
+                '$PASSWORD',
+                smbtorture3,
+                "-mNT1"])
+
+plantestsuite("samba3.smbtorture_s3.smb1.SMB1-NEGOTIATE-EXIT",
+                "fileserver_smb1",
+                [os.path.join(samba3srcdir,
+                              "script/tests/test_smbtorture_s3.sh"),
+                'SMB1-NEGOTIATE-EXIT',
+                '//$SERVER_IP/tmp',
+                '$USERNAME',
+                '$PASSWORD',
+                smbtorture3,
+                "-mNT1"])
+
+plantestsuite("samba3.smbtorture_s3.smb1.SMB1-NEGOTIATE-TCON",
+                "fileserver_smb1",
+                [os.path.join(samba3srcdir,
+                              "script/tests/test_smbtorture_s3.sh"),
+                'SMB1-NEGOTIATE-TCON',
+                '//$SERVER_IP/tmp',
+                '$USERNAME',
+                '$PASSWORD',
+                smbtorture3,
+                "-mNT1"])
+
 #
 # MSDFS attribute tests.
 #
@@ -1514,6 +1547,16 @@ plantestsuite(
      smbtorture3,
      "",
      "-b $PREFIX/clusteredmember/unclists/tmp.txt -N 5 -o 10"])
+
+plantestsuite("samba3.blackbox.smbclient-bug15435",
+              "fileserver",
+              [os.path.join(samba3srcdir, "script/tests/test_bug15435_widelink_dfs.sh"),
+               "$SERVER",
+               "$SERVER_IP",
+               "$USERNAME",
+               "$PASSWORD",
+               smbclient3,
+               configuration])
 
 plantestsuite(
     "samba3.net_machine_account",
