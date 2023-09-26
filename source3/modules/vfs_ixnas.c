@@ -329,7 +329,7 @@ static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
 
 	ok = ixnas_set_native_dosmode(fsp, flags);
 	if (ok) {
-		return NT_STATUS_OK;
+		goto out;
 	} else if ((errno != EACCES) && (errno != EPERM)) {
 		return map_nt_error_from_unix(errno);
 	}
@@ -360,7 +360,7 @@ static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
 		return map_nt_error_from_unix(errno);
 	}
 
-
+out:
 #if defined (FREEBSD)
 	return NT_STATUS_OK;
 #else
