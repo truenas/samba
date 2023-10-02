@@ -20,6 +20,8 @@
 #include "includes.h"
 #include "winbindd.h"
 #include "librpc/gen_ndr/ndr_winbind_c.h"
+#include "passdb/lookup_sid.h" /* only for LOOKUP flags */
+#include "passdb/machine_sid.h"
 #include "../libcli/security/security.h"
 
 struct wb_lookupname_state {
@@ -72,6 +74,20 @@ struct tevent_req *wb_lookupname_send(TALLOC_CTX *mem_ctx,
 		D_WARNING("Could not find domain for %s\n", namespace);
 		tevent_req_nterror(req, NT_STATUS_NONE_MAPPED);
 		return tevent_req_post(req, ev);
+	}
+
+	if (flags == (LOOKUP_NAME_NO_NSS | LOOKUP_NAME_REMOTE)) {
+		if (dom_sid_compare_domain(&domain->sid,
+		    get_global_sam_sid()) == 0) {
+			D_NOTICE("Domain [%s] is our local domain, "
+				 "skipping recursive lookup\n",
+				 dom_name);
+
+			tevent_req_nterror(req, NT_STATUS_NONE_MAPPED);
+			return tevent_req_post(req, ev);
+		}
+
+		flags &= ~LOOKUP_NAME_REMOTE;
 	}
 
 	subreq = dcerpc_wbint_LookupName_send(
