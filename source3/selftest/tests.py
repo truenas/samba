@@ -67,6 +67,8 @@ except KeyError:
     samba4bindir = bindir()
     config_h = os.path.join(samba4bindir, "default/include/config.h")
 
+bbdir = os.path.join(srcdir(), "testprogs/blackbox")
+
 # check available features
 config_hash = dict()
 f = open(config_h, 'r')
@@ -239,6 +241,17 @@ plantestsuite("samba3.smbtorture_s3.smb1.SMB1-NEGOTIATE-EXIT",
                 smbtorture3,
                 "-mNT1"])
 
+plantestsuite("samba3.smbtorture_s3.smb1.SMB1-NEGOTIATE-TCON",
+                "fileserver_smb1",
+                [os.path.join(samba3srcdir,
+                              "script/tests/test_smbtorture_s3.sh"),
+                'SMB1-NEGOTIATE-TCON',
+                '//$SERVER_IP/tmp',
+                '$USERNAME',
+                '$PASSWORD',
+                smbtorture3,
+                "-mNT1"])
+
 #
 # MSDFS attribute tests.
 #
@@ -291,6 +304,20 @@ plantestsuite("samba3.smbtorture_s3.smb2.SMB2-DFS-FILENAME-LEADING-BACKSLASH",
                               "script/tests/test_smbtorture_s3.sh"),
                 'SMB2-DFS-FILENAME-LEADING-BACKSLASH',
                 '//$SERVER_IP/msdfs-pathname-share',
+                '$USERNAME',
+                '$PASSWORD',
+                smbtorture3,
+                "-mSMB2"])
+
+# BUG: https://bugzilla.samba.org/show_bug.cgi?id=15422
+# Prevent bad pipenames.
+#
+plantestsuite("samba3.smbtorture_s3.smb2.SMB2-INVALID-PIPENAME",
+                "fileserver",
+                [os.path.join(samba3srcdir,
+                              "script/tests/test_smbtorture_s3.sh"),
+                'SMB2-INVALID-PIPENAME',
+                '//$SERVER_IP/tmp',
                 '$USERNAME',
                 '$PASSWORD',
                 smbtorture3,
@@ -377,6 +404,20 @@ plantestsuite("samba3.smbtorture_s3.smb1.SMB1-DFS-OPERATIONS",
                 '$PASSWORD',
                 smbtorture3,
                 "-mNT1"])
+#
+# SMB1-DFS-BADPATH needs to run against a special share msdfs-pathname-share
+# BUG: https://bugzilla.samba.org/show_bug.cgi?id=15419
+#
+plantestsuite("samba3.smbtorture_s3.smb1.SMB1-DFS-BADPATH",
+                "fileserver_smb1",
+                [os.path.join(samba3srcdir,
+                              "script/tests/test_smbtorture_s3.sh"),
+                'SMB1-DFS-BADPATH',
+                '//$SERVER_IP/msdfs-pathname-share',
+                '$USERNAME',
+                '$PASSWORD',
+                smbtorture3,
+                "-mNT1"])
 
 #
 # SMB2-STREAM-ACL needs to run against a special share - vfs_wo_fruit
@@ -446,6 +487,22 @@ plantestsuite("samba3.smbtorture_s3.plain.%s" % "SMB2-DEL-ON-CLOSE-NONWRITE-DELE
                               "script/tests/test_smbtorture_s3.sh"),
                 'SMB2-DEL-ON-CLOSE-NONWRITE-DELETE-NO',
                 '//$SERVER_IP/delete_no_unwrite',
+                '$USERNAME',
+                '$PASSWORD',
+                smbtorture3,
+                "",
+                "-l $LOCAL_PATH"])
+
+#
+# Test doing an async read + disconnect on a pipe doesn't crash the server.
+# BUG: https://bugzilla.samba.org/show_bug.cgi?id=15423
+#
+plantestsuite("samba3.smbtorture_s3.plain.%s" % "SMB2-PIPE-READ-ASYNC-DISCONNECT",
+                "fileserver",
+                [os.path.join(samba3srcdir,
+                              "script/tests/test_smbtorture_nocrash_s3.sh"),
+                'SMB2-PIPE-READ-ASYNC-DISCONNECT',
+                '//$SERVER_IP/tmp',
                 '$USERNAME',
                 '$PASSWORD',
                 smbtorture3,
@@ -911,6 +968,10 @@ if with_pthreadpool:
                   [os.path.join(samba3srcdir,
                                 "script/tests/test_libwbclient_threads.sh"),
                    "$DOMAIN", "$DC_USERNAME"])
+    plantestsuite("b15464_testcase", "none",
+                  [os.path.join(bbdir, "b15464-testcase.sh"),
+                   binpath("b15464-testcase"),
+                   binpath("plugins/libnss_winbind.so.2")])
 
 plantestsuite("samba3.test_nfs4_acl", "none",
               [os.path.join(bindir(), "test_nfs4_acls"),
