@@ -176,9 +176,11 @@ NTSTATUS winbindd_getgrnam_recv(struct tevent_req *req,
 
 	if (tevent_req_is_nterror(req, &status)) {
 		struct dom_sid_buf sidbuf;
-		D_WARNING("Could not convert sid %s: %s\n",
-			  dom_sid_str_buf(&state->sid, &sidbuf),
-			  nt_errstr(status));
+		if (!is_null_sid(&state->sid)) {
+			D_WARNING("Could not convert sid %s: %s\n",
+				  dom_sid_str_buf(&state->sid, &sidbuf),
+				  nt_errstr(status));
+		}
 		return status;
 	}
 
