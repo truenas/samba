@@ -50,6 +50,8 @@ typedef struct libaio_event_context {
 #define LIBAIO_ADDITIONAL_FD_FLAG_REPORT_ERROR	(1<<1)
 #define LIBAIO_ADDITIONAL_FD_FLAG_GOT_ERROR	(1<<2)
 #define LIBAIO_ADDITIONAL_FD_FLAG_HAS_MPX	(1<<3)
+#define EVTOLA(x) (talloc_get_type_abort(x->additional_data, libaio_ev_ctx_t))
+#define DATATOFDE(x) (talloc_get_type_abort(x, struct tevent_fd))
 
 static void libaio_panic(libaio_ev_ctx_t *libaio_ev,
 			 const char *reason, bool replay)
@@ -306,9 +308,7 @@ static void libaio_add_event(libaio_ev_ctx_t *libaio_ev, struct tevent_fd *fde)
 		 * This is a multiplexed fde, we need to include both
 		 * flags in the modified event.
 		 */
-		mpx_fde = talloc_get_type_abort(fde->additional_data,
-						struct tevent_fd);
-
+		mpx_fde = DATATOFDE(fde->additional_data);
 		mpx_fde->additional_flags &= ~LIBAIO_ADDITIONAL_FD_FLAG_HAS_EVENT;
 		mpx_fde->additional_flags &= ~LIBAIO_ADDITIONAL_FD_FLAG_REPORT_ERROR;
 	}
@@ -367,9 +367,7 @@ static void libaio_del_event(libaio_ev_ctx_t *libaio_ev, struct tevent_fd *fde)
 		/*
 		 * This is a multiplexed fde, we need to modify both events.
 		 */
-		mpx_fde = talloc_get_type_abort(fde->additional_data,
-						struct tevent_fd);
-
+		mpx_fde = DATATOFDE(fde->additional_data);
 		mpx_fde->additional_flags &= ~LIBAIO_ADDITIONAL_FD_FLAG_HAS_EVENT;
 		mpx_fde->additional_flags &= ~LIBAIO_ADDITIONAL_FD_FLAG_REPORT_ERROR;
 	}
@@ -399,9 +397,7 @@ static void libaio_mod_event(libaio_ev_ctx_t *libaio_ev, struct tevent_fd *fde)
 		 * This is a multiplexed fde, we need to include both
 		 * flags in the modified event.
 		 */
-		mpx_fde = talloc_get_type_abort(fde->additional_data,
-						struct tevent_fd);
-
+		mpx_fde = DATATOFDE(fde->additional_data);
 		mpx_fde->additional_flags &= ~LIBAIO_ADDITIONAL_FD_FLAG_HAS_EVENT;
 		mpx_fde->additional_flags &= ~LIBAIO_ADDITIONAL_FD_FLAG_REPORT_ERROR;
 	}
@@ -459,9 +455,7 @@ static void libaio_update_event(libaio_ev_ctx_t *libaio_ev, struct tevent_fd *fd
 		/*
 		 * work out what the multiplexed fde wants.
 		 */
-		mpx_fde = talloc_get_type_abort(fde->additional_data,
-						struct tevent_fd);
-
+		mpx_fde = DATATOFDE(fde->additional_data);
 		if (mpx_fde->flags & TEVENT_FD_READ) {
 			want_read = true;
 		}
@@ -520,15 +514,13 @@ static int process_poll_event(libaio_ev_ctx_t *libaio_ev, struct iocb *aiocb)
 	struct tevent_fd *fde = NULL, *mpx_fde = NULL;
 	int pollret = aiocb->u.poll.events;
 
-	fde = talloc_get_type_abort(aiocb->data, struct tevent_fd);
-
+	fde = DATATOFDE(aiocb->data);
 	if (fde->additional_flags & LIBAIO_ADDITIONAL_FD_FLAG_HAS_MPX) {
 		/*
 		 * Save off the multiplexed event in case we need
 		 * to use it to call the handler function.
 		 */
-		mpx_fde = talloc_get_type_abort(fde->additional_data,
-						struct tevent_fd);
+		mpx_fde = DATATOFDE(fde->additional_data);
 	}
 	if (pollret & (POLLHUP|POLLERR)) {
 		bool handled_fde = libaio_handle_hup_or_err(libaio_ev, fde);
@@ -679,8 +671,7 @@ static int libaio_event_fd_destructor(struct tevent_fd *fde)
 		return tevent_common_fd_destructor(fde);
 	}
 
-	libaio_ev = talloc_get_type_abort(ev->additional_data,
-					  libaio_ev_ctx_t);
+	libaio_ev = EVTOLA(ev);
 
 	/*
 	 * we must remove the event from the list
@@ -690,9 +681,7 @@ static int libaio_event_fd_destructor(struct tevent_fd *fde)
 	DLIST_REMOVE(ev->fd_events, fde);
 
 	if (fde->additional_flags & LIBAIO_ADDITIONAL_FD_FLAG_HAS_MPX) {
-		mpx_fde = talloc_get_type_abort(fde->additional_data,
-						struct tevent_fd);
-
+		mpx_fde = DATATOFDE(fde->additional_data);
 		fde->additional_flags &= ~LIBAIO_ADDITIONAL_FD_FLAG_HAS_MPX;
 		mpx_fde->additional_flags &= ~LIBAIO_ADDITIONAL_FD_FLAG_HAS_MPX;
 
@@ -735,8 +724,7 @@ static struct tevent_fd *libaio_event_add_fd(struct tevent_context *ev, TALLOC_C
 					     const char *handler_name,
 					     const char *location)
 {
-	libaio_ev_ctx_t *libaio_ev = talloc_get_type_abort(
-			ev->additional_data, libaio_ev_ctx_t);
+	libaio_ev_ctx_t *libaio_ev = EVTOLA(ev);
 	struct tevent_fd *fde;
 	bool panic_triggered = false;
 	pid_t old_pid = libaio_ev->pid;
@@ -766,16 +754,17 @@ static struct tevent_fd *libaio_event_add_fd(struct tevent_context *ev, TALLOC_C
 
 static void libaio_event_set_fd_flags(struct tevent_fd *fde, uint16_t flags)
 {
-	struct tevent_context *ev;
-	libaio_ev_ctx_t *libaio_ev;
+	struct tevent_context *ev = NULL;
+	libaio_ev_ctx_t *libaio_ev = NULL;
 	bool panic_triggered = false;
 	pid_t old_pid;
 
 	if (fde->flags == flags) return;
 
 	ev = fde->event_ctx;
-	libaio_ev = talloc_get_type_abort(ev->additional_data,
-					  libaio_ev_ctx_t);
+
+	libaio_ev = EVTOLA(ev);
+
 	old_pid = libaio_ev->pid;
 
 	fde->flags = flags;
@@ -796,9 +785,7 @@ static void libaio_event_set_fd_flags(struct tevent_fd *fde, uint16_t flags)
 
 static int libaio_event_loop_once(struct tevent_context *ev, const char *location)
 {
-	libaio_ev_ctx_t *libaio_ev =
-		talloc_get_type_abort(ev->additional_data,
-		libaio_ev_ctx_t);
+	libaio_ev_ctx_tt *libaio_ev = EVTOLA(ev);
 	struct timeval tval;
 	bool panic_triggered = false;
 
