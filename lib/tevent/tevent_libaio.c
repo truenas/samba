@@ -51,8 +51,6 @@ typedef struct libaio_event_context {
 #define LIBAIO_ADDITIONAL_FD_FLAG_GOT_ERROR	(1<<2)
 #define LIBAIO_ADDITIONAL_FD_FLAG_HAS_MPX	(1<<3)
 
-#ifdef TEST_PANIC_FALLBACK
-
 static void libaio_panic(libaio_ev_ctx_t *libaio_ev,
 			 const char *reason, bool replay)
 {
