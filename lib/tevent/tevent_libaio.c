@@ -100,7 +100,7 @@ static int libaio_poll(io_context_t *ctx,
 		.aio_fildes = fde->fd,
 		.aio_lio_opcode = IO_CMD_POLL,
 		.aio_reqprio = 0,
-		.u.poll.events = events
+		.u.poll.events = events,
 		.data = (void*)fde
 	};
 
@@ -174,7 +174,7 @@ static void libaio_check_reopen(libaio_ev_ctx_t *libaio_ev)
 
 	io_destroy(libaio_ev->ctx);
 
-	error = io_setup(LIBAIO_MAX_EV, libaio_ev->ctx);
+	error = io_queue_init(LIBAIO_MAX_EV, libaio_ev->ctx);
 	if (error) {
 		errno = -error;
 		libaio_panic(libaio_ev, "io_setup() failed", false);
@@ -598,8 +598,7 @@ static int handle_libaio_event(libaio_ev_ctx_t *libaio_ev, struct iocb *aiocb)
 static int libaio_event_loop(libaio_ev_ctx_t *libaio_ev, struct timeval *tvalp)
 {
 	int ret, i;
-#define MAXEVENTS 1
-	struct iocb aiocb[MAXEVENTS];
+	struct iocb aiocb;
 	struct timespec ts;
 	struct timespec *tsp = NULL;
 	int wait_errno;
@@ -622,7 +621,7 @@ static int libaio_event_loop(libaio_ev_ctx_t *libaio_ev, struct timeval *tvalp)
 	}
 
 	tevent_trace_point_callback(libaio_ev->ev, TEVENT_TRACE_BEFORE_WAIT);
-	ret = io_getevents(libaio_ev->ctx, 0, MAXEVENTS, aiocb, tsp);  
+	ret = io_getevents(libaio_ev->ctx, 0, 1, &aiocb, tsp);
 	tevent_trace_point_callback(libaio_ev->ev, TEVENT_TRACE_AFTER_WAIT);
 
 	if (ret == -1 && libaio_ev->ev->signal_events) {
