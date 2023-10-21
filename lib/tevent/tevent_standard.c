@@ -221,7 +221,7 @@ static int std_event_context_init(struct tevent_context *ev)
 			goto fallback;
 		}
 #ifdef HAVE_EPOLL
-		tevent_epoll_set_panic_fallback(ev, std_fallback_to_poll);
+		tevent_libaio_set_panic_fallback(ev, std_fallback_to_poll);
 #endif
 #ifdef HAVE_KQUEUE
 		tevent_kqueue_set_panic_fallback(ev, std_fallback_to_poll);

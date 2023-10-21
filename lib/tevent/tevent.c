@@ -129,7 +129,8 @@ static void tevent_backend_init(void)
 	tevent_poll_init();
 	tevent_poll_mt_init();
 #if defined(HAVE_EPOLL)
-	tevent_epoll_init();
+	//tevent_epoll_init();
+	tevent_libaio_init();
 #elif defined(HAVE_SOLARIS_PORTS)
 	tevent_port_init();
 #elif defined(HAVE_KQUEUE)
