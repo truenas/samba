@@ -54,7 +54,6 @@ typedef struct libaio_event_context {
 #define LIBAIO_ADDITIONAL_FD_FLAG_HAS_MPX	(1<<3)
 #define EVTOLA(x) (talloc_get_type_abort(x->additional_data, libaio_ev_ctx_t))
 #define DATATOFDE(x) (talloc_get_type_abort(x, struct tevent_fd))
-typedef  bool (*fn)(struct tevent_context *ev, bool replay) libaio_fallback_t;
 
 static void libaio_panic(libaio_ev_ctx_t *libaio_ev,
 			 const char *reason, bool replay)
@@ -107,7 +106,7 @@ static int libaio_poll(io_context_t ctx,
 		.data = (void*)fde
 	};
 
-	return io_submit(ctx, 1, iocb);
+	return io_submit(ctx, 1, &iocb);
 }
 
 /*
@@ -865,27 +864,44 @@ static int libaio_event_loop_once(struct tevent_context *ev, const char *locatio
 	return libaio_event_loop(libaio_ev, &tval);
 }
 
+static bool aio_req_cancel(struct tevent_req *req)
+{
+	struct tevent_aiocb *taiocb = tevent_req_data(req, struct tevent_aiocb);
+	tevent_aio_cancel(taiocb);
+	return true;
+}
+
+static int aio_destructor(struct tevent_aiocb *taio)
+{
+	if (taio->iocbp != NULL) {
+		tevent_aio_cancel(taio);
+	}
+	return 0;
+}
+
 struct iocb *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb)
 {
 	libaio_ev_ctx_t *libaio_ev = EVTOLA(ev);
-        struct aiocb *iocbp = NULL;
-        if (kqueue_ev->aio_pool == NULL) {
-                kqueue_ev->aio_pool = talloc_pool(taiocb->ev, 128 * sizeof(struct aiocb));
-                if (kqueue_ev->aio_pool == NULL) {
+        struct iocb *iocbp = NULL;
+        if (libaio_ev->aio_pool == NULL) {
+                libaio_ev->aio_pool = talloc_pool(taiocb->ev, 128 * sizeof(struct iocb));
+                if (libaio_ev->aio_pool == NULL) {
                         abort();
                 }
         }
 
         tevent_req_set_cancel_fn(taiocb->req, aio_req_cancel);
-        iocbp = talloc_zero(kqueue_ev->aio_pool, struct aiocb);
+        iocbp = talloc_zero(libaio_ev->aio_pool, struct iocb);
         if (iocbp == NULL) {
                 abort();
         }
+#if 0
         iocbp->aio_sigevent.sigev_notify_kqueue = kqueue_ev->rdwrq->kq_fd;
         iocbp->aio_sigevent.sigev_value.sival_ptr = taiocb;
         iocbp->aio_sigevent.sigev_notify = SIGEV_KEVENT;
         iocbp->aio_sigevent.sigev_notify_kevent_flags = EV_ONESHOT;
         taiocb->iocbp = iocbp;
+#endif
         talloc_set_destructor(taiocb, aio_destructor);
         return iocbp;
 }
