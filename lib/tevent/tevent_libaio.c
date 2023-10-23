@@ -138,7 +138,7 @@ static int libaio_ctx_destructor(libaio_ev_ctx_t *libaio_ev)
 	return 0;
 }
 
-_PRIVATE_ void tevent_kqueue_set_panic_fallback(struct tevent_context *ev,
+_PRIVATE_ void tevent_libaio_set_panic_fallback(struct tevent_context *ev,
 						libaio_fallback_t *panic_fallback)
 {
 	libaio_ev_ctx_t *libaio_ev = EVTOLA(ev);
