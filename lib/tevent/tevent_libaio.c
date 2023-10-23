@@ -903,7 +903,7 @@ static int aio_destructor(struct tevent_aiocb *taio)
 
 struct iocb *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb)
 {
-	libaio_ev_ctx_t *libaio_ev = EVTOLA(taiocv->ev);
+	libaio_ev_ctx_t *libaio_ev = EVTOLA(taiocb->ev);
         struct iocb *iocbp = NULL;
         if (libaio_ev->aio_pool == NULL) {
                 libaio_ev->aio_pool = talloc_pool(taiocb->ev, 128 * sizeof(struct iocb));
