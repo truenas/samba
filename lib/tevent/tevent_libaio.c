@@ -321,7 +321,7 @@ static void libaio_add_event(libaio_ev_ctx_t *libaio_ev, struct tevent_fd *fde)
 		mpx_fde->additional_flags &= ~LIBAIO_ADDITIONAL_FD_FLAG_REPORT_ERROR;
 	}
 
-	pollflags = libaio_map_flags(mpx_fde->flags | add_fde->flags);
+	pollflags = libaio_map_flags(mpx_fde->flags | fde->flags);
 
 	ret = libaio_poll(libaio_ev->ctx, &aiocb, fde, pollflags);
 	if (ret != 0 && errno == EBADF) {
@@ -857,13 +857,13 @@ static void tevent_aio_cancel(struct tevent_aiocb *taiocb)
 	}
 
 	error = io_cancel(libaio_ev->ctx, iocbp, &event);
-        switch (errro) {
+        switch (error) {
         case EFAULT:
 		// EFAULT If any of the data structures pointed to are invalid.
                 tevent_debug(
                         taiocb->ev, TEVENT_DEBUG_WARNING,
                         "tevent_aio_cancel(): "
-                        "io_cancel() failed with EFAULT\n",
+                        "io_cancel() failed with EFAULT\n"
                 );
                 abort();
         case EINVAL:
@@ -871,7 +871,7 @@ static void tevent_aio_cancel(struct tevent_aiocb *taiocb)
                 tevent_debug(
                         taiocb->ev, TEVENT_DEBUG_WARNING,
                         "tevent_aio_cancel(): "
-                        "io_cancel() failed with EINVAL\n",
+                        "io_cancel() failed with EINVAL\n"
                 );
                 abort();
 	case EAGAIN:
@@ -879,10 +879,11 @@ static void tevent_aio_cancel(struct tevent_aiocb *taiocb)
                 tevent_debug(
                         taiocb->ev, TEVENT_DEBUG_WARNING,
                         "tevent_aio_cancel(): "
-                        "io_cancel() failed with EAGAIN\n",
+                        "io_cancel() failed with EAGAIN\n"
                 );
                 abort();
 	};
+	TALLOC_FREE(taiocb->iocbp);
 }
 
 static bool aio_req_cancel(struct tevent_req *req)
