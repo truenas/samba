@@ -181,7 +181,7 @@ static void libaio_check_reopen(libaio_ev_ctx_t *libaio_ev)
 
 	io_destroy(libaio_ev->ctx);
 
-	error = io_queue_init(LIBAIO_MAX_EV, libaio_ev->ctx);
+	error = io_queue_init(LIBAIO_MAX_EV, &libaio_ev->ctx);
 	if (error) {
 		errno = -error;
 		libaio_panic(libaio_ev, "io_setup() failed", false);
@@ -396,6 +396,7 @@ static void libaio_mod_event(libaio_ev_ctx_t *libaio_ev, struct tevent_fd *fde)
 	struct tevent_fd *mpx_fde = NULL;
 	struct iocb aiocb;
 	int ret;
+	uint16_t pollflags;
 
 	fde->additional_flags &= ~LIBAIO_ADDITIONAL_FD_FLAG_HAS_EVENT;
 	fde->additional_flags &= ~LIBAIO_ADDITIONAL_FD_FLAG_REPORT_ERROR;
@@ -410,7 +411,7 @@ static void libaio_mod_event(libaio_ev_ctx_t *libaio_ev, struct tevent_fd *fde)
 		mpx_fde->additional_flags &= ~LIBAIO_ADDITIONAL_FD_FLAG_REPORT_ERROR;
 	}
 
-	pollflags = libaio_map_flags(mpx_fde->flags | add_fde->flags);
+	pollflags = libaio_map_flags(fde->flags);
 	if (mpx_fde != NULL) {
 		pollflags |= libaio_map_flags(mpx_fde->flags);
 	}
@@ -517,12 +518,15 @@ static bool libaio_handle_hup_or_err(libaio_ev_ctx_t *libaio_ev,
 	return false;
 }
 
-static int process_poll_event(libaio_ev_ctx_t *libaio_ev, struct iocb *aiocb)
+static int process_poll_event(libaio_ev_ctx_t *libaio_ev,
+			      struct iocb *aiocb,
+			      void *data)
 {
 	struct tevent_fd *fde = NULL, *mpx_fde = NULL;
 	int pollret = aiocb->u.poll.events;
+	int flags;
 
-	fde = DATATOFDE(aiocb->data);
+	fde = DATATOFDE(data);
 	if (fde->additional_flags & LIBAIO_ADDITIONAL_FD_FLAG_HAS_MPX) {
 		/*
 		 * Save off the multiplexed event in case we need
@@ -535,7 +539,7 @@ static int process_poll_event(libaio_ev_ctx_t *libaio_ev, struct iocb *aiocb)
 		bool handled_mpx = libaio_handle_hup_or_err(libaio_ev, mpx_fde);
 		if (handled_fde && handled_mpx) {
 			libaio_update_event(libaio_ev, fde);
-			continue;
+			return
 		}
 
 		if (!handled_mpx) {
@@ -583,11 +587,13 @@ static int process_poll_event(libaio_ev_ctx_t *libaio_ev, struct iocb *aiocb)
 	return 0;
 }
 
-static int handle_libaio_event(libaio_ev_ctx_t *libaio_ev, struct iocb *aiocb)
+static int handle_libaio_event(libaio_ev_ctx_t *libaio_ev,
+	       		       struct iocb *iocbp,
+			       void *data)
 {
-	switch (aiocb->aio_lio_opcode) {
+	switch (iocbp->aio_lio_opcode) {
 	case IO_CMD_POLL:
-		return process_poll_event(libaio_ev, aiocb);
+		return process_poll_event(libaio_ev, iocbp, data);
 	default:
 		abort();
 	};
@@ -597,6 +603,7 @@ static int libaio_event_loop(libaio_ev_ctx_t *libaio_ev, struct timeval *tvalp)
 {
 	int ret, i;
 	struct iocb aiocb;
+	struct io_event event;
 	struct timespec ts;
 	struct timespec *tsp = NULL;
 	int wait_errno;
@@ -619,7 +626,7 @@ static int libaio_event_loop(libaio_ev_ctx_t *libaio_ev, struct timeval *tvalp)
 	}
 
 	tevent_trace_point_callback(libaio_ev->ev, TEVENT_TRACE_BEFORE_WAIT);
-	ret = io_getevents(libaio_ev->ctx, 0, 1, &aiocb, tsp);
+	ret = io_getevents(libaio_ev->ctx, 0, 1, &event, tsp);
 	tevent_trace_point_callback(libaio_ev->ev, TEVENT_TRACE_AFTER_WAIT);
 
 	if (ret == -1 && libaio_ev->ev->signal_events) {
@@ -639,7 +646,7 @@ static int libaio_event_loop(libaio_ev_ctx_t *libaio_ev, struct timeval *tvalp)
 		return 0;
 	}
 
-	return handle_libaio_event(libaio_ev, aiocb);
+	return handle_libaio_event(libaio_ev, event.obj, event.data);
 }
 
 static int libaio_event_context_init(struct tevent_context *ev)
