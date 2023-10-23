@@ -96,7 +96,8 @@ def build(bld):
              tevent_signal.c tevent_standard.c tevent_timed.c tevent_util.c tevent_wakeup.c'''
 
     if bld.CONFIG_SET('HAVE_EPOLL'):
-        SRC += ' tevent_epoll.c'
+        //SRC += ' tevent_epoll.c'
+        SRC += ' tevent_libaio.c'
 
     if bld.CONFIG_SET('HAVE_KQUEUE'):
         SRC += ' tevent_kqueue.c'
