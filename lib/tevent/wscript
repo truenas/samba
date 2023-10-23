@@ -53,6 +53,7 @@ def configure(conf):
 
     if conf.CHECK_FUNCS('epoll_create1', headers='sys/epoll.h'):
         conf.DEFINE('HAVE_EPOLL', 1)
+        conf.ADD_LDFLAGS('-llibaio')
 
     if conf.CHECK_FUNCS('kqueue', headers='sys/event.h'):
         conf.DEFINE('HAVE_KQUEUE', 1)
@@ -112,7 +113,7 @@ def build(bld):
         private_library = True
 
     if not bld.CONFIG_SET('USING_SYSTEM_TEVENT'):
-        tevent_deps = 'replace talloc libaio'
+        tevent_deps = 'replace talloc'
         if bld.CONFIG_SET('HAVE_PTHREAD'):
             tevent_deps += ' pthread'
 
