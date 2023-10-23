@@ -539,7 +539,7 @@ static int process_poll_event(libaio_ev_ctx_t *libaio_ev,
 		bool handled_mpx = libaio_handle_hup_or_err(libaio_ev, mpx_fde);
 		if (handled_fde && handled_mpx) {
 			libaio_update_event(libaio_ev, fde);
-			return;
+			return 0;
 		}
 
 		if (!handled_mpx) {
@@ -903,7 +903,7 @@ static int aio_destructor(struct tevent_aiocb *taio)
 
 struct iocb *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb)
 {
-	libaio_ev_ctx_t *libaio_ev = EVTOLA(ev);
+	libaio_ev_ctx_t *libaio_ev = EVTOLA(taiocv->ev);
         struct iocb *iocbp = NULL;
         if (libaio_ev->aio_pool == NULL) {
                 libaio_ev->aio_pool = talloc_pool(taiocb->ev, 128 * sizeof(struct iocb));
