@@ -36,6 +36,7 @@
 
 #define LIBAIO_MAX_EV 256
 
+typedef  bool (*fn)(struct tevent_context *ev, bool replay) libaio_fallback_t;
 typedef struct libaio_event_context {
 	/* a pointer back to the generic event_context */
 	struct tevent_context *ev;
@@ -43,7 +44,8 @@ typedef struct libaio_event_context {
 	pid_t pid;
 	bool panic_force_replay;
 	bool *panic_state;
-	bool (*panic_fallback)(struct tevent_context *ev, bool replay);
+	libaio_fallback_t *panic_fallback;
+        TALLOC_CTX *aio_pool;
 } libaio_ev_ctx_t;
 
 #define LIBAIO_ADDITIONAL_FD_FLAG_HAS_EVENT	(1<<0)
@@ -52,12 +54,13 @@ typedef struct libaio_event_context {
 #define LIBAIO_ADDITIONAL_FD_FLAG_HAS_MPX	(1<<3)
 #define EVTOLA(x) (talloc_get_type_abort(x->additional_data, libaio_ev_ctx_t))
 #define DATATOFDE(x) (talloc_get_type_abort(x, struct tevent_fd))
+typedef  bool (*fn)(struct tevent_context *ev, bool replay) libaio_fallback_t;
 
 static void libaio_panic(libaio_ev_ctx_t *libaio_ev,
 			 const char *reason, bool replay)
 {
 	struct tevent_context *ev = libaio_ev->ev;
-	bool (*panic_fallback)(struct tevent_context *ev, bool replay);
+	libaio_fallback_t *panic_fallback = libaio_ev->panic_fallback;
 
 	panic_fallback = libaio_ev->panic_fallback;
 
@@ -135,6 +138,45 @@ static int libaio_ctx_destructor(libaio_ev_ctx_t *libaio_ev)
 
 	libaio_ev->ctx = NULL;
 	return 0;
+}
+
+_PRIVATE_ void tevent_kqueue_set_panic_fallback(struct tevent_context *ev,
+		bool (*panic_fallback)(struct tevent_context *ev,
+				        bool replay))
+{
+	libaio_ev_ctx_t *libaio_ev = EVTOLA(ev);
+	libaio_ev->panic_fallback = panic_fallback;
+}
+
+static void libaio_panic(libaio_ev_ctx_t *libaio_ev,
+			 const char *reason, bool replay)
+{
+        struct tevent_context *ev = libaio_ev->ev;
+        bool (*panic_fallback)(struct tevent_context *ev, bool replay);
+
+        panic_fallback = kqueue_ev->panic_fallback;
+
+        if (kqueue_ev->panic_state != NULL) {
+                *kqueue_ev->panic_state = true;
+        }
+
+        if (kqueue_ev->panic_force_replay) {
+                replay = true;
+        }
+
+        if (panic_fallback == NULL) {
+                tevent_debug(ev, TEVENT_DEBUG_FATAL,
+                        "%s (%s) replay[%u] - calling abort()\n",
+                        reason, strerror(errno), (unsigned)replay);
+                abort();
+        }
+        if (!panic_fallback(ev, replay)) {
+                /* Fallback failed. */
+                tevent_debug(ev, TEVENT_DEBUG_FATAL,
+                        "%s (%s) replay[%u] - calling abort()\n",
+                        reason, strerror(errno), (unsigned)replay);
+                abort();
+        }
 }
 
 static int libaio_init_ctx(libaio_ev_ctx_t *libaio_ev)
@@ -785,7 +827,7 @@ static void libaio_event_set_fd_flags(struct tevent_fd *fde, uint16_t flags)
 
 static int libaio_event_loop_once(struct tevent_context *ev, const char *location)
 {
-	libaio_ev_ctx_tt *libaio_ev = EVTOLA(ev);
+	libaio_ev_ctx_t *libaio_ev = EVTOLA(ev);
 	struct timeval tval;
 	bool panic_triggered = false;
 
@@ -821,6 +863,31 @@ static int libaio_event_loop_once(struct tevent_context *ev, const char *locatio
 	}
 
 	return libaio_event_loop(libaio_ev, &tval);
+}
+
+struct iocb *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb)
+{
+	libaio_ev_ctx_t *libaio_ev = EVTOLA(ev);
+        struct aiocb *iocbp = NULL;
+        if (kqueue_ev->aio_pool == NULL) {
+                kqueue_ev->aio_pool = talloc_pool(taiocb->ev, 128 * sizeof(struct aiocb));
+                if (kqueue_ev->aio_pool == NULL) {
+                        abort();
+                }
+        }
+
+        tevent_req_set_cancel_fn(taiocb->req, aio_req_cancel);
+        iocbp = talloc_zero(kqueue_ev->aio_pool, struct aiocb);
+        if (iocbp == NULL) {
+                abort();
+        }
+        iocbp->aio_sigevent.sigev_notify_kqueue = kqueue_ev->rdwrq->kq_fd;
+        iocbp->aio_sigevent.sigev_value.sival_ptr = taiocb;
+        iocbp->aio_sigevent.sigev_notify = SIGEV_KEVENT;
+        iocbp->aio_sigevent.sigev_notify_kevent_flags = EV_ONESHOT;
+        taiocb->iocbp = iocbp;
+        talloc_set_destructor(taiocb, aio_destructor);
+        return iocbp;
 }
 
 static const struct tevent_ops libaio_event_ops = {

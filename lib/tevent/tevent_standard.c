@@ -178,7 +178,8 @@ static int std_event_context_init(struct tevent_context *ev)
 #ifdef HAVE_KQUEUE
 		glue->epoll_ops = tevent_find_ops_byname("kqueue");
 #else
-		glue->epoll_ops = tevent_find_ops_byname("epoll");
+		//glue->epoll_ops = tevent_find_ops_byname("epoll");
+		glue->epoll_ops = tevent_find_ops_byname("libaio");
 #endif
 
 		glue->poll_ops = tevent_find_ops_byname("poll");
