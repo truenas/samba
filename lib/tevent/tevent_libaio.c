@@ -61,8 +61,6 @@ static void libaio_panic(libaio_ev_ctx_t *libaio_ev,
 	struct tevent_context *ev = libaio_ev->ev;
 	libaio_fallback_t *panic_fallback = libaio_ev->panic_fallback;
 
-	panic_fallback = libaio_ev->panic_fallback;
-
 	if (libaio_ev->panic_state != NULL) {
 		*libaio_ev->panic_state = true;
 	}
@@ -140,49 +138,17 @@ static int libaio_ctx_destructor(libaio_ev_ctx_t *libaio_ev)
 }
 
 _PRIVATE_ void tevent_kqueue_set_panic_fallback(struct tevent_context *ev,
-		bool (*panic_fallback)(struct tevent_context *ev,
-				        bool replay))
+						libaio_fallback_t *panic_fallback)
 {
 	libaio_ev_ctx_t *libaio_ev = EVTOLA(ev);
 	libaio_ev->panic_fallback = panic_fallback;
-}
-
-static void libaio_panic(libaio_ev_ctx_t *libaio_ev,
-			 const char *reason, bool replay)
-{
-        struct tevent_context *ev = libaio_ev->ev;
-        bool (*panic_fallback)(struct tevent_context *ev, bool replay);
-
-        panic_fallback = kqueue_ev->panic_fallback;
-
-        if (kqueue_ev->panic_state != NULL) {
-                *kqueue_ev->panic_state = true;
-        }
-
-        if (kqueue_ev->panic_force_replay) {
-                replay = true;
-        }
-
-        if (panic_fallback == NULL) {
-                tevent_debug(ev, TEVENT_DEBUG_FATAL,
-                        "%s (%s) replay[%u] - calling abort()\n",
-                        reason, strerror(errno), (unsigned)replay);
-                abort();
-        }
-        if (!panic_fallback(ev, replay)) {
-                /* Fallback failed. */
-                tevent_debug(ev, TEVENT_DEBUG_FATAL,
-                        "%s (%s) replay[%u] - calling abort()\n",
-                        reason, strerror(errno), (unsigned)replay);
-                abort();
-        }
 }
 
 static int libaio_init_ctx(libaio_ev_ctx_t *libaio_ev)
 {
 	long error;
 
-	error = io_queue_init(LIBAIO_MAX_EV, libaio_ev->ctx);
+	error = io_queue_init(LIBAIO_MAX_EV, &libaio_ev->ctx);
 	if (error) {
 		tevent_debug(libaio_ev->ev, TEVENT_DEBUG_FATAL,
 			     "Failed to create aio context (%s).\n",
@@ -248,7 +214,7 @@ static void libaio_check_reopen(libaio_ev_ctx_t *libaio_ev)
  event triggering.
 */
 
-static int libaio_add_multiplex_fd(nlibaio_ev_ctx_t *libaio_ev,
+static int libaio_add_multiplex_fd(libaio_ev_ctx_t *libaio_ev,
 				   struct tevent_fd *add_fde)
 {
 	struct iocb aiocb; // io_poll zeroes this struct
@@ -340,6 +306,7 @@ static void libaio_add_event(libaio_ev_ctx_t *libaio_ev, struct tevent_fd *fde)
 	struct iocb aiocb; // io_poll zeroes this struct
 	int ret;
 	struct tevent_fd *mpx_fde = NULL;
+	uint16_t pollflags;
 
 	fde->additional_flags &= ~LIBAIO_ADDITIONAL_FD_FLAG_HAS_EVENT;
 	fde->additional_flags &= ~LIBAIO_ADDITIONAL_FD_FLAG_REPORT_ERROR;
@@ -415,7 +382,7 @@ static void libaio_del_event(libaio_ev_ctx_t *libaio_ev, struct tevent_fd *fde)
 
 	aiocb = (struct iocb) {
 		.aio_fildes = fde->fd,
-		.aio_lio_opcode = IOCB_CMD_POLL,
+		.aio_lio_opcode = IO_CMD_POLL,
 	};
 	ret = io_cancel(libaio_ev->ctx, &aiocb, &event);
 	if (ret != 0) {
@@ -619,7 +586,7 @@ static int process_poll_event(libaio_ev_ctx_t *libaio_ev, struct iocb *aiocb)
 static int handle_libaio_event(libaio_ev_ctx_t *libaio_ev, struct iocb *aiocb)
 {
 	switch (aiocb->aio_lio_opcode) {
-	case IOCB_CMD_POLL:
+	case IO_CMD_POLL:
 		return process_poll_event(libaio_ev, aiocb);
 	default:
 		abort();
@@ -862,6 +829,52 @@ static int libaio_event_loop_once(struct tevent_context *ev, const char *locatio
 	}
 
 	return libaio_event_loop(libaio_ev, &tval);
+}
+
+static void tevent_aio_cancel(struct tevent_aiocb *taiocb)
+{
+	int error;
+	libaio_ev_ctx_t *libaio_ev = EVTOLA(taiocb->ev);
+	struct iocb *iocbp = taiocb->iocbp;
+
+	tevent_debug(
+		taiocb->ev, TEVENT_DEBUG_WARNING,
+		"tevent_aio_cancel(): "
+		"taio: %p, iocbp: %p\n",
+		taiocb, iocbp
+	);
+
+	if (iocbp == NULL) {
+		abort();
+	}
+
+	error = io_cancel(libaio_ev->ctx, iocbp);
+        switch (errro) {
+        case EFAULT:
+		// EFAULT If any of the data structures pointed to are invalid.
+                tevent_debug(
+                        taiocb->ev, TEVENT_DEBUG_WARNING,
+                        "tevent_aio_cancel(): "
+                        "io_cancel() failed with EFAULT\n",
+                );
+                abort();
+        case EINVAL:
+		// EINVAL If aio_context specified by ctx is invalid.
+                tevent_debug(
+                        taiocb->ev, TEVENT_DEBUG_WARNING,
+                        "tevent_aio_cancel(): "
+                        "io_cancel() failed with EINVAL\n",
+                );
+                abort();
+	case EAGAIN:
+		// EAGAIN If the iocb specified was not cancelled.
+                tevent_debug(
+                        taiocb->ev, TEVENT_DEBUG_WARNING,
+                        "tevent_aio_cancel(): "
+                        "io_cancel() failed with EAGAIN\n",
+                );
+                abort();
+	};
 }
 
 static bool aio_req_cancel(struct tevent_req *req)
