@@ -33,6 +33,7 @@
 #include "tevent_internal.h"
 #include "tevent_util.h"
 #include "libaio.h"
+#include "tevent_libaio.h"
 
 #define LIBAIO_MAX_EV 256
 
@@ -219,7 +220,6 @@ static int libaio_add_multiplex_fd(libaio_ev_ctx_t *libaio_ev,
 {
 	struct iocb aiocb; // io_poll zeroes this struct
 	struct tevent_fd *mpx_fde = NULL;
-	struct io
 	int ret;
 	uint16_t pollflags;
 
@@ -539,7 +539,7 @@ static int process_poll_event(libaio_ev_ctx_t *libaio_ev,
 		bool handled_mpx = libaio_handle_hup_or_err(libaio_ev, mpx_fde);
 		if (handled_fde && handled_mpx) {
 			libaio_update_event(libaio_ev, fde);
-			return
+			return;
 		}
 
 		if (!handled_mpx) {
@@ -843,6 +843,7 @@ static void tevent_aio_cancel(struct tevent_aiocb *taiocb)
 	int error;
 	libaio_ev_ctx_t *libaio_ev = EVTOLA(taiocb->ev);
 	struct iocb *iocbp = taiocb->iocbp;
+	struct io_event event;
 
 	tevent_debug(
 		taiocb->ev, TEVENT_DEBUG_WARNING,
@@ -855,7 +856,7 @@ static void tevent_aio_cancel(struct tevent_aiocb *taiocb)
 		abort();
 	}
 
-	error = io_cancel(libaio_ev->ctx, iocbp);
+	error = io_cancel(libaio_ev->ctx, iocbp, &event);
         switch (errro) {
         case EFAULT:
 		// EFAULT If any of the data structures pointed to are invalid.
