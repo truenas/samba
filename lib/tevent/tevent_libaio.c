@@ -36,11 +36,11 @@
 
 #define LIBAIO_MAX_EV 256
 
-typedef  bool (*fn)(struct tevent_context *ev, bool replay) libaio_fallback_t;
+typedef  bool libaio_fallback_t(struct tevent_context *ev, bool replay);
 typedef struct libaio_event_context {
 	/* a pointer back to the generic event_context */
 	struct tevent_context *ev;
-	io_context_t *ctx;
+	io_context_t ctx;
 	pid_t pid;
 	bool panic_force_replay;
 	bool *panic_state;
@@ -94,7 +94,7 @@ static void libaio_panic(libaio_ev_ctx_t *libaio_ev,
 	}
 }
 
-static int libaio_poll(io_context_t *ctx,
+static int libaio_poll(io_context_t ctx,
 		       struct iocb *iocb,
 		       struct tevent_fd *fde,
 		       int events)
