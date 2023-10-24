@@ -38,7 +38,9 @@
 #endif
 #ifdef HAVE_KQUEUE
 #include "tevent_kqueue.h"
-#endif
+#else
+#include "tevent_libaio.h"
+#endif /* HAVE_KQUEUE */
 
 
 static struct tevent_context *
@@ -1960,7 +1962,6 @@ static bool test_cached_pid(struct torture_context *test,
 	return true;
 }
 
-#ifdef HAVE_KQUEUE
 static bool aio_recv(struct torture_context *test, struct tevent_req *req)
 {
 	struct tevent_aiocb *taiocbp = NULL;
@@ -1987,10 +1988,7 @@ static bool aio_pread_send(struct torture_context *test,
 	taiocbp->req = req;
 
 	iocbp = tevent_ctx_get_iocb(taiocbp);
-	iocbp->aio_fildes = fd;
-	iocbp->aio_offset = offset;
-	iocbp->aio_buf = data;
-	iocbp->aio_nbytes = n;
+	tio_prep_pread(iocbp, fd, data, n, offset);
 
 	ret = tevent_add_aio_read(taiocbp);
 	torture_assert(test, ret != -1, "aio_pread_send()");
@@ -2016,10 +2014,7 @@ static bool aio_pwrite_send(struct torture_context *test,
 	taiocbp->req = req;
 
 	iocbp = tevent_ctx_get_iocb(taiocbp);
-	iocbp->aio_fildes = fd;
-	iocbp->aio_offset = offset;
-	iocbp->aio_buf = data;
-	iocbp->aio_nbytes = n;
+	tio_prep_write(iocbp, fd, data, n, offset);
 
 	ret = tevent_add_aio_write(taiocbp);
 	torture_assert(test, ret != -1, "aio_write_send()");
@@ -2043,7 +2038,7 @@ static bool aio_fsync_send(struct torture_context *test,
 	taiocbp->req = req;
 
 	iocbp = tevent_ctx_get_iocb(taiocbp);
-	iocbp->aio_fildes = fd;
+	tio_prep_fsync(iocbp, fd);
 
 	ret = tevent_add_aio_fsync(taiocbp);
 	torture_assert(test, ret != -1, "aio_write_send()");
@@ -2203,7 +2198,6 @@ static bool test_event_kqueue_aio_pwrite_cancel(struct torture_context *test,
 	TALLOC_FREE(ev_ctx);
 	return true;
 }
-#endif
 
 struct torture_suite *torture_local_event(TALLOC_CTX *mem_ctx)
 {

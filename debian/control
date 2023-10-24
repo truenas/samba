@@ -12,6 +12,8 @@ Build-Depends: bison,
                docbook-xsl,
                flex,
                libacl1-dev,
+               libaio1,
+               libaio-dev,
                libarchive-dev,
                libblkid-dev,
                libbsd-dev,
@@ -61,6 +63,7 @@ Package: truenas-samba
 Architecture: any
 Pre-Depends: dpkg (>= 1.15.6~), ${misc:Pre-Depends}
 Depends: adduser,
+         libaio1,
          libpam-modules,
          libpam-runtime (>= 1.0.1-11),
          lsb-base (>= 4.1+Debian),

@@ -25,14 +25,29 @@
    License along with this library; if not, see <http://www.gnu.org/licenses/>.
 */
 
+#include <sys/eventfd.h>
 #include "replace.h"
 #include "system/filesys.h"
 #include "system/select.h"
 #include "tevent.h"
 #include "tevent_internal.h"
 #include "tevent_util.h"
+#include "libaio.h"
+#include "tevent_libaio.h"
 
-struct epoll_event_context {
+#define LIBAIO_MAX_EV 256
+#define LIBAIO_MAX_RECV 16
+
+struct libaio_data {
+	io_context_t ctx;
+	TALLOC_CTX *iocb_pool;
+	int io_event_fd;
+	struct io_event events[LIBAIO_MAX_RECV];
+};
+
+struct timespec libaio_ts;
+
+typedef struct epoll_event_context {
 	/* a pointer back to the generic event_context */
 	struct tevent_context *ev;
 
@@ -44,12 +59,14 @@ struct epoll_event_context {
 	bool panic_force_replay;
 	bool *panic_state;
 	bool (*panic_fallback)(struct tevent_context *ev, bool replay);
-};
+	struct libaio_data aio;
+} epoll_ev_ctx_t;
 
 #define EPOLL_ADDITIONAL_FD_FLAG_HAS_EVENT	(1<<0)
 #define EPOLL_ADDITIONAL_FD_FLAG_REPORT_ERROR	(1<<1)
 #define EPOLL_ADDITIONAL_FD_FLAG_GOT_ERROR	(1<<2)
 #define EPOLL_ADDITIONAL_FD_FLAG_HAS_MPX	(1<<3)
+#define EVTOEPOLL(x) (talloc_get_type_abort(x->additional_data, epoll_ev_ctx_t))
 
 #ifdef TEST_PANIC_FALLBACK
 
@@ -179,6 +196,100 @@ static uint32_t epoll_map_flags(uint16_t flags)
 	return ret;
 }
 
+static void free_libaio_data(struct libaio_data *data)
+{
+	io_queue_release(data->ctx);
+	close(data->io_event_fd);
+	data->io_event_fd = -1;
+	TALLOC_FREE(data->iocb_pool);
+}
+
+static void process_io_event(epoll_ev_ctx_t *epoll_ev,
+			     struct io_event *event)
+{
+	struct tevent_aiocb *tiocbp = NULL;
+	tiocbp = talloc_get_type_abort(event->data, struct tevent_aiocb);
+
+	if (tiocbp->iocbp == NULL) {
+		tevent_debug(epoll_ev->ev, TEVENT_DEBUG_FATAL,
+			     "iocb request is already completed.\n");
+		abort();
+	}
+	if (event->res < 0) {
+		int error = -event->res;
+		tevent_debug(epoll_ev->ev, TEVENT_DEBUG_WARNING,
+			     "%s: processing AIO [%p] - failed: %s\n",
+			     tiocbp->location, tiocbp->iocbp,
+			     strerror(error));
+		tiocbp->saved_errno = error;
+		tiocbp->rv = -1;
+		TALLOC_FREE(tiocbp->iocbp);
+		tevent_req_error(tiocbp->req, error);
+		return;
+	}
+
+	tiocbp->rv = event->res;
+	return;
+}
+
+static void libaio_eventfd_handler(struct tevent_context *ev,
+				   struct tevent_fd *fde,
+				   uint16_t flags,
+				   void *private_data)
+{
+	int nevents, i;
+	epoll_ev_ctx_t *epoll_ev = EVTOEPOLL(ev);
+
+	/* io_getevents either returns event count or -errno */
+	nevents = io_getevents(epoll_ev->aio.ctx,
+			       0, LIBAIO_MAX_RECV,
+			       epoll_ev->aio.events, &libaio_ts);
+
+	switch (nevents) {
+	case -EINTR:
+		if (epoll_ev->ev->signal_events) {
+			tevent_common_check_signal(epoll_ev->ev);
+		}
+		return;
+	case 0:
+		return;
+	};
+
+	if (nevents < 0) {
+		errno = -nevents;
+		epoll_panic(epoll_ev, "io_getevents() failed", false);
+	}
+
+	for (i = 0; i < nevents; i++) {
+		process_io_event(epoll_ev, &epoll_ev->aio.events[i]);
+	}
+}
+
+static void init_libaio_data(epoll_ev_ctx_t *epoll_ev)
+{
+	long error;
+
+	if (epoll_ev->aio.io_event_fd != -1) {
+		return;
+	}
+
+	epoll_ev->aio.io_event_fd = eventfd(0, 0);
+	if (epoll_ev->aio.io_event_fd == -1) {
+		abort();
+	}
+
+	error = io_queue_init(LIBAIO_MAX_EV, &epoll_ev->aio.ctx);
+	if (error) {
+		errno = -error;
+		abort();
+	}
+
+	epoll_ev->aio.iocb_pool = talloc_pool(epoll_ev, LIBAIO_MAX_EV * sizeof(struct iocb));
+	if (epoll_ev == NULL) {
+		abort();
+	}
+}
+
 /*
  free the epoll fd
 */
@@ -186,6 +297,7 @@ static int epoll_ctx_destructor(struct epoll_event_context *epoll_ev)
 {
 	close(epoll_ev->epoll_fd);
 	epoll_ev->epoll_fd = -1;
+	free_libaio_data(&epoll_ev->aio);
 	return 0;
 }
 
@@ -204,6 +316,9 @@ static int epoll_init_ctx(struct epoll_event_context *epoll_ev)
 
 	epoll_ev->pid = tevent_cached_getpid();
 	talloc_set_destructor(epoll_ev, epoll_ctx_destructor);
+
+	// lazy-initialize our AIO event fd
+	epoll_ev->aio.io_event_fd = -1;
 
 	return 0;
 }
@@ -945,6 +1060,124 @@ static int epoll_event_loop_once(struct tevent_context *ev, const char *location
 
 	return epoll_event_loop(epoll_ev, &tval);
 }
+
+static void tevent_aio_cancel(struct tevent_aiocb *taiocb)
+{
+	int error;
+	epoll_ev_ctx_t *epoll_ev = EVTOEPOLL(taiocb->ev);
+        struct iocb *iocbp = taiocb->iocbp;
+        struct io_event event;
+
+	tevent_debug(
+		taiocb->ev, TEVENT_DEBUG_WARNING,
+		"tevent_aio_cancel(): "
+		"taio: %p, iocbp: %p\n",
+		taiocb, iocbp
+	);
+
+	if (iocbp == NULL) {
+		abort();
+	}
+
+	error = io_cancel(epoll_ev->aio.ctx, iocbp, &event);
+	switch (error) {
+	case EFAULT:
+		// EFAULT If any of the data structures pointed to are invalid.
+		tevent_debug(
+			taiocb->ev, TEVENT_DEBUG_WARNING,
+			"tevent_aio_cancel(): "
+			"io_cancel() failed with EFAULT\n"
+		);
+		abort();
+	case EINVAL:
+		// EINVAL If aio_context specified by ctx is invalid.
+		tevent_debug(
+			taiocb->ev, TEVENT_DEBUG_WARNING,
+			"tevent_aio_cancel(): "
+			"io_cancel() failed with EINVAL\n"
+		);
+		abort();
+	case EAGAIN:
+		tevent_debug(
+			taiocb->ev, TEVENT_DEBUG_WARNING,
+			"tevent_aio_cancel(): "
+			"io_cancel() failed with EAGAIN\n"
+		);
+		abort();
+	case EINPROGRESS:
+		// Cancellation is in progress. Nothing for us to do.
+		break;
+	default:
+		abort();
+	};
+
+	// release memory back to our iocb pool
+	TALLOC_FREE(taiocb->iocbp);
+}
+
+static bool aio_req_cancel(struct tevent_req *req)
+{
+	struct tevent_aiocb *taiocb = tevent_req_data(req, struct tevent_aiocb);
+	tevent_aio_cancel(taiocb);
+	return true;
+}
+
+static int aio_destructor(struct tevent_aiocb *taio)
+{
+	if (taio->iocbp != NULL) {
+		tevent_aio_cancel(taio);
+	}
+	return 0;
+}
+
+struct iocb *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb)
+{
+	epoll_ev_ctx_t *epoll_ev = EVTOEPOLL(taiocb->ev);
+	struct iocb *iocbp = NULL;
+
+	tevent_req_set_cancel_fn(taiocb->req, aio_req_cancel);
+	iocbp = talloc_zero(epoll_ev->aio.iocb_pool, struct iocb);
+	if (iocbp == NULL) {
+		abort();
+	}
+
+	talloc_set_destructor(taiocb, aio_destructor);
+	return iocbp;
+}
+
+static int _tevent_add_aio_op(struct tevent_aiocb *taiocb,
+			      enum io_iocb_cmd opcode,
+			      const char *location)
+{
+	int err;
+	epoll_ev_ctx_t *epoll_ev = EVTOEPOLL(taiocb->ev);
+
+        taiocb->location = location;
+	if (opcode != taiocb->iocbp->aio_lio_opcode) {
+		abort();
+	}
+
+	taiocb->iocbp-data = taiocb;
+	io_set_eventfd(taiocb->iocbp, epoll_ev->aio.io_event_fd);
+
+	err = io_submit(epoll_ev->aio.ctx, 1, &taiocb->iocbp);
+        if (err) {
+                TALLOC_FREE(taiocb->iocbp);
+		errno = -err;
+		err = -1;
+        }
+
+        return err;
+}
+
+#define _tevent_add_aio_read(taiocb, __location__)\
+        (int)_tevent_add_aio_op(taiocb, IO_CMD_PREAD, __location__)
+
+#define _tevent_add_aio_write(taiocb, __location__)\
+        (int)_tevent_add_aio_op(taiocb, IO_CMD_PWRITE, __location__)
+
+#define _tevent_add_aio_fsync(taiocb, __location__)\
+        (int)_tevent_add_aio_op(taiocb, IO_CMD_FSYNC, __location__)
 
 static const struct tevent_ops epoll_event_ops = {
 	.context_init		= epoll_event_context_init,

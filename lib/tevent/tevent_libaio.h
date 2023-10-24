@@ -3,7 +3,7 @@
 
    main select loop and event handling - kqueue implementation
 
-   Copyright (C) iXsystems		2020
+   Copyright (C) iXsystems		2023
 
      ** NOTE! The following LGPL license applies to the tevent
      ** library. This does NOT imply that all of Samba is released
@@ -22,9 +22,9 @@
    You should have received a copy of the GNU Lesser General Public
    License along with this library; if not, see <http://www.gnu.org/licenses/>.
 */
-#include <aio.h>
+#include "libaio.h"
 
-typedef struct aiocb iocb_t;
+typedef struct iocb iocb_t;
 
 struct tevent_aiocb {
 	const char *location;
@@ -47,33 +47,8 @@ int _tevent_add_aio_fsync(struct tevent_aiocb *taiocb, const char *location);
 #define tevent_add_aio_fsync(taiocb)\
         (int)_tevent_add_aio_fsync(taiocb, __location__)
 
-struct aiocb *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb);
+struct iocb *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb);
 
-static inline void tio_prep_pread(iocb_t *iocbp,
-				  int fd,
-				  void *buf,
-				  size_t count,
-				  long long offset)
-{
-        iocbp->aio_fildes = fd;
-        iocbp->aio_offset = offset;
-        iocbp->aio_buf = buf;
-        iocbp->aio_nbytes = count;
-}
-
-static inline void tio_prep_pwrite(iocb_t *iocbp,
-				   int fd,
-				   void *buf,
-				   size_t count,
-				   long long offset)
-{
-        iocbp->aio_fildes = fd;
-        iocbp->aio_offset = offset;
-        iocbp->aio_buf = buf;
-        iocbp->aio_nbytes = count;
-}
-
-static inline void tio_prep_fsync(iocb_t *iocbp, int fd)
-{
-        iocbp->aio_fildes = fd;
-}
+#define tio_prep_pread io_prep_pread
+#define tio_prep_pwrite io_prep_pwrite
+#define tio_prep_fsync io_prep_fsync
