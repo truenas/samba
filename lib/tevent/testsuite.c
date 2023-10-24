@@ -1980,7 +1980,7 @@ static bool aio_pread_send(struct torture_context *test,
 	int ret;
 	struct tevent_req *req = NULL;
 	struct tevent_aiocb *taiocbp = NULL;
-	struct aiocb *iocbp = NULL;
+	iocb_t *iocbp = NULL;
 
 	req = tevent_req_create(test, &taiocbp, struct tevent_aiocb);
 	torture_assert(test, req != NULL, "tevent_req_create()");
@@ -2006,7 +2006,7 @@ static bool aio_pwrite_send(struct torture_context *test,
 	int ret;
 	struct tevent_req *req = NULL;
 	struct tevent_aiocb *taiocbp = NULL;
-	struct aiocb *iocbp = NULL;
+	iocb_t *iocbp = NULL;
 
 	req = tevent_req_create(test, &taiocbp, struct tevent_aiocb);
 	torture_assert(test, req != NULL, "tevent_req_create()");
@@ -2014,7 +2014,7 @@ static bool aio_pwrite_send(struct torture_context *test,
 	taiocbp->req = req;
 
 	iocbp = tevent_ctx_get_iocb(taiocbp);
-	tio_prep_write(iocbp, fd, data, n, offset);
+	tio_prep_pwrite(iocbp, fd, data, n, offset);
 
 	ret = tevent_add_aio_write(taiocbp);
 	torture_assert(test, ret != -1, "aio_write_send()");
@@ -2030,7 +2030,7 @@ static bool aio_fsync_send(struct torture_context *test,
 	int ret;
 	struct tevent_req *req = NULL;
 	struct tevent_aiocb *taiocbp = NULL;
-	struct aiocb *iocbp = NULL;
+	iocb_t *iocbp = NULL;
 
 	req = tevent_req_create(test, &taiocbp, struct tevent_aiocb);
 	torture_assert(test, req != NULL, "tevent_req_create()");
@@ -2272,7 +2272,6 @@ struct torture_suite *torture_local_event_aio(TALLOC_CTX *mem_ctx)
 {
         struct torture_suite *suite = torture_suite_create(mem_ctx, "event_aio");
 
-#ifdef HAVE_KQUEUE
         torture_suite_add_simple_tcase_const(suite,
                                              "basic_kqueue_aio",
                                              test_event_kqueue_aio,
@@ -2292,6 +2291,5 @@ struct torture_suite *torture_local_event_aio(TALLOC_CTX *mem_ctx)
                                              "aio_write_cancel_destructor",
                                              test_event_kqueue_aio_pwrite_cancel,
                                              NULL);
-#endif /* HAVE_KQUEUE */
 	return suite;
 }

@@ -49,6 +49,25 @@ int _tevent_add_aio_fsync(struct tevent_aiocb *taiocb, const char *location);
 
 struct iocb *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb);
 
-#define tio_prep_pread io_prep_pread
-#define tio_prep_pwrite io_prep_pwrite
-#define tio_prep_fsync io_prep_fsync
+static inline void tio_prep_pread(iocb_t *iocbp,
+                                  int fd,
+                                  void *buf,
+                                  size_t count,
+                                  long long offset)
+{
+	return io_prep_pread(iocbp, fd, buf, count, offset);
+}
+
+static inline void tio_prep_pwrite(iocb_t *iocbp,
+                                   int fd,
+                                   void *buf,
+                                   size_t count,
+                                   long long offset)
+{
+	return io_prep_pwrite(iocbp, fd, buf, count, offset);
+}
+
+static inline void tio_prep_fsync(iocb_t *iocbp, int fd)
+{
+	return io_prep_fsync(iocbp, fd);
+}

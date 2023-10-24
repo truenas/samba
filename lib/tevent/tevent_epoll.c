@@ -137,10 +137,7 @@ _PRIVATE_ void tevent_epoll_set_panic_fallback(struct tevent_context *ev,
 				bool (*panic_fallback)(struct tevent_context *ev,
 						       bool replay))
 {
-	struct epoll_event_context *epoll_ev =
-		talloc_get_type_abort(ev->additional_data,
-		struct epoll_event_context);
-
+	epoll_ev_ctx_t *epoll_ev = EVTOEPOLL(ev);
 	epoll_ev->panic_fallback = panic_fallback;
 }
 
@@ -855,7 +852,7 @@ static int epoll_event_loop(struct epoll_event_context *epoll_ev, struct timeval
 static int epoll_event_context_init(struct tevent_context *ev)
 {
 	int ret;
-	struct epoll_event_context *epoll_ev;
+	epoll_ev_ctx_t *epoll_ev;
 
 	/*
 	 * We might be called during tevent_re_initialise()
@@ -863,7 +860,7 @@ static int epoll_event_context_init(struct tevent_context *ev)
 	 */
 	TALLOC_FREE(ev->additional_data);
 
-	epoll_ev = talloc_zero(ev, struct epoll_event_context);
+	epoll_ev = talloc_zero(ev, epoll_ev_ctx_t);
 	if (!epoll_ev) return -1;
 	epoll_ev->ev = ev;
 	epoll_ev->epoll_fd = -1;
@@ -893,8 +890,7 @@ static int epoll_event_fd_destructor(struct tevent_fd *fde)
 		return tevent_common_fd_destructor(fde);
 	}
 
-	epoll_ev = talloc_get_type_abort(ev->additional_data,
-					 struct epoll_event_context);
+	epoll_ev = EVTOEPOLL(ev);
 
 	/*
 	 * we must remove the event from the list
@@ -953,9 +949,7 @@ static struct tevent_fd *epoll_event_add_fd(struct tevent_context *ev, TALLOC_CT
 					    const char *handler_name,
 					    const char *location)
 {
-	struct epoll_event_context *epoll_ev =
-		talloc_get_type_abort(ev->additional_data,
-		struct epoll_event_context);
+	epoll_ev_ctx_t *epoll_ev = EVTOEPOLL(ev);
 	struct tevent_fd *fde;
 	bool panic_triggered = false;
 	pid_t old_pid = epoll_ev->pid;
@@ -996,8 +990,7 @@ static void epoll_event_set_fd_flags(struct tevent_fd *fde, uint16_t flags)
 	if (fde->flags == flags) return;
 
 	ev = fde->event_ctx;
-	epoll_ev = talloc_get_type_abort(ev->additional_data,
-					 struct epoll_event_context);
+	epoll_ev = EVTOEPOLL(ev);
 	old_pid = epoll_ev->pid;
 
 	fde->flags = flags;
@@ -1021,9 +1014,7 @@ static void epoll_event_set_fd_flags(struct tevent_fd *fde, uint16_t flags)
 */
 static int epoll_event_loop_once(struct tevent_context *ev, const char *location)
 {
-	struct epoll_event_context *epoll_ev =
-		talloc_get_type_abort(ev->additional_data,
-		struct epoll_event_context);
+	epoll_ev_ctx_t *epoll_ev = EVTOEPOLL(ev);
 	struct timeval tval;
 	bool panic_triggered = false;
 
@@ -1145,19 +1136,21 @@ struct iocb *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb)
 	return iocbp;
 }
 
-static int _tevent_add_aio_op(struct tevent_aiocb *taiocb,
-			      enum io_iocb_cmd opcode,
-			      const char *location)
+static int tevent_add_aio_op(struct tevent_aiocb *taiocb,
+			     enum io_iocb_cmd opcode,
+			     const char *location)
 {
 	int err;
 	epoll_ev_ctx_t *epoll_ev = EVTOEPOLL(taiocb->ev);
 
+	tevent_debug(epoll_ev->ev, TEVENT_DEBUG_FATAL,
+		"entering!\n");
         taiocb->location = location;
 	if (opcode != taiocb->iocbp->aio_lio_opcode) {
 		abort();
 	}
 
-	taiocb->iocbp-data = taiocb;
+	taiocb->iocbp->data = taiocb;
 	io_set_eventfd(taiocb->iocbp, epoll_ev->aio.io_event_fd);
 
 	err = io_submit(epoll_ev->aio.ctx, 1, &taiocb->iocbp);
@@ -1170,14 +1163,20 @@ static int _tevent_add_aio_op(struct tevent_aiocb *taiocb,
         return err;
 }
 
-#define _tevent_add_aio_read(taiocb, __location__)\
-        (int)_tevent_add_aio_op(taiocb, IO_CMD_PREAD, __location__)
+int _tevent_add_aio_read(struct tevent_aiocb *taiocb, const char *location)
+{
+	return tevent_add_aio_op(taiocb, IO_CMD_PREAD, location);
+}
 
-#define _tevent_add_aio_write(taiocb, __location__)\
-        (int)_tevent_add_aio_op(taiocb, IO_CMD_PWRITE, __location__)
+int _tevent_add_aio_write(struct tevent_aiocb *taiocb, const char *location)
+{
+	return tevent_add_aio_op(taiocb, IO_CMD_PWRITE, location);
+}
 
-#define _tevent_add_aio_fsync(taiocb, __location__)\
-        (int)_tevent_add_aio_op(taiocb, IO_CMD_FSYNC, __location__)
+int _tevent_add_aio_fsync(struct tevent_aiocb *taiocb, const char *location)
+{
+	return tevent_add_aio_op(taiocb, IO_CMD_FSYNC, location);
+}
 
 static const struct tevent_ops epoll_event_ops = {
 	.context_init		= epoll_event_context_init,
