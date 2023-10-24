@@ -53,7 +53,6 @@ def configure(conf):
 
     if conf.CHECK_FUNCS('epoll_create1', headers='sys/epoll.h'):
         conf.DEFINE('HAVE_EPOLL', 1)
-        conf.ADD_LDFLAGS('-llibaio')
 
     if conf.CHECK_FUNCS('kqueue', headers='sys/event.h'):
         conf.DEFINE('HAVE_KQUEUE', 1)
@@ -125,6 +124,7 @@ def build(bld):
                           abi_directory='ABI',
                           abi_match='tevent_* _tevent_* __tevent_*',
                           vnum=VERSION,
+                          ldflags='-laio',
                           public_headers=('' if private_library else 'tevent.h'),
                           public_headers_install=not private_library,
                           pc_files='tevent.pc',
