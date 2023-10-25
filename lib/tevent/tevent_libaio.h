@@ -26,6 +26,8 @@
 
 typedef struct iocb iocb_t;
 
+enum taiocb_state { TAIO_INIT, TAIO_RUNNING, TAIO_COMPLETE, TAIO_CANCELLED };
+
 struct tevent_aiocb {
 	const char *location;
 	struct tevent_req *req;
@@ -33,6 +35,7 @@ struct tevent_aiocb {
 	iocb_t *iocbp;
 	int saved_errno;
 	int rv;
+	enum taiocb_state state;
 };
 
 int _tevent_add_aio_read(struct tevent_aiocb *taiocb, const char *location);

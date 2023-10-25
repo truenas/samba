@@ -1988,6 +1988,8 @@ static bool aio_pread_send(struct torture_context *test,
 	taiocbp->req = req;
 
 	iocbp = tevent_ctx_get_iocb(taiocbp);
+	torture_assert(test, iocbp != NULL, "tevent_ctx_get_iocb()");
+
 	tio_prep_pread(iocbp, fd, data, n, offset);
 
 	ret = tevent_add_aio_read(taiocbp);
@@ -2014,6 +2016,8 @@ static bool aio_pwrite_send(struct torture_context *test,
 	taiocbp->req = req;
 
 	iocbp = tevent_ctx_get_iocb(taiocbp);
+	torture_assert(test, iocbp != NULL, "tevent_ctx_get_iocb()");
+
 	tio_prep_pwrite(iocbp, fd, data, n, offset);
 
 	ret = tevent_add_aio_write(taiocbp);
@@ -2038,6 +2042,8 @@ static bool aio_fsync_send(struct torture_context *test,
 	taiocbp->req = req;
 
 	iocbp = tevent_ctx_get_iocb(taiocbp);
+	torture_assert(test, iocbp != NULL, "tevent_ctx_get_iocb()");
+
 	tio_prep_fsync(iocbp, fd);
 
 	ret = tevent_add_aio_fsync(taiocbp);
