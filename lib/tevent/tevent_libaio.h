@@ -22,9 +22,9 @@
    You should have received a copy of the GNU Lesser General Public
    License along with this library; if not, see <http://www.gnu.org/licenses/>.
 */
-#include "libaio.h"
+#include <liburing.h>
 
-typedef struct iocb iocb_t;
+typedef struct io_uring_sqe iocb_t;
 
 enum taiocb_state { TAIO_INIT, TAIO_RUNNING, TAIO_COMPLETE, TAIO_CANCELLED };
 
@@ -50,7 +50,7 @@ int _tevent_add_aio_fsync(struct tevent_aiocb *taiocb, const char *location);
 #define tevent_add_aio_fsync(taiocb)\
         (int)_tevent_add_aio_fsync(taiocb, __location__)
 
-struct iocb *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb);
+iocb_t *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb);
 
 static inline void tio_prep_pread(iocb_t *iocbp,
                                   int fd,
@@ -58,7 +58,7 @@ static inline void tio_prep_pread(iocb_t *iocbp,
                                   size_t count,
                                   long long offset)
 {
-	return io_prep_pread(iocbp, fd, buf, count, offset);
+	return io_uring_prep_read(iocbp, fd, buf, count, offset);
 }
 
 static inline void tio_prep_pwrite(iocb_t *iocbp,
@@ -67,10 +67,10 @@ static inline void tio_prep_pwrite(iocb_t *iocbp,
                                    size_t count,
                                    long long offset)
 {
-	return io_prep_pwrite(iocbp, fd, buf, count, offset);
+	return io_uring_prep_write(iocbp, fd, buf, count, offset);
 }
 
 static inline void tio_prep_fsync(iocb_t *iocbp, int fd)
 {
-	return io_prep_fsync(iocbp, fd);
+	return io_uring_prep_fsync(iocbp, fd, 0);
 }
