@@ -82,6 +82,7 @@ static bool tn_log_rw_common(vfs_handle_struct *handle,
 	struct json_object msg, entry;
 	struct timespec now, *old = NULL;
 	bool ok;
+	uint32_t js_flags = FILE_ADD_NAME | FILE_NAME_IS_PATH | FILE_ADD_HANDLE;
 	tn_audit_conf_t *config = NULL;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config, tn_audit_conf_t,
@@ -151,7 +152,7 @@ static bool tn_log_rw_common(vfs_handle_struct *handle,
 		return false;
 	}
 
-	ok = tn_add_file_to_object(fsp->fsp_name, fsp_ext, "file", FILE_ADD_HANDLE, &entry);
+	ok = tn_add_file_to_object(NULL, fsp_ext, "file", js_flags, &entry);
 	if (!ok) {
 		goto cleanup;
 	}

@@ -567,6 +567,7 @@ static tn_audit_ext_t *init_fsp_extension(vfs_handle_struct *handle,
 	 * add the file_id information to the JSON object
 	 */
 	tn_audit_ext_t *fsp_ext = NULL;
+	TALLOC_CTX *mem_ctx = NULL;
 
 	fsp_ext = (tn_audit_ext_t *)VFS_FETCH_FSP_EXTENSION(handle, fsp);
 	if (fsp_ext) {
@@ -576,7 +577,12 @@ static tn_audit_ext_t *init_fsp_extension(vfs_handle_struct *handle,
 	fsp_ext = VFS_ADD_FSP_EXTENSION(handle, fsp, tn_audit_ext_t,
 					NULL);
 	SMB_ASSERT(fsp_ext != NULL);
+
+	mem_ctx = VFS_MEMCTX_FSP_EXTENSION(handle, fsp);
+	SMB_ASSERT(mem_ctx != NULL);
+
 	file_id_str_buf(fsp->file_id, &fsp_ext->fid_str);
+	fsp_ext->cached_fname = cp_smb_filename(mem_ctx, fsp->fsp_name);
 	return fsp_ext;
 }
 
@@ -774,6 +780,7 @@ static int tn_audit_close(vfs_handle_struct *handle, files_struct *fsp)
 	tn_audit_conf_t *config = NULL;
 	tn_audit_ext_t *fsp_ext = NULL;
 	struct json_object msg, entry, counters;
+	uint32_t js_flags = FILE_ADD_NAME | FILE_NAME_IS_PATH | FILE_ADD_HANDLE;
 	bool ok;
 
 	result = SMB_VFS_NEXT_CLOSE(handle, fsp);
@@ -796,7 +803,7 @@ static int tn_audit_close(vfs_handle_struct *handle, files_struct *fsp)
 		return result;
 	}
 
-	ok = tn_add_file_to_object(fsp->fsp_name, fsp_ext, "file", FILE_ADD_HANDLE, &entry);
+	ok = tn_add_file_to_object(NULL, fsp_ext, "file", js_flags, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
@@ -1088,6 +1095,7 @@ static NTSTATUS tn_audit_fsctl(struct vfs_handle_struct *handle,
 	tn_audit_conf_t *config = NULL;
 	tn_audit_ext_t *fsp_ext = NULL;
 	struct json_object msg, entry, jsfn;
+	uint32_t js_flags = FILE_ADD_NAME | FILE_NAME_IS_PATH | FILE_ADD_HANDLE;
 	bool ok;
 
 	result = SMB_VFS_NEXT_FSCTL(handle,
@@ -1138,7 +1146,7 @@ static NTSTATUS tn_audit_fsctl(struct vfs_handle_struct *handle,
 		goto cleanup;
 	}
 
-	ok = tn_add_file_to_object(fsp->fsp_name, fsp_ext, "file", FILE_ADD_HANDLE, &entry);
+	ok = tn_add_file_to_object(NULL, fsp_ext, "file", js_flags, &entry);
 	if (!ok) {
 		goto cleanup;
 	}
@@ -1288,7 +1296,8 @@ static void log_setattr_common(vfs_handle_struct *handle,
 	};
 
 	if (fsp_ext) {
-		ok = tn_add_file_to_object(fsp->fsp_name, fsp_ext, "file", FILE_ADD_HANDLE, &entry);
+		uint32_t js_flags = FILE_ADD_NAME | FILE_NAME_IS_PATH | FILE_ADD_HANDLE;
+		ok = tn_add_file_to_object(NULL, fsp_ext, "file", js_flags, &entry);
 		if (!ok) {
 			goto cleanup;
 		}
