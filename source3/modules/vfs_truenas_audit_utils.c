@@ -181,7 +181,7 @@ bool tn_add_file_type_to_object(struct json_object *jsobj,
 	return false;
 }
 
-bool _tn_add_file_to_object(const struct smb_filename *fname,
+bool _tn_add_file_to_object(const struct smb_filename *fname_in,
 			    const tn_audit_ext_t *fsp_ext,
 			    const char *key,
 			    uint32_t flags,
@@ -192,6 +192,11 @@ bool _tn_add_file_to_object(const struct smb_filename *fname,
 	bool ok;
 	struct json_object wrapper, fhandle;
 	const char *namekey = flags & FILE_NAME_IS_PATH ? "path" : "name";
+	const struct smb_filename *fname = NULL;
+
+	SMB_ASSERT(fname_in || (fsp_ext && fsp_ext->cached_fname));
+
+	fname = fname_in ? fname_in : fsp_ext->cached_fname;
 
 	if (json_is_invalid(jsobj)) {
 		DBG_ERR("%s: Unable to add file information to object. "
