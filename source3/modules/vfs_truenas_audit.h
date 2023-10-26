@@ -105,6 +105,7 @@ typedef struct truenas_audit_vfs_extension {
 	struct timespec last_write;
 	struct timespec last_offload_write;
 	struct file_id_buf fid_str;
+	struct smb_filename *cached_fname;
 } tn_audit_ext_t;
 
 typedef enum tn_audit_op {
