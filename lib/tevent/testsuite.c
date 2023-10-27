@@ -2120,18 +2120,21 @@ static bool test_event_kqueue_aio_fsync_cancel(struct torture_context *test,
 	torture_assert(test, fd != -1, "open() failed");
 
 	for (i = 0; i < INFLIGHT_REQ; i++) {
+		torture_comment(test, "fsync_cancel %d\n", i);
 		struct tevent_req *req = NULL;
 		ok = aio_fsync_send(test, ev_ctx, fd, &req);
 		torture_assert(test, ok, "aio_fsync_send() failed");
 		TALLOC_FREE(req);
 	}
 
+	torture_comment(test, "fsync_cancel complete\n");
 	if (tevent_loop_once(ev_ctx) == -1) {
-		TALLOC_FREE(ev_ctx);
 		torture_fail(test, talloc_asprintf(test, "Failed event loop %s\n", strerror(errno)));
+		TALLOC_FREE(ev_ctx);
 		return false;
 	}
 
+	torture_comment(test, "preparing to free event context\n");
 	TALLOC_FREE(ev_ctx);
 	return true;
 }
@@ -2155,18 +2158,21 @@ static bool test_event_kqueue_aio_pread_cancel(struct torture_context *test,
 	torture_assert(test, fd != -1, "open() failed");
 
 	for (i = 0; i < INFLIGHT_REQ; i++) {
+		torture_comment(test, "pread_cancel %d\n", i);
 		struct tevent_req *req = NULL;
 		ok = aio_fsync_send(test, ev_ctx, fd, &req);
 		torture_assert(test, ok, "aio_fsync_send() failed");
 		TALLOC_FREE(req);
 	}
 
+	torture_comment(test, "pread_cancel complete\n");
 	if (tevent_loop_once(ev_ctx) == -1) {
 		TALLOC_FREE(ev_ctx);
 		torture_fail(test, talloc_asprintf(test, "Failed event loop %s\n", strerror(errno)));
 		return false;
 	}
 
+	torture_comment(test, "preparing to free event context\n");
 	TALLOC_FREE(ev_ctx);
 	return true;
 }

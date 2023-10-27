@@ -213,19 +213,22 @@ static void process_io_cqe(epoll_ev_ctx_t *epoll_ev,
 			   const struct io_uring_cqe *cqe)
 {
 	struct tevent_aiocb *tiocbp = NULL;
+	void *data = io_uring_cqe_get_data(cqe);
+	int rv = cqe->res;
 
-	tiocbp = talloc_get_type_abort(io_uring_cqe_get_data(cqe),
-				       struct tevent_aiocb);
+	if (rv == -ECANCELED) {
+		// We have cancelled the SQE and freed
+		// memory for struct tevent_aiocb. Nothing to do.
+		return;
+	}
+
+	tiocbp = talloc_get_type_abort(data, struct tevent_aiocb);
 
 	switch (tiocbp->state) {
 	case TAIO_RUNNING:
 		// Generally, the AIO task should be running.
 		break;
 	case TAIO_CANCELLED:
-		// Event was cancelled. Remove destructor
-		// and free everything.
-		talloc_set_destructor(tiocbp, NULL);
-		TALLOC_FREE(tiocbp->iocbp);
 		return;
 	case TAIO_INIT:
 	case TAIO_COMPLETE:
@@ -276,7 +279,7 @@ static int process_uring_event(epoll_ev_ctx_t *epoll_ev)
 
 	io_uring_cq_advance(&epoll_ev->aio.ring, cnt);
 	return 0;
-} 
+}
 
 static int io_event_abort(struct tevent_fd *fde)
 {
@@ -855,7 +858,7 @@ static int epoll_event_loop(struct epoll_event_context *epoll_ev, struct timeval
 
 		if (fde == epoll_ev->aio.fde) {
 			return process_uring_event(epoll_ev);
-		} 
+		}
 
 		if (fde->additional_flags & EPOLL_ADDITIONAL_FD_FLAG_HAS_MPX) {
 			/*
@@ -1125,58 +1128,204 @@ static int epoll_event_loop_once(struct tevent_context *ev, const char *location
 	return epoll_event_loop(epoll_ev, &tval);
 }
 
-static void tevent_aio_cancel(struct tevent_aiocb *taiocb)
+static bool drain_cqe_for_event(epoll_ev_ctx_t *epoll_ev,
+				struct tevent_aiocb *taiocb,
+				bool handle_request)
+{
+	int cnt = 0;
+	bool found_event = false;
+	unsigned head;
+	struct io_uring_cqe *cqe = NULL;
+	void *data = NULL;
+
+	io_uring_for_each_cqe(&epoll_ev->aio.ring, head, cqe) {
+		data = io_uring_cqe_get_data(cqe);
+
+		if (handle_request || (data != taiocb)) {
+			process_io_cqe(epoll_ev, cqe);
+		}
+		cnt++;
+		if (data == taiocb) {
+			found_event = true;
+			break;
+		}
+	}
+
+	io_uring_cq_advance(&epoll_ev->aio.ring, cnt);
+	return found_event;
+}
+
+static bool tevent_aio_cancel(struct tevent_aiocb *taiocb,
+			      bool handle_request)
 {
 	int ret;
+	bool saw_result = false;
 	struct io_uring_sqe *sqe = NULL;
 	struct io_uring_cqe *cqe = NULL;
 	epoll_ev_ctx_t *epoll_ev = EVTOEPOLL(taiocb->ev);
+	void *data = NULL;
 
 	sqe = io_uring_get_sqe(&epoll_ev->aio.ring);
 	if (sqe == NULL) {
 		abort();
 	}
 
-	io_uring_prep_cancel(sqe, taiocb, 0);
+	/*
+	 * Cancel requests are always processed synchronously
+	 * We deliberately don't set user_data so that cancellation
+	 * CQEs are readily apparent
+	 */
+	io_uring_prep_cancel(sqe, taiocb, IORING_ASYNC_CANCEL_ALL);
 
 	ret = io_uring_submit(&epoll_ev->aio.ring);
 	if (ret < 0) {
 		abort();
 	}
 
-	ret = io_uring_wait_cqe(&epoll_ev->aio.ring, &cqe); 
+again:
+	ret = io_uring_wait_cqe(&epoll_ev->aio.ring, &cqe);
 	if (ret < 0) {
 		abort();
 	}
 
-	if (io_uring_cqe_get_data(cqe)) {
-		abort();
+	data = io_uring_cqe_get_data(cqe);
+	if (data == taiocb) {
+		/*
+		 * We have hit upon the request that we're trying to async
+		 * cancel. This often means that it was already sitting on our
+		 * completion queue prior to issuing the cancel request.
+		 *
+		 * Depending on state of request at time it was cancelled, the
+		 * result of the operation may also be -ECANCELED. In this case
+		 * we don't need to do anything special, continue looping cqes
+		 * till we get our cancellation request.
+		 */
+		saw_result = true;
+
+		ret = cqe->res;
+		if (ret == -ECANCELED) {
+			io_uring_cqe_seen(&epoll_ev->aio.ring, cqe);
+			goto again;
+		}
+
+		tevent_debug(epoll_ev->ev, TEVENT_DEBUG_WARNING,
+			     "%s: AIO request finished prior to or during "
+			     "processing of request for its cancellation.\n",
+			     taiocb->location);
+
+		if (handle_request) {
+			process_io_cqe(epoll_ev, cqe);
+		}
+
+		io_uring_cqe_seen(&epoll_ev->aio.ring, cqe);
+		goto again;
 	}
 
-	io_uring_cqe_seen(&epoll_ev->aio.ring, cqe);
+	if (data != NULL) {
+		/*
+		 * This is unfortunatey, but there's another request on the
+		 * completion queue between us and our cancellation event.
+		 * We're honor-bound to process it, and thus we do.
+		 */
+		process_io_cqe(epoll_ev, cqe);
+		io_uring_cqe_seen(&epoll_ev->aio.ring, cqe);
+		goto again;
+	}
+
+	/*
+	 * By the time we get here the cqe is for the async cancellation
+	 * request. If it has failed, then our choices are limited. This
+	 * cancellation function is often called by the talloc destructor
+	 * for the initial tevent request, which means our choices are either:
+	 *
+	 * 1) prevent the destructor from freeing memory of aio request
+	 * 2) drain the completion queue until we hit the request being
+	 *    cancelled.
+	 *
+         * The second option is being used here to avoid leaking memory and
+	 * to avoid potential for talloc library assertion due to using memory
+	 * via talloc_get_type_abort() in process_io_cqe() that should have
+	 * been freed.
+	 */
+	ret = cqe->res;
+	if ((ret < 0) && !saw_result) {
+		errno = -ret;
+
+		switch (ret) {
+		case -EALREADY:
+		/*
+		 * The execution state of request progressed far enough that
+		 * cancellation is no longer possible.
+		 * see man 3 io_uring_prep_cancel
+		 */
+		case -ENOENT:
+		/*
+		 * The request identifed by taiocb could not be located.
+		 * This could mean that it was completed before the
+		 * cancellation request was issued (sitting on queue waiting
+		 * to be processed in this case).
+		 * see man 3 io_uring_prep_cancel
+		 */
+			tevent_debug(epoll_ev->ev, TEVENT_DEBUG_WARNING,
+				     "%s: failed to cancel AIO request: %s",
+				     taiocb->location, strerror(errno));
+
+			/*
+			 * Regardless of how we got here, the original req
+			 * should be waiting on the completion queue.
+			 * The following function advances the queue as its
+			 * read and so io_uring_cqe_seen() isn't needed
+			 * at end of the function we're currently in.
+			 */
+			saw_result = drain_cqe_for_event(epoll_ev, taiocb,
+							 handle_request);
+		default:
+			tevent_debug(epoll_ev->ev, TEVENT_DEBUG_FATAL,
+				     "%s: failed to cancel AIO request: %s",
+				     taiocb->location, strerror(errno));
+			abort();
+		};
+
+		if (!saw_result) {
+			/*
+			 * We failed to safely handle this cancellation
+			 * request. The completion queue event is unhandled
+			 * and puts us at risk of a use-after-free. This is
+			 * unusual enough of a situation that getting core
+			 * is probably required.
+			 */
+			tevent_debug(epoll_ev->ev, TEVENT_DEBUG_FATAL,
+				     "%s: failed to find event in completion "
+				     "queue after cancellation attempt.\n",
+				     taiocb->location, strerror(errno));
+			abort();
+		}
+	} else {
+		io_uring_cqe_seen(&epoll_ev->aio.ring, cqe);
+	}
+
+	taiocb->state = TAIO_CANCELLED;
+	return ret > 0;
 }
 
 static bool aio_req_cancel(struct tevent_req *req)
 {
 	struct tevent_aiocb *taiocb = tevent_req_data(req, struct tevent_aiocb);
-	tevent_aio_cancel(taiocb);
-	return true;
+	return tevent_aio_cancel(taiocb, true);
 }
 
 static int aio_destructor(struct tevent_aiocb *taio)
 {
 	switch (taio->state) {
+	case TAIO_RUNNING:
+		tevent_aio_cancel(taio, false);
 	case TAIO_INIT:
 	case TAIO_CANCELLED:
 	case TAIO_COMPLETE:
 		return 0;
 	case TAIO_RUNNING:
-		// switch state to CANCELLED and
-		// hopefully pick up once we getevents 
-		tevent_aio_cancel(taio);
-		return 0;
 	default:
-		// unknown value
+		// unknown value. should never happen
 		abort();
 	};
 }
@@ -1188,7 +1337,7 @@ iocb_t *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb)
 	if (!init_libaio_data(epoll_ev)) {
 		abort();
 		errno = EAGAIN;
-		return -1;
+		return NULL;
 	}
 
 	tevent_req_set_cancel_fn(taiocb->req, aio_req_cancel);
@@ -1213,7 +1362,7 @@ static int tevent_add_aio_op(struct tevent_aiocb *taiocb,
 		return -1;
 	}
 
-        taiocb->location = location;
+	taiocb->location = location;
 	io_uring_sqe_set_data(taiocb->iocbp, (void *)taiocb);
 
 	err = io_uring_submit(&epoll_ev->aio.ring);
@@ -1221,8 +1370,9 @@ static int tevent_add_aio_op(struct tevent_aiocb *taiocb,
 		abort();
 	}
 
-	taiocb->state = TAIO_RUNNING; 
-        return 0;
+	taiocb->iocbp = NULL;
+	taiocb->state = TAIO_RUNNING;
+	return 0;
 }
 
 int _tevent_add_aio_read(struct tevent_aiocb *taiocb, const char *location)
