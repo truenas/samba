@@ -64,6 +64,7 @@
 #include "librpc/ndr/libndr.h"
 #include "librpc/gen_ndr/windows_event_ids.h"
 #include "lib/audit_logging/audit_logging.h"
+#include "system/syslog.h"
 
 /*
  * Determine the type of the password supplied for the
@@ -121,6 +122,526 @@ static enum event_logon_type get_logon_type(
 	return EVT_LOGON_NETWORK;
 }
 
+static bool authentication_event_json(
+	struct imessaging_context *msg_ctx,
+	struct loadparm_context *lp_ctx,
+	const struct timeval *start_time,
+	const struct auth_usersupplied_info *ui,
+	NTSTATUS status,
+	const char *domain_name,
+	const char *account_name,
+	struct dom_sid *sid,
+	const struct authn_audit_info *client_audit_info,
+	const struct authn_audit_info *server_audit_info,
+	enum event_id_type event_id,
+	int debug_level,
+	struct json_object *authentication)
+{
+	struct json_object client_policy = json_null_object();
+	struct json_object server_policy = json_null_object();
+	char logon_id[19];
+	int rc = 0;
+	const char *clientDomain = ui->orig_client.domain_name ?
+				   ui->orig_client.domain_name :
+				   ui->client.domain_name;
+	const char *clientAccount = ui->orig_client.account_name ?
+				    ui->orig_client.account_name :
+				    ui->client.account_name;
+
+	if (json_is_invalid(authentication)) {
+		goto failure;
+	}
+
+	rc = json_add_version(authentication, AUTH_MAJOR, AUTH_MINOR);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_int(authentication,
+			  "eventId",
+			  event_id);
+	if (rc != 0) {
+		goto failure;
+	}
+	snprintf(logon_id,
+		 sizeof( logon_id),
+		 "%"PRIx64"",
+		 ui->logon_id);
+	rc = json_add_string(authentication, "logonId", logon_id);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_int(authentication, "logonType", get_logon_type(ui));
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_string(authentication, "status", nt_errstr(status));
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_address(authentication, "localAddress", ui->local_host);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc =
+	    json_add_address(authentication, "remoteAddress", ui->remote_host);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_string(
+	    authentication, "serviceDescription", ui->service_description);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_string(
+	    authentication, "authDescription", ui->auth_description);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_string(
+	    authentication, "clientDomain", clientDomain);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_string(
+	    authentication, "clientAccount", clientAccount);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_string(
+	    authentication, "workstation", ui->workstation_name);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_string(authentication, "becameAccount", account_name);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_string(authentication, "becameDomain", domain_name);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_sid(authentication, "becameSid", sid);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_string(
+	    authentication, "mappedAccount", ui->mapped.account_name);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_string(
+	    authentication, "mappedDomain", ui->mapped.domain_name);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_string(authentication,
+			     "netlogonComputer",
+			     ui->netlogon_trust_account.computer_name);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_string(authentication,
+			     "netlogonTrustAccount",
+			     ui->netlogon_trust_account.account_name);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_flags32(
+	    authentication, "netlogonNegotiateFlags",
+	    ui->netlogon_trust_account.negotiate_flags);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_int(authentication,
+			  "netlogonSecureChannelType",
+			  ui->netlogon_trust_account.secure_channel_type);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_sid(authentication,
+			  "netlogonTrustAccountSid",
+			  ui->netlogon_trust_account.sid);
+	if (rc != 0) {
+		goto failure;
+	}
+	rc = json_add_string(
+	    authentication, "passwordType", get_password_type(ui));
+	if (rc != 0) {
+		goto failure;
+	}
+
+	if (client_audit_info != NULL) {
+		client_policy = json_from_audit_info(client_audit_info);
+		if (json_is_invalid(&client_policy)) {
+			goto failure;
+		}
+	}
+
+	rc = json_add_object(authentication, "clientPolicyAccessCheck", &client_policy);
+	if (rc != 0) {
+		goto failure;
+	}
+
+	if (server_audit_info != NULL) {
+		server_policy = json_from_audit_info(server_audit_info);
+		if (json_is_invalid(&server_policy)) {
+			goto failure;
+		}
+	}
+
+	rc = json_add_object(authentication, "serverPolicyAccessCheck", &server_policy);
+	if (rc != 0) {
+		goto failure;
+	}
+
+	return true;
+failure:
+	json_free(&server_policy);
+	json_free(&client_policy);
+	return false;
+}
+
+static bool truenas_audit_add_vers(struct json_object *wrapper,
+				   const char *key)
+{
+	struct json_object vers = json_empty_object;
+	int error;
+
+	vers = json_new_object();
+	if (json_is_invalid(&vers)) {
+		goto failure;
+	}
+
+	error = json_add_int(&vers, "major", 0);
+	if (error) {
+		goto failure;
+	}
+
+	error = json_add_int(&vers, "minor", 1);
+	if (error) {
+		goto failure;
+	}
+
+	error = json_add_object(wrapper, key, &vers);
+	if (error != 0) {
+		goto failure;
+	}
+
+	return true;
+failure:
+	json_free(&vers);
+	return false;
+}
+
+static bool truenas_audit_add_svc_data(struct json_object *wrapper)
+{
+	struct json_object svc_data = json_empty_object;
+	int error;
+	bool rv = false;
+	char *msg = NULL;
+
+	svc_data = json_new_object();
+	if (json_is_invalid(&svc_data)) {
+		goto failure;
+	}
+
+	if (!truenas_audit_add_vers(&svc_data, "vers")) {
+		goto failure;
+	}
+
+	error = json_add_string(&svc_data, "service", NULL);
+	if (error) {
+		goto failure;
+	}
+
+	error = json_add_string(&svc_data, "session_id", NULL);
+	if (error) {
+		goto failure;
+	}
+	error = json_add_string(&svc_data, "tcon_id", NULL);
+	if (error) {
+		goto failure;
+	}
+
+	msg = json_dumps(svc_data.root, 0);
+	if (msg == NULL) {
+		goto failure;
+	}
+	error = json_add_string(wrapper, "svc_data", msg);
+	free(msg);
+	if (error != 0) {
+		goto failure;
+	}
+
+	rv = true;
+failure:
+	json_free(&svc_data);
+	return rv;
+}
+
+bool truenas_audit_add_time(struct json_object *object,
+			    const char *key)
+{
+	char buffer[40];
+	char ts[65];
+	char tz[10];
+	struct tm *tm_info, tmbuf;
+	struct timeval tv;
+	int r;
+	int ret;
+
+        if (json_is_invalid(object)) {
+                return false;
+        }
+
+	r = gettimeofday(&tv, NULL);
+	if (r) {
+		return false;
+        }
+
+	tm_info = gmtime_r(&tv.tv_sec, &tmbuf);
+	if (tm_info == NULL) {
+		return false;
+	}
+
+	strftime(buffer, sizeof(buffer)-1, "%Y-%m-%d %T", tm_info);
+	snprintf(ts, sizeof(ts), "%s.%06ldZ", buffer, tv.tv_usec);
+
+	ret = json_add_string(object, key, ts);
+	if (ret != 0) {
+		return false;
+	}
+
+	return true;
+}
+
+static bool truenas_audit_add_inet_addr(struct json_object *object,
+					const char *key,
+					const struct tsocket_address *addr)
+{
+	char *addr_s = NULL;
+	int error;
+
+	if (json_is_invalid(object)) {
+		return false;
+        }
+
+	if (addr == NULL) {
+		error = json_add_string(object, key, NULL);
+		if (error) {
+			return false;
+		}
+		return true;
+	}
+
+	addr_s = tsocket_address_inet_addr_string(addr, talloc_tos());
+	if (addr_s == NULL) {
+		return false;
+	}
+
+	error = json_add_string(object, key, addr_s);
+	TALLOC_FREE(addr_s);
+	return error ? false : true;
+}
+
+static bool truenas_audit_add_result(struct json_object *authentication,
+				     NTSTATUS status)
+{
+	struct json_object result = json_empty_object;
+	int error;
+
+	result = json_new_object();
+	if (json_is_invalid(&result)) {
+		goto failure;
+	}
+
+	error = json_add_string(&result, "type", "NTSTATUS");
+	if (error) {
+		goto failure;
+	}
+
+	error = json_add_int(&result, "value_raw", NT_STATUS_V(status));
+	if (error) {
+		goto failure;
+	}
+
+	error = json_add_string(&result, "value_parsed",
+				NT_STATUS_IS_OK(status) ?
+				"SUCCESS" :
+				nt_errstr(status));
+	if (error) {
+		goto failure;
+	}
+
+	error = json_add_object(authentication, "result", &result);
+	if (error != 0) {
+		goto failure;
+	}
+
+	return true;
+failure:
+	json_free(&result);
+	return false;
+}
+
+static void truenas_audit_authentication_event(
+	struct imessaging_context *msg_ctx,
+	struct loadparm_context *lp_ctx,
+	const struct timeval *start_time,
+	const struct auth_usersupplied_info *ui,
+	NTSTATUS status,
+	const char *domain_name,
+	const char *account_name,
+	struct dom_sid *sid,
+	const struct authn_audit_info *client_audit_info,
+	const struct authn_audit_info *server_audit_info,
+	enum event_id_type event_id,
+	int debug_level)
+{
+	struct json_object authentication = json_empty_object;
+	struct json_object wrapper = json_empty_object;
+	int rc = 0;
+	char *msg = NULL;
+	bool ok;
+	static bool log_opened = false;
+	struct GUID msgid = GUID_random();
+	const char *clientAccount = ui->orig_client.account_name ?
+				    ui->orig_client.account_name :
+				    ui->client.account_name;
+
+	if (!log_opened) {
+		openlog("TNAUDIT_SMB", 0, LOG_AUTH);
+		log_opened = true;
+	}
+
+	authentication = json_new_object();
+	if (json_is_invalid(&authentication)) {
+		goto failure;
+	}
+
+	ok = authentication_event_json(
+		msg_ctx, lp_ctx, start_time, ui, status, domain_name,
+		account_name, sid, client_audit_info, server_audit_info,
+		event_id, debug_level, &authentication
+	);
+	if (!ok) {
+		goto failure;
+	}
+
+	rc = json_object_del(authentication.root, "version");
+	if (rc != 0) {
+		goto failure;
+	}
+
+	rc = json_object_del(authentication.root, "status");
+	if (rc != 0) {
+		goto failure;
+	}
+
+	rc = json_object_del(authentication.root, "eventId");
+	if (rc != 0) {
+		goto failure;
+	}
+
+	ok = truenas_audit_add_vers(&authentication, "vers");
+	if (!ok) {
+		goto failure;
+	}
+
+	wrapper = json_new_object();
+	if (json_is_invalid(&wrapper)) {
+		goto failure;
+	}
+
+	rc = json_add_guid(&wrapper, "aid", &msgid);
+	if (rc != 0) {
+		goto failure;
+	}
+
+	ok = truenas_audit_add_vers(&wrapper, "vers");
+	if (!ok) {
+		goto failure;
+	}
+
+	ok = truenas_audit_add_inet_addr(&wrapper, "addr", ui->remote_host);
+	if (!ok) {
+		goto failure;
+	}
+
+	rc = json_add_string(&wrapper, "user", account_name ? account_name : clientAccount);
+	if (rc != 0) {
+		goto failure;
+	}
+
+	rc = json_add_string(&wrapper, "sess", NULL);
+	if (rc != 0) {
+		goto failure;
+	}
+
+	ok = truenas_audit_add_time(&wrapper, "time");
+	if (!ok) {
+		goto failure;
+	}
+
+	rc = json_add_string(&wrapper, "svc", "SMB");
+	if (rc != 0) {
+		goto failure;
+	}
+
+	ok = truenas_audit_add_svc_data(&wrapper);
+	if (!ok) {
+		goto failure;
+	}
+
+	rc = json_add_string(&wrapper, "event", "AUTHENTICATION");
+	if (rc != 0) {
+		goto failure;
+	}
+
+	if (!truenas_audit_add_result(&authentication, status)) {
+		goto failure;
+	}
+
+	msg = json_dumps(authentication.root, 0);
+	if (msg == NULL) {
+		goto failure;
+	}
+
+	rc = json_add_string(&wrapper, "event_data", msg);
+	free(msg);
+	if (rc != 0) {
+		goto failure;
+	}
+
+	rc = json_add_bool(&wrapper, "success", NT_STATUS_IS_OK(status));
+	if (rc != 0) {
+		goto failure;
+	}
+
+	msg = json_dumps(wrapper.root, 0);
+	if (msg == NULL) {
+		goto failure;
+	}
+
+	syslog(LOG_MAKEPRI(LOG_AUTH, LOG_NOTICE),
+	       "@cee:{\"TNAUDIT\": %s}", msg);
+
+	free(msg);
+	json_free(&authentication);
+	json_free(&wrapper);
+	return;
+
+failure:
+	/*
+	 * On a failure authentication will not have been added to wrapper so it
+	 * needs to be freed to avoid a leak.
+	 *
+	 */
+	json_free(&authentication);
+	json_free(&wrapper);
+	DBG_ERR("Failed to generate audit event for authenticaiton\n");
+}
+
 /*
  * Write a machine parsable json formatted authentication log entry.
  *
@@ -154,162 +675,22 @@ static void log_authentication_event_json(
 	enum event_id_type event_id,
 	int debug_level)
 {
-	struct json_object wrapper = json_empty_object;
 	struct json_object authentication = json_empty_object;
-	struct json_object client_policy = json_null_object();
-	struct json_object server_policy = json_null_object();
-	char logon_id[19];
+	struct json_object wrapper = json_empty_object;
 	int rc = 0;
-	const char *clientDomain = ui->orig_client.domain_name ?
-				   ui->orig_client.domain_name :
-				   ui->client.domain_name;
-	const char *clientAccount = ui->orig_client.account_name ?
-				    ui->orig_client.account_name :
-				    ui->client.account_name;
+	bool ok;
 
 	authentication = json_new_object();
 	if (json_is_invalid(&authentication)) {
 		goto failure;
 	}
-	rc = json_add_version(&authentication, AUTH_MAJOR, AUTH_MINOR);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_int(&authentication,
-			  "eventId",
-			  event_id);
-	if (rc != 0) {
-		goto failure;
-	}
-	snprintf(logon_id,
-		 sizeof( logon_id),
-		 "%"PRIx64"",
-		 ui->logon_id);
-	rc = json_add_string(&authentication, "logonId", logon_id);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_int(&authentication, "logonType", get_logon_type(ui));
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_string(&authentication, "status", nt_errstr(status));
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_address(&authentication, "localAddress", ui->local_host);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc =
-	    json_add_address(&authentication, "remoteAddress", ui->remote_host);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_string(
-	    &authentication, "serviceDescription", ui->service_description);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_string(
-	    &authentication, "authDescription", ui->auth_description);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_string(
-	    &authentication, "clientDomain", clientDomain);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_string(
-	    &authentication, "clientAccount", clientAccount);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_string(
-	    &authentication, "workstation", ui->workstation_name);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_string(&authentication, "becameAccount", account_name);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_string(&authentication, "becameDomain", domain_name);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_sid(&authentication, "becameSid", sid);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_string(
-	    &authentication, "mappedAccount", ui->mapped.account_name);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_string(
-	    &authentication, "mappedDomain", ui->mapped.domain_name);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_string(&authentication,
-			     "netlogonComputer",
-			     ui->netlogon_trust_account.computer_name);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_string(&authentication,
-			     "netlogonTrustAccount",
-			     ui->netlogon_trust_account.account_name);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_flags32(
-	    &authentication, "netlogonNegotiateFlags",
-	    ui->netlogon_trust_account.negotiate_flags);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_int(&authentication,
-			  "netlogonSecureChannelType",
-			  ui->netlogon_trust_account.secure_channel_type);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_sid(&authentication,
-			  "netlogonTrustAccountSid",
-			  ui->netlogon_trust_account.sid);
-	if (rc != 0) {
-		goto failure;
-	}
-	rc = json_add_string(
-	    &authentication, "passwordType", get_password_type(ui));
-	if (rc != 0) {
-		goto failure;
-	}
 
-	if (client_audit_info != NULL) {
-		client_policy = json_from_audit_info(client_audit_info);
-		if (json_is_invalid(&client_policy)) {
-			goto failure;
-		}
-	}
-
-	rc = json_add_object(&authentication, "clientPolicyAccessCheck", &client_policy);
-	if (rc != 0) {
-		goto failure;
-	}
-
-	if (server_audit_info != NULL) {
-		server_policy = json_from_audit_info(server_audit_info);
-		if (json_is_invalid(&server_policy)) {
-			goto failure;
-		}
-	}
-
-	rc = json_add_object(&authentication, "serverPolicyAccessCheck", &server_policy);
-	if (rc != 0) {
+	ok = authentication_event_json(
+		msg_ctx, lp_ctx, start_time, ui, status, domain_name,
+		account_name, sid, client_audit_info, server_audit_info,
+		event_id, debug_level, &authentication
+	);
+	if (!ok) {
 		goto failure;
 	}
 
@@ -355,8 +736,6 @@ static void log_authentication_event_json(
 	json_free(&wrapper);
 	return;
 failure:
-	json_free(&server_policy);
-	json_free(&client_policy);
 	/*
 	 * On a failure authentication will not have been added to wrapper so it
 	 * needs to be freed to avoid a leak.
@@ -932,9 +1311,20 @@ void log_authentication_event(
 					      event_id,
 					      debug_level);
 	}
+
+	truenas_audit_authentication_event(msg_ctx,
+					      lp_ctx,
+					      start_time,
+					      ui,
+					      status,
+					      domain_name,
+					      account_name,
+					      sid,
+					      client_audit_info,
+					      server_audit_info,
+					      event_id,
+					      debug_level);
 }
-
-
 
 /*
  * Log details of a successful authorization to a service,
