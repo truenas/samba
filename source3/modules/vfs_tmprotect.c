@@ -42,7 +42,7 @@ struct tmprotect_config_data {
 	int retention;
 	int min_snaps;
 	bool enabled;
-	FILE *history_file;
+	char *history_file;
 	time_t last_snap;
 	time_t oldest_snap;
 	time_t last_success;
@@ -174,11 +174,49 @@ static bool last_snap_ts(vfs_handle_struct *handle,
 	return true;
 }
 
-static bool parse_history(FILE *history, size_t *cntp, time_t *timestamp)
+static FILE *open_history(const char *history_path)
 {
+	/*
+	 * Open our cached history file path with flag to fail on presence of
+	 * symlink in any path component.
+	 */
+	FILE *history = NULL;
+	int fd;
+	struct open_how how = {
+		.flags = O_RDONLY,
+		.resolve = RESOLVE_NO_SYMLINKS
+	};
+
+	fd = openat2(AT_FDCWD, history_path, &how, sizeof(how));
+	if (fd == -1) {
+		DBG_ERR("%s: failed to open history path: %s\n",
+			history_path, strerror(errno));
+		return NULL;
+	}
+
+	history = fdopen(fd, "r");
+	if (history == NULL) {
+		DBG_ERR("fdopen() failed: %s\n",
+			strerror(errno));
+		close(fd);
+		return NULL;
+	}
+
+	return history;
+}
+
+static bool parse_history(const char *history_path, size_t *cntp, time_t *timestamp)
+{
+	bool success = True;
 	char *line = NULL;
+	FILE *history = NULL;
 	size_t linecap = 0, cnt = 0;
 	ssize_t linelen;
+
+	history = open_history(history_path);
+	if (history == NULL) {
+		return false;
+	}
 
 	while ((linelen = getline(&line, &linecap, history)) > 0) {
 		char *begin = NULL, *end = NULL;
@@ -186,7 +224,6 @@ static bool parse_history(FILE *history, size_t *cntp, time_t *timestamp)
 		struct tm ts;
 		time_t tm_int;
 
-		DBG_DEBUG("Evaluating history line: %s\n", line);
 		begin = strstr(line, "<date>");
 		if (begin == NULL || begin == line) {
 			DBG_DEBUG("skipping line: %s\n", line);
@@ -198,7 +235,7 @@ static bool parse_history(FILE *history, size_t *cntp, time_t *timestamp)
 			DBG_ERR("%s: strptime() failed: %s\n",
 				begin, strerror(errno));
 			free(line);
-			return false;
+			success = false;
 		}
 
 		cnt++;
@@ -211,39 +248,42 @@ static bool parse_history(FILE *history, size_t *cntp, time_t *timestamp)
 		}
 
 		*timestamp = tm_int;
+		DBG_INFO("%s: selecting timestamp %s and converted to unix timestamp %ld\n",
+			 history_path, line, tm_int);
 	}
 
 	*cntp = cnt;
+out:
 	free(line);
-	rewind(history);
-	return true;
+	fclose(history);
+	return success;
 }
 
-static bool open_history(int _fd, struct tmprotect_config_data *config)
+static bool get_history_full_path(int _fd, struct tmprotect_config_data *config)
 {
-	FILE *history = NULL;
+	/*
+	 * This resolves the opened fd for our history file into an absolute
+	 * path via procfs
+	 */
 	const char *p = NULL;
+	char procfd_buf[35]; // /proc/self/fd/<fd number>
 	char buf[PATH_MAX];
 	int fd;
+	ssize_t sz;
 
-	p = sys_proc_fd_path(_fd, buf, sizeof(buf));
+	p = sys_proc_fd_path(_fd, procfd_buf, sizeof(procfd_buf));
 	SMB_ASSERT(p != NULL);
 
-	fd = open(p, O_RDONLY);
-	if (fd == -1) {
-		DBG_ERR("open() failed: %s\n", strerror(errno));
+	sz = readlink(p, buf, sizeof(buf));
+	if (sz == -1) {
+		DBG_ERR("%s: readlink failed: %s\n", p, strerror(errno));
 		return false;
 	}
 
-	history = fdopen(fd, "r");
-	if (history == NULL) {
-		DBG_ERR("fdopen() failed: %s\n",
-			strerror(errno));
-		close(fd);
+	config->history_file = talloc_strndup(config, buf, sz);
+	if (config->history_file == NULL) {
 		return false;
 	}
-
-	config->history_file = history;
 	return true;
 }
 
@@ -253,6 +293,11 @@ static int tmprotect_openat(vfs_handle_struct *handle,
                             files_struct *fsp,
                             const struct vfs_open_how *how)
 {
+	/*
+	 * Check file being opeed for whether it's our backup history
+	 * and store reference to it. We also prune our snapshots at
+	 * this point (if necessary). This will only occur once per tcon.
+	 */
 	int ret;
 	struct tmprotect_config_data *config = NULL;
 	size_t cnt, flen, slen = strlen(tm_plist_suffix);
@@ -281,10 +326,11 @@ static int tmprotect_openat(vfs_handle_struct *handle,
 		return ret;
 	}
 
-	ok = open_history(ret, config);
+	ok = get_history_full_path(ret, config);
 	if (!ok) {
-		DBG_ERR("%s at %s: failed to open history file\n",
-			smb_fname_str_dbg(smb_fname), fsp_str_dbg(dirfsp));
+		DBG_ERR("%s at %s: failed to open history file: %s\n",
+			smb_fname_str_dbg(smb_fname), fsp_str_dbg(dirfsp),
+			strerror(errno));
 		return ret;
 	}
 
@@ -322,8 +368,6 @@ static bool history_changed(vfs_handle_struct *handle,
 	DBG_INFO("Backup history file: %zu backups, last: %ld\n",
 		 cnt, timestamp);
 
-out:
-	fclose(config->history_file);
 	return rv;
 }
 
@@ -347,7 +391,7 @@ static void tmprotect_disconnect(vfs_handle_struct *handle)
 	 */
 
 	if (!config->enabled || config->history_file == NULL) {
-		DBG_INFO("Module was not enabled for this session\n");
+		DBG_DEBUG("Module was not enabled for this session\n");
 		return;
 	}
 
@@ -359,6 +403,7 @@ static void tmprotect_disconnect(vfs_handle_struct *handle)
 
 	ok = last_snap_ts(handle, config, &last_snap);
 	if (!ok) {
+		DBG_ERR("Failed to look up timestamp for last session\n");
 		return;
 	}
 
@@ -368,7 +413,7 @@ static void tmprotect_disconnect(vfs_handle_struct *handle)
 	 */
 
 	if ((config->history_file == NULL) || (last_snap + 900 > curtime)) {
-		DBG_ERR("Refusing to generate new snapshot on disconnect"
+		DBG_INFO("Refusing to generate new snapshot on disconnect"
 			 "last snapshot is less than 15 minutes old\n");
 		return;
 	}
@@ -381,6 +426,9 @@ static void tmprotect_disconnect(vfs_handle_struct *handle)
 		DBG_ERR("Failed to generate closing snapshot on path: %s\n",
 			handle->conn->connectpath);
 	}
+
+	DBG_INFO("%s: snapshot taken following successful time machine backup\n",
+		 snapshot_name);
 }
 
 
