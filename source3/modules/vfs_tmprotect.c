@@ -95,7 +95,10 @@ static bool prune_snapshots(vfs_handle_struct *handle,
 	snapshots = zhandle_list_snapshots(config->hdl,
 					   talloc_tos(),
 					   config->filter);
-	SMB_ASSERT(snapshots != NULL);
+	if (snapshots == NULL) {
+		return false;
+	}
+
 	time(&curtime);
 	for (entry = snapshots->entries; entry; entry = entry->next) {
 		struct snapshot_entry *del_entry = NULL;
@@ -341,7 +344,8 @@ static int tmprotect_openat(vfs_handle_struct *handle,
 
 	ok = prune_snapshots(handle, config);
 	if (!ok) {
-		DBG_ERR("Failed to prune snapshots\n");
+		DBG_ERR("%s: failed to prune snapshots: %s\n",
+			handle->conn->connectpath, strerror(errno));
 	}
 	return ret;
 }
