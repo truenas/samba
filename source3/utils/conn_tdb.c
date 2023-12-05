@@ -46,6 +46,7 @@ struct connections_forall_session {
 	uint16_t dialect;
 	uint16_t signing;
 	bool authenticated;
+	uint32_t num_channels;
 };
 
 static int collect_sessions_fn(struct smbXsrv_session_global0 *global,
@@ -77,6 +78,7 @@ static int collect_sessions_fn(struct smbXsrv_session_global0 *global,
 	} else {
 		sess.authenticated = false;
 	}
+	sess.num_channels = global->num_channels;
 
 	status = dbwrap_store(state->session_by_pid,
 			      make_tdb_data((void*)&id, sizeof(id)),
@@ -142,6 +144,7 @@ static int traverse_tcon_fn(struct smbXsrv_tcon_global0 *global,
 	data.signing = sess.signing;
 	data.signing_flags = global->signing_flags;
 	data.authenticated = sess.authenticated;
+	data.num_channels = sess.num_channels;
 
 	state->count++;
 
