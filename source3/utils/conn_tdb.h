@@ -34,6 +34,7 @@ struct connections_data {
 	uint16_t dialect;
 	uint8_t signing_flags;
 	uint16_t signing;
+	uint32_t num_channels;
 };
 
 /* The following definitions come from lib/conn_tdb.c  */

@@ -365,6 +365,11 @@ int traverse_connections_json(struct traverse_state *state,
 		goto failure;
 	}
 
+	result = json_add_int(&sub_json, "num_channels", crec->num_channels);
+	if (result < 0) {
+		goto failure;
+	}
+
 	result = json_add_object(&connections_json, tcon_id_str, &sub_json);
 	if (result < 0) {
 		goto failure;
