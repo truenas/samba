@@ -118,6 +118,22 @@ struct smbacl4_vfs_params {
 int smbacl4_get_vfs_params(struct connection_struct *conn,
 			   struct smbacl4_vfs_params *params);
 
+int nfs4_acl_stat(struct vfs_handle_struct *handle,
+		  struct smb_filename *smb_fname);
+
+int nfs4_acl_fstat(struct vfs_handle_struct *handle,
+		   struct files_struct *fsp,
+		   SMB_STRUCT_STAT *sbuf);
+
+int nfs4_acl_lstat(struct vfs_handle_struct *handle,
+		   struct smb_filename *smb_fname);
+
+int nfs4_acl_fstatat(struct vfs_handle_struct *handle,
+		     const struct files_struct *dirfsp,
+		     const struct smb_filename *smb_fname,
+		     SMB_STRUCT_STAT *sbuf,
+		     int flags);
+
 struct SMB4ACL_T *smb_create_smb4acl(TALLOC_CTX *mem_ctx);
 
 /* prop's contents are copied */
