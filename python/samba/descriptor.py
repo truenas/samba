@@ -52,6 +52,16 @@ def get_empty_descriptor(domain_sid, name_map={}):
 # "get_schema_descriptor" is located in "schema.py"
 
 
+def get_deletedobjects_descriptor(domain_sid, name_map=None):
+    if name_map is None:
+        name_map = {}
+
+    sddl = "O:SYG:SYD:PAI" \
+        "(A;;RPWPCCDCLCRCWOWDSDSW;;;SY)" \
+        "(A;;RPLC;;;BA)"
+    return sddl2binary(sddl, domain_sid, name_map)
+
+
 def get_config_descriptor(domain_sid, name_map={}):
     sddl = "O:EAG:EAD:(OA;;CR;1131f6aa-9c07-11d1-f79f-00c04fc2dcd2;;ED)" \
            "(OA;;CR;1131f6ab-9c07-11d1-f79f-00c04fc2dcd2;;ED)" \
@@ -407,6 +417,7 @@ def get_wellknown_sds(samdb):
     # Then subcontainers
     subcontainers = [
         (ldb.Dn(samdb, "%s" % str(samdb.domain_dn())), get_domain_descriptor),
+        (ldb.Dn(samdb, "CN=Deleted Objects,%s" % str(samdb.domain_dn())), get_deletedobjects_descriptor),
         (ldb.Dn(samdb, "CN=LostAndFound,%s" % str(samdb.domain_dn())), get_domain_delete_protected2_descriptor),
         (ldb.Dn(samdb, "CN=System,%s" % str(samdb.domain_dn())), get_domain_delete_protected1_descriptor),
         (ldb.Dn(samdb, "CN=Infrastructure,%s" % str(samdb.domain_dn())), get_domain_infrastructure_descriptor),
@@ -417,6 +428,7 @@ def get_wellknown_sds(samdb):
         (ldb.Dn(samdb, "CN=MicrosoftDNS,CN=System,%s" % str(samdb.domain_dn())), get_dns_domain_microsoft_dns_descriptor),
 
         (ldb.Dn(samdb, "%s" % str(samdb.get_config_basedn())), get_config_descriptor),
+        (ldb.Dn(samdb, "CN=Deleted Objects,%s" % str(samdb.get_config_basedn())), get_deletedobjects_descriptor),
         (ldb.Dn(samdb, "CN=NTDS Quotas,%s" % str(samdb.get_config_basedn())), get_config_ntds_quotas_descriptor),
         (ldb.Dn(samdb, "CN=LostAndFoundConfig,%s" % str(samdb.get_config_basedn())), get_config_delete_protected1wd_descriptor),
         (ldb.Dn(samdb, "CN=Services,%s" % str(samdb.get_config_basedn())), get_config_delete_protected1_descriptor),
@@ -441,6 +453,9 @@ def get_wellknown_sds(samdb):
         if ldb.Dn(samdb, nc.decode('utf8')) == dnsforestdn:
             c = (ldb.Dn(samdb, "%s" % str(dnsforestdn)), get_dns_partition_descriptor)
             subcontainers.append(c)
+            c = (ldb.Dn(samdb, "CN=Deleted Objects,%s" % str(dnsforestdn)),
+                 get_deletedobjects_descriptor)
+            subcontainers.append(c)
             c = (ldb.Dn(samdb, "CN=Infrastructure,%s" % str(dnsforestdn)),
                  get_domain_delete_protected1_descriptor)
             subcontainers.append(c)
@@ -455,6 +470,9 @@ def get_wellknown_sds(samdb):
         dnsdomaindn = ldb.Dn(samdb, "DC=DomainDnsZones,%s" % (str(samdb.domain_dn())))
         if ldb.Dn(samdb, nc.decode('utf8')) == dnsdomaindn:
             c = (ldb.Dn(samdb, "%s" % str(dnsdomaindn)), get_dns_partition_descriptor)
+            subcontainers.append(c)
+            c = (ldb.Dn(samdb, "CN=Deleted Objects,%s" % str(dnsdomaindn)),
+                 get_deletedobjects_descriptor)
             subcontainers.append(c)
             c = (ldb.Dn(samdb, "CN=Infrastructure,%s" % str(dnsdomaindn)),
                  get_domain_delete_protected1_descriptor)
@@ -548,7 +566,8 @@ def get_clean_sd(sd):
     return sd_clean
 
 
-def get_diff_sds(refsd, cursd, domainsid, checkSacl=True):
+def get_diff_sds(refsd, cursd, domainsid, checkSacl=True,
+                 ignoreAdditionalACEs=False):
     """Get the difference between 2 sd
 
     This function split the textual representation of ACL into smaller
@@ -603,6 +622,10 @@ def get_diff_sds(refsd, cursd, domainsid, checkSacl=True):
                     h_ref.remove(k)
 
             if len(h_cur) + len(h_ref) > 0:
+                if txt == "" and len(h_ref) == 0:
+                    if ignoreAdditionalACEs:
+                        return ""
+
                 txt = "%s\tPart %s is different between reference" \
                       " and current here is the detail:\n" % (txt, part)
 
