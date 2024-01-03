@@ -1594,76 +1594,6 @@ static NTSTATUS vfs_gpfs_fset_dos_attributes(struct vfs_handle_struct *handle,
 	return NT_STATUS_OK;
 }
 
-static int stat_with_capability(struct vfs_handle_struct *handle,
-				struct smb_filename *smb_fname, int flag)
-{
-	bool fake_dctime = lp_fake_directory_create_times(SNUM(handle->conn));
-	int fd = -1;
-	NTSTATUS status;
-	struct smb_filename *dir_name = NULL;
-	struct smb_filename *rel_name = NULL;
-	int ret = -1;
-
-	status = SMB_VFS_PARENT_PATHNAME(handle->conn,
-					 talloc_tos(),
-					 smb_fname,
-					 &dir_name,
-					 &rel_name);
-	if (!NT_STATUS_IS_OK(status)) {
-		errno = map_errno_from_nt_status(status);
-		return -1;
-	}
-
-	fd = open(dir_name->base_name, O_RDONLY, 0);
-	if (fd == -1) {
-		TALLOC_FREE(dir_name);
-		return -1;
-	}
-
-	set_effective_capability(DAC_OVERRIDE_CAPABILITY);
-	ret = sys_fstatat(fd,
-				rel_name->base_name,
-				&smb_fname->st,
-				flag,
-				fake_dctime);
-
-	drop_effective_capability(DAC_OVERRIDE_CAPABILITY);
-
-	TALLOC_FREE(dir_name);
-	close(fd);
-
-	return ret;
-}
-
-static int vfs_gpfs_stat(struct vfs_handle_struct *handle,
-			 struct smb_filename *smb_fname)
-{
-	int ret;
-
-	ret = SMB_VFS_NEXT_STAT(handle, smb_fname);
-	if (ret == -1 && errno == EACCES) {
-		DEBUG(10, ("Trying stat with capability for %s\n",
-			   smb_fname->base_name));
-		ret = stat_with_capability(handle, smb_fname, 0);
-	}
-	return ret;
-}
-
-static int vfs_gpfs_lstat(struct vfs_handle_struct *handle,
-			  struct smb_filename *smb_fname)
-{
-	int ret;
-
-	ret = SMB_VFS_NEXT_LSTAT(handle, smb_fname);
-	if (ret == -1 && errno == EACCES) {
-		DEBUG(10, ("Trying lstat with capability for %s\n",
-			   smb_fname->base_name));
-		ret = stat_with_capability(handle, smb_fname,
-					   AT_SYMLINK_NOFOLLOW);
-	}
-	return ret;
-}
-
 static int timespec_to_gpfs_time(
 	struct timespec ts, gpfs_timestruc_t *gt, int idx, int *flags)
 {
@@ -2592,8 +2522,10 @@ static struct vfs_fn_pointers vfs_gpfs_fns = {
 	.sys_acl_delete_def_fd_fn = gpfsacl_sys_acl_delete_def_fd,
 	.fchmod_fn = vfs_gpfs_fchmod,
 	.close_fn = vfs_gpfs_close,
-	.stat_fn = vfs_gpfs_stat,
-	.lstat_fn = vfs_gpfs_lstat,
+	.stat_fn = nfs4_acl_stat,
+	.fstat_fn = nfs4_acl_fstat,
+	.lstat_fn = nfs4_acl_lstat,
+	.fstatat_fn = nfs4_acl_fstatat,
 	.fntimes_fn = vfs_gpfs_fntimes,
 	.aio_force_fn = vfs_gpfs_aio_force,
 	.sendfile_fn = vfs_gpfs_sendfile,
