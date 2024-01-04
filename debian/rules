@@ -66,6 +66,7 @@ conf_args = \
 		--enable-etcd-reclock \
 		--disable-cups \
 		--disable-iprint \
+                --disable-glusterfs \
                 --disable-cephfs
 
 ifeq ($(DEB_HOST_ARCH_OS), linux)
