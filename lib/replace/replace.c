@@ -1110,9 +1110,9 @@ ssize_t rep_copy_file_range(int fd_in,
 
 #ifdef O_RESOLVE_NO_SYMLINKS
 #define RESOLVE_FLAGS_CHECKED 0x1000
-static bool get_supported_flags(uint64_t *flagsp)
+static bool get_supported_flags(uint16_t *flagsp)
 {
-	uint64_t supported_flags = 0;
+	uint16_t supported_flags = 0;
 	int has_it;
 	size_t sz = sizeof(has_it);
 	int error;
@@ -1136,6 +1136,7 @@ static bool get_supported_flags(uint64_t *flagsp)
 	}
 
 	supported_flags |= RESOLVE_FLAGS_CHECKED;
+	*flagsp = supported_flags;
 	return true;
 }
 #endif
@@ -1175,7 +1176,7 @@ long rep_openat2(int dirfd, const char *pathname,
 		       size);
 
 #elif defined(O_RESOLVE_NO_SYMLINKS)
-	static __thread uint64_t supported_flags;
+	static uint16_t supported_flags;
 	int flags = how->flags;
 
 	if (!supported_flags && !get_supported_flags(&supported_flags)) {
