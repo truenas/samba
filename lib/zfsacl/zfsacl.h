@@ -192,6 +192,8 @@ bool zfsace_set_flagset(zfsacl_entry_t _entry, zfsace_flagset_t _flags);
 bool zfsace_set_who(zfsacl_entry_t _entry, zfsace_who_t _who, zfsace_id_t _aeid);
 bool zfsace_set_entry_type(zfsacl_entry_t _entry, zfsace_entry_type_t _tp);
 
+zfsacl_t zfsacl_calculate_inherited_acl(zfsacl_t p, zfsacl_t t, bool dir);
+
 
 /*
  * NFSv4 ACL-wide flags
@@ -278,7 +280,7 @@ bool zfsace_set_entry_type(zfsacl_entry_t _entry, zfsace_entry_type_t _tp);
     (who != ZFSACL_GROUP_OBJ) && (who != ZFSACL_GROUP) && \
     (who != ZFSACL_EVERYONE))
 
-const struct {
+static const struct {
 	zfsacl_aclflags_t flag;
 	const char *name;
 } aclflag2name[] = {
@@ -289,7 +291,7 @@ const struct {
 	{ ZFSACL_IS_DIR, "IS_DIRECTORY" },
 };
 
-const struct {
+static const struct {
 	zfsace_permset_t perm;
 	const char *name;
 	char letter;
@@ -312,7 +314,7 @@ const struct {
 	{ ZFSACE_SYNCHRONIZE, "SYNCHRONIZE", 's' },
 };
 
-const struct {
+static const struct {
 	zfsace_flagset_t flag;
 	const char *name;
 	char letter;
@@ -324,7 +326,7 @@ const struct {
 	{ ZFSACE_INHERITED_ACE, "INHERITED", 'I' },
 };
 
-const struct {
+static const struct {
 	zfsace_who_t who;
 	const char *name;
 } acewho2name[] = {
