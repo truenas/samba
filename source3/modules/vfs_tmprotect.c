@@ -185,12 +185,17 @@ static FILE *open_history(const char *history_path)
 	 */
 	FILE *history = NULL;
 	int fd;
+
+#ifndef FREEBSD
 	struct open_how how = {
 		.flags = O_RDONLY,
 		.resolve = RESOLVE_NO_SYMLINKS
 	};
-
 	fd = openat2(AT_FDCWD, history_path, &how, sizeof(how));
+
+#else
+	fd = openat(AT_FDCWD, history_path, O_RDONLY | O_RESOLVE_BENEATH);
+#endif
 	if (fd == -1) {
 		DBG_ERR("%s: failed to open history path: %s\n",
 			history_path, strerror(errno));
