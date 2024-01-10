@@ -245,6 +245,8 @@ int rep_fsetxattr (int filedes, const char *name, const void *value, size_t size
 
 #ifdef HAVE_LINUX_OPENAT2_H
 #include <linux/openat2.h>
+#elif HAVE_SYS_OPENAT2_H
+#include <sys/openat2.h>
 #else /* ! HAVE_LINUX_OPENAT2_H */
 /* how->resolve flags for openat2(2). */
 #define RESOLVE_NO_XDEV		0x01 /* Block mount-point crossings

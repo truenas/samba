@@ -1236,8 +1236,7 @@ long rep_openat2(int dirfd, const char *pathname,
 
 	return openat(dirfd, pathname, flags, how->mode);
 #else
-	errno = ENOSYS;
-	return -1;
+#error "no openat2 implementation"
 #endif
 }
 #endif /* !HAVE_OPENAT2 */
