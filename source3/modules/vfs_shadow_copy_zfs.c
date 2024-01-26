@@ -75,7 +75,7 @@ struct snapshot_data {
  */
 typedef struct open_snapdir {
 	struct snapshot_data data;
-	int mp_fd;
+	int mp_fd; // O_DIRECTORY open for mountpoint as root.
 	int refcnt;
 	struct shadow_copy_zfs_config *config;
 	struct open_snapdir *next, *prev;
@@ -192,7 +192,9 @@ static bool open_snapdir(struct shadow_copy_fsp_ext *ext)
 		 * If we fail to open, keep struct around so that we can
 		 * avoid list churn / memory allocations
 		 */
+		become_root();
 		snapdir->mp_fd = open(ext->data.shadow_cp, O_DIRECTORY);
+		unbecome_root();
 		if (snapdir->mp_fd == -1) {
 			DBG_ERR("%s: snapdir open failed: %s\n",
 				snapdir->data.shadow_cp, strerror(errno));
@@ -1063,7 +1065,6 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 		 * our O_PATH open and pass error back up stack.
 		 */
 		if (!open_snapdir(fsp_ext)) {
-			TALLOC_FREE(fsp_ext);
 			close(ret);
 			ret = -1;
 		}
