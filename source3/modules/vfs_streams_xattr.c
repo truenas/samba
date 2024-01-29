@@ -46,6 +46,16 @@ struct stream_io {
 	vfs_handle_struct *handle;
 };
 
+static bool can_write_ea(files_struct *fsp)
+{
+	NTSTATUS status;
+	status = smbd_check_access_rights_fsp(fsp->conn->cwd_fsp,
+					      fsp,
+					      false,
+					      SEC_FILE_WRITE_EA);
+	return NT_STATUS_IS_OK(status);
+}
+
 static ssize_t get_xattr_size_fsp(vfs_handle_struct *handle,
 				  struct files_struct *fsp,
 			          const char *xattr_name)
@@ -1018,6 +1028,20 @@ static ssize_t streams_xattr_pwrite(vfs_handle_struct *handle,
 				ea.value.data,
 				ea.value.length,
 				0);
+
+	if ((ret == -1) && (errno == EACCES)) {
+		bool ok;
+		ok = can_write_ea(fsp->base_fsp);
+		if (ok) {
+			become_root();
+			ret = SMB_VFS_FSETXATTR(fsp->base_fsp,
+						sio->xattr_name,
+						ea.value.data,
+						ea.value.length,
+						0);
+			unbecome_root();
+		}
+	}
 	TALLOC_FREE(ea.value.data);
 
 	if (ret == -1) {
@@ -1300,6 +1324,20 @@ static int streams_xattr_ftruncate(struct vfs_handle_struct *handle,
 				ea.value.data,
 				ea.value.length,
 				0);
+
+	if ((ret == -1) && (errno == EACCES)) {
+		bool ok;
+		ok = can_write_ea(fsp->base_fsp);
+		if (ok) {
+			become_root();
+			ret = SMB_VFS_FSETXATTR(fsp->base_fsp,
+						sio->xattr_name,
+						ea.value.data,
+						ea.value.length,
+						0);
+			unbecome_root();
+		}
+	}
 
 	TALLOC_FREE(ea.value.data);
 
