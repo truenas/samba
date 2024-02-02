@@ -38,7 +38,9 @@
 #endif
 #ifdef HAVE_KQUEUE
 #include "tevent_kqueue.h"
-#endif
+#else
+#include "tevent_libaio.h"
+#endif /* HAVE_KQUEUE */
 
 
 static struct tevent_context *
@@ -1960,7 +1962,6 @@ static bool test_cached_pid(struct torture_context *test,
 	return true;
 }
 
-#ifdef HAVE_KQUEUE
 static bool aio_recv(struct torture_context *test, struct tevent_req *req)
 {
 	struct tevent_aiocb *taiocbp = NULL;
@@ -1979,7 +1980,7 @@ static bool aio_pread_send(struct torture_context *test,
 	int ret;
 	struct tevent_req *req = NULL;
 	struct tevent_aiocb *taiocbp = NULL;
-	struct aiocb *iocbp = NULL;
+	iocb_t *iocbp = NULL;
 
 	req = tevent_req_create(test, &taiocbp, struct tevent_aiocb);
 	torture_assert(test, req != NULL, "tevent_req_create()");
@@ -1987,10 +1988,9 @@ static bool aio_pread_send(struct torture_context *test,
 	taiocbp->req = req;
 
 	iocbp = tevent_ctx_get_iocb(taiocbp);
-	iocbp->aio_fildes = fd;
-	iocbp->aio_offset = offset;
-	iocbp->aio_buf = data;
-	iocbp->aio_nbytes = n;
+	torture_assert(test, iocbp != NULL, "tevent_ctx_get_iocb()");
+
+	tio_prep_pread(iocbp, fd, data, n, offset);
 
 	ret = tevent_add_aio_read(taiocbp);
 	torture_assert(test, ret != -1, "aio_pread_send()");
@@ -2008,7 +2008,7 @@ static bool aio_pwrite_send(struct torture_context *test,
 	int ret;
 	struct tevent_req *req = NULL;
 	struct tevent_aiocb *taiocbp = NULL;
-	struct aiocb *iocbp = NULL;
+	iocb_t *iocbp = NULL;
 
 	req = tevent_req_create(test, &taiocbp, struct tevent_aiocb);
 	torture_assert(test, req != NULL, "tevent_req_create()");
@@ -2016,10 +2016,9 @@ static bool aio_pwrite_send(struct torture_context *test,
 	taiocbp->req = req;
 
 	iocbp = tevent_ctx_get_iocb(taiocbp);
-	iocbp->aio_fildes = fd;
-	iocbp->aio_offset = offset;
-	iocbp->aio_buf = data;
-	iocbp->aio_nbytes = n;
+	torture_assert(test, iocbp != NULL, "tevent_ctx_get_iocb()");
+
+	tio_prep_pwrite(iocbp, fd, data, n, offset);
 
 	ret = tevent_add_aio_write(taiocbp);
 	torture_assert(test, ret != -1, "aio_write_send()");
@@ -2035,7 +2034,7 @@ static bool aio_fsync_send(struct torture_context *test,
 	int ret;
 	struct tevent_req *req = NULL;
 	struct tevent_aiocb *taiocbp = NULL;
-	struct aiocb *iocbp = NULL;
+	iocb_t *iocbp = NULL;
 
 	req = tevent_req_create(test, &taiocbp, struct tevent_aiocb);
 	torture_assert(test, req != NULL, "tevent_req_create()");
@@ -2043,7 +2042,9 @@ static bool aio_fsync_send(struct torture_context *test,
 	taiocbp->req = req;
 
 	iocbp = tevent_ctx_get_iocb(taiocbp);
-	iocbp->aio_fildes = fd;
+	torture_assert(test, iocbp != NULL, "tevent_ctx_get_iocb()");
+
+	tio_prep_fsync(iocbp, fd);
 
 	ret = tevent_add_aio_fsync(taiocbp);
 	torture_assert(test, ret != -1, "aio_write_send()");
@@ -2119,18 +2120,21 @@ static bool test_event_kqueue_aio_fsync_cancel(struct torture_context *test,
 	torture_assert(test, fd != -1, "open() failed");
 
 	for (i = 0; i < INFLIGHT_REQ; i++) {
+		torture_comment(test, "fsync_cancel %d\n", i);
 		struct tevent_req *req = NULL;
 		ok = aio_fsync_send(test, ev_ctx, fd, &req);
 		torture_assert(test, ok, "aio_fsync_send() failed");
 		TALLOC_FREE(req);
 	}
 
+	torture_comment(test, "fsync_cancel complete\n");
 	if (tevent_loop_once(ev_ctx) == -1) {
-		TALLOC_FREE(ev_ctx);
 		torture_fail(test, talloc_asprintf(test, "Failed event loop %s\n", strerror(errno)));
+		TALLOC_FREE(ev_ctx);
 		return false;
 	}
 
+	torture_comment(test, "preparing to free event context\n");
 	TALLOC_FREE(ev_ctx);
 	return true;
 }
@@ -2154,18 +2158,21 @@ static bool test_event_kqueue_aio_pread_cancel(struct torture_context *test,
 	torture_assert(test, fd != -1, "open() failed");
 
 	for (i = 0; i < INFLIGHT_REQ; i++) {
+		torture_comment(test, "pread_cancel %d\n", i);
 		struct tevent_req *req = NULL;
 		ok = aio_fsync_send(test, ev_ctx, fd, &req);
 		torture_assert(test, ok, "aio_fsync_send() failed");
 		TALLOC_FREE(req);
 	}
 
+	torture_comment(test, "pread_cancel complete\n");
 	if (tevent_loop_once(ev_ctx) == -1) {
 		TALLOC_FREE(ev_ctx);
 		torture_fail(test, talloc_asprintf(test, "Failed event loop %s\n", strerror(errno)));
 		return false;
 	}
 
+	torture_comment(test, "preparing to free event context\n");
 	TALLOC_FREE(ev_ctx);
 	return true;
 }
@@ -2203,7 +2210,6 @@ static bool test_event_kqueue_aio_pwrite_cancel(struct torture_context *test,
 	TALLOC_FREE(ev_ctx);
 	return true;
 }
-#endif
 
 struct torture_suite *torture_local_event(TALLOC_CTX *mem_ctx)
 {
@@ -2278,7 +2284,6 @@ struct torture_suite *torture_local_event_aio(TALLOC_CTX *mem_ctx)
 {
         struct torture_suite *suite = torture_suite_create(mem_ctx, "event_aio");
 
-#ifdef HAVE_KQUEUE
         torture_suite_add_simple_tcase_const(suite,
                                              "basic_kqueue_aio",
                                              test_event_kqueue_aio,
@@ -2298,6 +2303,5 @@ struct torture_suite *torture_local_event_aio(TALLOC_CTX *mem_ctx)
                                              "aio_write_cancel_destructor",
                                              test_event_kqueue_aio_pwrite_cancel,
                                              NULL);
-#endif /* HAVE_KQUEUE */
 	return suite;
 }

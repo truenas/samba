@@ -111,7 +111,7 @@ def build(bld):
         private_library = True
 
     if not bld.CONFIG_SET('USING_SYSTEM_TEVENT'):
-        tevent_deps = 'replace talloc'
+        tevent_deps = 'replace talloc uring'
         if bld.CONFIG_SET('HAVE_PTHREAD'):
             tevent_deps += ' pthread'
 
@@ -125,6 +125,7 @@ def build(bld):
                           vnum=VERSION,
                           public_headers=('' if private_library else 'tevent.h'),
                           public_headers_install=not private_library,
+                          ldflags='-laio',
                           pc_files='tevent.pc',
                           private_library=private_library)
 
