@@ -229,7 +229,7 @@ static int vfs_io_uring_connect(vfs_handle_struct *handle, const char *service,
 	force_aio_read = lp_parm_bool(SNUM(handle->conn),
 				      "io_uring",
 				      "iosqe_async_read",
-				      false);
+				      true);
 	if (force_aio_read) {
 		config->async_ops |= IO_URING_ASYNC_READ;
 	}
