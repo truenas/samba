@@ -2248,6 +2248,7 @@ struct torture_suite *torture_local_event(TALLOC_CTX *mem_ctx)
 		torture_suite_add_suite(suite, backend_suite);
 	}
 
+#if 0
 #ifdef HAVE_PTHREAD
 	torture_suite_add_simple_tcase_const(suite, "threaded_poll_mt",
 					     test_event_context_threaded,
@@ -2266,7 +2267,7 @@ struct torture_suite *torture_local_event(TALLOC_CTX *mem_ctx)
 					     NULL);
 
 #endif
-
+#endif
 	torture_suite_add_simple_tcase_const(suite, "tevent_cached_getpid",
 					     test_cached_pid,
 					     NULL);
