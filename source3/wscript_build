@@ -467,6 +467,17 @@ bld.SAMBA3_LIBRARY('libsmbjson',
                           ''',
                    private_library=True)
 
+bld.SAMBA3_LIBRARY('libsmburing',
+                   deps='''samba-debug
+                           smbd_base
+                           uring
+                        ''',
+                   source='''
+                           libsmburing/smburing.c
+                           libsmburing/aio.c
+                          ''',
+                   private_library=True)
+
 bld.SAMBA3_SUBSYSTEM('CLDAP',
                     source='libads/cldap.c',
                     deps='cli-ldap-common cli_cldap LIBTSOCKET')

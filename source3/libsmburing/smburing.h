@@ -20,17 +20,16 @@
 #ifndef __SMBURING_H__
 #define __SMBURING_H__
 
-static struct iovec_status;
+#include <liburing.h>
+
+struct iovec_status;
 struct smburing_aiocb;
 
 typedef struct smburing_ctx {
 	int event_fd;
-	struct io_uring *ring;
-        struct iovec *iovarray;
-        size_t array_sz;
-	struct iovec_status *status;
+	struct io_uring ring;
 	TALLOC_CTX *aiocb_pool;
-	struct *aio_queue;
+	struct smburing_aiocb *aio_queue;
 	void *fde;
 } suctx_t;
 
@@ -52,31 +51,21 @@ typedef struct smburing_aiocb {
 	void *private_data;
 } suaiocb_t;
 
-suctx_t *init_smburing_ctx(TALLOC_CTX *mem_ctx, struct io_uring *ring);
-bool get_smburing_iov(suctx_t *ctx, struct iovec *iov_out, int *idx_out);
-void release_smburing_iov(struct smburing_ctx *ctx, int idx);
+suctx_t *init_smburing_ctx(TALLOC_CTX *mem_ctx, size_t ring_sz);
+
+int _smburing_process_events(suctx_t *ctx, const char *location);
+#define smburing_process_events(ctx)\
+	_smburing_process_events(ctx, __location__)
 
 suaiocb_t *_get_aio_cb(suctx_t *ctx, const char *location);
 #define get_aio_cb(ctx)\
 	(suctx_t *)_get_aio_cb(ctx, __location__)
 
-/* Fixed-buffer variants of read / write */
-int _add_aio_read_fixed(suaiocb_t *aiocb, int fd, size_t n,
-			off_t offset, const char *location);
-#define add_aio_read_fixed(aiocb, fd, n, offset)\
-	(int)_add_aio_read_fixed(aiocb, fd, n, offset __location__)
-
-int _add_aio_write_fixed(suaiocb_t *aiocb, int fd, void *data, size_t n,
-			 off_t offset, const char *location);
-#define add_aio_write_fixed(aiocb, fd, data, n, offset)\
-	(int)_add_aio_write_fixed(aiocb, fd, data, n, offset, __location__)
-
-
 /* Normal variants of read / write */
 int _add_aio_read(suaiocb_t *aiocb, int fd, void *data, size_t n,
 		  off_t offset, const char *location);
 #define add_aio_read(aiocb, fd, data, n, offset)\
-	(int)_add_aio_read(aiocb, fd, data, n, offset __location__)
+	(int)_add_aio_read(aiocb, fd, data, n, offset, __location__)
 
 int _add_aio_write(suaiocb_t *aiocb, int fd, void *data, size_t n,
 		   off_t offset, const char *location);

@@ -43,7 +43,7 @@ conf_args = \
 		--with-winbind \
 		--without-ad-dc \
 		--with-quotas \
-		--with-shared-modules=idmap_rid,idmap_ad,idmap_ldap,idmap_tdb2,auth_samba4,vfs_nfs4acl_xattr \
+		--with-shared-modules=idmap_rid,idmap_ad,idmap_ldap,vfs_aio_truenas,auth_samba4,vfs_nfs4acl_xattr \
 		--with-automount \
 		--with-ldap \
 		--with-ads \

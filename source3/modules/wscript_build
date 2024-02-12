@@ -518,6 +518,14 @@ bld.SAMBA3_MODULE('vfs_io_uring',
                  internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_io_uring'),
                  enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_io_uring'))
 
+bld.SAMBA3_MODULE('vfs_aio_truenas',
+                 subsystem='vfs',
+                 source='vfs_aio_truenas.c',
+                 deps='samba-util tevent uring libsmburing',
+                 init_function='',
+                 internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_aio_truenas'),
+                 enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_aio_truenas'))
+
 bld.SAMBA3_MODULE('vfs_preopen',
                  subsystem='vfs',
                  source='vfs_preopen.c',
