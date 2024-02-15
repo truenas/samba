@@ -23,6 +23,7 @@
 #include "smbd/globals.h"
 #include "../lib/util/tevent_ntstatus.h"
 #include "../lib/util/tevent_unix.h"
+#include "source3/lib/truenas_mempool.h"
 
 /****************************************************************************
  Accessor function to return write_through state.
@@ -354,8 +355,8 @@ NTSTATUS schedule_smb2_aio_read(connection_struct *conn,
 	}
 
 	/* Create the out buffer. */
-	*preadbuf = data_blob_talloc(ctx, NULL, smb_maxcnt);
-	if (preadbuf->data == NULL) {
+
+	if (!io_pool_alloc_blob(conn, smb_maxcnt, preadbuf)) {
 		return NT_STATUS_NO_MEMORY;
 	}
 
