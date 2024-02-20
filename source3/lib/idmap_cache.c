@@ -23,6 +23,7 @@
 #include "../librpc/gen_ndr/idmap.h"
 #include "lib/gencache.h"
 #include "lib/util/string_wrappers.h"
+#include "util_unixsids.h"
 
 /**
  * Find a sid2xid mapping
@@ -281,6 +282,7 @@ void idmap_cache_set_sid2unixid(const struct dom_sid *sid, struct unixid *unix_i
 	time_t now = time(NULL);
 	time_t timeout;
 	fstring key, value;
+	bool is_implicit_sid = false;
 
 	if (!is_null_sid(sid)) {
 		struct dom_sid_buf sidstr;
@@ -306,8 +308,15 @@ void idmap_cache_set_sid2unixid(const struct dom_sid *sid, struct unixid *unix_i
 			? lp_idmap_negative_cache_time()
 			: lp_idmap_cache_time();
 		gencache_set(key, value, now + timeout);
+
+		if (sid_check_is_in_unix_groups(sid) ||
+		    sid_check_is_in_unix_users(sid)) {
+			// Avoid setting IDMAP/UID2SID cache entry for local
+			// users and groups to avoid cache pollution
+			is_implicit_sid = true;
+		}
 	}
-	if (unix_id->id != -1) {
+	if ((unix_id->id != -1) && !is_implicit_sid) {
 		if (is_null_sid(sid)) {
 			/* negative xid mapping */
 			fstrcpy(value, "-");
