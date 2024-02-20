@@ -49,6 +49,7 @@ struct ixnas_config_data {
 #define ACL_BRAND_UNKNOWN	0
 #define ACL_BRAND_POSIX		1
 #define ACL_BRAND_NFS4		2
+#define ACL_BRAND_NONE		3
 
 
 #define ACL4_XATTR "system.nfs4_acl_xdr"
@@ -215,9 +216,13 @@ static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
 		return status;
 	}
 
-	if (!NT_STATUS_IS_OK(status) &&
-	    !NT_STATUS_EQUAL(status, NT_STATUS_NOT_FOUND)) {
-		return status;
+	if (!NT_STATUS_IS_OK(status)) {
+		if (NT_STATUS_EQUAL(status, NT_STATUS_NOT_SUPPORTED)) {
+			// .zfs and .zfs/snapshot do not support xattrs
+			return NT_STATUS_OK;
+		} else if (!NT_STATUS_EQUAL(status, NT_STATUS_NOT_FOUND)) {
+			return status;
+		}
 	}
 
 #endif /* FREEBSD */
@@ -421,6 +426,9 @@ static int fsp_get_acl_brand(files_struct *fsp)
 		if (errno == ENODATA) {
 			/* probably need to add disabled */
 			return ACL_BRAND_UNKNOWN;
+		} else if (errno == EOPNOTSUPP) {
+			/* Neither NFSv4 nor POSIX acls are supported */
+			return ACL_BRAND_NONE;
 		}
 		DBG_ERR("%s: fgetxattr() for %s failed: %s\n",
 			fsp_str_dbg(fsp), ACL4_XATTR, strerror(errno));
@@ -698,6 +706,56 @@ static NTSTATUS ixnas_get_nt_acl_nfs4_common(struct connection_struct *conn,
 	return NT_STATUS_OK;
 }
 
+/* See include/os/linux/zfs/sys/zfs_ctldir.h */
+#define ZFSCTL_INO_ROOT         0x0000FFFFFFFFFFFFULL
+#define ZFSCTL_INO_SHARES       0x0000FFFFFFFFFFFEULL
+#define ZFSCTL_INO_SNAPDIR      0x0000FFFFFFFFFFFDULL
+#define ZFSCTL_INO_SNAPDIRS     0x0000FFFFFFFFFFFCULL
+
+#define ASSERT_CTL_INO(x) do { \
+	SMB_ASSERT( \
+		(x == ZFSCTL_INO_ROOT) || \
+		(x == ZFSCTL_INO_SNAPDIR) || \
+		(x == ZFSCTL_INO_SNAPDIRS) \
+	); \
+} while (0)
+
+static int mode_to_acl(zfsacl_t *new_acl, mode_t mode);
+
+static zfsacl_t fsp_get_zfsacl_from_mode(struct files_struct *fsp)
+{
+	zfsacl_t zfsacl = NULL;
+	struct stat st;
+	int error;
+
+	error = fstat(fsp_get_pathref_fd(fsp), &st);
+	if (error) {
+		return NULL;
+	}
+
+	if (st.st_ino == ZFSCTL_INO_SHARES) {
+		// There is no legitimate reason to expose this dir to SMB clients
+		errno = EACCES;
+		return NULL;
+	}
+
+	ASSERT_CTL_INO(st.st_ino);
+
+	zfsacl = zfsacl_init(ZFSACL_MAX_ENTRIES, ZFSACL_BRAND_NFSV4);
+	if (zfsacl == NULL) {
+		return NULL;
+	}
+
+	error = mode_to_acl(&zfsacl, st.st_mode & ~(S_IWUSR|S_IWGRP|S_IWOTH));
+	if (error) {
+		DBG_ERR("%s: failed to convert permissions to acl\n", fsp_str_dbg(fsp));
+		zfsacl_free(&zfsacl);
+		return NULL;
+	}
+
+	return zfsacl;
+}
+
 static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 				   struct files_struct *fsp,
 				   uint32_t security_info,
@@ -722,13 +780,24 @@ static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 	to_check = fsp->base_fsp ? fsp->base_fsp : fsp;
 	zfsacl = fsp_get_zfsacl(to_check);
 	if (zfsacl == NULL) {
-		if ((errno == EINVAL) &&
-		    (fsp_get_acl_brand(fsp) == ACL_BRAND_POSIX)) {
-			status = SMB_VFS_NEXT_FGET_NT_ACL(handle, fsp, security_info, mem_ctx, ppdesc);
-			if (NT_STATUS_IS_OK(status)) {
-				(*ppdesc)->type |= SEC_DESC_DACL_PROTECTED;
+		if ((errno == EINVAL) || (errno == EOPNOTSUPP)) {
+			switch (fsp_get_acl_brand(fsp)) {
+			case ACL_BRAND_POSIX:
+			case ACL_BRAND_UNKNOWN:
+				status = SMB_VFS_NEXT_FGET_NT_ACL(handle, fsp, security_info, mem_ctx, ppdesc);
+				if (NT_STATUS_IS_OK(status)) {
+						(*ppdesc)->type |= SEC_DESC_DACL_PROTECTED;
+				}
+				return status;
+			case ACL_BRAND_NONE:
+				zfsacl = fsp_get_zfsacl_from_mode(fsp);
+				if (zfsacl == NULL) {
+					return map_nt_error_from_unix(errno);
+				}
+				break;
+			default:
+				smb_panic("Unknown ACL brand");
 			}
-			return status;
 		} else {
 			return map_nt_error_from_unix(errno);
 		}
