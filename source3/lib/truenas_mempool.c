@@ -22,13 +22,12 @@
 #include "../lib/util/tevent_ntstatus.h"
 #include "../lib/util/tevent_unix.h"
 
-/****************************************************************************
- Accessor function to return write_through state.
-*****************************************************************************/
 #define MEM_POOL_SZ (16 * 1024 * 1024)
 #define IO_POOL_IDLE_TIMEOUT 300
 
+/* Count of allocations out of memory pool */
 static uint alloc_cnt;
+
 static struct tevent_timer *io_buffer_timer;
 static struct timespec last_alloc;
 
@@ -36,6 +35,15 @@ struct io_pool_link { uint8_t *to_free; };
 
 static int io_buffer_destroy(struct io_pool_link *lnk)
 {
+	/*
+	 * This is the destructor function for linkage between
+	 * between allocations out of our memory pool and is
+	 * used for keeping track of how many outstanding
+	 * allocations there are. In the case of data blobs,
+	 * the linkage is created external to this library in order
+	 * to allow a mechanism to effectively reparent the buffer under
+	 * a different memory context.
+	 */
 	if (lnk->to_free) {
 		TALLOC_FREE(lnk->to_free);
 	}

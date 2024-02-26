@@ -36,7 +36,7 @@
 bool link_io_buffer_blob(TALLOC_CTX *mem_ctx, DATA_BLOB *buf);
 
 /**
- * @brief Allocate a DATA_BLOB with a buffer size specied by buflen
+ * @brief Allocate a DATA_BLOB with a buffer size specified by buflen
  * 	  using memory in the io_memory_pool.
  *
  * @param[in]	conn		The current tree connection
@@ -53,8 +53,8 @@ void *_io_pool_calloc_size(struct connection_struct *conn, size_t size,
 			   const char *name, const char *location);
 
 /**
- * @brief Allocate a specified amount of memory with the specified
- * 	  name using the io_memory_pool.
+ * @brief Allocate a specified amount of zero-initialized memory with the
+ *	  specified name using the io_memory_pool.
  *
  * @param[in]	conn		The current tree connection
  * @param[in]	size		size of allocation
@@ -66,7 +66,7 @@ void *_io_pool_calloc_size(struct connection_struct *conn, size_t size,
 	_io_pool_calloc_size(conn, size, name, __location__)
 
 /**
- * @brief Allocate a zero-initialized memory chunk of the  specified
+ * @brief Allocate a zero-initialized memory chunk of the specified
  * 	  type.
  *
  * @param[in]	conn		The current tree connection
