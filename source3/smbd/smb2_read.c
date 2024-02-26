@@ -27,9 +27,11 @@
 #include "../lib/util/tevent_ntstatus.h"
 #include "rpc_server/srv_pipe_hnd.h"
 #include "lib/util/sys_rw_data.h"
+#include "source3/lib/truenas_mempool.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_SMB2
+#define OP_USES_MEMORY_POOL 0x01
 
 static struct tevent_req *smbd_smb2_read_send(TALLOC_CTX *mem_ctx,
 					      struct tevent_context *ev,
@@ -194,6 +196,7 @@ struct smbd_smb2_read_state {
 	uint8_t _out_hdr_buf[NBT_HDR_SIZE + SMB2_HDR_BODY + 0x10];
 	DATA_BLOB out_data;
 	uint32_t out_remaining;
+	uint32_t op_flags;
 };
 
 static int smb2_smb2_read_state_deny_destructor(struct smbd_smb2_read_state *state)
@@ -549,6 +552,7 @@ static struct tevent_req *smbd_smb2_read_send(TALLOC_CTX *mem_ctx,
 		 * Doing an async read, allow this
 		 * request to be canceled
 		 */
+		state->op_flags |= OP_USES_MEMORY_POOL;
 		tevent_req_set_cancel_fn(req, smbd_smb2_read_cancel);
 		return req;
 	}
@@ -587,10 +591,12 @@ static struct tevent_req *smbd_smb2_read_send(TALLOC_CTX *mem_ctx,
 	}
 
 	/* Ok, read into memory. Allocate the out buffer. */
-	state->out_data = data_blob_talloc(state, NULL, in_length);
-	if (in_length > 0 && tevent_req_nomem(state->out_data.data, req)) {
+	if (!io_pool_alloc_blob(fsp->conn, in_length, &state->out_data)) {
+		tevent_req_nomem(NULL, req);
 		return tevent_req_post(req, ev);
 	}
+
+	state->op_flags |= OP_USES_MEMORY_POOL;
 
 	nread = read_file(fsp,
 			  (char *)state->out_data.data,
@@ -667,7 +673,15 @@ static NTSTATUS smbd_smb2_read_recv(struct tevent_req *req,
 	}
 
 	*out_data = state->out_data;
-	talloc_steal(mem_ctx, out_data->data);
+
+	if (state->op_flags & OP_USES_MEMORY_POOL) {
+		if (!link_io_buffer_blob(mem_ctx, out_data)) {
+			smb_panic("Failed to link aio buffer\n");
+		}
+	} else {
+		talloc_steal(mem_ctx, out_data->data);
+	}
+
 	*out_remaining = state->out_remaining;
 
 	if (state->out_headers.length > 0) {
