@@ -752,6 +752,7 @@ bld.SAMBA3_LIBRARY('smbd_base',
                         GNUTLS_HELPERS
                         fd_handle
                         cli_spoolss
+                        TRUENAS_MEMPOOL
                    ''' +
                    bld.env['dmapi_lib'] +
                    bld.env['legacy_quota_libs'] +
@@ -1146,6 +1147,16 @@ bld.SAMBA3_BINARY('smbd/smbd',
 bld.SAMBA3_SUBSYSTEM('TDB_VALIDATE',
                      source='lib/tdb_validate.c',
                      deps='samba-util')
+
+
+bld.SAMBA3_SUBSYSTEM('TRUENAS_MEMPOOL',
+                     source='lib/truenas_mempool.c',
+                     deps='''
+                          samba-util
+                          talloc
+                          tevent
+                          ''')
+
 
 bld.SAMBA3_SUBSYSTEM('util_sd',
                      deps='smbclient',
