@@ -914,6 +914,8 @@ struct smbd_server_connection {
 	struct pthreadpool_tevent *pool;
 
 	struct smbXsrv_client *client;
+
+	TALLOC_CTX *io_memory_pool;
 };
 
 extern struct smbXsrv_client *global_smbXsrv_client;
