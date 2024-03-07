@@ -727,8 +727,7 @@ static bool add_fsp_operations(tn_audit_ext_t *fsp_ext, struct json_object *jsob
 		return false;
 	}
 
-	snprintf(buf, sizeof(buf), "%zu",
-		 fsp_ext->ops.read_bytes * (fsp_ext->ops.read_wrap + 1));
+	snprintf(buf, sizeof(buf), "%zu", fsp_ext->ops.read_bytes);
 	error = json_add_string(jsobj, "read_bytes", buf);
 	if (error) {
 		return false;
@@ -740,8 +739,7 @@ static bool add_fsp_operations(tn_audit_ext_t *fsp_ext, struct json_object *jsob
 		return false;
 	}
 
-	snprintf(buf, sizeof(buf), "%zu",
-		 fsp_ext->ops.write_bytes * (fsp_ext->ops.write_wrap + 1));
+	snprintf(buf, sizeof(buf), "%zu", fsp_ext->ops.write_bytes);
 	error = json_add_string(jsobj, "write_bytes", buf);
 	if (error) {
 		return false;
