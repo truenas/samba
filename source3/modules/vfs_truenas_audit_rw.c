@@ -98,36 +98,24 @@ static bool tn_log_rw_common(vfs_handle_struct *handle,
 		old = &fsp_ext->last_read;
 		config->op_cnt.read++;
 		fsp_ext->ops.read_cnt++;
-		if (fsp_ext->ops.read_bytes + bytes > sizeof(size_t)) {
-			fsp_ext->ops.write_wrap++;
-		}
 		fsp_ext->ops.read_bytes += bytes;
 		break;
 	case TN_OP_WRITE_DATA:
 		old = &fsp_ext->last_write;
 		config->op_cnt.write++;
 		fsp_ext->ops.write_cnt++;
-		if (fsp_ext->ops.write_bytes + bytes > sizeof(size_t)) {
-			fsp_ext->ops.write_wrap++;
-		}
 		fsp_ext->ops.write_bytes += bytes;
 		break;
 	case TN_OP_OFFLOAD_READ_DATA:
 		old = &fsp_ext->last_offload_read;
 		config->op_cnt.read++;
 		fsp_ext->ops.read_cnt++;
-		if (fsp_ext->ops.read_bytes + bytes > sizeof(size_t)) {
-			fsp_ext->ops.write_wrap++;
-		}
 		fsp_ext->ops.read_bytes += bytes;
 		break;
 	case TN_OP_OFFLOAD_WRITE_DATA:
 		old = &fsp_ext->last_offload_write;
 		config->op_cnt.write++;
 		fsp_ext->ops.write_cnt++;
-		if (fsp_ext->ops.write_bytes + bytes > sizeof(size_t)) {
-			fsp_ext->ops.write_wrap++;
-		}
 		fsp_ext->ops.write_bytes += bytes;
 		break;
 	default:
