@@ -95,10 +95,8 @@ typedef struct truenas_audit_vfs_extension {
 	struct {
 		size_t read_cnt;
 		size_t read_bytes;
-		uint32_t read_wrap;
 		size_t write_cnt;
 		size_t write_bytes;
-		uint32_t write_wrap;
 	} ops;
 	struct timespec last_read;
 	struct timespec last_offload_read;
