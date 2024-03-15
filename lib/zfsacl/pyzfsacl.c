@@ -1311,7 +1311,7 @@ static PyMethodDef acl_object_methods[] = {
 	},
 	{
 		.ml_name = "calculate_inherited_acl",
-		.ml_meth = py_acl_inherit,
+		.ml_meth = (PyCFunction)py_acl_inherit,
 		.ml_flags = METH_VARARGS|METH_KEYWORDS,
 		.ml_doc = "calculate an inherited ACL"
 	},
