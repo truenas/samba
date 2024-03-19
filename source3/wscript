@@ -1707,40 +1707,23 @@ int main(void) {
 
     if Options.options.with_libzfs:
         conf.DEFINE('HAVE_LIBZFS', '1')
-        if os.path.exists('/usr/include/libzfs/libzfs.h'):
-            conf.env['CPPPATH_ZFS'] = [
-                '/usr/include/libspl',
-                '/usr/include/libzfs',
-                '/usr/include/libzfs/sys',
-                '/usr/include/libzfs/sys/fs',
-            ]
-        elif os.path.exists('/usr/local/include/libzfs/libzfs.h'):
+        if os.path.exists('/usr/local/include/libzfs/libzfs.h'):
             conf.env['CPPPATH_ZFS'] = [
                 '/usr/local/include/libspl',
                 '/usr/local/include/libzfs',
                 '/usr/local/include/libzfs/sys',
                 '/usr/local/include/libzfs/sys/fs',
             ]
-        else:
-            src_base = conf.CONFIG_GET("SRC_BASE")
-            if src_base is None:
-                src_base = "/usr/src"
+        elif os.path.exists('/usr/include/libzfs/libzfs.h'):
             conf.env['CPPPATH_ZFS'] = [
-                f'{src_base}/cddl/contrib/opensolaris/lib/libzpool/common',
-                f'{src_base}/cddl/compat/opensolaris/include',
-                f'{src_base}/cddl/compat/opensolaris/lib/libumem',
-                f'{src_base}/sys/cddl/compat/opensolaris',
-                f'{src_base}/cddl/contrib/opensolaris/head',
-                f'{src_base}/cddl/contrib/opensolaris/lib/libuutil/common',
-                f'{src_base}/cddl/contrib/opensolaris/lib/libzfs/common',
-                f'{src_base}/cddl/contrib/opensolaris/lib/libzfs_core/common',
-                f'{src_base}/cddl/contrib/opensolaris/lib/libumem/common',
-                f'{src_base}/cddl/contrib/opensolaris/lib/libnvpair',
-                f'{src_base}/sys/cddl/contrib/opensolaris/uts/common',
-                f'{src_base}/sys/cddl/contrib/opensolaris/uts/common/fs/zfs',
-                f'{src_base}/sys/cddl/contrib/opensolaris/uts/common/sys',
-                f'{src_base}/sys/cddl/contrib/opensolaris/common/zfs',
+                '/usr/include/libspl',
+                '/usr/include/libzfs',
+                '/usr/include/libzfs/sys',
+                '/usr/include/libzfs/sys/fs',
             ]
+        else:
+            Logs.error('''No availalbe ZFS''')
+            sys.exit(1)
 
     if Options.options.with_glusterfs:
         conf.CHECK_CFG(package='glusterfs-api', args='"glusterfs-api >= 4" --cflags --libs',
