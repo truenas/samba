@@ -89,6 +89,8 @@ typedef struct fbsd_dirent {
 
 #define ZFS_IOC_GETDOSFLAGS     _IOR(0x83, 1, uint64_t)
 #define ZFS_IOC_SETDOSFLAGS     _IOW(0x83, 2, uint64_t)
+#else
+#define ACL_BRAND_NONE		3
 #endif /* FREEBSD */
 
 static const struct {
