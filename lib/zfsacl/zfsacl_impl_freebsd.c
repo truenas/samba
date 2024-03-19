@@ -400,7 +400,7 @@ bool zfsace_set_permset(zfsacl_entry_t _entry, zfsace_permset_t _permset)
 		}
 	}
 
-	err = acl_set_permset(entry, &permset);
+	err = acl_set_permset(entry, (acl_permset_t)&permset);
 	return err ? false : true;
 }
 
