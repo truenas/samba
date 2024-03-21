@@ -56,6 +56,8 @@ static int tdbsam_debug_level = DBGC_ALL;
 #define RIDPREFIX		"RID_"
 #define PRIVPREFIX		"PRIV_"
 #define NEXT_RID_STRING		"NEXT_RID"
+#define TRUENAS_PRIVATE_DIR	"/var/run/samba-cache/private/"
+#define TRUENAS_PASSDB		TRUENAS_PRIVATE_DIR PASSDB_FILE_NAME
 
 /* GLOBAL TDB SAM CONTEXT */
 
@@ -1340,8 +1342,8 @@ static NTSTATUS pdb_init_tdbsam(struct pdb_methods **pdb_method, const char *loc
 	/* save the path for later */
 
 	if (!location) {
-		if (asprintf(&tdbfile, "%s/%s", lp_private_dir(),
-			     PASSDB_FILE_NAME) < 0) {
+		tdbfile = strdup(TRUENAS_PASSDB);
+		if (tdbfile == NULL) {
 			return NT_STATUS_NO_MEMORY;
 		}
 		pfile = tdbfile;
