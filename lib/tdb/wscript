@@ -114,11 +114,8 @@ def build(bld):
 
     COMMON_SRC = bld.SUBDIR('common', COMMON_FILES)
 
-    if bld.env.standalone_tdb:
-        bld.env.PKGCONFIGDIR = '${LIBDIR}/pkgconfig'
-        private_library = False
-    else:
-        private_library = True
+    bld.env.PKGCONFIGDIR = '${LIBDIR}/pkgconfig'
+    private_library = False
 
     if not bld.CONFIG_SET('USING_SYSTEM_TDB'):
 
