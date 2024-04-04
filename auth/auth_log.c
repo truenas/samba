@@ -1312,6 +1312,7 @@ void log_authentication_event(
 					      debug_level);
 	}
 
+#ifndef FREEBSD
 	truenas_audit_authentication_event(msg_ctx,
 					      lp_ctx,
 					      start_time,
@@ -1324,6 +1325,7 @@ void log_authentication_event(
 					      server_audit_info,
 					      event_id,
 					      debug_level);
+#endif
 }
 
 /*
