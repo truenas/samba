@@ -133,18 +133,12 @@ static int kq_destructor(struct tkq *kq)
 static int do_kqueue(struct kq_context *kqueue_ev, struct tkq *kq)
 {
 	#define INIT_KQ_SZ	16
-	kq->kq_fd = kqueue();
+	kq->kq_fd = kqueuex(KQUEUE_CLOEXEC);
 	if (kq->kq_fd == -1) {
 		tevent_debug(kqueue_ev->ev, TEVENT_DEBUG_FATAL,
 			     "do_kqueue: Failed to create kqueue: %s \n",
 			     strerror(errno));
 		return -1;
-	}
-	if (!ev_set_close_on_exec(kq->kq_fd)) {
-		tevent_debug(kqueue_ev->ev, TEVENT_DEBUG_WARNING,
-			     "do_kqueue: "
-			     "Failed to set close-on-exec on queue, "
-			     "file descriptor may be leaked to children.\n");
 	}
 	kq->kq_array = talloc_zero_array(kqueue_ev, struct kevent, INIT_KQ_SZ);
 	kq->kq_sz = INIT_KQ_SZ;
@@ -166,7 +160,7 @@ static int kqueue_init_ctx(struct kq_context *kqueue_ev)
 		return ret;
 	}
 
-	kqueue_ev->pid = getpid();
+	kqueue_ev->pid = tevent_cached_getpid();
 
 	return 0;
 }
@@ -181,24 +175,32 @@ static void kqueue_check_reopen(struct kq_context *kqueue_ev)
 	int ret, signum;
 	bool *caller_panic_state = kqueue_ev->panic_state;
 	bool panic_triggered = false;
+	pid_t pid = tevent_cached_getpid();
 
-	if (kqueue_ev->pid == getpid()) {
+	if (kqueue_ev->pid == pid) {
 		return;
 	}
 	/*
 	 * We've forked. Re-initialize.
 	 */
 
-	close(kqueue_ev->rdwrq->kq_fd);
 	ret = do_kqueue(kqueue_ev, kqueue_ev->rdwrq);
 	if (ret != 0) {
 		kqueue_panic(kqueue_ev, "kqueue() failed", false);
 		return;
 	}
-	kqueue_ev->pid = getpid();
+	kqueue_ev->pid = pid;
 	kqueue_ev->panic_state = &panic_triggered;
 	kqueue_ev->busy = true;
-	for (fde=kqueue_ev->ev->fd_events;fde;fde=fde->next) {
+	for (fde=kqueue_ev->ev->fd_events; fde; fde=fde->next) {
+		/*
+		 * We will reinitialize these multiplexed FDEs
+		 * when re-adding them.
+		 */
+		fde->additional_data = NULL;
+	}
+
+	for (fde=kqueue_ev->ev->fd_events; fde; fde=fde->next) {
 		kqueue_add_event(kqueue_ev, fde);
 		if (panic_triggered) {
 			if (caller_panic_state != NULL) {
@@ -513,7 +515,7 @@ static void kqueue_process_kev(struct kq_context *kqueue_ev,
 			 * log, but don't add error handling.
 			 */
 			if (kev.fflags != 0) {
-				tevent_debug(kqueue_ev->ev, TEVENT_DEBUG_TRACE,
+				TEVENT_DEBUG(kqueue_ev->ev, TEVENT_DEBUG_TRACE,
 					"EVFILT_WRITE EV_EOF on [%s], "
 					"fd [%d]: %s\n", fde->location, fde->fd,
 					strerror(kev.fflags));
@@ -534,11 +536,11 @@ static void kqueue_process_kev(struct kq_context *kqueue_ev,
 		fde = DATATOFDE(kev.udata);
 		if ((kev.flags & EV_EOF)) {
 			if (kev.fflags != 0) {
-				tevent_debug(kqueue_ev->ev, TEVENT_DEBUG_TRACE,
+				TEVENT_DEBUG(kqueue_ev->ev, TEVENT_DEBUG_TRACE,
 					"evfilt_read ev_eof on [%s]: %s\n",
 					fde->location, strerror(kev.fflags));
 			}
-			tevent_debug(kqueue_ev->ev, TEVENT_DEBUG_TRACE,
+			TEVENT_DEBUG(kqueue_ev->ev, TEVENT_DEBUG_TRACE,
 				"EVFILT_READ EV_EOF on fd: %d flags: 0x%08x: "
 				"additional flags: 0x%08lx\n",
 				fde->fd, fde->flags,
