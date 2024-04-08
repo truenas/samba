@@ -58,6 +58,7 @@ struct poll_event_context {
 	 * use tevent_common_wakeup(ev) to wake the poll() thread
 	 */
 	bool use_mt_mode;
+	void *aioctx;
 };
 
 /*
@@ -660,4 +661,20 @@ static const struct tevent_ops poll_event_mt_ops = {
 _PRIVATE_ bool tevent_poll_mt_init(void)
 {
 	return tevent_register_backend("poll_mt", &poll_event_mt_ops);
+}
+
+_PRIVATE_ bool tevent_poll_aioctx_get(struct tevent_context *ev, void **aioctx)
+{
+	struct poll_event_context *poll_ev = talloc_get_type_abort(
+		ev->additional_data, struct poll_event_context);
+	*aioctx = poll_ev->aioctx;
+	return true;
+}
+
+_PRIVATE_ bool tevent_poll_aioctx_set(struct tevent_context *ev, void *aioctx)
+{
+	struct poll_event_context *poll_ev = talloc_get_type_abort(
+		ev->additional_data, struct poll_event_context);
+	poll_ev->aioctx = aioctx;
+	return true;
 }

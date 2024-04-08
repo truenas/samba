@@ -54,7 +54,7 @@ static const struct tevent_ops std_event_ops = {
   Move us to using poll instead. If we return false here,
   caller should abort().
 */
-#if defined(HAVE_EPOLL) || defined(HAVE_KQUEUE)
+#if defined(HAVE_EPOLL)
 static bool std_fallback_to_poll(struct tevent_context *ev, bool replay)
 {
 
@@ -175,12 +175,7 @@ static int std_event_context_init(struct tevent_context *ev)
 		if (glue == NULL) {
 			return -1;
 		}
-#ifdef HAVE_KQUEUE
-		glue->epoll_ops = tevent_find_ops_byname("kqueue");
-#else
 		glue->epoll_ops = tevent_find_ops_byname("epoll");
-#endif
-
 		glue->poll_ops = tevent_find_ops_byname("poll");
 		if (glue->poll_ops == NULL) {
 			return -1;
@@ -223,10 +218,6 @@ static int std_event_context_init(struct tevent_context *ev)
 #ifdef HAVE_EPOLL
 		tevent_epoll_set_panic_fallback(ev, std_fallback_to_poll);
 #endif
-#ifdef HAVE_KQUEUE
-		tevent_kqueue_set_panic_fallback(ev, std_fallback_to_poll);
-#endif
-
 		return ret;
 	}
 
