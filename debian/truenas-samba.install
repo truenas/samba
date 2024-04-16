@@ -114,6 +114,12 @@ usr/lib/*/libsamba-policy.cpython-*.so.*
 usr/lib/*/libsmbconf.so.0*
 usr/lib/*/libsmbldap.so.2*
 usr/lib/*/libtevent-util.so.*
+usr/lib/*/libldb.*
+usr/lib/*/libtalloc.*
+usr/lib/*/libtdb.*
+usr/lib/*/libtevent.*
+usr/lib/*/libpytalloc-util.*
+usr/lib/*/libpyldb-util.*
 usr/lib/*/samba/*
 usr/lib/*/samba/ldb
 usr/share/man/man1/gentest.1

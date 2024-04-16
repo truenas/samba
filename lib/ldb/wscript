@@ -204,13 +204,9 @@ def build(bld):
     bld.RECURSE('lib/replace')
     bld.RECURSE('lib/tdb')
 
-    if bld.env.standalone_ldb:
-        if not 'PACKAGE_VERSION' in bld.env:
-            bld.env.PACKAGE_VERSION = VERSION
-        bld.env.PKGCONFIGDIR = '${LIBDIR}/pkgconfig'
-        private_library = False
-    else:
-        private_library = True
+    bld.env.PACKAGE_VERSION = VERSION
+    bld.env.PKGCONFIGDIR = '${LIBDIR}/pkgconfig'
+    private_library = False
     # we're not currently linking against the ldap libs, but ldb.pc.in
     # has @LDAP_LIBS@
     bld.env.LDAP_LIBS = ''
