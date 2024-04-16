@@ -42,11 +42,8 @@ def configure(conf):
     conf.define('TALLOC_BUILD_VERSION_MINOR', int(VERSION.split('.')[1]))
     conf.define('TALLOC_BUILD_VERSION_RELEASE', int(VERSION.split('.')[2]))
 
-    conf.env.TALLOC_COMPAT1 = False
-    if conf.env.standalone_talloc:
-        conf.env.TALLOC_COMPAT1 = Options.options.TALLOC_COMPAT1
-        conf.env.PKGCONFIGDIR = '${LIBDIR}/pkgconfig'
-        conf.env.TALLOC_VERSION = VERSION
+    conf.env.PKGCONFIGDIR = '${LIBDIR}/pkgconfig'
+    conf.env.TALLOC_VERSION = VERSION
 
     conf.CHECK_XSLTPROC_MANPAGES()
 
@@ -81,8 +78,8 @@ def configure(conf):
 def build(bld):
     bld.RECURSE('lib/replace')
 
+    private_library = False
     if bld.env.standalone_talloc:
-        private_library = False
 
         # should we also install the symlink to libtalloc1.so here?
         bld.SAMBA_LIBRARY('talloc-compat1-%s' % (VERSION),
@@ -105,9 +102,6 @@ def build(bld):
         bld.SAMBA_BINARY('talloc_test_magic_differs_helper',
                          'test_magic_differs_helper.c',
                          'talloc', install=False)
-
-    else:
-        private_library = True
 
     if not bld.CONFIG_SET('USING_SYSTEM_TALLOC'):
 
