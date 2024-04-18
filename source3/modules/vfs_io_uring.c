@@ -73,6 +73,7 @@ struct vfs_io_uring_request {
 	struct tevent_req *req;
 	void (*completion_fn)(struct vfs_io_uring_request *cur,
 			      const char *location);
+	int (*destructor_fn)(void *);
 	struct timespec start_time;
 	struct timespec end_time;
 	unsigned sqe_flags;
@@ -151,13 +152,8 @@ static int vfs_io_uring_config_destructor(struct vfs_io_uring_config *config)
 	return 0;
 }
 
-static int vfs_io_uring_request_state_deny_destructor(void *_state)
+static int vfs_io_uring_request_state_deny_destructor(struct vfs_io_uring_request *cur)
 {
-	struct __vfs_io_uring_generic_state {
-		struct vfs_io_uring_request ur;
-	} *state = (struct __vfs_io_uring_generic_state *)_state;
-	struct vfs_io_uring_request *cur = &state->ur;
-
 	/* our parent is gone */
 	cur->req = NULL;
 
@@ -304,8 +300,7 @@ static void _vfs_io_uring_queue_run(struct vfs_io_uring_config *config)
 			break;
 		}
 
-		talloc_set_destructor(state,
-			vfs_io_uring_request_state_deny_destructor);
+		talloc_set_destructor(state, cur->destructor_fn);
 		DLIST_REMOVE(config->queue, cur);
 		*sqe = cur->sqe;
 		DLIST_ADD_END(config->pending, cur);
@@ -462,6 +457,14 @@ static void vfs_io_uring_pread_submit(struct vfs_io_uring_pread_state *state);
 static void vfs_io_uring_pread_completion(struct vfs_io_uring_request *cur,
 					  const char *location);
 
+static int vfs_io_uring_pread_destructor(void *data)
+{
+	struct vfs_io_uring_pread_state *state = NULL;
+
+	state = talloc_get_type_abort(data, struct vfs_io_uring_pread_state);
+	return vfs_io_uring_request_state_deny_destructor(&state->ur);
+}
+
 static struct tevent_req *vfs_io_uring_pread_send(struct vfs_handle_struct *handle,
 					     TALLOC_CTX *mem_ctx,
 					     struct tevent_context *ev,
@@ -489,6 +492,7 @@ static struct tevent_req *vfs_io_uring_pread_send(struct vfs_handle_struct *hand
 	state->ur.config = config;
 	state->ur.req = req;
 	state->ur.completion_fn = vfs_io_uring_pread_completion;
+	state->ur.destructor_fn = vfs_io_uring_pread_destructor;
 
 	SMBPROFILE_BYTES_ASYNC_START(syscall_asys_pread, profile_p,
 				     state->ur.profile_bytes, n);
@@ -613,6 +617,14 @@ static void vfs_io_uring_pwrite_submit(struct vfs_io_uring_pwrite_state *state);
 static void vfs_io_uring_pwrite_completion(struct vfs_io_uring_request *cur,
 					   const char *location);
 
+static int vfs_io_uring_pwrite_destructor(void *data)
+{
+	struct vfs_io_uring_pwrite_state *state = NULL;
+
+	state = talloc_get_type_abort(data, struct vfs_io_uring_pwrite_state);
+	return vfs_io_uring_request_state_deny_destructor(&state->ur);
+}
+
 static struct tevent_req *vfs_io_uring_pwrite_send(struct vfs_handle_struct *handle,
 					      TALLOC_CTX *mem_ctx,
 					      struct tevent_context *ev,
@@ -640,6 +652,7 @@ static struct tevent_req *vfs_io_uring_pwrite_send(struct vfs_handle_struct *han
 	state->ur.config = config;
 	state->ur.req = req;
 	state->ur.completion_fn = vfs_io_uring_pwrite_completion;
+	state->ur.destructor_fn = vfs_io_uring_pwrite_destructor;
 
 	SMBPROFILE_BYTES_ASYNC_START(syscall_asys_pwrite, profile_p,
 				     state->ur.profile_bytes, n);
@@ -759,6 +772,14 @@ struct vfs_io_uring_fsync_state {
 static void vfs_io_uring_fsync_completion(struct vfs_io_uring_request *cur,
 					  const char *location);
 
+static int vfs_io_uring_fsync_destructor(void *data)
+{
+	struct vfs_io_uring_fsync_state *state = NULL;
+
+	state = talloc_get_type_abort(data, struct vfs_io_uring_fsync_state);
+	return vfs_io_uring_request_state_deny_destructor(&state->ur);
+}
+
 static struct tevent_req *vfs_io_uring_fsync_send(struct vfs_handle_struct *handle,
 					     TALLOC_CTX *mem_ctx,
 					     struct tevent_context *ev,
@@ -783,6 +804,7 @@ static struct tevent_req *vfs_io_uring_fsync_send(struct vfs_handle_struct *hand
 	state->ur.config = config;
 	state->ur.req = req;
 	state->ur.completion_fn = vfs_io_uring_fsync_completion;
+	state->ur.destructor_fn = vfs_io_uring_fsync_destructor;
 
 	SMBPROFILE_BYTES_ASYNC_START(syscall_asys_fsync, profile_p,
 				     state->ur.profile_bytes, 0);
