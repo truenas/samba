@@ -741,7 +741,19 @@ static zfsacl_t fsp_get_zfsacl_from_mode(struct files_struct *fsp)
 		return NULL;
 	}
 
-	ASSERT_CTL_INO(st.st_ino);
+	if ((st.st_ino != ZFSCTL_INO_ROOT) && (st.st_ino != ZFSCTL_INO_SNAPDIR)) {
+		SMB_ASSERT(S_ISDIR(st.st_mode));
+
+		struct stat parent;
+		error = fstatat(fsp_get_pathref_fd(fsp), "..", &parent, 0);
+		if (error) {
+			DBG_ERR("%s: failed to stat parent directory", fsp_str_dbg(fsp));
+			errno = EACCES;
+			return NULL;
+		}
+
+		ASSERT_CTL_INO(parent.st_ino);
+	}
 
 	zfsacl = zfsacl_init(ZFSACL_MAX_ENTRIES, ZFSACL_BRAND_NFSV4);
 	if (zfsacl == NULL) {
