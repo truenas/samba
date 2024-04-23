@@ -148,6 +148,7 @@ static uint64_t zfs_core_disk_free(vfs_handle_struct *handle,
 	if (ds == NULL) {
 		DBG_ERR("Failed to retrive ZFS dataset handle on %s: %s\n",
 			smb_fname_str_dbg(smb_fname), strerror(errno));
+		return -1;
 	}
 
 	res = smb_zfs_disk_free(ds->zhandle, bsize, dfree, dsize);
