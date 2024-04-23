@@ -4,6 +4,7 @@ Documentation=man:smbd(8) man:samba(7) man:smb.conf(5)
 Wants=network-online.target
 After=network.target network-online.target nmb.service winbind.service
 Requires=winbind.service
+StartLimitBurst=10
 
 [Service]
 Type=notify
