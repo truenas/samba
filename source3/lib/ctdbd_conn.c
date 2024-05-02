@@ -131,19 +131,32 @@ int register_with_ctdbd(struct ctdbd_connection *conn, uint64_t srvid,
 				  void *private_data),
 			void *private_data)
 {
-
-	int ret;
-	int32_t cstatus;
-	size_t num_callbacks;
+	size_t num_callbacks = talloc_array_length(conn->callbacks);
 	struct ctdbd_srvid_cb *tmp;
+	bool need_register = true;
+	size_t i;
 
-	ret = ctdbd_control_local(conn, CTDB_CONTROL_REGISTER_SRVID, srvid, 0,
-				  tdb_null, NULL, NULL, &cstatus);
-	if (ret != 0) {
-		return ret;
+	for (i = 0; i < num_callbacks; i++) {
+		struct ctdbd_srvid_cb *c = &conn->callbacks[i];
+
+		if (c->srvid == srvid) {
+			need_register = false;
+			break;
+		}
 	}
 
-	num_callbacks = talloc_array_length(conn->callbacks);
+	if (need_register) {
+		int ret;
+		int32_t cstatus;
+
+		ret = ctdbd_control_local(conn, CTDB_CONTROL_REGISTER_SRVID,
+					  srvid, 0, tdb_null, NULL, NULL,
+					  &cstatus);
+		if (ret != 0) {
+			return ret;
+		}
+	}
+
 
 	tmp = talloc_realloc(conn, conn->callbacks, struct ctdbd_srvid_cb,
 			     num_callbacks + 1);
@@ -157,6 +170,73 @@ int register_with_ctdbd(struct ctdbd_connection *conn, uint64_t srvid,
 	};
 
 	return 0;
+}
+
+void deregister_from_ctdbd(struct ctdbd_connection *conn,
+			   uint64_t srvid,
+			   int (*cb)(struct tevent_context *ev,
+				     uint32_t src_vnn,
+				     uint32_t dst_vnn,
+				     uint64_t dst_srvid,
+				     const uint8_t *msg,
+				     size_t msglen,
+				     void *private_data),
+			   void *private_data)
+{
+	struct ctdbd_srvid_cb *cbs = conn->callbacks;
+	size_t i, num_callbacks = talloc_array_length(cbs);
+	bool need_deregister = false;
+	bool keep_registration = false;
+
+	if (num_callbacks == 0) {
+		return;
+	}
+
+	for (i = 0; i < num_callbacks;) {
+		struct ctdbd_srvid_cb *c = &cbs[i];
+
+		if (c->srvid != srvid) {
+			i++;
+			continue;
+		}
+
+		if ((c->cb == cb) && (c->private_data == private_data)) {
+			need_deregister = true;
+			ARRAY_DEL_ELEMENT(cbs, i, num_callbacks);
+			num_callbacks--;
+			continue;
+		}
+
+		keep_registration = true;
+		i++;
+	}
+
+	conn->callbacks = talloc_realloc(conn,
+					 cbs,
+					 struct ctdbd_srvid_cb,
+					 num_callbacks);
+
+	if (keep_registration) {
+		need_deregister = false;
+	}
+
+	if (need_deregister) {
+		int ret;
+		int32_t cstatus;
+
+		ret = ctdbd_control_local(conn, CTDB_CONTROL_DEREGISTER_SRVID,
+					  srvid, 0, tdb_null, NULL, NULL,
+					  &cstatus);
+		if (ret != 0) {
+			/*
+			 * If CTDB_CONTROL_DEREGISTER_SRVID fails we may still
+			 * get messages later, but we don't have a callback
+			 * anymore, we just ignore these.
+			 */
+		}
+	}
+
+	return;
 }
 
 static int ctdbd_msg_call_back(struct tevent_context *ev,
@@ -1144,6 +1224,7 @@ int ctdbd_register_ips(struct ctdbd_connection *conn,
 	smbd_ctdb_canonicalize_ip(_client, &client);
 	smbd_ctdb_canonicalize_ip(_server, &server);
 
+	ZERO_STRUCT(p);
 	switch (client.ss_family) {
 	case AF_INET:
 		memcpy(&p.dst.ip, &server, sizeof(p.dst.ip));
@@ -1180,6 +1261,135 @@ int ctdbd_register_ips(struct ctdbd_connection *conn,
 		return ret;
 	}
 	return 0;
+}
+
+void ctdbd_unregister_ips(struct ctdbd_connection *conn,
+			  const struct sockaddr_storage *_server,
+			  const struct sockaddr_storage *_client,
+			  int (*cb)(struct tevent_context *ev,
+				    uint32_t src_vnn,
+				    uint32_t dst_vnn,
+				    uint64_t dst_srvid,
+				    const uint8_t *msg,
+				    size_t msglen,
+				    void *private_data),
+			  void *private_data)
+{
+	struct ctdb_connection p;
+	TDB_DATA data = { .dptr = (uint8_t *)&p, .dsize = sizeof(p) };
+	int ret;
+	struct sockaddr_storage client;
+	struct sockaddr_storage server;
+
+	/*
+	 * Only one connection so far
+	 */
+
+	smbd_ctdb_canonicalize_ip(_client, &client);
+	smbd_ctdb_canonicalize_ip(_server, &server);
+
+	ZERO_STRUCT(p);
+	switch (client.ss_family) {
+	case AF_INET:
+		memcpy(&p.dst.ip, &server, sizeof(p.dst.ip));
+		memcpy(&p.src.ip, &client, sizeof(p.src.ip));
+		break;
+	case AF_INET6:
+		memcpy(&p.dst.ip6, &server, sizeof(p.dst.ip6));
+		memcpy(&p.src.ip6, &client, sizeof(p.src.ip6));
+		break;
+	default:
+		return;
+	}
+
+	/*
+	 * We no longer want to be told about IP releases
+	 * for the given callback/private_data combination
+	 */
+	deregister_from_ctdbd(conn, CTDB_SRVID_RELEASE_IP,
+			      cb, private_data);
+
+	/*
+	 * inform ctdb of our tcp connection is no longer active
+	 */
+	ret = ctdbd_control_local(conn,
+				  CTDB_CONTROL_TCP_CLIENT_DISCONNECTED, 0,
+				  CTDB_CTRL_FLAG_NOREPLY, data, NULL, NULL,
+				  NULL);
+	if (ret != 0) {
+		/*
+		 * We ignore errors here, as we'll just
+		 * no longer have a callback handler
+		 * registered and messages may just be ignored
+		 */
+	}
+
+	return;
+}
+
+void ctdbd_passed_ips(struct ctdbd_connection *conn,
+		      const struct sockaddr_storage *_server,
+		      const struct sockaddr_storage *_client,
+		      int (*cb)(struct tevent_context *ev,
+				uint32_t src_vnn,
+				uint32_t dst_vnn,
+				uint64_t dst_srvid,
+				const uint8_t *msg,
+				size_t msglen,
+				void *private_data),
+		      void *private_data)
+{
+	struct ctdb_connection p;
+	TDB_DATA data = { .dptr = (uint8_t *)&p, .dsize = sizeof(p) };
+	int ret;
+	struct sockaddr_storage client;
+	struct sockaddr_storage server;
+
+	/*
+	 * Only one connection so far
+	 */
+
+	smbd_ctdb_canonicalize_ip(_client, &client);
+	smbd_ctdb_canonicalize_ip(_server, &server);
+
+	ZERO_STRUCT(p);
+	switch (client.ss_family) {
+	case AF_INET:
+		memcpy(&p.dst.ip, &server, sizeof(p.dst.ip));
+		memcpy(&p.src.ip, &client, sizeof(p.src.ip));
+		break;
+	case AF_INET6:
+		memcpy(&p.dst.ip6, &server, sizeof(p.dst.ip6));
+		memcpy(&p.src.ip6, &client, sizeof(p.src.ip6));
+		break;
+	default:
+		return;
+	}
+
+	/*
+	 * We no longer want to be told about IP releases
+	 * for the given callback/private_data combination
+	 */
+	deregister_from_ctdbd(conn, CTDB_SRVID_RELEASE_IP,
+			      cb, private_data);
+
+	/*
+	 * inform ctdb of our tcp connection is now passed to
+	 * another process.
+	 */
+	ret = ctdbd_control_local(conn,
+				  CTDB_CONTROL_TCP_CLIENT_PASSED, 0,
+				  CTDB_CTRL_FLAG_NOREPLY, data, NULL, NULL,
+				  NULL);
+	if (ret != 0) {
+		/*
+		 * We ignore errors here, as we'll just
+		 * no longer have a callback handler
+		 * registered and messages may just be ignored
+		 */
+	}
+
+	return;
 }
 
 static int ctdbd_control_get_public_ips(struct ctdbd_connection *conn,
@@ -1228,6 +1438,32 @@ static int ctdbd_control_get_public_ips(struct ctdbd_connection *conn,
 	return 0;
 }
 
+static struct samba_sockaddr ctdbd_sock_addr_to_samba(const ctdb_sock_addr *c)
+{
+	struct samba_sockaddr s = {};
+
+	switch (c->sa.sa_family) {
+	case AF_INET:
+		s.u.in = c->ip;
+		break;
+	case AF_INET6:
+		/*
+		 * ctdb always requires HAVE_IPV6,
+		 * so we don't need an ifdef here.
+		 */
+		s.u.in6 = c->ip6;
+		break;
+	default:
+		/*
+		 * ctdb_sock_addr only supports ipv4 and ipv6
+		 */
+		smb_panic(__location__);
+		break;
+	}
+
+	return s;
+}
+
 int ctdbd_public_ip_foreach(struct ctdbd_connection *conn,
 			    int (*cb)(uint32_t total_ip_count,
 				      const struct sockaddr_storage *ip,
@@ -1247,11 +1483,8 @@ int ctdbd_public_ip_foreach(struct ctdbd_connection *conn,
 	}
 
 	for (i=0; i < ips->num; i++) {
-		struct samba_sockaddr tmp = {
-			.u = {
-				.sa = ips->ips[i].addr.sa,
-			},
-		};
+		const ctdb_sock_addr *addr = &ips->ips[i].addr;
+		struct samba_sockaddr tmp = ctdbd_sock_addr_to_samba(addr);
 
 		ret = cb(ips->num,
 			 &tmp.u.ss,

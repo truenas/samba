@@ -48,6 +48,7 @@ static void torture_creds_init(void **state)
 	const char *username = NULL;
 	const char *domain = NULL;
 	const char *password = NULL;
+	enum credentials_obtained dom_obtained = CRED_UNINITIALISED;
 	enum credentials_obtained usr_obtained = CRED_UNINITIALISED;
 	enum credentials_obtained pwd_obtained = CRED_UNINITIALISED;
 	bool ok;
@@ -63,6 +64,11 @@ static void torture_creds_init(void **state)
 	assert_true(ok);
 	assert_int_equal(creds->domain_obtained, CRED_SPECIFIED);
 	domain = cli_credentials_get_domain(creds);
+	assert_string_equal(domain, "WURST");
+
+	domain = cli_credentials_get_domain_and_obtained(creds,
+							 &dom_obtained);
+	assert_int_equal(dom_obtained, CRED_SPECIFIED);
 	assert_string_equal(domain, "WURST");
 
 	username = cli_credentials_get_username(creds);
@@ -285,6 +291,37 @@ static void torture_creds_gensec_feature(void **state)
 	assert_int_equal(creds->gensec_features, GENSEC_FEATURE_SIGN);
 }
 
+static const char *torture_get_password(struct cli_credentials *creds)
+{
+	return talloc_strdup(creds, "SECRET");
+}
+
+static void torture_creds_password_callback(void **state)
+{
+	TALLOC_CTX *mem_ctx = *state;
+	struct cli_credentials *creds = NULL;
+	const char *password = NULL;
+	enum credentials_obtained pwd_obtained = CRED_UNINITIALISED;
+	bool ok;
+
+	creds = cli_credentials_init(mem_ctx);
+	assert_non_null(creds);
+
+	ok = cli_credentials_set_domain(creds, "WURST", CRED_SPECIFIED);
+	assert_true(ok);
+	ok = cli_credentials_set_username(creds, "brot", CRED_SPECIFIED);
+	assert_true(ok);
+
+	ok = cli_credentials_set_password_callback(creds, torture_get_password);
+	assert_true(ok);
+	assert_int_equal(creds->password_obtained, CRED_CALLBACK);
+
+	password = cli_credentials_get_password_and_obtained(creds,
+							     &pwd_obtained);
+	assert_int_equal(pwd_obtained, CRED_CALLBACK_RESULT);
+	assert_string_equal(password, "SECRET");
+}
+
 int main(int argc, char *argv[])
 {
 	int rc;
@@ -296,6 +333,7 @@ int main(int argc, char *argv[])
 		cmocka_unit_test(torture_creds_parse_string),
 		cmocka_unit_test(torture_creds_krb5_state),
 		cmocka_unit_test(torture_creds_gensec_feature),
+		cmocka_unit_test(torture_creds_password_callback)
 	};
 
 	if (argc == 2) {
