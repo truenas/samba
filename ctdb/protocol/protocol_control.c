@@ -410,6 +410,14 @@ static size_t ctdb_req_control_data_len(struct ctdb_req_control_data *cd)
 
 	case CTDB_CONTROL_ENABLE_NODE:
 		break;
+
+	case CTDB_CONTROL_TCP_CLIENT_DISCONNECTED:
+		len = ctdb_connection_len(cd->data.conn);
+		break;
+
+	case CTDB_CONTROL_TCP_CLIENT_PASSED:
+		len = ctdb_connection_len(cd->data.conn);
+		break;
 	}
 
 	return len;
@@ -684,6 +692,14 @@ static void ctdb_req_control_data_push(struct ctdb_req_control_data *cd,
 
 	case CTDB_CONTROL_ECHO_DATA:
 		ctdb_echo_data_push(cd->data.echo_data, buf, &np);
+		break;
+
+	case CTDB_CONTROL_TCP_CLIENT_DISCONNECTED:
+		ctdb_connection_push(cd->data.conn, buf, &np);
+		break;
+
+	case CTDB_CONTROL_TCP_CLIENT_PASSED:
+		ctdb_connection_push(cd->data.conn, buf, &np);
 		break;
 	}
 
@@ -1015,6 +1031,22 @@ static int ctdb_req_control_data_pull(uint8_t *buf, size_t buflen,
 					  mem_ctx,
 					  &cd->data.echo_data,
 					  &np);
+		break;
+
+	case CTDB_CONTROL_TCP_CLIENT_DISCONNECTED:
+		ret = ctdb_connection_pull(buf,
+					   buflen,
+					   mem_ctx,
+					   &cd->data.conn,
+					   &np);
+		break;
+
+	case CTDB_CONTROL_TCP_CLIENT_PASSED:
+		ret = ctdb_connection_pull(buf,
+					   buflen,
+					   mem_ctx,
+					   &cd->data.conn,
+					   &np);
 		break;
 	}
 
@@ -1375,6 +1407,12 @@ static size_t ctdb_reply_control_data_len(struct ctdb_reply_control_data *cd)
 		break;
 
 	case CTDB_CONTROL_ENABLE_NODE:
+		break;
+
+	case CTDB_CONTROL_TCP_CLIENT_DISCONNECTED:
+		break;
+
+	case CTDB_CONTROL_TCP_CLIENT_PASSED:
 		break;
 	}
 

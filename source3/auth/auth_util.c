@@ -21,6 +21,7 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include "dom_sid.h"
 #include "includes.h"
 #include "auth.h"
 #include "lib/util_unixsids.h"
@@ -144,14 +145,14 @@ NTSTATUS make_user_info_map(TALLOC_CTX *mem_ctx,
 }
 
 /****************************************************************************
- Create an auth_usersupplied_data, making the DATA_BLOBs here. 
+ Create an auth_usersupplied_data, making the DATA_BLOBs here.
  Decrypt and encrypt the passwords.
 ****************************************************************************/
 
 bool make_user_info_netlogon_network(TALLOC_CTX *mem_ctx,
 				     struct auth_usersupplied_info **user_info,
-				     const char *smb_name, 
-				     const char *client_domain, 
+				     const char *smb_name,
+				     const char *client_domain,
 				     const char *workstation_name,
 				     const struct tsocket_address *remote_address,
 				     const struct tsocket_address *local_address,
@@ -167,12 +168,12 @@ bool make_user_info_netlogon_network(TALLOC_CTX *mem_ctx,
 	DATA_BLOB nt_blob = data_blob(nt_network_pwd, nt_pwd_len);
 
 	status = make_user_info_map(mem_ctx, user_info,
-				    smb_name, client_domain, 
+				    smb_name, client_domain,
 				    workstation_name,
 				    remote_address,
 				    local_address,
 				    "SamLogon",
-				    lm_pwd_len ? &lm_blob : NULL, 
+				    lm_pwd_len ? &lm_blob : NULL,
 				    nt_pwd_len ? &nt_blob : NULL,
 				    NULL, NULL, NULL,
 				    AUTH_PASSWORD_RESPONSE);
@@ -188,20 +189,20 @@ bool make_user_info_netlogon_network(TALLOC_CTX *mem_ctx,
 }
 
 /****************************************************************************
- Create an auth_usersupplied_data, making the DATA_BLOBs here. 
+ Create an auth_usersupplied_data, making the DATA_BLOBs here.
  Decrypt and encrypt the passwords.
 ****************************************************************************/
 
 bool make_user_info_netlogon_interactive(TALLOC_CTX *mem_ctx,
 					 struct auth_usersupplied_info **user_info,
-					 const char *smb_name, 
-					 const char *client_domain, 
+					 const char *smb_name,
+					 const char *client_domain,
 					 const char *workstation_name,
 					 const struct tsocket_address *remote_address,
 					 const struct tsocket_address *local_address,
 					 uint32_t logon_parameters,
-					 const uchar chal[8], 
-					 const uchar lm_interactive_pwd[16], 
+					 const uchar chal[8],
+					 const uchar lm_interactive_pwd[16],
 					 const uchar nt_interactive_pwd[16])
 {
 	struct samr_Password lm_pwd;
@@ -250,7 +251,7 @@ bool make_user_info_netlogon_interactive(TALLOC_CTX *mem_ctx,
 
 		nt_status = make_user_info_map(
 			mem_ctx,
-			user_info, 
+			user_info,
 			smb_name, client_domain, workstation_name,
 			remote_address,
 			local_address,
@@ -280,7 +281,7 @@ bool make_user_info_netlogon_interactive(TALLOC_CTX *mem_ctx,
 
 bool make_user_info_for_reply(TALLOC_CTX *mem_ctx,
 			      struct auth_usersupplied_info **user_info,
-			      const char *smb_name, 
+			      const char *smb_name,
 			      const char *client_domain,
 			      const struct tsocket_address *remote_address,
 			      const struct tsocket_address *local_address,
@@ -315,10 +316,10 @@ bool make_user_info_for_reply(TALLOC_CTX *mem_ctx,
 
 		/* We can't do an NT hash here, as the password needs to be
 		   case insensitive */
-		local_nt_blob = data_blob_null; 
+		local_nt_blob = data_blob_null;
 	} else {
-		local_lm_blob = data_blob_null; 
-		local_nt_blob = data_blob_null; 
+		local_lm_blob = data_blob_null;
+		local_nt_blob = data_blob_null;
 	}
 
 	plaintext_password_string = talloc_strndup(talloc_tos(),
@@ -329,7 +330,7 @@ bool make_user_info_for_reply(TALLOC_CTX *mem_ctx,
 	}
 
 	ret = make_user_info(mem_ctx,
-		user_info, smb_name, smb_name, client_domain, client_domain, 
+		user_info, smb_name, smb_name, client_domain, client_domain,
 		get_remote_machine_name(),
 		remote_address,
 		local_address,
@@ -403,14 +404,14 @@ bool make_user_info_guest(TALLOC_CTX *mem_ctx,
 
 	nt_status = make_user_info(mem_ctx,
 				   user_info,
-				   "","", 
-				   "","", 
-				   "", 
+				   "","",
+				   "","",
+				   "",
 				   remote_address,
 				   local_address,
 				   service_description,
-				   NULL, NULL, 
-				   NULL, NULL, 
+				   NULL, NULL,
+				   NULL, NULL,
 				   NULL,
 				   AUTH_PASSWORD_RESPONSE);
 
@@ -478,6 +479,7 @@ NTSTATUS create_local_token(TALLOC_CTX *mem_ctx,
 	struct dom_sid tmp_sid;
 	struct auth_session_info *session_info = NULL;
 	struct unixid *ids;
+	bool is_allowed = false;
 
 	/* Ensure we can't possible take a code path leading to a
 	 * null deref. */
@@ -485,7 +487,20 @@ NTSTATUS create_local_token(TALLOC_CTX *mem_ctx,
 		return NT_STATUS_LOGON_FAILURE;
 	}
 
-	if (!is_allowed_domain(server_info->info3->base.logon_domain.string)) {
+	if (is_allowed_domain(server_info->info3->base.logon_domain.string)) {
+		is_allowed = true;
+	}
+
+	/* Check if we have extra info about the user. */
+	if (dom_sid_in_domain(&global_sid_Unix_Users,
+			      &server_info->extra.user_sid) ||
+	    dom_sid_in_domain(&global_sid_Unix_Groups,
+			      &server_info->extra.pgid_sid))
+	{
+		is_allowed = true;
+	}
+
+	if (!is_allowed) {
 		DBG_NOTICE("Authentication failed for user [%s] "
 			   "from firewalled domain [%s]\n",
 			   server_info->info3->base.account_name.string,
@@ -1258,7 +1273,7 @@ done:
 	}
 
 	session_info->unique_session_token = GUID_random();
-	
+
 	*session_info_out = talloc_move(mem_ctx, &session_info);
 	TALLOC_FREE(frame);
 	return NT_STATUS_OK;
@@ -1954,9 +1969,9 @@ static NTSTATUS check_account(TALLOC_CTX *mem_ctx, const char *domain,
 	*pwd = passwd;
 
 	/* This is pointless -- there is no support for differing
-	   unix and windows names.  Make sure to always store the 
+	   unix and windows names.  Make sure to always store the
 	   one we actually looked up and succeeded. Have I mentioned
-	   why I hate the 'winbind use default domain' parameter?   
+	   why I hate the 'winbind use default domain' parameter?
 	                                 --jerry              */
 
 	*found_username = talloc_strdup( mem_ctx, real_username );
@@ -1965,8 +1980,8 @@ static NTSTATUS check_account(TALLOC_CTX *mem_ctx, const char *domain,
 }
 
 /****************************************************************************
- Wrapper to allow the getpwnam() call to strip the domain name and 
- try again in case a local UNIX user is already there.  Also run through 
+ Wrapper to allow the getpwnam() call to strip the domain name and
+ try again in case a local UNIX user is already there.  Also run through
  the username if we fallback to the username only.
  ****************************************************************************/
 
@@ -1977,11 +1992,11 @@ struct passwd *smb_getpwnam( TALLOC_CTX *mem_ctx, const char *domuser,
 	char *p = NULL;
 	const char *username = NULL;
 
-	/* we only save a copy of the username it has been mangled 
+	/* we only save a copy of the username it has been mangled
 	   by winbindd use default domain */
 	*p_save_username = NULL;
 
-	/* don't call map_username() here since it has to be done higher 
+	/* don't call map_username() here since it has to be done higher
 	   up the stack so we don't call it multiple times */
 
 	username = talloc_strdup(mem_ctx, domuser);
@@ -2068,10 +2083,10 @@ username_only:
 }
 
 /***************************************************************************
- Make a server_info struct from the info3 returned by a domain logon 
+ Make a server_info struct from the info3 returned by a domain logon
 ***************************************************************************/
 
-NTSTATUS make_server_info_info3(TALLOC_CTX *mem_ctx, 
+NTSTATUS make_server_info_info3(TALLOC_CTX *mem_ctx,
 				const char *sent_nt_username,
 				const char *domain,
 				struct auth_serversupplied_info **server_info,
@@ -2089,9 +2104,9 @@ NTSTATUS make_server_info_info3(TALLOC_CTX *mem_ctx,
 	struct dom_sid sid;
 	TALLOC_CTX *tmp_ctx = talloc_stackframe();
 
-	/* 
+	/*
 	   Here is where we should check the list of
-	   trusted domains, and verify that the SID 
+	   trusted domains, and verify that the SID
 	   matches.
 	*/
 

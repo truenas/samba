@@ -754,10 +754,18 @@ NTSTATUS read_symlink_reparse(
 	}
 
 	if (symlink->substitute_name[0] == '/') {
-		const char *connectpath = dirfsp->conn->connectpath;
+		char *subdir_path = NULL;
 		char *abs_target_canon = NULL;
 		const char *relative = NULL;
 		bool in_share;
+
+		subdir_path = talloc_asprintf(talloc_tos(),
+					      "%s/%s",
+					      dirfsp->conn->connectpath,
+					      dirfsp->fsp_name->base_name);
+		if (subdir_path == NULL) {
+			goto nomem;
+		}
 
 		abs_target_canon =
 			canonicalize_absolute_path(talloc_tos(),
@@ -766,8 +774,8 @@ NTSTATUS read_symlink_reparse(
 			goto nomem;
 		}
 
-		in_share = subdir_of(connectpath,
-				     strlen(connectpath),
+		in_share = subdir_of(subdir_path,
+				     strlen(subdir_path),
 				     abs_target_canon,
 				     &relative);
 		if (in_share) {
@@ -2140,6 +2148,9 @@ NTSTATUS dup_file_fsp(
 	to->fsp_flags.can_write =
 		CAN_WRITE(from->conn) &&
 		((access_mask & (FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0);
+	if (from->fsp_name->twrp != 0) {
+		to->fsp_flags.can_write = false;
+	}
 	to->fsp_flags.modified = from->fsp_flags.modified;
 	to->fsp_flags.is_directory = from->fsp_flags.is_directory;
 	to->fsp_flags.aio_write_behind = from->fsp_flags.aio_write_behind;
