@@ -72,18 +72,61 @@ NTSTATUS refuse_symlink_fsp(const files_struct *fsp)
 	return NT_STATUS_OK;
 }
 
-NTSTATUS check_access_fsp(struct files_struct *fsp,
-			  uint32_t access_mask)
+/**
+ * Check that one or more of the rights in access mask are
+ * allowed. Iow, access_requested can contain more then one right and
+ * it is sufficient having only one of those granted to pass.
+ **/
+NTSTATUS check_any_access_fsp(struct files_struct *fsp,
+			      uint32_t access_requested)
 {
-	if (!fsp->fsp_flags.is_fsa) {
-		return smbd_check_access_rights_fsp(fsp->conn->cwd_fsp,
-						    fsp,
-						    false,
-						    access_mask);
+	const uint32_t ro_access = SEC_RIGHTS_FILE_READ | SEC_FILE_EXECUTE;
+	uint32_t ro_access_granted = 0;
+	uint32_t access_granted = 0;
+	NTSTATUS status;
+
+	if (fsp->fsp_flags.is_fsa) {
+		access_granted = fsp->access_mask;
+	} else {
+		uint32_t mask = 1;
+
+		while (mask != 0) {
+			if (!(mask & access_requested)) {
+				mask <<= 1;
+				continue;
+			}
+
+			status = smbd_check_access_rights_fsp(
+							fsp->conn->cwd_fsp,
+							fsp,
+							false,
+							mask);
+			if (NT_STATUS_IS_OK(status)) {
+				access_granted |= mask;
+				if (fsp->fsp_name->twrp == 0) {
+					/*
+					 * We can only optimize
+					 * the non-snapshot case
+					 */
+					break;
+				}
+			}
+			mask <<= 1;
+		}
 	}
-	if (!(fsp->access_mask & access_mask)) {
+	if ((access_granted & access_requested) == 0) {
 		return NT_STATUS_ACCESS_DENIED;
 	}
+
+	if (fsp->fsp_name->twrp == 0) {
+		return NT_STATUS_OK;
+	}
+
+	ro_access_granted = access_granted & ro_access;
+	if ((ro_access_granted & access_requested) == 0) {
+		return NT_STATUS_MEDIA_WRITE_PROTECTED;
+	}
+
 	return NT_STATUS_OK;
 }
 
@@ -677,7 +720,7 @@ NTSTATUS set_ea(connection_struct *conn, files_struct *fsp,
 		return status;
 	}
 
-	status = check_access_fsp(fsp, FILE_WRITE_EA);
+	status = check_any_access_fsp(fsp, FILE_WRITE_EA);
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
@@ -3763,6 +3806,11 @@ NTSTATUS hardlink_internals(TALLOC_CTX *ctx,
 		goto out;
 	}
 
+	if (smb_fname_old->twrp != 0) {
+		status = NT_STATUS_NOT_SAME_DEVICE;
+		goto out;
+	}
+
 	status = parent_pathref(talloc_tos(),
 				conn->cwd_fsp,
 				smb_fname_old,
@@ -4021,8 +4069,9 @@ NTSTATUS smb_set_file_size(connection_struct *conn,
 	    fsp_get_io_fd(fsp) != -1)
 	{
 		/* Handle based call. */
-		if (!(fsp->access_mask & FILE_WRITE_DATA)) {
-			return NT_STATUS_ACCESS_DENIED;
+		status = check_any_access_fsp(fsp, FILE_WRITE_DATA);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
 		}
 
 		if (vfs_set_filelen(fsp, size) == -1) {
@@ -4803,7 +4852,7 @@ static NTSTATUS smb_set_file_basic_info(connection_struct *conn,
 		return NT_STATUS_INVALID_HANDLE;
 	}
 
-	status = check_access_fsp(fsp, FILE_WRITE_ATTRIBUTES);
+	status = check_any_access_fsp(fsp, FILE_WRITE_ATTRIBUTES);
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
@@ -4879,7 +4928,7 @@ static NTSTATUS smb_set_info_standard(connection_struct *conn,
 	DEBUG(10,("smb_set_info_standard: file %s\n",
 		smb_fname_str_dbg(smb_fname)));
 
-	status = check_access_fsp(fsp, FILE_WRITE_ATTRIBUTES);
+	status = check_any_access_fsp(fsp, FILE_WRITE_ATTRIBUTES);
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
@@ -4937,8 +4986,9 @@ static NTSTATUS smb_set_file_allocation_info(connection_struct *conn,
 	    fsp_get_io_fd(fsp) != -1)
 	{
 		/* Open file handle. */
-		if (!(fsp->access_mask & FILE_WRITE_DATA)) {
-			return NT_STATUS_ACCESS_DENIED;
+		status = check_any_access_fsp(fsp, FILE_WRITE_DATA);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
 		}
 
 		/* Only change if needed. */

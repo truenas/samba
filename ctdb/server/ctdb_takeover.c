@@ -348,19 +348,9 @@ struct ctdb_takeover_arp {
  */
 struct ctdb_tcp_list {
 	struct ctdb_tcp_list *prev, *next;
+	struct ctdb_client *client;
 	struct ctdb_connection connection;
 };
-
-/*
-  list of clients to kill on IP release
- */
-struct ctdb_client_ip {
-	struct ctdb_client_ip *prev, *next;
-	struct ctdb_context *ctdb;
-	ctdb_sock_addr addr;
-	uint32_t client_id;
-};
-
 
 /*
   send a gratuitous arp
@@ -1233,16 +1223,37 @@ int ctdb_set_public_addresses(struct ctdb_context *ctdb, bool check_addresses)
 }
 
 /*
-  destroy a ctdb_client_ip structure
+  destroy a ctdb_tcp_list structure
  */
-static int ctdb_client_ip_destructor(struct ctdb_client_ip *ip)
+static int ctdb_tcp_list_destructor(struct ctdb_tcp_list *tcp)
 {
-	DEBUG(DEBUG_DEBUG,("destroying client tcp for %s:%u (client_id %u)\n",
-		ctdb_addr_to_str(&ip->addr),
-		ntohs(ip->addr.ip.sin_port),
-		ip->client_id));
+	struct ctdb_client *client = tcp->client;
+	struct ctdb_connection *conn = &tcp->connection;
+	char conn_str[132] = { 0, };
+	int ret;
 
-	DLIST_REMOVE(ip->ctdb->client_ip_list, ip);
+	ret = ctdb_connection_to_buf(conn_str,
+				     sizeof(conn_str),
+				     conn,
+				     false,
+				     " -> ");
+	if (ret != 0) {
+		strlcpy(conn_str, "UNKNOWN", sizeof(conn_str));
+	}
+
+	D_DEBUG("removing client TCP connection %s "
+		"(client_id %u pid %d)\n",
+		conn_str, client->client_id, client->pid);
+
+	DLIST_REMOVE(client->tcp_list, tcp);
+
+	/*
+	 * We don't call ctdb_remove_connection(vnn, conn) here
+	 * as we want the caller to decide if it's called
+	 * directly (local only) or indirectly via a
+	 * CTDB_CONTROL_TCP_REMOVE broadcast
+	 */
+
 	return 0;
 }
 
@@ -1259,10 +1270,8 @@ int32_t ctdb_control_tcp_client(struct ctdb_context *ctdb, uint32_t client_id,
 	struct ctdb_connection t;
 	int ret;
 	TDB_DATA data;
-	struct ctdb_client_ip *ip;
 	struct ctdb_vnn *vnn;
-	ctdb_sock_addr src_addr;
-	ctdb_sock_addr dst_addr;
+	char conn_str[132] = { 0, };
 
 	/* If we don't have public IPs, tickles are useless */
 	if (ctdb->vnn == NULL) {
@@ -1271,75 +1280,44 @@ int32_t ctdb_control_tcp_client(struct ctdb_context *ctdb, uint32_t client_id,
 
 	tcp_sock = (struct ctdb_connection *)indata.dptr;
 
-	src_addr = tcp_sock->src;
-	ctdb_canonicalize_ip(&src_addr,  &tcp_sock->src);
-	ZERO_STRUCT(src_addr);
-	memcpy(&src_addr, &tcp_sock->src, sizeof(src_addr));
+	ctdb_canonicalize_ip_inplace(&tcp_sock->src);
+	ctdb_canonicalize_ip_inplace(&tcp_sock->dst);
 
-	dst_addr = tcp_sock->dst;
-	ctdb_canonicalize_ip(&dst_addr, &tcp_sock->dst);
-	ZERO_STRUCT(dst_addr);
-	memcpy(&dst_addr, &tcp_sock->dst, sizeof(dst_addr));
+	ret = ctdb_connection_to_buf(conn_str,
+				     sizeof(conn_str),
+				     tcp_sock,
+				     false,
+				     " -> ");
+	if (ret != 0) {
+		strlcpy(conn_str, "UNKNOWN", sizeof(conn_str));
+	}
 
-	vnn = find_public_ip_vnn(ctdb, &dst_addr);
+	vnn = find_public_ip_vnn(ctdb, &tcp_sock->dst);
 	if (vnn == NULL) {
-		char *src_addr_str = NULL;
-		char *dst_addr_str = NULL;
-
-		switch (dst_addr.sa.sa_family) {
-		case AF_INET:
-			if (ntohl(dst_addr.ip.sin_addr.s_addr) == INADDR_LOOPBACK) {
-				/* ignore ... */
-				return 0;
-			}
-			break;
-		case AF_INET6:
-			break;
-		default:
-			DEBUG(DEBUG_ERR,(__location__ " Unknown family type %d\n",
-			      dst_addr.sa.sa_family));
-			return 0;
-		}
-
-		src_addr_str = ctdb_sock_addr_to_string(client, &src_addr, false);
-		dst_addr_str = ctdb_sock_addr_to_string(client, &dst_addr, false);
-		DEBUG(DEBUG_ERR,(
-		      "Could not register TCP connection from "
-		      "%s to %s (not a public address) (port %u) "
-		      "(client_id %u pid %u).\n",
-		      src_addr_str,
-		      dst_addr_str,
-		      ctdb_sock_addr_port(&dst_addr),
-		      client_id, client->pid));
-		TALLOC_FREE(src_addr_str);
-		TALLOC_FREE(dst_addr_str);
+		D_ERR("Could not register TCP connection %s - "
+		      "not a public address (client_id %u pid %u)\n",
+			conn_str, client_id, client->pid);
 		return 0;
 	}
 
 	if (vnn->pnn != ctdb->pnn) {
-		DEBUG(DEBUG_ERR,("Attempt to register tcp client for IP %s we don't hold - failing (client_id %u pid %u)\n",
-			ctdb_addr_to_str(&dst_addr),
-			client_id, client->pid));
+		D_ERR("Attempt to register tcp client for IP %s we don't hold - "
+		      "failing (client_id %u pid %u)\n",
+		      ctdb_addr_to_str(&tcp_sock->dst),
+		      client_id, client->pid);
 		/* failing this call will tell smbd to die */
 		return -1;
 	}
 
-	ip = talloc(client, struct ctdb_client_ip);
-	CTDB_NO_MEMORY(ctdb, ip);
-
-	ip->ctdb      = ctdb;
-	ip->addr      = dst_addr;
-	ip->client_id = client_id;
-	talloc_set_destructor(ip, ctdb_client_ip_destructor);
-	DLIST_ADD(ctdb->client_ip_list, ip);
-
 	tcp = talloc(client, struct ctdb_tcp_list);
 	CTDB_NO_MEMORY(ctdb, tcp);
+	tcp->client = client;
 
 	tcp->connection.src = tcp_sock->src;
 	tcp->connection.dst = tcp_sock->dst;
 
 	DLIST_ADD(client->tcp_list, tcp);
+	talloc_set_destructor(tcp, ctdb_tcp_list_destructor);
 
 	t.src = tcp_sock->src;
 	t.dst = tcp_sock->dst;
@@ -1347,24 +1325,8 @@ int32_t ctdb_control_tcp_client(struct ctdb_context *ctdb, uint32_t client_id,
 	data.dptr = (uint8_t *)&t;
 	data.dsize = sizeof(t);
 
-	switch (dst_addr.sa.sa_family) {
-	case AF_INET:
-		DEBUG(DEBUG_INFO,("registered tcp client for %u->%s:%u (client_id %u pid %u)\n",
-			(unsigned)ntohs(tcp_sock->dst.ip.sin_port),
-			ctdb_addr_to_str(&tcp_sock->src),
-			(unsigned)ntohs(tcp_sock->src.ip.sin_port), client_id, client->pid));
-		break;
-	case AF_INET6:
-		DEBUG(DEBUG_INFO,("registered tcp client for %u->%s:%u (client_id %u pid %u)\n",
-			(unsigned)ntohs(tcp_sock->dst.ip6.sin6_port),
-			ctdb_addr_to_str(&tcp_sock->src),
-			(unsigned)ntohs(tcp_sock->src.ip6.sin6_port), client_id, client->pid));
-		break;
-	default:
-		DEBUG(DEBUG_ERR,(__location__ " Unknown family %d\n",
-		      dst_addr.sa.sa_family));
-	}
-
+	D_INFO("Registered TCP connection %s (client_id %u pid %u)\n",
+	       conn_str, client_id, client->pid);
 
 	/* tell all nodes about this tcp connection */
 	ret = ctdb_daemon_send_control(ctdb, CTDB_BROADCAST_CONNECTED, 0, 
@@ -1374,6 +1336,141 @@ int32_t ctdb_control_tcp_client(struct ctdb_context *ctdb, uint32_t client_id,
 		DEBUG(DEBUG_ERR,(__location__ " Failed to send CTDB_CONTROL_TCP_ADD\n"));
 		return -1;
 	}
+
+	return 0;
+}
+
+static bool ctdb_client_remove_tcp(struct ctdb_client *client,
+				   const struct ctdb_connection *conn)
+{
+	struct ctdb_tcp_list *tcp = NULL;
+	struct ctdb_tcp_list *tcp_next = NULL;
+	bool found = false;
+
+	for (tcp = client->tcp_list; tcp != NULL; tcp = tcp_next) {
+		bool same;
+
+		tcp_next = tcp->next;
+
+		same = ctdb_connection_same(conn, &tcp->connection);
+		if (!same) {
+			continue;
+		}
+
+		TALLOC_FREE(tcp);
+		found = true;
+	}
+
+	return found;
+}
+
+/*
+  called by a client to inform us of a TCP connection that was disconnected
+ */
+int32_t ctdb_control_tcp_client_disconnected(struct ctdb_context *ctdb,
+					     uint32_t client_id,
+					     TDB_DATA indata)
+{
+	struct ctdb_client *client = reqid_find(ctdb->idr, client_id, struct ctdb_client);
+	struct ctdb_connection *tcp_sock = NULL;
+	int ret;
+	TDB_DATA data;
+	char conn_str[132] = { 0, };
+	bool found = false;
+
+	tcp_sock = (struct ctdb_connection *)indata.dptr;
+
+	ctdb_canonicalize_ip_inplace(&tcp_sock->src);
+	ctdb_canonicalize_ip_inplace(&tcp_sock->dst);
+
+	ret = ctdb_connection_to_buf(conn_str,
+				     sizeof(conn_str),
+				     tcp_sock,
+				     false,
+				     " -> ");
+	if (ret != 0) {
+		strlcpy(conn_str, "UNKNOWN", sizeof(conn_str));
+	}
+
+	found = ctdb_client_remove_tcp(client, tcp_sock);
+	if (!found) {
+		DBG_DEBUG("TCP connection %s not found "
+			  "(client_id %u pid %u).\n",
+			  conn_str, client_id, client->pid);
+		return 0;
+	}
+
+	D_INFO("deregistered TCP connection %s "
+	       "(client_id %u pid %u)\n",
+	       conn_str, client_id, client->pid);
+
+	data.dptr = (uint8_t *)tcp_sock;
+	data.dsize = sizeof(*tcp_sock);
+
+	/* tell all nodes about this tcp connection is gone */
+	ret = ctdb_daemon_send_control(ctdb,
+				       CTDB_BROADCAST_CONNECTED,
+				       0,
+				       CTDB_CONTROL_TCP_REMOVE,
+				       0,
+				       CTDB_CTRL_FLAG_NOREPLY,
+				       data,
+				       NULL,
+				       NULL);
+	if (ret != 0) {
+		DBG_ERR("Failed to send CTDB_CONTROL_TCP_REMOVE: %s\n",
+			conn_str);
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+  called by a client to inform us of a TCP connection was passed to a different
+  "client" (typically with multichannel to another smbd process).
+ */
+int32_t ctdb_control_tcp_client_passed(struct ctdb_context *ctdb,
+				       uint32_t client_id,
+				       TDB_DATA indata)
+{
+	struct ctdb_client *client = reqid_find(ctdb->idr, client_id, struct ctdb_client);
+	struct ctdb_connection *tcp_sock = NULL;
+	int ret;
+	char conn_str[132] = { 0, };
+	bool found = false;
+
+	tcp_sock = (struct ctdb_connection *)indata.dptr;
+
+	ctdb_canonicalize_ip_inplace(&tcp_sock->src);
+	ctdb_canonicalize_ip_inplace(&tcp_sock->dst);
+
+	ret = ctdb_connection_to_buf(conn_str,
+				     sizeof(conn_str),
+				     tcp_sock,
+				     false,
+				     " -> ");
+	if (ret != 0) {
+		strlcpy(conn_str, "UNKNOWN", sizeof(conn_str));
+	}
+
+	found = ctdb_client_remove_tcp(client, tcp_sock);
+	if (!found) {
+		DBG_DEBUG("TCP connection from %s not found "
+			  "(client_id %u pid %u).\n",
+			  conn_str, client_id, client->pid);
+		return 0;
+	}
+
+	D_INFO("TCP connection from %s "
+	       "(client_id %u pid %u) passed to another client\n",
+	       conn_str, client_id, client->pid);
+
+	/*
+	 * We don't call CTDB_CONTROL_TCP_REMOVE
+	 * nor ctdb_remove_connection() as the connection
+	 * is still alive, but handled by another client
+	 */
 
 	return 0;
 }
@@ -1599,20 +1696,12 @@ void ctdb_takeover_client_destructor_hook(struct ctdb_client *client)
 		struct ctdb_tcp_list *tcp = client->tcp_list;
 		struct ctdb_connection *conn = &tcp->connection;
 
-		DLIST_REMOVE(client->tcp_list, tcp);
-
 		vnn = find_public_ip_vnn(client->ctdb,
 					 &conn->dst);
-		if (vnn == NULL) {
-			DEBUG(DEBUG_ERR,
-			      (__location__ " unable to find public address %s\n",
-			       ctdb_addr_to_str(&conn->dst)));
-			continue;
-		}
 
 		/* If the IP address is hosted on this node then
 		 * remove the connection. */
-		if (vnn->pnn == client->ctdb->pnn) {
+		if (vnn != NULL && vnn->pnn == client->ctdb->pnn) {
 			ctdb_remove_connection(vnn, conn);
 		}
 
@@ -1621,6 +1710,11 @@ void ctdb_takeover_client_destructor_hook(struct ctdb_client *client)
 		 * and the client has exited.  This means that we
 		 * should not delete the connection information.  The
 		 * takeover node processes connections too. */
+
+		/*
+		 * The destructor removes from the list
+		 */
+		TALLOC_FREE(tcp);
 	}
 }
 

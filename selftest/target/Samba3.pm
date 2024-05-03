@@ -527,8 +527,8 @@ sub setup_clusteredmember
 		my $pub_iface = $node->{SOCKET_WRAPPER_DEFAULT_IFACE};
 		my $node_prefix = $node->{NODE_PREFIX};
 
-		print "NODE_PREFIX=${node_prefix}\n";
-		print "SOCKET=${socket}\n";
+		print "CTDB_BASE=${node_prefix}\n";
+		print "CTDB_SOCKET=${socket}\n";
 
 		my $require_mutexes = "dbwrap_tdb_require_mutexes:* = yes";
 		if ($ENV{SELFTEST_DONT_REQUIRE_TDB_MUTEX_SUPPORT} // '' eq "1") {
@@ -1006,6 +1006,10 @@ sub provision_ad_member
 	$ret->{DC_NETBIOSNAME} = $dcvars->{NETBIOSNAME};
 	$ret->{DC_USERNAME} = $dcvars->{USERNAME};
 	$ret->{DC_PASSWORD} = $dcvars->{PASSWORD};
+	$ret->{DOMAIN_ADMIN} = $dcvars->{DOMAIN_ADMIN};
+	$ret->{DOMAIN_ADMIN_PASSWORD} = $dcvars->{DOMAIN_ADMIN_PASSWORD};
+	$ret->{DOMAIN_USER} = $dcvars->{DOMAIN_USER};
+	$ret->{DOMAIN_USER_PASSWORD} = $dcvars->{DOMAIN_USER_PASSWORD};
 
 	# forest trust
 	$ret->{TRUST_F_BOTH_SERVER} = $trustvars_f->{SERVER};
@@ -1171,6 +1175,10 @@ sub setup_ad_member_rfc2307
 	$ret->{DC_NETBIOSNAME} = $dcvars->{NETBIOSNAME};
 	$ret->{DC_USERNAME} = $dcvars->{USERNAME};
 	$ret->{DC_PASSWORD} = $dcvars->{PASSWORD};
+	$ret->{DOMAIN_ADMIN} = $dcvars->{DOMAIN_ADMIN};
+	$ret->{DOMAIN_ADMIN_PASSWORD} = $dcvars->{DOMAIN_ADMIN_PASSWORD};
+	$ret->{DOMAIN_USER} = $dcvars->{DOMAIN_USER};
+	$ret->{DOMAIN_USER_PASSWORD} = $dcvars->{DOMAIN_USER_PASSWORD};
 
 	return $ret;
 }
@@ -1267,6 +1275,10 @@ sub setup_admem_idmap_autorid
 	$ret->{DC_NETBIOSNAME} = $dcvars->{NETBIOSNAME};
 	$ret->{DC_USERNAME} = $dcvars->{USERNAME};
 	$ret->{DC_PASSWORD} = $dcvars->{PASSWORD};
+	$ret->{DOMAIN_ADMIN} = $dcvars->{DOMAIN_ADMIN};
+	$ret->{DOMAIN_ADMIN_PASSWORD} = $dcvars->{DOMAIN_ADMIN_PASSWORD};
+	$ret->{DOMAIN_USER} = $dcvars->{DOMAIN_USER};
+	$ret->{DOMAIN_USER_PASSWORD} = $dcvars->{DOMAIN_USER_PASSWORD};
 
 	return $ret;
 }
@@ -1366,6 +1378,10 @@ sub setup_ad_member_idmap_rid
 	$ret->{DC_NETBIOSNAME} = $dcvars->{NETBIOSNAME};
 	$ret->{DC_USERNAME} = $dcvars->{USERNAME};
 	$ret->{DC_PASSWORD} = $dcvars->{PASSWORD};
+	$ret->{DOMAIN_ADMIN} = $dcvars->{DOMAIN_ADMIN};
+	$ret->{DOMAIN_ADMIN_PASSWORD} = $dcvars->{DOMAIN_ADMIN_PASSWORD};
+	$ret->{DOMAIN_USER} = $dcvars->{DOMAIN_USER};
+	$ret->{DOMAIN_USER_PASSWORD} = $dcvars->{DOMAIN_USER_PASSWORD};
 
 	return $ret;
 }
@@ -1466,6 +1482,10 @@ sub setup_ad_member_idmap_ad
 	$ret->{DC_NETBIOSNAME} = $dcvars->{NETBIOSNAME};
 	$ret->{DC_USERNAME} = $dcvars->{USERNAME};
 	$ret->{DC_PASSWORD} = $dcvars->{PASSWORD};
+	$ret->{DOMAIN_ADMIN} = $dcvars->{DOMAIN_ADMIN};
+	$ret->{DOMAIN_ADMIN_PASSWORD} = $dcvars->{DOMAIN_ADMIN_PASSWORD};
+	$ret->{DOMAIN_USER} = $dcvars->{DOMAIN_USER};
+	$ret->{DOMAIN_USER_PASSWORD} = $dcvars->{DOMAIN_USER_PASSWORD};
 
 	$ret->{TRUST_SERVER} = $dcvars->{TRUST_SERVER};
 	$ret->{TRUST_USERNAME} = $dcvars->{TRUST_USERNAME};
@@ -1558,6 +1578,10 @@ sub setup_ad_member_oneway
 	$ret->{DC_NETBIOSNAME} = $dcvars->{NETBIOSNAME};
 	$ret->{DC_USERNAME} = $dcvars->{USERNAME};
 	$ret->{DC_PASSWORD} = $dcvars->{PASSWORD};
+	$ret->{DOMAIN_ADMIN} = $dcvars->{DOMAIN_ADMIN};
+	$ret->{DOMAIN_ADMIN_PASSWORD} = $dcvars->{DOMAIN_ADMIN_PASSWORD};
+	$ret->{DOMAIN_USER} = $dcvars->{DOMAIN_USER};
+	$ret->{DOMAIN_USER_PASSWORD} = $dcvars->{DOMAIN_USER_PASSWORD};
 
 	$ret->{TRUST_SERVER} = $dcvars->{TRUST_SERVER};
 	$ret->{TRUST_USERNAME} = $dcvars->{TRUST_USERNAME};
@@ -1689,6 +1713,7 @@ sub setup_simpleserver
 	vfs objects = xattr_tdb streams_depot
 	change notify = no
 	server smb encrypt = off
+        allow trusted domains = no
 
 [vfs_aio_pthread]
 	path = $prefix_abs/share
@@ -3412,9 +3437,7 @@ sub provision($$)
 [shadow_write]
 	path = $shadow_tstdir
 	comment = previous versions snapshots under mount point
-	vfs objects = shadow_copy2 streams_xattr error_inject
-	aio write size = 0
-	error_inject:pwrite = EBADF
+	vfs objects = shadow_copy2 streams_xattr
 	shadow:mountpoint = $shadow_tstdir
 	shadow:fixinodes = yes
 	smbd async dosmode = yes
@@ -3560,6 +3583,10 @@ sub provision($$)
 	server addresses = $server_ipv6
 
 [smbget]
+	path = $smbget_sharedir
+	comment = smb username is [%U]
+
+[smbget_guest]
 	path = $smbget_sharedir
 	comment = smb username is [%U]
 	guest ok = yes
@@ -4128,6 +4155,24 @@ sub provision_ctdb($$$$)
 	$ret{NUM_NODES} = $num_nodes;
 	$ret{CTDB_NODES} = \@nodes;
 	$ret{CTDB_NODES_FILE} = $nodes_file;
+
+	for (my $i = 0; $i < $num_nodes; $i++) {
+		my $node = $nodes[$i];
+		my $socket = $node->{SOCKET_FILE};
+		my $server_name = $node->{SERVER_NAME};
+		my $node_prefix = $node->{NODE_PREFIX};
+		my $ip = $node->{IP};
+
+		$ret{"CTDB_BASE_NODE${i}"} = $node_prefix;
+		$ret{"CTDB_SOCKET_NODE${i}"} = $socket;
+		$ret{"CTDB_SERVER_NAME_NODE${i}"} = $server_name;
+		$ret{"CTDB_IFACE_IP_NODE${i}"} = $ip;
+	}
+
+	$ret{CTDB_BASE} = $ret{CTDB_BASE_NODE0};
+	$ret{CTDB_SOCKET} = $ret{CTDB_SOCKET_NODE0};
+	$ret{CTDB_SERVER_NAME} = $ret{CTDB_SERVER_NAME_NODE0};
+	$ret{CTDB_IFACE_IP} = $ret{CTDB_IFACE_IP_NODE0};
 
 	return \%ret;
 }

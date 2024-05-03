@@ -1,4 +1,203 @@
                    ==============================
+                   Release Notes for Samba 4.19.6
+                           April 08, 2024
+                   ==============================
+
+
+This is the latest stable release of the Samba 4.19 release series.
+
+
+Changes since 4.19.5
+--------------------
+
+o  Ralph Boehme <slow@samba.org>
+   * BUG 15527: fd_handle_destructor() panics within an smbd_smb2_close() if
+     vfs_stat_fsp() fails in fd_close().
+
+o  Guenther Deschner <gd@samba.org>
+   * BUG 15588: samba-gpupdate: Correctly implement site support.
+
+o  Noel Power <noel.power@suse.com>
+   * BUG 15527: fd_handle_destructor() panics within an smbd_smb2_close() if
+     vfs_stat_fsp() fails in fd_close().
+
+o  Andreas Schneider <asn@samba.org>
+   * BUG 15588: samba-gpupdate: Correctly implement site support.
+   * BUG 15599: libgpo: Segfault in python bindings.
+
+o  Martin Schwenke <mschwenke@ddn.com>
+   * BUG 15580: Packet marshalling push support missing for
+     CTDB_CONTROL_TCP_CLIENT_DISCONNECTED and
+     CTDB_CONTROL_TCP_CLIENT_PASSED.
+
+
+#######################################
+Reporting bugs & Development Discussion
+#######################################
+
+Please discuss this release on the samba-technical mailing list or by
+joining the #samba-technical:matrix.org matrix room, or
+#samba-technical IRC channel on irc.libera.chat.
+
+If you do report problems then please try to send high quality
+feedback. If you don't provide vital information to help us track down
+the problem then you will probably be ignored.  All bug reports should
+be filed under the Samba 4.1 and newer product in the project's Bugzilla
+database (https://bugzilla.samba.org/).
+
+
+======================================================================
+== Our Code, Our Bugs, Our Responsibility.
+== The Samba Team
+======================================================================
+
+
+Release notes for older releases follow:
+----------------------------------------
+                   ==============================
+                   Release Notes for Samba 4.19.5
+                         February 19, 2024
+                   ==============================
+
+
+This is the latest stable release of the Samba 4.19 release series.
+
+
+Changes since 4.19.4
+--------------------
+
+o  Ralph Boehme <slow@samba.org>
+   * BUG 13688: Windows 2016 fails to restore previous version of a file from a
+     shadow_copy2 snapshot.
+   * BUG 15549: Symlinks on AIX are broken in 4.19 (and a few version before
+     that).
+
+o  Bjoern Jacke <bj@sernet.de>
+   * BUG 12421: Fake directory create times has no effect.
+
+o  Björn Jacke <bjacke@samba.org>
+   * BUG 15550: ctime mixed up with mtime by smbd.
+
+o  David Mulder <dmulder@samba.org>
+   * BUG 15548: samba-gpupdate --rsop fails if machine is not in a site.
+
+o  Gabriel Nagy <gabriel.nagy@canonical.com>
+   * BUG 15557: gpupdate: The root cert import when NDES is not available is
+     broken.
+
+o  Andreas Schneider <asn@samba.org>
+   * BUG 15552: samba-gpupdate should print a useful message if cepces-submit
+     can't be found.
+   * BUG 15558: samba-gpupdate logging doesn't work.
+
+o  Jones Syue <jonessyue@qnap.com>
+   * BUG 15555: smbpasswd reset permissions only if not 0600.
+
+
+#######################################
+Reporting bugs & Development Discussion
+#######################################
+
+Please discuss this release on the samba-technical mailing list or by
+joining the #samba-technical:matrix.org matrix room, or
+#samba-technical IRC channel on irc.libera.chat.
+
+If you do report problems then please try to send high quality
+feedback. If you don't provide vital information to help us track down
+the problem then you will probably be ignored.  All bug reports should
+be filed under the Samba 4.1 and newer product in the project's Bugzilla
+database (https://bugzilla.samba.org/).
+
+
+======================================================================
+== Our Code, Our Bugs, Our Responsibility.
+== The Samba Team
+======================================================================
+
+
+----------------------------------------------------------------------
+                   ==============================
+                   Release Notes for Samba 4.19.4
+                          January 08, 2024
+                   ==============================
+
+
+This is the latest stable release of the Samba 4.19 release series.
+
+
+Changes since 4.19.3
+--------------------
+
+o  Samuel Cabrero <scabrero@samba.org>
+   * BUG 13577: net changesecretpw cannot set the machine account password if
+     secrets.tdb is empty.
+
+o  Björn Jacke <bjacke@samba.org>
+   * BUG 15540: For generating doc, take, if defined, env XML_CATALOG_FILES.
+   * BUG 15541: Trivial C typo in nsswitch/winbind_nss_netbsd.c.
+   * BUG 15542: vfs_linux_xfs is incorrectly named.
+
+o  Björn Jacke <bj@sernet.de>
+   * BUG 15377: systemd stumbled over copyright-message at smbd startup.
+
+o  Volker Lendecke <vl@samba.org>
+   * BUG 15505: Following intermediate abolute share-local symlinks is broken.
+   * BUG 15523: ctdb RELEASE_IP causes a crash in release_ip if a connection to
+     a non-public address disconnects first.
+   * BUG 15544: shadow_copy2 broken when current fileset's directories are
+     removed.
+
+o  Stefan Metzmacher <metze@samba.org>
+   * BUG 15377: systemd stumbled over copyright-message at smbd startup.
+   * BUG 15523: ctdb RELEASE_IP causes a crash in release_ip if a connection to
+     a non-public address disconnects first.
+   * BUG 15534: smbd does not detect ctdb public ipv6 addresses for multichannel
+     exclusion.
+
+o  Andreas Schneider <asn@samba.org>
+   * BUG 15469: 'force user = localunixuser' doesn't work if 'allow trusted
+     domains = no' is set.
+   * BUG 15525: smbget debug logging doesn't work.
+   * BUG 15532: smget: username in the smburl and interactive password entry
+     doesn't work.
+   * BUG 15538: smbget auth function doesn't set values for password prompt
+     correctly.
+
+o  Martin Schwenke <mschwenke@ddn.com>
+   * BUG 15523: ctdb RELEASE_IP causes a crash in release_ip if a connection to
+     a non-public address disconnects first.
+
+o  Shachar Sharon <ssharon@redhat.com>
+   * BUG 15440: Unable to copy and write files from clients to Ceph cluster via
+     SMB Linux gateway with Ceph VFS module.
+
+o  Jones Syue <jonessyue@qnap.com>
+   * BUG 15547: Multichannel refresh network information.
+
+
+#######################################
+Reporting bugs & Development Discussion
+#######################################
+
+Please discuss this release on the samba-technical mailing list or by
+joining the #samba-technical:matrix.org matrix room, or
+#samba-technical IRC channel on irc.libera.chat.
+
+If you do report problems then please try to send high quality
+feedback. If you don't provide vital information to help us track down
+the problem then you will probably be ignored.  All bug reports should
+be filed under the Samba 4.1 and newer product in the project's Bugzilla
+database (https://bugzilla.samba.org/).
+
+
+======================================================================
+== Our Code, Our Bugs, Our Responsibility.
+== The Samba Team
+======================================================================
+
+
+----------------------------------------------------------------------
+                   ==============================
                    Release Notes for Samba 4.19.3
                          November 27, 2023
                    ==============================
@@ -119,8 +318,7 @@ database (https://bugzilla.samba.org/).
 ======================================================================
 
 
-Release notes for older releases follow:
-----------------------------------------
+----------------------------------------------------------------------
                    ==============================
                    Release Notes for Samba 4.19.2
                           October 16, 2023

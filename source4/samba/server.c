@@ -630,11 +630,10 @@ static int binary_smbd_main(TALLOC_CTX *mem_ctx,
 	   so set our umask to 0 */
 	umask(0);
 
-	DEBUG(0,("%s version %s started.\n",
-		binary_name,
-		SAMBA_VERSION_STRING));
-	DEBUGADD(0,("Copyright Andrew Tridgell and the Samba Team"
-		" 1992-2023\n"));
+	DBG_STARTUP_NOTICE("%s version %s started.\n%s\n",
+			   binary_name,
+			   SAMBA_VERSION_STRING,
+			   SAMBA_COPYRIGHT_STRING);
 
 	if (sizeof(uint16_t) < 2 ||
 			sizeof(uint32_t) < 4 ||
@@ -801,7 +800,7 @@ static int binary_smbd_main(TALLOC_CTX *mem_ctx,
 
 	if (max_runtime) {
 		struct tevent_timer *te;
-		DBG_ERR("%s PID %d was called with maxruntime %d - "
+		DBG_NOTICE("%s PID %d was called with maxruntime %d - "
 			"current ts %llu\n",
 			binary_name, (int)getpid(),
 			max_runtime, (unsigned long long) time(NULL));
@@ -905,7 +904,7 @@ static int binary_smbd_main(TALLOC_CTX *mem_ctx,
 		return 1;
 	}
 
-	DBG_ERR("%s: using '%s' process model\n", binary_name, model);
+	DBG_NOTICE("%s: using '%s' process model\n", binary_name, model);
 
 	{
 		int child_pipe[2];

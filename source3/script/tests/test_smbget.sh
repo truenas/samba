@@ -16,9 +16,11 @@ DOMAIN=${3}
 REALM=${4}
 USERNAME=${5}
 PASSWORD=${6}
-WORKDIR=${7}
-SMBGET="$VALGRIND ${8}"
-shift 8
+DOMAIN_USER=${7}
+DOMAIN_USER_PASSWORD=${8}
+WORKDIR=${9}
+SMBGET="$VALGRIND ${10}"
+shift 10
 
 TMPDIR="$SELFTEST_TMPDIR"
 
@@ -27,6 +29,7 @@ incdir=$(dirname $0)/../../../testprogs/blackbox
 . "${incdir}/common_test_fns.inc"
 
 samba_kinit=$(system_or_builddir_binary kinit "${BINDIR}" samba4kinit)
+samba_texpect="${BINDIR}/texpect"
 
 create_test_data()
 {
@@ -55,8 +58,8 @@ clear_download_area()
 test_singlefile_guest()
 {
 	clear_download_area
-	echo "$SMBGET --verbose --guest smb://$SERVER_IP/smbget/testfile"
-	$SMBGET --verbose --guest smb://$SERVER_IP/smbget/testfile
+	echo "$SMBGET --verbose --guest smb://$SERVER_IP/smbget_guest/testfile"
+	$SMBGET --verbose --guest smb://$SERVER_IP/smbget_guest/testfile
 	if [ $? -ne 0 ]; then
 		echo 'ERROR: RC does not match, expected: 0'
 		return 1
@@ -72,7 +75,7 @@ test_singlefile_guest()
 test_singlefile_U()
 {
 	clear_download_area
-	$SMBGET --verbose -U$USERNAME%$PASSWORD smb://$SERVER_IP/smbget/testfile
+	$SMBGET --verbose -U${SERVER}/${USERNAME}%$PASSWORD smb://$SERVER_IP/smbget/testfile
 	if [ $? -ne 0 ]; then
 		echo 'ERROR: RC does not match, expected: 0'
 		return 1
@@ -89,7 +92,7 @@ test_singlefile_U_UPN()
 {
 	clear_download_area
 
-	${SMBGET} --verbose -U"${DC_USERNAME}@${REALM}%${DC_PASSWORD}" \
+	${SMBGET} --verbose -U"${DOMAIN_USER}@${REALM}%${DOMAIN_USER_PASSWORD}" \
 		"smb://${SERVER_IP}/smbget/testfile"
 	ret=${?}
 	if [ ${ret} -ne 0 ]; then
@@ -111,7 +114,7 @@ test_singlefile_U_domain()
 {
 	clear_download_area
 
-	${SMBGET} --verbose -U"${DOMAIN}/${DC_USERNAME}%${DC_PASSWORD}" \
+	${SMBGET} --verbose -U"${DOMAIN}/${DOMAIN_USER}%${DOMAIN_USER_PASSWORD}" \
 		"smb://${SERVER_IP}/smbget/testfile"
 	ret=${?}
 	if [ ${ret} -ne 0 ]; then
@@ -132,7 +135,7 @@ test_singlefile_U_domain()
 test_singlefile_smburl()
 {
 	clear_download_area
-	$SMBGET --workgroup $DOMAIN smb://$USERNAME:$PASSWORD@$SERVER_IP/smbget/testfile
+	$SMBGET --workgroup $DOMAIN smb://${DOMAIN_USER}:$DOMAIN_USER_PASSWORD@$SERVER_IP/smbget/testfile
 	if [ $? -ne 0 ]; then
 		echo 'ERROR: RC does not match, expected: 0'
 		return 1
@@ -145,11 +148,54 @@ test_singlefile_smburl()
 	return 0
 }
 
+test_singlefile_smburl2()
+{
+	clear_download_area
+	$SMBGET "smb://$DOMAIN;${DOMAIN_USER}:$DOMAIN_USER_PASSWORD@$SERVER_IP/smbget/testfile"
+	if [ $? -ne 0 ]; then
+		echo 'ERROR: RC does not match, expected: 0'
+		return 1
+	fi
+	cmp --silent $WORKDIR/testfile ./testfile
+	if [ $? -ne 0 ]; then
+		echo 'ERROR: file content does not match'
+		return 1
+	fi
+	return 0
+}
+
+test_singlefile_smburl_interactive()
+{
+	clear_download_area
+
+	tmpfile="$(mktemp --tmpdir="${TMPDIR}" expect_XXXXXXXXXX)"
+
+	cat >"${tmpfile}" <<EOF
+expect Password for
+send ${DOMAIN_USER_PASSWORD}\n
+EOF
+
+	USER="hanswurst" ${samba_texpect} "${tmpfile}" ${SMBGET} "smb://${DOMAIN};${DOMAIN_USER}@${SERVER_IP}/smbget/testfile"
+	ret=$?
+	rm -f "${tmpfile}"
+	if [ ${ret} -ne 0 ]; then
+		echo 'ERROR: RC does not match, expected: 0'
+		return 1
+	fi
+	cmp --silent $WORKDIR/testfile ./testfile
+	ret=$?
+	if [ ${ret} -ne 0 ]; then
+		echo 'ERROR: file content does not match'
+		return 1
+	fi
+	return 0
+}
+
 test_singlefile_authfile()
 {
 	clear_download_area
 	cat >"${TMPDIR}/authfile" << EOF
-username = $USERNAME
+username = ${SERVER}/${USERNAME}
 password = $PASSWORD
 EOF
 	$SMBGET --verbose --authentication-file="${TMPDIR}/authfile" smb://$SERVER_IP/smbget/testfile
@@ -170,7 +216,7 @@ EOF
 test_recursive_U()
 {
 	clear_download_area
-	$SMBGET --verbose --recursive -U$USERNAME%$PASSWORD smb://$SERVER_IP/smbget/
+	$SMBGET --verbose --recursive -U${SERVER}/${USERNAME}%$PASSWORD smb://$SERVER_IP/smbget/
 	if [ $? -ne 0 ]; then
 		echo 'ERROR: RC does not match, expected: 0'
 		return 1
@@ -191,7 +237,7 @@ test_recursive_existing_dir()
 {
 	clear_download_area
 	mkdir dir1
-	$SMBGET --verbose --recursive -U$USERNAME%$PASSWORD smb://$SERVER_IP/smbget/
+	$SMBGET --verbose --recursive -U${SERVER}/${USERNAME}%$PASSWORD smb://$SERVER_IP/smbget/
 	if [ $? -ne 0 ]; then
 		echo 'ERROR: RC does not match, expected: 0'
 		return 1
@@ -214,7 +260,7 @@ test_recursive_with_empty()
 	# create some additional empty directories
 	mkdir -p $WORKDIR/dir001/dir002/dir003
 	mkdir -p $WORKDIR/dir004/dir005/dir006
-	$SMBGET --verbose --recursive -U$USERNAME%$PASSWORD smb://$SERVER_IP/smbget/
+	$SMBGET --verbose --recursive -U${SERVER}/${USERNAME}%$PASSWORD smb://$SERVER_IP/smbget/
 	rc=$?
 	rm -rf $WORKDIR/dir001
 	rm -rf $WORKDIR/dir004
@@ -244,7 +290,7 @@ test_resume()
 	clear_download_area
 	cp $WORKDIR/testfile .
 	truncate -s 1024 testfile
-	$SMBGET --verbose --resume -U$USERNAME%$PASSWORD smb://$SERVER_IP/smbget/testfile
+	$SMBGET --verbose --resume -U${SERVER}/${USERNAME}%$PASSWORD smb://$SERVER_IP/smbget/testfile
 	if [ $? -ne 0 ]; then
 		echo 'ERROR: RC does not match, expected: 0'
 		return 1
@@ -263,7 +309,7 @@ test_resume_modified()
 {
 	clear_download_area
 	dd if=/dev/urandom bs=1024 count=2 of=testfile
-	$SMBGET --verbose --resume -U$USERNAME%$PASSWORD smb://$SERVER_IP/smbget/testfile
+	$SMBGET --verbose --resume -U${SERVER}/${USERNAME}%$PASSWORD smb://$SERVER_IP/smbget/testfile
 	if [ $? -ne 1 ]; then
 		echo 'ERROR: RC does not match, expected: 1'
 		return 1
@@ -275,14 +321,14 @@ test_resume_modified()
 test_update()
 {
 	clear_download_area
-	$SMBGET --verbose -U$USERNAME%$PASSWORD smb://$SERVER_IP/smbget/testfile
+	$SMBGET --verbose -U${SERVER}/${USERNAME}%$PASSWORD smb://$SERVER_IP/smbget/testfile
 	if [ $? -ne 0 ]; then
 		echo 'ERROR: RC does not match, expected: 0'
 		return 1
 	fi
 
 	# secondary download should pass
-	$SMBGET --verbose --update -U$USERNAME%$PASSWORD smb://$SERVER_IP/smbget/testfile
+	$SMBGET --verbose --update -U${SERVER}/${USERNAME}%$PASSWORD smb://$SERVER_IP/smbget/testfile
 	if [ $? -ne 0 ]; then
 		echo 'ERROR: RC does not match, expected: 0'
 		return 1
@@ -292,7 +338,7 @@ test_update()
 	# touch source to trigger new download
 	sleep 2
 	touch -m $WORKDIR/testfile
-	$SMBGET --verbose --update -U$USERNAME%$PASSWORD smb://$SERVER_IP/smbget/testfile
+	$SMBGET --verbose --update -U${SERVER}/${USERNAME}%$PASSWORD smb://$SERVER_IP/smbget/testfile
 	if [ $? -ne 0 ]; then
 		echo 'ERROR: RC does not match, expected: 0'
 		return 1
@@ -327,7 +373,7 @@ test_msdfs_link_domain()
 {
 	clear_download_area
 
-	${SMBGET} --verbose "-U${DOMAIN}/${DC_USERNAME}%${DC_PASSWORD}" \
+	${SMBGET} --verbose "-U${DOMAIN}/${DOMAIN_USER}%${DOMAIN_USER_PASSWORD}" \
 		"smb://${SERVER}/msdfs-share/deeppath/msdfs-src2/readable_file"
 	ret=$?
 	if [ ${ret} -ne 0 ]; then
@@ -342,7 +388,7 @@ test_msdfs_link_upn()
 {
 	clear_download_area
 
-	${SMBGET} --verbose "-U${DC_USERNAME}@${REALM}%${DC_PASSWORD}" \
+	${SMBGET} --verbose "-U${DOMAIN_USER}@${REALM}%${DOMAIN_USER_PASSWORD}" \
 		"smb://${SERVER}/msdfs-share/deeppath/msdfs-src2/readable_file"
 	ret=$?
 	if [ ${ret} -ne 0 ]; then
@@ -358,9 +404,9 @@ test_msdfs_link_upn()
 test_limit_rate()
 {
 	clear_download_area
-	echo "$SMBGET --verbose --guest --limit-rate 100 smb://$SERVER_IP/smbget/testfile"
+	echo "$SMBGET --verbose --guest --limit-rate 100 smb://$SERVER_IP/smbget_guest/testfile"
 	time_begin=$(date +%s)
-	$SMBGET --verbose --guest --limit-rate 100 smb://$SERVER_IP/smbget/testfile
+	$SMBGET --verbose --guest --limit-rate 100 smb://$SERVER_IP/smbget_guest/testfile
 	if [ $? -ne 0 ]; then
 		echo 'ERROR: RC does not match, expected: 0'
 		return 1
@@ -381,7 +427,7 @@ test_limit_rate()
 test_encrypt()
 {
 	clear_download_area
-	$SMBGET --verbose --encrypt -U$USERNAME%$PASSWORD smb://$SERVER_IP/smbget/testfile
+	$SMBGET --verbose --encrypt -U${SERVER}/${USERNAME}%$PASSWORD smb://$SERVER_IP/smbget/testfile
 	if [ $? -ne 0 ]; then
 		echo 'ERROR: RC does not match, expected: 0'
 		return 1
@@ -393,7 +439,7 @@ test_encrypt()
 	fi
 
 	clear_download_area
-	$SMBGET --verbose --client-protection=encrypt -U$USERNAME%$PASSWORD smb://$SERVER_IP/smbget/testfile
+	$SMBGET --verbose --client-protection=encrypt -U${SERVER}/${USERNAME}%$PASSWORD smb://$SERVER_IP/smbget/testfile
 	if [ $? -ne 0 ]; then
 		echo 'ERROR: RC does not match, expected: 0'
 		return 1
@@ -411,13 +457,17 @@ test_kerberos()
 {
 	clear_download_area
 
-	KRB5CCNAME_PATH="$PREFIX/smget_krb5ccache"
+	KRB5CCNAME_PATH="${TMPDIR}/smget_krb5ccache"
 	rm -f "${KRB5CCNAME_PATH}"
 
 	KRB5CCNAME="FILE:${KRB5CCNAME_PATH}"
 	export KRB5CCNAME
 	kerberos_kinit "${samba_kinit}" \
-		"${DC_USERNAME}@${REALM}" "${DC_PASSWORD}"
+		"${DOMAIN_USER}@${REALM}" "${DOMAIN_USER_PASSWORD}"
+	if [ $? -ne 0 ]; then
+		echo 'Failed to get Kerberos ticket'
+		return 1
+	fi
 
 	$SMBGET --verbose --use-krb5-ccache="${KRB5CCNAME}" \
 		smb://$SERVER/smbget/testfile
@@ -443,7 +493,7 @@ test_kerberos_trust()
 
 	$SMBGET --verbose --use-kerberos=required \
 		-U"${TRUST_F_BOTH_USERNAME}@${TRUST_F_BOTH_REALM}%${TRUST_F_BOTH_PASSWORD}" \
-		smb://$SERVER/smbget/testfile
+		smb://$SERVER.${REALM}/smbget/testfile
 	if [ $? -ne 0 ]; then
 		echo 'ERROR: RC does not match, expected: 0'
 		return 1
@@ -458,26 +508,34 @@ test_kerberos_trust()
 	return 0
 }
 
-test_kerberos_upn_denied()
-{
-	clear_download_area
-
-	$SMBGET --verbose --use-kerberos=required \
-		-U"testdenied_upn@${REALM}.upn%${PASSWORD}" \
-		"smb://${SERVER}/smbget/testfile"
-	if [ $? -ne 0 ]; then
-		echo 'ERROR: RC does not match, expected: 0'
-		return 1
-	fi
-
-	cmp --silent $WORKDIR/testfile ./testfile
-	if [ $? -ne 0 ]; then
-		echo 'ERROR: file content does not match'
-		return 1
-	fi
-
-	return 0
-}
+# TODO FIXME
+# This test does not work, as we can't tell the libsmb code that the
+# principal is an enterprice principal. We need support for enterprise
+# principals in kerberos_kinit_password_ext() and a way to pass it via the
+# credenitals structure and commandline options.
+# It works if you do: kinit -E testdenied_upn@${REALM}.upn
+#
+# test_kerberos_upn_denied()
+# {
+# 	set -x
+# 	clear_download_area
+#
+# 	$SMBGET --verbose --use-kerberos=required \
+# 		-U"testdenied_upn@${REALM}.upn%${DC_PASSWORD}" \
+# 		"smb://${SERVER}.${REALM}/smbget/testfile" -d10
+# 	if [ $? -ne 0 ]; then
+# 		echo 'ERROR: RC does not match, expected: 0'
+# 		return 1
+# 	fi
+#
+# 	cmp --silent $WORKDIR/testfile ./testfile
+# 	if [ $? -ne 0 ]; then
+# 		echo 'ERROR: file content does not match'
+# 		return 1
+# 	fi
+#
+# 	return 0
+# }
 
 create_test_data
 
@@ -497,6 +555,14 @@ testit "download single file with --update and UPN" test_singlefile_U_UPN ||
 	failed=$((failed + 1))
 
 testit "download single file with smb URL" test_singlefile_smburl ||
+	failed=$(expr $failed + 1)
+
+testit "download single file with smb URL including domain" \
+	test_singlefile_smburl2 ||
+	failed=$(expr $failed + 1)
+
+testit "download single file with smb URL interactive" \
+	test_singlefile_smburl_interactive ||
 	failed=$(expr $failed + 1)
 
 testit "download single file with authfile" test_singlefile_authfile ||
@@ -541,8 +607,8 @@ testit "kerberos" test_kerberos ||
 testit "kerberos_trust" test_kerberos_trust ||
 	failed=$((failed + 1))
 
-testit "kerberos_upn_denied" test_kerberos_upn_denied ||
-	failed=$((failed + 1))
+# testit "kerberos_upn_denied" test_kerberos_upn_denied ||
+# 	failed=$((failed + 1))
 
 clear_download_area
 
