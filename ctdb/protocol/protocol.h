@@ -381,6 +381,8 @@ enum ctdb_controls {CTDB_CONTROL_PROCESS_EXISTS          = 0,
 		    CTDB_CONTROL_ECHO_DATA               = 156,
 		    CTDB_CONTROL_DISABLE_NODE            = 157,
 		    CTDB_CONTROL_ENABLE_NODE             = 158,
+		    CTDB_CONTROL_TCP_CLIENT_DISCONNECTED = 159,
+		    CTDB_CONTROL_TCP_CLIENT_PASSED       = 160,
 };
 
 #define MAX_COUNT_BUCKETS 16

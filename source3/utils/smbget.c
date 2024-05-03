@@ -114,31 +114,62 @@ static void get_auth_data_with_context_fn(SMBCCTX *ctx,
 	const char *username = NULL;
 	const char *password = NULL;
 	const char *domain = NULL;
+	enum credentials_obtained obtained = CRED_UNINITIALISED;
 
-	username = cli_credentials_get_username(creds);
-	if (username != NULL) {
-		strncpy(usr, username, usr_len - 1);
-	}
-
-	password = cli_credentials_get_password(creds);
-	if (password != NULL) {
-		strncpy(pwd, password, pwd_len - 1);
-	}
-
-	domain = cli_credentials_get_domain(creds);
+	domain = cli_credentials_get_domain_and_obtained(creds, &obtained);
 	if (domain != NULL) {
-		strncpy(dom, domain, dom_len - 1);
+		bool overwrite = false;
+		if (dom[0] == '\0') {
+			overwrite = true;
+		}
+		if (obtained >= CRED_CALLBACK_RESULT) {
+			overwrite = true;
+		}
+		if (overwrite) {
+			strncpy(dom, domain, dom_len - 1);
+		}
 	}
+	cli_credentials_set_domain(creds, dom, obtained);
 
-	smbc_set_credentials_with_fallback(ctx, domain, username, password);
+	username = cli_credentials_get_username_and_obtained(creds, &obtained);
+	if (username != NULL) {
+		bool overwrite = false;
+		if (usr[0] == '\0') {
+			overwrite = true;
+		}
+		if (obtained >= CRED_CALLBACK_RESULT) {
+			overwrite = true;
+		}
+		if (overwrite) {
+			strncpy(usr, username, usr_len - 1);
+		}
+	}
+	cli_credentials_set_username(creds, usr, obtained);
 
-	if (!opt.quiet && username != NULL) {
-		if (username[0] == '\0') {
+	password = cli_credentials_get_password_and_obtained(creds, &obtained);
+	if (password != NULL) {
+		bool overwrite = false;
+		if (pwd[0] == '\0') {
+			overwrite = true;
+		}
+		if (obtained >= CRED_CALLBACK_RESULT) {
+			overwrite = true;
+		}
+		if (overwrite) {
+			strncpy(pwd, password, pwd_len - 1);
+		}
+	}
+	cli_credentials_set_password(creds, pwd, obtained);
+
+	smbc_set_credentials_with_fallback(ctx, dom, usr, pwd);
+
+	if (!opt.quiet) {
+		if (usr[0] == '\0') {
 			printf("Using guest user\n");
+		} else if (dom[0] == '\0') {
+			printf("Using user: %s\n", usr);
 		} else {
-			printf("Using domain: %s, user: %s\n",
-				domain,
-				username);
+			printf("Using domain: %s, user: %s\n", dom, usr);
 		}
 	}
 }
@@ -849,6 +880,7 @@ int main(int argc, char **argv)
 	uint32_t gensec_features;
 	bool use_wbccache = false;
 	SMBCCTX *smb_ctx = NULL;
+	int dbg_lvl = -1;
 	int rc;
 
 	smb_init_locale();
@@ -922,13 +954,16 @@ int main(int argc, char **argv)
 
 	samba_cmdline_burn(argc, argv);
 
+	/* smbc_new_context() will set the log level to 0 */
+	dbg_lvl = debuglevel_get();
+
 	smb_ctx = smbc_new_context();
 	if (smb_ctx == NULL) {
 		fprintf(stderr, "Unable to initialize libsmbclient\n");
 		ok = false;
 		goto done;
 	}
-	smbc_setDebug(smb_ctx, debuglevel_get());
+	smbc_setDebug(smb_ctx, dbg_lvl);
 
 	rc = smbc_setConfiguration(smb_ctx, lp_default_path());
 	if (rc < 0) {

@@ -102,16 +102,20 @@ def dummy_certificate():
 
 # Dummy requests structure for Certificate Auto Enrollment
 class dummy_requests(object):
-    @staticmethod
-    def get(url=None, params=None):
+    class exceptions(object):
+        ConnectionError = Exception
+
+    def __init__(self, want_exception=False):
+        self.want_exception = want_exception
+
+    def get(self, url=None, params=None):
+        if self.want_exception:
+            raise self.exceptions.ConnectionError
+
         dummy = requests.Response()
         dummy._content = dummy_certificate()
         dummy.headers = {'Content-Type': 'application/x-x509-ca-cert'}
         return dummy
-
-    class exceptions(object):
-        ConnectionError = Exception
-cae.requests = dummy_requests
 
 realm = os.environ.get('REALM')
 policies = realm + '/POLICIES'
@@ -123,7 +127,7 @@ dspath = 'CN=Policies,CN=System,' + base_dn
 gpt_data = '[General]\nVersion=%d'
 
 gnome_test_reg_pol = \
-b"""
+br"""
 <?xml version="1.0" encoding="utf-8"?>
 <PolFile num_entries="26" signature="PReg" version="1">
     <Entry type="4" type_name="REG_DWORD">
@@ -260,7 +264,7 @@ b"""
 """
 
 auto_enroll_reg_pol = \
-b"""
+br"""
 <?xml version="1.0" encoding="utf-8"?>
 <PolFile num_entries="3" signature="PReg" version="1">
         <Entry type="4" type_name="REG_DWORD">
@@ -281,8 +285,30 @@ b"""
 </PolFile>
 """
 
+auto_enroll_unchecked_reg_pol = \
+br"""
+<?xml version="1.0" encoding="utf-8"?>
+<PolFile num_entries="3" signature="PReg" version="1">
+        <Entry type="4" type_name="REG_DWORD">
+                <Key>Software\Policies\Microsoft\Cryptography\AutoEnrollment</Key>
+                <ValueName>AEPolicy</ValueName>
+                <Value>0</Value>
+        </Entry>
+        <Entry type="4" type_name="REG_DWORD">
+                <Key>Software\Policies\Microsoft\Cryptography\AutoEnrollment</Key>
+                <ValueName>OfflineExpirationPercent</ValueName>
+                <Value>10</Value>
+        </Entry>
+        <Entry type="1" type_name="REG_SZ">
+                <Key>Software\Policies\Microsoft\Cryptography\AutoEnrollment</Key>
+                <ValueName>OfflineExpirationStoreNames</ValueName>
+                <Value>MY</Value>
+        </Entry>
+</PolFile>
+"""
+
 advanced_enroll_reg_pol = \
-b"""
+br"""
 <?xml version="1.0" encoding="utf-8"?>
 <PolFile num_entries="30" signature="PReg" version="1">
     <Entry type="1" type_name="REG_SZ">
@@ -316,122 +342,122 @@ b"""
         <Value>0</Value>
     </Entry>
     <Entry type="1" type_name="REG_SZ">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\37c9dc30f207f27f61a2f7c3aed598a6e2920b54</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\37c9dc30f207f27f61a2f7c3aed598a6e2920b54</Key>
         <ValueName>URL</ValueName>
         <Value>LDAP:</Value>
     </Entry>
     <Entry type="1" type_name="REG_SZ">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\37c9dc30f207f27f61a2f7c3aed598a6e2920b54</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\37c9dc30f207f27f61a2f7c3aed598a6e2920b54</Key>
         <ValueName>PolicyID</ValueName>
         <Value>%s</Value>
     </Entry>
     <Entry type="1" type_name="REG_SZ">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\37c9dc30f207f27f61a2f7c3aed598a6e2920b54</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\37c9dc30f207f27f61a2f7c3aed598a6e2920b54</Key>
         <ValueName>FriendlyName</ValueName>
         <Value>Example</Value>
     </Entry>
     <Entry type="4" type_name="REG_DWORD">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\37c9dc30f207f27f61a2f7c3aed598a6e2920b54</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\37c9dc30f207f27f61a2f7c3aed598a6e2920b54</Key>
         <ValueName>Flags</ValueName>
         <Value>16</Value>
     </Entry>
     <Entry type="4" type_name="REG_DWORD">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\37c9dc30f207f27f61a2f7c3aed598a6e2920b54</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\37c9dc30f207f27f61a2f7c3aed598a6e2920b54</Key>
         <ValueName>AuthFlags</ValueName>
         <Value>2</Value>
     </Entry>
     <Entry type="4" type_name="REG_DWORD">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\37c9dc30f207f27f61a2f7c3aed598a6e2920b54</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\37c9dc30f207f27f61a2f7c3aed598a6e2920b54</Key>
         <ValueName>Cost</ValueName>
         <Value>2147483645</Value>
     </Entry>
     <Entry type="1" type_name="REG_SZ">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\144bdbb8e4717c26e408f3c9a0cb8d6cfacbcbbe</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\144bdbb8e4717c26e408f3c9a0cb8d6cfacbcbbe</Key>
         <ValueName>URL</ValueName>
         <Value>https://example2.com/ADPolicyProvider_CEP_Certificate/service.svc/CEP</Value>
     </Entry>
     <Entry type="1" type_name="REG_SZ">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\144bdbb8e4717c26e408f3c9a0cb8d6cfacbcbbe</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\144bdbb8e4717c26e408f3c9a0cb8d6cfacbcbbe</Key>
         <ValueName>PolicyID</ValueName>
         <Value>%s</Value>
     </Entry>
     <Entry type="1" type_name="REG_SZ">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\144bdbb8e4717c26e408f3c9a0cb8d6cfacbcbbe</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\144bdbb8e4717c26e408f3c9a0cb8d6cfacbcbbe</Key>
         <ValueName>FriendlyName</ValueName>
         <Value>Example2</Value>
     </Entry>
     <Entry type="4" type_name="REG_DWORD">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\144bdbb8e4717c26e408f3c9a0cb8d6cfacbcbbe</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\144bdbb8e4717c26e408f3c9a0cb8d6cfacbcbbe</Key>
         <ValueName>Flags</ValueName>
         <Value>16</Value>
     </Entry>
     <Entry type="4" type_name="REG_DWORD">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\144bdbb8e4717c26e408f3c9a0cb8d6cfacbcbbe</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\144bdbb8e4717c26e408f3c9a0cb8d6cfacbcbbe</Key>
         <ValueName>AuthFlags</ValueName>
         <Value>8</Value>
     </Entry>
     <Entry type="4" type_name="REG_DWORD">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\144bdbb8e4717c26e408f3c9a0cb8d6cfacbcbbe</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\144bdbb8e4717c26e408f3c9a0cb8d6cfacbcbbe</Key>
         <ValueName>Cost</ValueName>
         <Value>10</Value>
     </Entry>
     <Entry type="1" type_name="REG_SZ">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\20d46e856e9b9746c0b1265c328f126a7b3283a9</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\20d46e856e9b9746c0b1265c328f126a7b3283a9</Key>
         <ValueName>URL</ValueName>
         <Value>https://example0.com/ADPolicyProvider_CEP_Kerberos/service.svc/CEP</Value>
     </Entry>
     <Entry type="1" type_name="REG_SZ">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\20d46e856e9b9746c0b1265c328f126a7b3283a9</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\20d46e856e9b9746c0b1265c328f126a7b3283a9</Key>
         <ValueName>PolicyID</ValueName>
         <Value>%s</Value>
     </Entry>
     <Entry type="1" type_name="REG_SZ">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\20d46e856e9b9746c0b1265c328f126a7b3283a9</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\20d46e856e9b9746c0b1265c328f126a7b3283a9</Key>
         <ValueName>FriendlyName</ValueName>
         <Value>Example0</Value>
     </Entry>
     <Entry type="4" type_name="REG_DWORD">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\20d46e856e9b9746c0b1265c328f126a7b3283a9</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\20d46e856e9b9746c0b1265c328f126a7b3283a9</Key>
         <ValueName>Flags</ValueName>
         <Value>16</Value>
     </Entry>
     <Entry type="4" type_name="REG_DWORD">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\20d46e856e9b9746c0b1265c328f126a7b3283a9</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\20d46e856e9b9746c0b1265c328f126a7b3283a9</Key>
         <ValueName>AuthFlags</ValueName>
         <Value>2</Value>
     </Entry>
     <Entry type="4" type_name="REG_DWORD">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\20d46e856e9b9746c0b1265c328f126a7b3283a9</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\20d46e856e9b9746c0b1265c328f126a7b3283a9</Key>
         <ValueName>Cost</ValueName>
         <Value>1</Value>
     </Entry>
     <Entry type="1" type_name="REG_SZ">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\855b5246433a48402ac4f5c3427566df26ccc9ac</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\855b5246433a48402ac4f5c3427566df26ccc9ac</Key>
         <ValueName>URL</ValueName>
         <Value>https://example1.com/ADPolicyProvider_CEP_Kerberos/service.svc/CEP</Value>
     </Entry>
     <Entry type="1" type_name="REG_SZ">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\855b5246433a48402ac4f5c3427566df26ccc9ac</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\855b5246433a48402ac4f5c3427566df26ccc9ac</Key>
         <ValueName>PolicyID</ValueName>
         <Value>%s</Value>
     </Entry>
     <Entry type="1" type_name="REG_SZ">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\855b5246433a48402ac4f5c3427566df26ccc9ac</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\855b5246433a48402ac4f5c3427566df26ccc9ac</Key>
         <ValueName>FriendlyName</ValueName>
         <Value>Example1</Value>
     </Entry>
     <Entry type="4" type_name="REG_DWORD">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\855b5246433a48402ac4f5c3427566df26ccc9ac</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\855b5246433a48402ac4f5c3427566df26ccc9ac</Key>
         <ValueName>Flags</ValueName>
         <Value>16</Value>
     </Entry>
     <Entry type="4" type_name="REG_DWORD">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\855b5246433a48402ac4f5c3427566df26ccc9ac</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\855b5246433a48402ac4f5c3427566df26ccc9ac</Key>
         <ValueName>AuthFlags</ValueName>
         <Value>2</Value>
     </Entry>
     <Entry type="4" type_name="REG_DWORD">
-        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\\855b5246433a48402ac4f5c3427566df26ccc9ac</Key>
+        <Key>Software\Policies\Microsoft\Cryptography\PolicyServers\855b5246433a48402ac4f5c3427566df26ccc9ac</Key>
         <ValueName>Cost</ValueName>
         <Value>1</Value>
     </Entry>
@@ -2094,7 +2120,7 @@ firefox_json_expected = \
 """
 
 chromium_reg_pol = \
-b"""
+br"""
 <?xml version="1.0" encoding="utf-8"?>
 <PolFile num_entries="418" signature="PReg" version="1">
     <Entry type="4" type_name="REG_DWORD">
@@ -2990,12 +3016,12 @@ b"""
     <Entry type="1" type_name="REG_SZ">
         <Key>Software\Policies\Google\Chrome</Key>
         <ValueName>RestrictSigninToPattern</ValueName>
-        <Value>.*@example\\.com</Value>
+        <Value>.*@example\.com</Value>
     </Entry>
     <Entry type="1" type_name="REG_SZ">
         <Key>Software\Policies\Google\Chrome</Key>
         <ValueName>RoamingProfileLocation</ValueName>
-        <Value>${roaming_app_data}\\chrome-profile</Value>
+        <Value>${roaming_app_data}\chrome-profile</Value>
     </Entry>
     <Entry type="4" type_name="REG_DWORD">
         <Key>Software\Policies\Google\Chrome</Key>
@@ -3245,7 +3271,7 @@ b"""
     <Entry type="1" type_name="REG_SZ">
         <Key>Software\Policies\Google\Chrome\AlternativeBrowserParameters</Key>
         <ValueName>5</ValueName>
-        <Value>%HOME%\\browser_profile</Value>
+        <Value>%HOME%\browser_profile</Value>
     </Entry>
     <Entry type="1" type_name="REG_SZ">
         <Key>Software\Policies\Google\Chrome\AudioCaptureAllowedUrls</Key>
@@ -4951,7 +4977,7 @@ b"""
 """
 
 firewalld_reg_pol = \
-b"""
+br"""
 <?xml version="1.0" encoding="utf-8"?>
 <PolFile num_entries="6" signature="PReg" version="1">
     <Entry type="4" type_name="REG_DWORD">
@@ -6742,7 +6768,7 @@ class GPOTests(tests.TestCase):
         # Unstage the Registry.pol file
         unstage_file(reg_pol)
 
-    def test_gp_cert_auto_enroll_ext(self):
+    def test_gp_cert_auto_enroll_ext_without_ndes(self):
         local_path = self.lp.cache_path('gpo_cache')
         guid = '{31B2F340-016D-11D2-945F-00C04FB984F9}'
         reg_pol = os.path.join(local_path, policies, guid,
@@ -6755,6 +6781,7 @@ class GPOTests(tests.TestCase):
         machine_creds.set_machine_account()
 
         # Initialize the group policy extension
+        cae.requests = dummy_requests(want_exception=True)
         ext = cae.gp_cert_auto_enroll_ext(self.lp, machine_creds,
                                           machine_creds.get_username(), store)
 
@@ -6783,14 +6810,122 @@ class GPOTests(tests.TestCase):
         ldb.add({'dn': certa_dn,
                  'objectClass': 'certificationAuthority',
                  'authorityRevocationList': ['XXX'],
-                 'cACertificate': 'XXX',
+                 'cACertificate': dummy_certificate(),
                  'certificateRevocationList': ['XXX'],
                 })
         # Write the dummy pKIEnrollmentService
         enroll_dn = 'CN=%s,CN=Enrollment Services,%s' % (ca_cn, confdn)
         ldb.add({'dn': enroll_dn,
                  'objectClass': 'pKIEnrollmentService',
-                 'cACertificate': 'XXXX',
+                 'cACertificate': dummy_certificate(),
+                 'certificateTemplates': ['Machine'],
+                 'dNSHostName': hostname,
+                })
+        # Write the dummy pKICertificateTemplate
+        template_dn = 'CN=Machine,CN=Certificate Templates,%s' % confdn
+        ldb.add({'dn': template_dn,
+                 'objectClass': 'pKICertificateTemplate',
+                })
+
+        with TemporaryDirectory() as dname:
+            try:
+                ext.process_group_policy([], gpos, dname, dname)
+            except Exception as e:
+                self.fail(str(e))
+
+            ca_crt = os.path.join(dname, '%s.crt' % ca_cn)
+            self.assertTrue(os.path.exists(ca_crt),
+                            'Root CA certificate was not requested')
+            machine_crt = os.path.join(dname, '%s.Machine.crt' % ca_cn)
+            self.assertTrue(os.path.exists(machine_crt),
+                            'Machine certificate was not requested')
+            machine_key = os.path.join(dname, '%s.Machine.key' % ca_cn)
+            self.assertTrue(os.path.exists(machine_key),
+                            'Machine key was not generated')
+
+            # Verify RSOP does not fail
+            ext.rsop([g for g in gpos if g.name == guid][0])
+
+            # Check that a call to gpupdate --rsop also succeeds
+            ret = rsop(self.lp)
+            self.assertEqual(ret, 0, 'gpupdate --rsop failed!')
+
+            # Remove policy
+            gp_db = store.get_gplog(machine_creds.get_username())
+            del_gpos = get_deleted_gpos_list(gp_db, [])
+            ext.process_group_policy(del_gpos, [], dname)
+            self.assertFalse(os.path.exists(ca_crt),
+                            'Root CA certificate was not removed')
+            self.assertFalse(os.path.exists(machine_crt),
+                            'Machine certificate was not removed')
+            self.assertFalse(os.path.exists(machine_key),
+                            'Machine key was not removed')
+            out, _ = Popen(['getcert', 'list-cas'], stdout=PIPE).communicate()
+            self.assertNotIn(get_bytes(ca_cn), out, 'CA was not removed')
+            out, _ = Popen(['getcert', 'list'], stdout=PIPE).communicate()
+            self.assertNotIn(b'Machine', out,
+                             'Machine certificate not removed')
+            self.assertNotIn(b'Workstation', out,
+                             'Workstation certificate not removed')
+
+        # Remove the dummy CA, pKIEnrollmentService, and pKICertificateTemplate
+        ldb.delete(certa_dn)
+        ldb.delete(enroll_dn)
+        ldb.delete(template_dn)
+
+        # Unstage the Registry.pol file
+        unstage_file(reg_pol)
+
+    def test_gp_cert_auto_enroll_ext(self):
+        local_path = self.lp.cache_path('gpo_cache')
+        guid = '{31B2F340-016D-11D2-945F-00C04FB984F9}'
+        reg_pol = os.path.join(local_path, policies, guid,
+                               'MACHINE/REGISTRY.POL')
+        cache_dir = self.lp.get('cache directory')
+        store = GPOStorage(os.path.join(cache_dir, 'gpo.tdb'))
+
+        machine_creds = Credentials()
+        machine_creds.guess(self.lp)
+        machine_creds.set_machine_account()
+
+        # Initialize the group policy extension
+        cae.requests = dummy_requests()
+        ext = cae.gp_cert_auto_enroll_ext(self.lp, machine_creds,
+                                          machine_creds.get_username(), store)
+
+        gpos = get_gpo_list(self.server, machine_creds, self.lp,
+                            machine_creds.get_username())
+
+        # Stage the Registry.pol file with test data
+        parser = GPPolParser()
+        parser.load_xml(etree.fromstring(auto_enroll_reg_pol.strip()))
+        ret = stage_file(reg_pol, ndr_pack(parser.pol_file))
+        self.assertTrue(ret, 'Could not create the target %s' % reg_pol)
+
+        # Write the dummy CA entry, Enrollment Services, and Templates Entries
+        admin_creds = Credentials()
+        admin_creds.set_username(os.environ.get('DC_USERNAME'))
+        admin_creds.set_password(os.environ.get('DC_PASSWORD'))
+        admin_creds.set_realm(os.environ.get('REALM'))
+        hostname = get_dc_hostname(machine_creds, self.lp)
+        url = 'ldap://%s' % hostname
+        ldb = Ldb(url=url, session_info=system_session(),
+                  lp=self.lp, credentials=admin_creds)
+        # Write the dummy CA
+        confdn = 'CN=Public Key Services,CN=Services,CN=Configuration,%s' % base_dn
+        ca_cn = '%s-CA' % hostname.replace('.', '-')
+        certa_dn = 'CN=%s,CN=Certification Authorities,%s' % (ca_cn, confdn)
+        ldb.add({'dn': certa_dn,
+                 'objectClass': 'certificationAuthority',
+                 'authorityRevocationList': ['XXX'],
+                 'cACertificate': b'0\x82\x03u0\x82\x02]\xa0\x03\x02\x01\x02\x02\x10I',
+                 'certificateRevocationList': ['XXX'],
+                })
+        # Write the dummy pKIEnrollmentService
+        enroll_dn = 'CN=%s,CN=Enrollment Services,%s' % (ca_cn, confdn)
+        ldb.add({'dn': enroll_dn,
+                 'objectClass': 'pKIEnrollmentService',
+                 'cACertificate': b'0\x82\x03u0\x82\x02]\xa0\x03\x02\x01\x02\x02\x10I',
                  'certificateTemplates': ['Machine'],
                  'dNSHostName': hostname,
                 })
@@ -6812,12 +6947,61 @@ class GPOTests(tests.TestCase):
             self.assertTrue(os.path.exists(machine_crt),
                             'Machine key was not generated')
 
+            # Subsequent apply should react to new certificate templates
+            os.environ['CEPCES_SUBMIT_SUPPORTED_TEMPLATES'] = 'Machine,Workstation'
+            self.addCleanup(os.environ.pop, 'CEPCES_SUBMIT_SUPPORTED_TEMPLATES')
+            ext.process_group_policy([], gpos, dname, dname)
+            self.assertTrue(os.path.exists(ca_crt),
+                            'Root CA certificate was not requested')
+            self.assertTrue(os.path.exists(machine_crt),
+                            'Machine certificate was not requested')
+            self.assertTrue(os.path.exists(machine_crt),
+                            'Machine key was not generated')
+            workstation_crt = os.path.join(dname, '%s.Workstation.crt' % ca_cn)
+            self.assertTrue(os.path.exists(workstation_crt),
+                            'Workstation certificate was not requested')
+            workstation_key = os.path.join(dname, '%s.Workstation.key' % ca_cn)
+            self.assertTrue(os.path.exists(workstation_crt),
+                            'Workstation key was not generated')
+
             # Verify RSOP does not fail
             ext.rsop([g for g in gpos if g.name == guid][0])
 
             # Check that a call to gpupdate --rsop also succeeds
             ret = rsop(self.lp)
             self.assertEqual(ret, 0, 'gpupdate --rsop failed!')
+
+            # Remove policy by staging pol file with auto-enroll unchecked
+            parser.load_xml(etree.fromstring(auto_enroll_unchecked_reg_pol.strip()))
+            ret = stage_file(reg_pol, ndr_pack(parser.pol_file))
+            self.assertTrue(ret, 'Could not create the target %s' % reg_pol)
+            ext.process_group_policy([], gpos, dname, dname)
+            self.assertFalse(os.path.exists(ca_crt),
+                            'Root CA certificate was not removed')
+            self.assertFalse(os.path.exists(machine_crt),
+                            'Machine certificate was not removed')
+            self.assertFalse(os.path.exists(machine_crt),
+                            'Machine key was not removed')
+            self.assertFalse(os.path.exists(workstation_crt),
+                            'Workstation certificate was not removed')
+            self.assertFalse(os.path.exists(workstation_crt),
+                            'Workstation key was not removed')
+
+            # Reapply policy by staging the enabled pol file
+            parser.load_xml(etree.fromstring(auto_enroll_reg_pol.strip()))
+            ret = stage_file(reg_pol, ndr_pack(parser.pol_file))
+            self.assertTrue(ret, 'Could not create the target %s' % reg_pol)
+            ext.process_group_policy([], gpos, dname, dname)
+            self.assertTrue(os.path.exists(ca_crt),
+                            'Root CA certificate was not requested')
+            self.assertTrue(os.path.exists(machine_crt),
+                            'Machine certificate was not requested')
+            self.assertTrue(os.path.exists(machine_crt),
+                            'Machine key was not generated')
+            self.assertTrue(os.path.exists(workstation_crt),
+                            'Workstation certificate was not requested')
+            self.assertTrue(os.path.exists(workstation_crt),
+                            'Workstation key was not generated')
 
             # Remove policy
             gp_db = store.get_gplog(machine_creds.get_username())
@@ -6829,11 +7013,17 @@ class GPOTests(tests.TestCase):
                             'Machine certificate was not removed')
             self.assertFalse(os.path.exists(machine_crt),
                             'Machine key was not removed')
+            self.assertFalse(os.path.exists(workstation_crt),
+                            'Workstation certificate was not removed')
+            self.assertFalse(os.path.exists(workstation_crt),
+                            'Workstation key was not removed')
             out, _ = Popen(['getcert', 'list-cas'], stdout=PIPE).communicate()
             self.assertNotIn(get_bytes(ca_cn), out, 'CA was not removed')
             out, _ = Popen(['getcert', 'list'], stdout=PIPE).communicate()
             self.assertNotIn(b'Machine', out,
                              'Machine certificate not removed')
+            self.assertNotIn(b'Workstation', out,
+                             'Workstation certificate not removed')
 
         # Remove the dummy CA, pKIEnrollmentService, and pKICertificateTemplate
         ldb.delete(certa_dn)
@@ -7164,6 +7354,7 @@ class GPOTests(tests.TestCase):
         machine_creds.set_machine_account()
 
         # Initialize the group policy extension
+        cae.requests = dummy_requests()
         ext = cae.gp_cert_auto_enroll_ext(self.lp, machine_creds,
                                           machine_creds.get_username(), store)
 
@@ -7201,14 +7392,14 @@ class GPOTests(tests.TestCase):
         ldb.add({'dn': certa_dn,
                  'objectClass': 'certificationAuthority',
                  'authorityRevocationList': ['XXX'],
-                 'cACertificate': 'XXX',
+                 'cACertificate': b'0\x82\x03u0\x82\x02]\xa0\x03\x02\x01\x02\x02\x10I',
                  'certificateRevocationList': ['XXX'],
                 })
         # Write the dummy pKIEnrollmentService
         enroll_dn = 'CN=%s,CN=Enrollment Services,%s' % (ca_cn, confdn)
         ldb.add({'dn': enroll_dn,
                  'objectClass': 'pKIEnrollmentService',
-                 'cACertificate': 'XXXX',
+                 'cACertificate': b'0\x82\x03u0\x82\x02]\xa0\x03\x02\x01\x02\x02\x10I',
                  'certificateTemplates': ['Machine'],
                  'dNSHostName': hostname,
                 })
@@ -7233,6 +7424,25 @@ class GPOTests(tests.TestCase):
                 self.assertTrue(os.path.exists(machine_crt),
                                 'Machine key was not generated')
 
+            # Subsequent apply should react to new certificate templates
+            os.environ['CEPCES_SUBMIT_SUPPORTED_TEMPLATES'] = 'Machine,Workstation'
+            self.addCleanup(os.environ.pop, 'CEPCES_SUBMIT_SUPPORTED_TEMPLATES')
+            ext.process_group_policy([], gpos, dname, dname)
+            for ca in ca_list:
+                self.assertTrue(os.path.exists(ca_crt),
+                                'Root CA certificate was not requested')
+                self.assertTrue(os.path.exists(machine_crt),
+                                'Machine certificate was not requested')
+                self.assertTrue(os.path.exists(machine_crt),
+                                'Machine key was not generated')
+
+                workstation_crt = os.path.join(dname, '%s.Workstation.crt' % ca)
+                self.assertTrue(os.path.exists(workstation_crt),
+                                'Workstation certificate was not requested')
+                workstation_key = os.path.join(dname, '%s.Workstation.key' % ca)
+                self.assertTrue(os.path.exists(workstation_crt),
+                                'Workstation key was not generated')
+
             # Verify RSOP does not fail
             ext.rsop([g for g in gpos if g.name == guid][0])
 
@@ -7250,12 +7460,18 @@ class GPOTests(tests.TestCase):
                             'Machine certificate was not removed')
             self.assertFalse(os.path.exists(machine_crt),
                             'Machine key was not removed')
+            self.assertFalse(os.path.exists(workstation_crt),
+                            'Workstation certificate was not removed')
+            self.assertFalse(os.path.exists(workstation_crt),
+                            'Workstation key was not removed')
             out, _ = Popen(['getcert', 'list-cas'], stdout=PIPE).communicate()
             for ca in ca_list:
                 self.assertNotIn(get_bytes(ca), out, 'CA was not removed')
             out, _ = Popen(['getcert', 'list'], stdout=PIPE).communicate()
             self.assertNotIn(b'Machine', out,
                              'Machine certificate not removed')
+            self.assertNotIn(b'Workstation', out,
+                             'Workstation certificate not removed')
 
         # Remove the dummy CA, pKIEnrollmentService, and pKICertificateTemplate
         ldb.delete(certa_dn)
