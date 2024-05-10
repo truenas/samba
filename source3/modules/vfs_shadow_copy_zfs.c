@@ -375,7 +375,25 @@ char *get_snapshot_path(TALLOC_CTX *mem_ctx,
 			DBG_DEBUG("file [%s] is a sub-dataset mountpoint\n",
 				  filename);
 		} else {
-			SMB_ASSERT(strncmp_fn(tmp_name, child_offset, strlen(child_offset)) == 0);
+			if (strncmp_fn(tmp_name, child_offset, strlen(child_offset)) != 0) {
+				tmp_name = realpath(filename, buf);
+				if (tmp_name == NULL) {
+					DBG_ERR("%s: realpath() for path failed: %s. "
+						"Path does not appear to be within expected "
+						"dataset mountpoint.\n", filename, strerror(errno));
+					return NULL;
+				}
+
+				if (strncmp_fn(tmp_name, mountpoint, strlen(mountpoint)) == 0) {
+					DBG_INFO("%s: unsupported symbolic link to path within dataset\n",
+						 filename);
+				} else {
+					DBG_ERR("%s: path does not lie within mountpoint: %s\n",
+						tmp_name, mountpoint);
+				}
+				errno = EINVAL;
+				return NULL;
+			}
 			tmp_name += strlen(child_offset) + 1;
 			DBG_DEBUG("file [%s] is within sub-dataset [%s] base_name rewritten to [%s]\n",
 				  filename, mountpoint, tmp_name);
