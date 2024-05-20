@@ -21,7 +21,6 @@
 #include "winbindd.h"
 #include "passdb/lookup_sid.h" /* only for LOOKUP_NAME_NO_NSS flag */
 #include "libcli/security/dom_sid.h"
-#include "passdb/machine_sid.h"
 
 struct winbindd_getpwnam_state {
 	struct tevent_context *ev;
@@ -109,10 +108,7 @@ static void winbindd_getpwnam_lookupname_done(struct tevent_req *subreq)
 	if (tevent_req_nterror(req, status)) {
 		return;
 	}
-	if (dom_sid_compare_domain(&state->sid, get_global_sam_sid()) == 0) {
-		tevent_req_nterror(req, NT_STATUS_NO_SUCH_USER);
-		return;
-	}
+
 	subreq = wb_getpwsid_send(state, state->ev, &state->sid, &state->pw);
 	if (tevent_req_nomem(subreq, req)) {
 		return;
@@ -143,11 +139,9 @@ NTSTATUS winbindd_getpwnam_recv(struct tevent_req *req,
 
 	if (tevent_req_is_nterror(req, &status)) {
 		struct dom_sid_buf buf;
-		if (!is_null_sid(&state->sid)) {
-			D_WARNING("Could not convert sid %s: %s\n",
-				  dom_sid_str_buf(&state->sid, &buf),
-				  nt_errstr(status));
-		}
+		D_WARNING("Could not convert sid %s: %s\n",
+			  dom_sid_str_buf(&state->sid, &buf),
+			  nt_errstr(status));
 		return status;
 	}
 	response->data.pw = state->pw;
