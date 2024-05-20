@@ -21,7 +21,6 @@
 #include "winbindd.h"
 #include "libcli/security/dom_sid.h"
 #include "lib/util/string_wrappers.h"
-#include "passdb/machine_sid.h"
 
 struct winbindd_getgrnam_state {
 	struct tevent_context *ev;
@@ -136,10 +135,7 @@ static void winbindd_getgrnam_lookupname_done(struct tevent_req *subreq)
 		tevent_req_nterror(req, NT_STATUS_NO_SUCH_GROUP);
 		return;
 	}
-	if (dom_sid_compare_domain(&state->sid, get_global_sam_sid()) == 0) {
-		tevent_req_nterror(req, NT_STATUS_NO_SUCH_GROUP);
-		return;
-	}
+
 	subreq = wb_getgrsid_send(state, state->ev, &state->sid,
 				  lp_winbind_expand_groups());
 	if (tevent_req_nomem(subreq, req)) {
@@ -176,11 +172,9 @@ NTSTATUS winbindd_getgrnam_recv(struct tevent_req *req,
 
 	if (tevent_req_is_nterror(req, &status)) {
 		struct dom_sid_buf sidbuf;
-		if (!is_null_sid(&state->sid)) {
-			D_WARNING("Could not convert sid %s: %s\n",
-				  dom_sid_str_buf(&state->sid, &sidbuf),
-				  nt_errstr(status));
-		}
+		D_WARNING("Could not convert sid %s: %s\n",
+			  dom_sid_str_buf(&state->sid, &sidbuf),
+			  nt_errstr(status));
 		return status;
 	}
 
