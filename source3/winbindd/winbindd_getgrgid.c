@@ -20,7 +20,6 @@
 #include "includes.h"
 #include "winbindd.h"
 #include "libcli/security/dom_sid.h"
-#include "passdb/machine_sid.h"
 
 struct winbindd_getgrgid_state {
 	struct tevent_context *ev;
@@ -81,8 +80,7 @@ static void winbindd_getgrgid_gid2sid_done(struct tevent_req *subreq)
 	if (tevent_req_nterror(req, status)) {
 		return;
 	}
-	if (is_null_sid(state->sid) ||
-	    (dom_sid_compare_domain(state->sid, get_global_sam_sid()) == 0)) {
+	if (is_null_sid(state->sid)) {
 		tevent_req_nterror(req, NT_STATUS_NO_SUCH_GROUP);
 		return;
 	}
