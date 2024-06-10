@@ -132,6 +132,43 @@ static bool lp_scan_idmap_found_domain(
 static bool idmap_found_domain_backend(const char *domname,
 				       void *private_data);
 
+static bool idmap_init_default_domain(void)
+{
+	if (default_idmap_domain != NULL) {
+		return true;
+	}
+
+	if (!pdb_is_responsible_for_everything_else()) {
+		default_idmap_domain = idmap_init_named_domain(NULL, "*");
+		if (default_idmap_domain == NULL) {
+			return false;
+		}
+	}
+
+	passdb_idmap_domain = idmap_init_domain(
+		NULL, get_global_sam_name(), "passdb", false);
+
+	if (passdb_idmap_domain == NULL) {
+		TALLOC_FREE(default_idmap_domain);
+		return false;
+	}
+	idmap_domains = talloc_array(NULL, struct idmap_domain *, 0);
+
+	if (idmap_domains == NULL) {
+		TALLOC_FREE(passdb_idmap_domain);
+		TALLOC_FREE(default_idmap_domain);
+		return false;
+	}
+
+	ok = lp_scan_idmap_domains(idmap_found_domain_backend, NULL);
+	if (!ok) {
+		DBG_WARNING("lp_scan_idmap_domains failed\n");
+		return false;
+	}
+
+	return true;
+}
+
 static bool idmap_init(void)
 {
 	static bool initialized;
@@ -147,34 +184,7 @@ static bool idmap_init(void)
 
 	initialized = true;
 
-	if (!pdb_is_responsible_for_everything_else()) {
-		default_idmap_domain = idmap_init_named_domain(NULL, "*");
-		if (default_idmap_domain == NULL) {
-			return false;
-		}
-	}
-
-	passdb_idmap_domain = idmap_init_domain(
-		NULL, get_global_sam_name(), "passdb", false);
-	if (passdb_idmap_domain == NULL) {
-		TALLOC_FREE(default_idmap_domain);
-		return false;
-	}
-
-	idmap_domains = talloc_array(NULL, struct idmap_domain *, 0);
-	if (idmap_domains == NULL) {
-		TALLOC_FREE(passdb_idmap_domain);
-		TALLOC_FREE(default_idmap_domain);
-		return false;
-	}
-
-	ok = lp_scan_idmap_domains(idmap_found_domain_backend, NULL);
-	if (!ok) {
-		DBG_WARNING("lp_scan_idmap_domains failed\n");
-		return false;
-	}
-
-	return true;
+	return idmap_init_default_domain();
 }
 
 static int idmap_config_name(const char *domname, char *buf, size_t buflen)
@@ -613,6 +623,9 @@ NTSTATUS idmap_backend_unixids_to_sids(struct id_map **maps,
 	}
 
 	if (strequal(domain_name, get_global_sam_name())) {
+		if (passdb_idmap_domain == NULL) {
+			SMB_ASSERT(idmap_init_default_domain());
+		}
 		dom = passdb_idmap_domain;
 	}
 	if (dom == NULL) {
