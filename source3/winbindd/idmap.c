@@ -134,6 +134,8 @@ static bool idmap_found_domain_backend(const char *domname,
 
 static bool idmap_init_default_domain(void)
 {
+	bool ok;
+
 	if (default_idmap_domain != NULL) {
 		return true;
 	}
