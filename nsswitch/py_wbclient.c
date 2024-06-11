@@ -200,6 +200,14 @@ static PyObject *py_wbc_getboth(PyObject *obj, PyObject *args)
 static PyObject *py_id_info(PyObject *obj, PyObject *args)
 {
 	py_uid_gid *self = (py_uid_gid *)obj;
+	if (self->wbclient->ctx == NULL) {
+		PyErr_SetString(
+			PyExc_RuntimeError,
+			"winbind client connection closed"
+		);
+		return NULL;
+	}
+
 	return self->id_info_fn(obj, args);
 }
 
@@ -455,6 +463,14 @@ static PyObject *wbclient_domain_users(PyObject *obj, PyObject *args)
 	PyObject *pyusers = NULL;
 	py_wbdomain *self = (py_wbdomain *)obj;
 
+	if (self->wbclient->ctx == NULL) {
+		PyErr_SetString(
+			PyExc_RuntimeError,
+			"winbind client connection closed"
+		);
+		return NULL;
+	}
+
 	wbc_status = wbcCtxListUsers(
 		self->wbclient->ctx, self->domain, &num_users, &users
 	);
@@ -476,6 +492,14 @@ static PyObject *wbclient_domain_groups(PyObject *obj, PyObject *args)
 	PyObject *pygroups = NULL;
 	py_wbdomain *self = (py_wbdomain *)obj;
 
+	if (self->wbclient->ctx == NULL) {
+		PyErr_SetString(
+			PyExc_RuntimeError,
+			"winbind client connection closed"
+		);
+		return NULL;
+	}
+
 	wbc_status = wbcCtxListGroups(
 		self->wbclient->ctx, self->domain, &num_groups, &groups
 	);
@@ -494,6 +518,14 @@ static PyObject *wbclient_check_secret(PyObject *obj, PyObject *args)
 	wbcErr wbc_status = WBC_ERR_UNKNOWN_FAILURE;
 	struct wbcAuthErrorInfo *error = NULL;
 	py_wbdomain *self = (py_wbdomain *)obj;
+
+	if (self->wbclient->ctx == NULL) {
+		PyErr_SetString(
+			PyExc_RuntimeError,
+			"winbind client connection closed"
+		);
+		return NULL;
+	}
 
 	wbc_status = wbcCtxCheckTrustCredentials(
 		self->wbclient->ctx, self->domain, &error);
@@ -530,6 +562,14 @@ static PyObject *wbclient_ping_dc(PyObject *obj, PyObject *args)
 	char *dc_name = NULL;
 	py_wbdomain *self = (py_wbdomain *)obj;
 	PyObject *out = NULL;
+
+	if (self->wbclient->ctx == NULL) {
+		PyErr_SetString(
+			PyExc_RuntimeError,
+			"winbind client connection closed"
+		);
+		return NULL;
+	}
 
 	wbc_status = wbcCtxPingDc2(
 		self->wbclient->ctx, self->domain, &error, &dc_name
@@ -722,6 +762,14 @@ static PyObject *wbclient_domain_info(PyObject *obj, PyObject *argsunused)
 	PyObject *out = NULL;
 	struct wbcDomainInfo *dinfo = NULL;
 
+	if (self->wbclient->ctx == NULL) {
+		PyErr_SetString(
+			PyExc_RuntimeError,
+			"winbind client connection closed"
+		);
+		return NULL;
+	}
+
 	wbc_status = wbcCtxDomainInfo(
 		self->wbclient->ctx, self->domain, &dinfo
 	);
@@ -775,6 +823,14 @@ static PyObject *wbclient_dc_name(PyObject *obj, PyObject *argsunused)
 	 * NOTE: wbcCtxDcInfo retieves current DC from gencache
 	 * and so there will be at most one DC in the response.
 	 */
+	if (self->wbclient->ctx == NULL) {
+		PyErr_SetString(
+			PyExc_RuntimeError,
+			"winbind client connection closed"
+		);
+		return NULL;
+	}
+
 	wbc_status = wbcCtxDcInfo(
 		self->wbclient->ctx, self->domain,
 		&num_dcs, &dc_names, &dc_ips
@@ -960,6 +1016,14 @@ static PyObject *wbclient_iter_domains(struct domain_iter_info *iter_info)
 	struct wbcDomainInfo *domain_list = NULL;
 	PyObject *out = NULL;
 
+	if (iter_info->client->ctx == NULL) {
+		PyErr_SetString(
+			PyExc_RuntimeError,
+			"winbind client connection closed"
+		);
+		return NULL;
+	}
+
 	wbc_status = wbcCtxListTrusts(
 		iter_info->client->ctx, &domain_list, &num_domains
 	);
@@ -1137,6 +1201,14 @@ static PyObject *py_sids_to_xids(py_wbclient *client,
 	PyObject *unmapped = NULL;
 	int i;
 
+	if (client->ctx == NULL) {
+		PyErr_SetString(
+			PyExc_RuntimeError,
+			"winbind client connection closed"
+		);
+		return NULL;
+	}
+
 	unix_ids = calloc(num_sids, sizeof(struct wbcUnixId));
 	if (unix_ids == NULL) {
 		return PyErr_NoMemory();
@@ -1205,6 +1277,14 @@ static PyObject *wbclient_sids_to_xids(PyObject *obj, PyObject *args)
 	int num_sids = 0;
 	struct wbcDomainSid *sids = NULL;
 	bool ok;
+
+	if (self->ctx == NULL) {
+		PyErr_SetString(
+			PyExc_RuntimeError,
+			"winbind client connection closed"
+		);
+		return NULL;
+	}
 
 	if (!PyArg_ParseTuple(args, "O", &pysidlist)) {
 		return NULL;
@@ -1370,6 +1450,14 @@ static PyObject *xidlist_to_pysids(py_wbclient *client,
 	PyObject *mapped = NULL;
 	PyObject *unmapped = NULL;
 
+	if (self->ctx == NULL) {
+		PyErr_SetString(
+			PyExc_RuntimeError,
+			"winbind client connection closed"
+		);
+		return NULL;
+	}
+
 	sids = calloc((size_t)cnt, sizeof(struct wbcDomainSid));
 	if (sids == NULL) {
 		return NULL;
@@ -1443,6 +1531,14 @@ static PyObject *wbclient_xids_to_sids(PyObject *obj, PyObject *args)
 	struct wbcUnixId *xids = NULL;
 	bool ok;
 
+	if (self->ctx == NULL) {
+		PyErr_SetString(
+			PyExc_RuntimeError,
+			"winbind client connection closed"
+		);
+		return NULL;
+	}
+
 	if (!PyArg_ParseTuple(args, "O", &pyxidlist)) {
 		return NULL;
 	}
@@ -1487,6 +1583,14 @@ static bool name_to_unixid_and_sid(py_wbclient *self,
 	char user[256] = { 0 };
 	char domain[256] = { 0 };
 	char *p = NULL;
+
+	if (self->ctx == NULL) {
+		PyErr_SetString(
+			PyExc_RuntimeError,
+			"winbind client connection closed"
+		);
+		return NULL;
+	}
 
 	p = strchr(full_name, self->iface_details->winbind_separator);
 	if (p == NULL) {
@@ -1541,6 +1645,14 @@ static PyObject *wbclient_lookup_name(PyObject *obj, PyObject *args)
 	struct wbcUnixId *xid = NULL;
 	char sidstr[WBC_SID_STRING_BUFLEN] = { 0 };
 
+	if (self->ctx == NULL) {
+		PyErr_SetString(
+			PyExc_RuntimeError,
+			"winbind client connection closed"
+		);
+		return NULL;
+	}
+
 	if (!PyArg_ParseTuple(args, "s", &full_name)) {
 		return NULL;
 	}
@@ -1553,6 +1665,27 @@ static PyObject *wbclient_lookup_name(PyObject *obj, PyObject *args)
 	out = unixid_to_py(self, xid, sidstr);
 	free(xid);
 	return out;
+}
+
+static PyObject *wbclient_close_impl(py_wbclient *self)
+{
+	if (self->ctx != NULL) {
+		wbCtxFree(self->ctx);
+		self->ctx = NULL;
+	}
+
+	Py_RETURN_NONE;
+}
+
+static PyObject *wbclient__enter__(PyObject *self, PyObject *args)
+{
+	Py_INCREF(self);
+	return self;
+}
+
+static PyObject *wbclient__exit__(PyObject *self, PyObject *args)
+{
+	return wbclient_close_impl((py_wbclient *)self);
 }
 
 static PyMethodDef wbclient_object_methods[] = {
@@ -1585,6 +1718,22 @@ static PyMethodDef wbclient_object_methods[] = {
 		.ml_meth = (PyCFunction)wbclient_get_domain,
 		.ml_flags = METH_VARARGS,
 		.ml_doc = "Get specified domain (defaults to own domain)"
+	},
+	{
+		.ml_name = "close",
+		.ml_meth = (PyCFunction)wbclient_close_impl,
+		.ml_flags = METH_VARARGS,
+		.ml_doc = "Close the underlying winbind client connection"
+	},
+	{
+		.ml_name = "__enter__",
+		.ml_meth = (PyCFunction)wbclient__enter__,
+		.ml_flags = METH_NOARGS,
+	},
+	{
+		.ml_name = "__exit__",
+		.ml_meth = (PyCFunction)wbclient__exit__,
+		.ml_flags = METH_VARARGS,
 	},
 	{ NULL, NULL, 0, NULL }
 };
@@ -1697,9 +1846,8 @@ static void py_wbclient_dealloc(py_wbclient *self)
 	wbcFreeMemory(self->iface_details);
 	self->iface_details = NULL;
 
-	wbcCtxFree(self->ctx);
-	self->ctx = NULL;
-        Py_TYPE(self)->tp_free((PyObject *)self);
+	wbclient_close_impl(self);
+	Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
 static PyTypeObject PyWbclient = {
