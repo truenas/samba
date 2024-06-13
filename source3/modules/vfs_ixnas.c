@@ -583,7 +583,12 @@ static bool smbace2zfsentry(zfsacl_t zfsacl, SMB_ACE4PROP_T *aceprop)
 	} else if (aceprop->aceType == SMB_ACE4_ACCESS_DENIED_ACE_TYPE) {
 		entry_type = ZFSACL_ENTRY_TYPE_DENY;
 	} else {
-		smb_panic("Unsupported ace type.");
+		// Some clients may request to set ACCESS_ALLOWED_OBJECT_ACE and
+		// ACCESS_DENIED_OBJECT_ACE. Reject entire ACL and present error
+		// to client.
+		DBG_ERR("Unsupported ACE type %d, rejecting ACL\n", aceprop->aceType);
+		errno = EINVAL;
+		return false;
 	}
 
 	if (aceprop->flags & SMB_ACE4_ID_SPECIAL) {
