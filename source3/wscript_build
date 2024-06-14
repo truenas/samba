@@ -384,6 +384,7 @@ bld.SAMBA3_SUBSYSTEM('samba3core',
                           lib/idmap_cache.c
                           lib/namemap_cache.c
                           lib/util_ea.c
+                          lib/util_unixsids.c
                           lib/background.c
                           ''',
                    deps='''
