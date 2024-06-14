@@ -18,9 +18,16 @@
 
 #include "includes.h"
 #include "lib/util/tevent_unix.h"
+
+#ifdef HAVE_EPOLL
+#include "lib/tevent/tevent_libaio.h"
+#include "libaio.h"
+#else
 #include "lib/tevent/tevent_kqueue.h"
-#include "smbd/smbd.h"
 #include <aio.h>
+#endif /*HAVE_EPOLL*/
+
+#include "smbd/smbd.h"
 
 static struct tevent_req *vfs_aio_fbsd_pread_send(struct vfs_handle_struct *handle,
 					     TALLOC_CTX *mem_ctx,
@@ -32,7 +39,7 @@ static struct tevent_req *vfs_aio_fbsd_pread_send(struct vfs_handle_struct *hand
 	int ret;
 	struct tevent_req *req = NULL;
 	struct tevent_aiocb *taiocbp = NULL;
-	struct aiocb *iocbp = NULL;
+	iocb_t *iocbp = NULL;
 
 	req = tevent_req_create(mem_ctx, &taiocbp, struct tevent_aiocb);
 	if (req == NULL) {
@@ -42,10 +49,11 @@ static struct tevent_req *vfs_aio_fbsd_pread_send(struct vfs_handle_struct *hand
 	taiocbp->req = req;
 
 	iocbp = tevent_ctx_get_iocb(taiocbp);
-	iocbp->aio_fildes = fsp_get_io_fd(fsp);
-	iocbp->aio_offset = offset;
-	iocbp->aio_buf = data;
-	iocbp->aio_nbytes = n;
+	tio_prep_pread(iocbp,
+		       fsp_get_io_fd(fsp),
+		       data,
+		       n,
+		       offset);
 
 	ret = tevent_add_aio_read(taiocbp);
 	if (ret != 0) {
@@ -82,7 +90,7 @@ static struct tevent_req *vfs_aio_fbsd_pwrite_send(struct vfs_handle_struct *han
 	int ret;
 	struct tevent_req *req = NULL;
 	struct tevent_aiocb *taiocbp = NULL;
-	struct aiocb *iocbp = NULL;
+	iocb_t *iocbp = NULL;
 
 	req = tevent_req_create(mem_ctx, &taiocbp, struct tevent_aiocb);
 	if (req == NULL) {
@@ -92,10 +100,11 @@ static struct tevent_req *vfs_aio_fbsd_pwrite_send(struct vfs_handle_struct *han
 	taiocbp->req = req;
 
 	iocbp = tevent_ctx_get_iocb(taiocbp);
-	iocbp->aio_fildes = fsp_get_io_fd(fsp);
-	iocbp->aio_offset = offset;
-	iocbp->aio_buf = discard_const(data);
-	iocbp->aio_nbytes = n;
+	tio_prep_pwrite(iocbp,
+			fsp_get_io_fd(fsp),
+			discard_const(data),
+			n,
+			offset);
 
 	ret = tevent_add_aio_write(taiocbp);
 	if (ret != 0) {
@@ -122,7 +131,7 @@ static struct tevent_req *vfs_aio_fbsd_fsync_send(struct vfs_handle_struct *hand
 	int ret;
 	struct tevent_req *req = NULL;
 	struct tevent_aiocb *taiocbp = NULL;
-	struct aiocb *iocbp = NULL;
+	iocb_t *iocbp = NULL;
 
 	req = tevent_req_create(mem_ctx, &taiocbp, struct tevent_aiocb);
 	if (req == NULL) {
@@ -132,7 +141,8 @@ static struct tevent_req *vfs_aio_fbsd_fsync_send(struct vfs_handle_struct *hand
 	taiocbp->req = req;
 
 	iocbp = tevent_ctx_get_iocb(taiocbp);
-	iocbp->aio_fildes = fsp_get_io_fd(fsp);
+
+	tio_prep_fsync(iocbp, fsp_get_io_fd(fsp));
 
 	ret = tevent_add_aio_fsync(taiocbp);
 	if (ret != 0) {

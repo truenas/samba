@@ -3,7 +3,7 @@
 
    main select loop and event handling - kqueue implementation
 
-   Copyright (C) iXsystems		2020
+   Copyright (C) iXsystems		2023
 
      ** NOTE! The following LGPL license applies to the tevent
      ** library. This does NOT imply that all of Samba is released
@@ -22,9 +22,11 @@
    You should have received a copy of the GNU Lesser General Public
    License along with this library; if not, see <http://www.gnu.org/licenses/>.
 */
-#include <aio.h>
+#include <liburing.h>
 
-typedef struct aiocb iocb_t;
+typedef struct io_uring_sqe iocb_t;
+
+enum taiocb_state { TAIO_INIT, TAIO_RUNNING, TAIO_COMPLETE, TAIO_CANCELLED };
 
 struct tevent_aiocb {
 	const char *location;
@@ -33,6 +35,7 @@ struct tevent_aiocb {
 	iocb_t *iocbp;
 	int saved_errno;
 	int rv;
+	enum taiocb_state state;
 };
 
 int _tevent_add_aio_read(struct tevent_aiocb *taiocb, const char *location);
@@ -47,33 +50,27 @@ int _tevent_add_aio_fsync(struct tevent_aiocb *taiocb, const char *location);
 #define tevent_add_aio_fsync(taiocb)\
         (int)_tevent_add_aio_fsync(taiocb, __location__)
 
-struct aiocb *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb);
+iocb_t *tevent_ctx_get_iocb(struct tevent_aiocb *taiocb);
 
 static inline void tio_prep_pread(iocb_t *iocbp,
-				  int fd,
-				  void *buf,
-				  size_t count,
-				  long long offset)
+                                  int fd,
+                                  void *buf,
+                                  size_t count,
+                                  long long offset)
 {
-        iocbp->aio_fildes = fd;
-        iocbp->aio_offset = offset;
-        iocbp->aio_buf = buf;
-        iocbp->aio_nbytes = count;
+	return io_uring_prep_read(iocbp, fd, buf, count, offset);
 }
 
 static inline void tio_prep_pwrite(iocb_t *iocbp,
-				   int fd,
-				   void *buf,
-				   size_t count,
-				   long long offset)
+                                   int fd,
+                                   void *buf,
+                                   size_t count,
+                                   long long offset)
 {
-        iocbp->aio_fildes = fd;
-        iocbp->aio_offset = offset;
-        iocbp->aio_buf = buf;
-        iocbp->aio_nbytes = count;
+	return io_uring_prep_write(iocbp, fd, buf, count, offset);
 }
 
 static inline void tio_prep_fsync(iocb_t *iocbp, int fd)
 {
-        iocbp->aio_fildes = fd;
+	return io_uring_prep_fsync(iocbp, fd, 0);
 }
