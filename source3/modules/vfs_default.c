@@ -715,17 +715,6 @@ static int vfswrap_openat(vfs_handle_struct *handle,
 				 &linux_how,
 				 sizeof(linux_how));
 		if (result == -1) {
-			if (errno == ENOSYS) {
-				/*
-				 * The kernel doesn't support
-				 * openat2(), so indicate to
-				 * the callers that
-				 * VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS
-				 * would just be a waste of time.
-				 */
-				fsp->conn->open_how_resolve &=
-					~VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS;
-			}
 			goto out;
 		}
 
