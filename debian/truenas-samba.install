@@ -1,6 +1,7 @@
 #!/usr/bin/dh-exec --with-scripts=filter-arch
 [linux-any] lib/systemd/system/ctdb.service
 [linux-any] lib/systemd/system/nmbd.service
+[linux-any] lib/systemd/system/samba-bgqd.service
 [linux-any] lib/systemd/system/smbd.service
 [linux-any] lib/systemd/system/winbind.service
 [linux-any] lib/systemd/system/wsdd.service
@@ -18,7 +19,6 @@ usr/bin/dumpmscat
 usr/bin/gentest
 usr/bin/smbspool
 usr/bin/ldbdel
-usr/bin/smb.addshare.py
 usr/bin/smbpasswd
 usr/bin/smbtar
 usr/bin/tdbdump
@@ -55,10 +55,10 @@ usr/bin/smbcontrol
 usr/bin/samba-log-parser
 usr/bin/samba-regedit
 usr/bin/ldbedit
-usr/bin/smb.delshare.py
 usr/bin/ltdbtool
 usr/bin/pdbedit
 usr/bin/nmblookup
+usr/bin/wspsearch
 usr/sbin/smbd
 usr/sbin/ctdbd
 usr/sbin/winbindd
