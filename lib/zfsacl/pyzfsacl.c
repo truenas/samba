@@ -846,7 +846,8 @@ static int py_acl_init(PyObject *obj,
 	char *aclbrand = NULL;
 
 	if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|isi",
-					 kwnames, &fd, &path, &brand)) {
+					 discard_const_p(char *, kwnames),
+					 &fd, &path, &brand)) {
 		return -1;
 	}
 
@@ -1236,7 +1237,9 @@ static PyObject *py_acl_set(PyObject *obj, PyObject *args, PyObject *kwargs)
 	const char *kwnames [] = { "fd", "path", NULL };
 
 	ok = PyArg_ParseTupleAndKeywords(
-		args, kwargs, "|is", kwnames, &fd, &path
+		args, kwargs, "|is",
+		discard_const_p(char *, kwnames),
+		&fd, &path
 	);
 
 	if (!ok) {
@@ -1388,7 +1391,7 @@ static PyObject *py_acl_inherit(PyObject *obj, PyObject *args, PyObject *kwargs)
 	const char *kwnames [] = { "is_dir", NULL };
 
 	ok = PyArg_ParseTupleAndKeywords(
-		args, kwargs, "|bO", kwnames, &isdir
+		args, kwargs, "|bO", discard_const_p(char *, kwnames), &isdir
 	);
 
 	if (!ok) {

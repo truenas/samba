@@ -236,7 +236,7 @@ static bool zfs_process_smbacl(vfs_handle_struct *handle, files_struct *fsp,
 #ifdef O_PATH
 	if (fsp->fsp_flags.is_pathref) {
 		const char *proc_fd_path = NULL;
-		char buf[PATH_MAX];
+		struct sys_proc_fd_path_buf buf;
 
 		if (!fsp->fsp_flags.have_proc_fds) {
 			DBG_ERR("fdescfs filesystem must be mounted with 'nodup' "
@@ -246,7 +246,7 @@ static bool zfs_process_smbacl(vfs_handle_struct *handle, files_struct *fsp,
 		}
 
 		fd = fsp_get_pathref_fd(fsp);
-		proc_fd_path = sys_proc_fd_path(fd, buf, sizeof(buf));
+		proc_fd_path = sys_proc_fd_path(fd, &buf);
 		if (proc_fd_path == NULL) {
 			DBG_ERR("%s: failed to generate pathref fd for %d\n",
 				fsp_str_dbg(fsp), fd);
@@ -353,7 +353,7 @@ static int fget_zfsacl(TALLOC_CTX *mem_ctx,
 #ifdef O_PATH
 	if (fsp->fsp_flags.is_pathref) {
 		const char *proc_fd_path = NULL;
-		char buf[PATH_MAX];
+		struct sys_proc_fd_path_buf buf;
 		struct smb_filename smb_fname;
 
 		if (!fsp->fsp_flags.have_proc_fds) {
@@ -364,7 +364,7 @@ static int fget_zfsacl(TALLOC_CTX *mem_ctx,
 		}
 
 		fd = fsp_get_pathref_fd(fsp);
-		proc_fd_path = sys_proc_fd_path(fd, buf, sizeof(buf));
+		proc_fd_path = sys_proc_fd_path(fd, &buf);
 		if (proc_fd_path == NULL) {
 			DBG_ERR("%s: failed to generate pathref fd for %d\n",
 				fsp_str_dbg(fsp), fd);

@@ -269,12 +269,12 @@ static bool get_history_full_path(int _fd, struct tmprotect_config_data *config)
 	 * path via procfs
 	 */
 	const char *p = NULL;
-	char procfd_buf[35]; // /proc/self/fd/<fd number>
+	struct sys_proc_fd_path_buf procfd_buf;
 	char buf[PATH_MAX];
 	int fd;
 	ssize_t sz;
 
-	p = sys_proc_fd_path(_fd, procfd_buf, sizeof(procfd_buf));
+	p = sys_proc_fd_path(_fd, &procfd_buf);
 	SMB_ASSERT(p != NULL);
 
 	sz = readlink(p, buf, sizeof(buf));
