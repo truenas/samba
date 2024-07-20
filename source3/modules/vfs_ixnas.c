@@ -103,9 +103,9 @@ static int ixnas_pathref_reopen(const files_struct *fsp, int flags)
 {
 	int fd_out = -1;
 	const char *p = NULL;
-	char buf[PATH_MAX];
+	struct sys_proc_fd_path_buf buf;
 
-	p = sys_proc_fd_path(fsp_get_pathref_fd(fsp), buf, sizeof(buf));
+	p = sys_proc_fd_path(fsp_get_pathref_fd(fsp), &buf);
 	if (p == NULL) {
 		errno = EBADF;
 		return fd_out;
@@ -354,7 +354,7 @@ static zfsacl_t fsp_get_zfsacl(files_struct *fsp)
 {
 	int fd;
 	const char *proc_fd_path = NULL;
-	char buf[PATH_MAX];
+	struct sys_proc_fd_path_buf buf;
 
 	if (!fsp->fsp_flags.is_pathref) {
 		return zfsacl_get_fd(fsp_get_io_fd(fsp), ZFSACL_BRAND_NFSV4);
@@ -363,7 +363,7 @@ static zfsacl_t fsp_get_zfsacl(files_struct *fsp)
 	SMB_ASSERT(fsp->fsp_flags.have_proc_fds);
 
 	fd = fsp_get_pathref_fd(fsp);
-	proc_fd_path = sys_proc_fd_path(fd, buf, sizeof(buf));
+	proc_fd_path = sys_proc_fd_path(fd, &buf);
 	if (proc_fd_path == NULL) {
 		return NULL;
 	}
@@ -375,7 +375,7 @@ static bool fsp_set_zfsacl(files_struct *fsp, zfsacl_t zfsacl)
 {
 	int fd;
 	const char *proc_fd_path = NULL;
-	char buf[PATH_MAX];
+	struct sys_proc_fd_path_buf buf;
 
 	if (!fsp->fsp_flags.is_pathref) {
 		return zfsacl_set_fd(fsp_get_io_fd(fsp), zfsacl);
@@ -384,7 +384,7 @@ static bool fsp_set_zfsacl(files_struct *fsp, zfsacl_t zfsacl)
 	SMB_ASSERT(fsp->fsp_flags.have_proc_fds);
 
 	fd = fsp_get_pathref_fd(fsp);
-	proc_fd_path = sys_proc_fd_path(fd, buf, sizeof(buf));
+	proc_fd_path = sys_proc_fd_path(fd, &buf);
 	if (proc_fd_path == NULL) {
 		errno = EBADF;
 		return -1;
@@ -1535,9 +1535,9 @@ static int fsp_set_times(files_struct *fsp, struct timespec *times, bool set_bti
 	if (fsp->fsp_flags.have_proc_fds) {
 		int fd = fsp_get_pathref_fd(fsp);
 		const char *p = NULL;
-		char buf[PATH_MAX];
+		struct sys_proc_fd_path_buf buf;
 
-		p = sys_proc_fd_path(fd, buf, sizeof(buf));
+		p = sys_proc_fd_path(fd, &buf);
 		if (p != NULL) {
 			return utimensat(AT_FDCWD, p, times, 0);
                 }

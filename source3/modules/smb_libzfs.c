@@ -1494,7 +1494,7 @@ struct zfs_dataset *_smb_zfs_fd_get_dataset(TALLOC_CTX *mem_ctx,
 	return dsout;
 }
 
-static bool check_pattern(const char **pattern, const char *snap_name)
+static bool check_pattern(char **pattern, const char *snap_name)
 {
 	const char **to_check = NULL;
 	bool match = false;
