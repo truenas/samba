@@ -83,6 +83,7 @@ elif [ "$DISABLE_NETBIOS" = Yes ]; then
     mask_services "NetBIOS is disabled" nmbd.service
 fi
 
+mask_services "Masking samba-bgqd service" samba-bgqd.service
 #DEBHELPER#
 
 exit 0
