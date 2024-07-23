@@ -43,7 +43,7 @@ conf_args = \
 		--with-winbind \
 		--without-ad-dc \
 		--with-quotas \
-		--with-shared-modules=idmap_rid,idmap_ad,idmap_ldap,idmap_tdb2,auth_samba4,vfs_nfs4acl_xattr \
+		--with-shared-modules=idmap_rid,idmap_ad,idmap_ldap,auth_samba4,vfs_nfs4acl_xattr \
 		--with-automount \
 		--with-ldap \
 		--with-ads \
@@ -54,7 +54,7 @@ conf_args = \
 		--with-lockdir=/var/run/samba-lock \
 		--with-cachedir=/var/run/samba-cache \
 		--with-libzfs \
-                --with-profiling-data \
+		--with-profiling-data \
 		--disable-avahi \
 		--disable-rpath \
 		--disable-rpath-install \
@@ -66,7 +66,8 @@ conf_args = \
 		--enable-etcd-reclock \
 		--disable-cups \
 		--disable-iprint \
-                --disable-cephfs
+		--vendor-name=truenas \
+		--disable-cephfs
 
 ifeq ($(DEB_HOST_ARCH_OS), linux)
 	conf_args += \
