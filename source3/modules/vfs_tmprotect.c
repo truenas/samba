@@ -194,7 +194,7 @@ static FILE *open_history(const char *history_path)
 	fd = openat2(AT_FDCWD, history_path, &how, sizeof(how));
 
 #else
-	fd = openat(AT_FDCWD, history_path, O_RDONLY | O_RESOLVE_BENEATH);
+	fd = openat(AT_FDCWD, history_path, O_RDONLY);
 #endif
 	if (fd == -1) {
 		DBG_ERR("%s: failed to open history path: %s\n",
@@ -267,6 +267,7 @@ out:
 	return success;
 }
 
+#ifndef FREEBSD
 static bool get_history_full_path(int _fd, struct tmprotect_config_data *config)
 {
 	/*
@@ -294,6 +295,23 @@ static bool get_history_full_path(int _fd, struct tmprotect_config_data *config)
 	}
 	return true;
 }
+
+#else
+
+static bool get_history_full_path(const char *connectpath,
+				  const struct files_struct *fsp,
+				  struct tmprotect_config_data *config)
+{
+	config->history_file = talloc_asprintf(config, "%s/%s",
+					       connectpath,
+					       fsp->fsp_name->base_name);
+	if (config->history_file == NULL) {
+		return false;
+	}
+
+	return true;
+}
+#endif
 
 static int tmprotect_openat(vfs_handle_struct *handle,
                             const struct files_struct *dirfsp,
@@ -334,7 +352,11 @@ static int tmprotect_openat(vfs_handle_struct *handle,
 		return ret;
 	}
 
+#ifndef FREEBSD
 	ok = get_history_full_path(ret, config);
+#else
+	ok = get_history_full_path(handle->conn->connectpath, fsp, config);
+#endif
 	if (!ok) {
 		DBG_ERR("%s at %s: failed to open history file: %s\n",
 			smb_fname_str_dbg(smb_fname), fsp_str_dbg(dirfsp),
