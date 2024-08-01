@@ -257,17 +257,10 @@ static void zcache_remove_dataset(dev_t dev_id)
 	DS_UNLOCK();
 }
 
-static int dataset_destructor(dataset_t *ds)
-{
-	zcache_remove_dataset(ds->ds->devid);
-	return 0;
-}
-
 static void add_to_global_datasets(dataset_t *ds)
 {
 	DS_LOCK();
 	zcache_add_dataset(ds);
-	talloc_set_destructor(ds, dataset_destructor);
 	DS_UNLOCK();
 }
 
