@@ -35,6 +35,7 @@
 #define GMT_NAME_LEN 24 /* length of a @GMT- name */
 
 #define SHADOW_COPY_ZFS_SNAP_DIR ".zfs/snapshot"
+#define MAX_SNAPSHOT_COUNT 512
 
 /*
  * This module does the following:
@@ -1337,7 +1338,7 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 		mpoffset = handle->conn->connectpath + mplen + 1;
 	}
 
-	for (entry = snapshots->entries; entry; entry = entry->next) {
+	for (entry = snapshots->entries; entry && idx < MAX_SNAPSHOT_COUNT; entry = entry->next) {
 		/*
 		 * Directories should always be added if they exist in the
 		 * snapshot. Files only be added if mtime differs.
