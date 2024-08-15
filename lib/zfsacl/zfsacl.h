@@ -65,7 +65,7 @@ typedef unsigned int zfsacl_aclflags_t;
 
 #define ZFSACL_UNDEFINED_ID	((uid_t)-1)
 #define ZFSACL_APPEND_ENTRY	-1
-#define ZFSACL_MAX_ENTRIES	64
+#define ZFSACL_MAX_ENTRIES	1024
 
 bool zfsacl_set_fd(int _fd, zfsacl_t _acl);
 bool zfsacl_set_file(const char *_path_p, zfsacl_t _acl);
