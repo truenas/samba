@@ -729,6 +729,10 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 		return ret;
 	}
 
+	if (config->ds->properties->casesens == SMBZFS_INSENSITIVE) {
+		handle->conn->internal_tcon_flags |= TCON_FLAG_CASE_INSENSTIVE_FS;
+	}
+
 	base_quota_str = lp_parm_const_string(SNUM(handle->conn),
 			"zfs_core", "base_user_quota", NULL);
 
