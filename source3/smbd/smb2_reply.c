@@ -1494,7 +1494,8 @@ NTSTATUS rename_internals_fsp(connection_struct *conn,
 	 * don't do the rename, just return success.
 	 */
 
-	if (strcsequal(fsp->fsp_name->base_name, smb_fname_dst->base_name) &&
+	if ((conn->internal_tcon_flags & TCON_FLAG_CASE_INSENSTIVE_FS) == 0 &&
+	    strcsequal(fsp->fsp_name->base_name, smb_fname_dst->base_name) &&
 	    strcsequal(fsp->fsp_name->stream_name,
 		       smb_fname_dst->stream_name)) {
 		DBG_NOTICE("identical names in rename %s "
