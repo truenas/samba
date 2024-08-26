@@ -76,6 +76,7 @@ usr/share/ctdb/events/legacy/*.script
 lib/*/libnss_winbind.so.2
 lib/*/libnss_wins.so.2
 lib/*/security/pam_winbind.so
+lib/*/security/pam_tdb.so
 usr/share/pam-configs/winbind
 usr/lib/*/samba/*
 usr/include/samba-4.0/libsmbclient.h

@@ -127,6 +127,7 @@ def build(bld):
         bld.SAMBA_LIBRARY('tdb',
                           COMMON_SRC,
                           deps=tdb_deps,
+                          provide_builtin_linking=True,
                           includes='include',
                           abi_directory='ABI',
                           abi_match='tdb_*',
