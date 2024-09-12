@@ -415,7 +415,6 @@ static bool _pam_tdb_lookup_algo(const char *algo_name, pam_tdb_algo_t **out)
 
 #define MIN_KEY_LEN 64
 #define MIN_SALT_LEN 16	// SP 800-132 5.1
-#define MIN_ITER 500000 // SP 800-132 5.2 specifies 1K, our legacy API keys have 26K
 #define HASH_SEPARATOR "$"
 
 /*
