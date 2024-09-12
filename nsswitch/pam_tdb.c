@@ -357,7 +357,7 @@ static bool _pam_tdb_userhash_get_salt(struct ptdb_context *ctx,
 			return false;
 		}
 
-		strlcpy(tmp, salt_ptr, strlen(salt_ptr) + 1);
+		memcpy(tmp, salt_ptr, strlen(salt_ptr));
 
 		/*
 		 * Append padding as-needed. We're transitioning to a library that
