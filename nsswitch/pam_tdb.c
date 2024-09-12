@@ -643,7 +643,7 @@ static bool unpack_user_entry_token(struct ptdb_context *ctx,
 
 	// First validate that our data is long enough to actually
 	// contain our required fields
-	if ((data + sizeof(int64_t) + sizeof(uint8_t)) > endp) {
+	if ((data + sizeof(int64_t) + sizeof(uint32_t) + sizeof(uint8_t)) > endp) {
 		PAM_CTX_DEBUG(ctx, LOG_INFO,
 			      "%s: overflow reading expiry value "
 			      "in user token %u\n",
@@ -1009,6 +1009,11 @@ int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 		goto out;
 	}
 
+	/*
+	 * Get the password (API key) that we will be parsing
+	 * This is string of format <dbid>-<key> which is returned
+	 * by the TrueNAS middlware when generating an API key.
+	 */
 	retval = _tdb_read_password(ctx, username, &password);
 	if (retval != PAM_SUCCESS) {
 		PAM_CTX_DEBUG(ctx, LOG_ERR,
