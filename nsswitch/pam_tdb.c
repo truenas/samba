@@ -23,6 +23,7 @@ typedef struct {
 pam_tdb_algo_t algo_table[] = {
 	{"pbkdf2-sha256", GNUTLS_MAC_SHA256, 29000},
 	{"pbkdf2-sha512", GNUTLS_MAC_SHA512, 300000},
+	{ NULL, 0, 0 },
 };
 
 /* lifted from internal pam_macros in linux-pam */
@@ -400,11 +401,11 @@ static bool _pam_tdb_userhash_get_salt(struct ptdb_context *ctx,
 
 static bool _pam_tdb_lookup_algo(const char *algo_name, pam_tdb_algo_t **out)
 {
-	int i;
+	pam_tdb_algo_t *entry;
 
-	for (i = 0; i < ARRAY_SIZE(algo_table); i++) {
-		if (strcmp(algo_table[i].name, algo_name) == 0) {
-			*out = &algo_table[i];
+	for (entry=algo_table; entry->name != NULL; entry++) {
+		if (strcmp(entry->name, algo_name) == 0) {
+			*out = entry;
 			return true;
 		}
 	}
