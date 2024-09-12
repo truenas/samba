@@ -216,7 +216,7 @@ static bool _pam_tdb_parse_uint_str(struct ptdb_context *ctx,
 	}
 
 	/*
-	 * If there were no digitis at all then end == str_in
+	 * If there were no digits at all then end == str_in
 	 * If all characters were digits then *end will be '\0'
 	 * Otherwise *end will be the first invalid character.
 	 */
@@ -312,6 +312,8 @@ static bool _pam_tdb_validate_pbkdf2(struct ptdb_context *ctx,
  * @param[in] ctx ptdb_context (to support logging if needed)
  * @param[in] salt_ptr null-terminated string containing b64-encoded salt
  *     information.
+ * @param[in] is_legacy means salt_ptr is munged by passlib and we need
+ *     to fix it up before decode.
  * @param[out] salt_data results of base64 decode of salt_ptr. salt_data
  *     must not be NULL. salt_data->data must be freed by caller if
  *     successful.
@@ -441,6 +443,7 @@ enum ptdb_hash_field {
  * @param[in] pass plain-text password provided by PAM
  * @param[in] hash_in full pbkdf2 hash string
  * @param[in] is_admin bool indicating whether username is for admin user
+ *     This is used to determine whether legacy hash is allowed
  *
  * @returns boolean Returns true if resulting password hatch matches expected
  *     value.
@@ -839,6 +842,8 @@ static int tdb_data_check_password(struct ptdb_context *ctx,
  * @param[in] user username provided to PAM
  * @param[in] pass password provided to PAM
  * @param[out] username_ret copy of validated username
+ *     This is allocated under a talloc context that is freed
+ *     at end of pam_sm_authenticate().
  *
  * @returns int Returns PAM_SUCCESS on successful authentication or:
  *     PAM_USER_UNKNOWN: no TDB entry for the specified user
