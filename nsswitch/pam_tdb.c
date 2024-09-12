@@ -333,7 +333,7 @@ static bool _pam_tdb_userhash_get_salt(struct ptdb_context *ctx,
 	int error, pad_cnt, i;
 	char *tmp = salt_ptr;
 	char *found;
-
+	bool rv = true;
 
 	if (is_legacy) {
 		/*
@@ -342,7 +342,9 @@ static bool _pam_tdb_userhash_get_salt(struct ptdb_context *ctx,
 		 * we need to re-add it based on length of the salt in the
 		 * token.
 		 */
-		pad_cnt = 4 - (strlen(salt_ptr) % 4);
+		size_t salt_ptr_len = strlen(salt_ptr);
+
+		pad_cnt = 4 - (salt_ptr_len % 4);
 		if (pad_cnt > 2) {
 			PAM_CTX_DEBUG(ctx, LOG_ERR, "salt has invalid length.");
 			return false;
@@ -351,20 +353,21 @@ static bool _pam_tdb_userhash_get_salt(struct ptdb_context *ctx,
 		/*
 		 * Since we have to add padding bytes back in we have to make a
 		 * copy of the salt token.
+		 * length of salt + max padding (2) + byte for null
 		 */
-		tmp = calloc(1, strlen(salt_ptr) + 3);
+		tmp = calloc(1, salt_ptr_len + 3);
 		if (tmp == NULL) {
 			return false;
 		}
 
-		memcpy(tmp, salt_ptr, strlen(salt_ptr));
+		memcpy(tmp, salt_ptr, salt_ptr_len);
 
 		/*
 		 * Append padding as-needed. We're transitioning to a library that
 		 * doesn't strip the padding.
 		 */
 		for (i = 0; i < pad_cnt; i++)
-			tmp[strlen(salt_ptr) + i] = '=';
+			tmp[salt_ptr_len + i] = '=';
 
 		/*
 		 * passlib replaced `.` character with `+` after b64 encoding
@@ -384,12 +387,7 @@ static bool _pam_tdb_userhash_get_salt(struct ptdb_context *ctx,
 	if (error != GNUTLS_E_SUCCESS) {
 		PAM_CTX_DEBUG(ctx, LOG_ERR, "Failed to decode salt: %s",
 			      gnutls_strerror(error));
-
-		if (is_legacy) {
-			pam_overwrite_string(tmp);
-			free(tmp);
-		}
-		return false;
+		rv = false;
 	}
 
 	if (is_legacy) {
@@ -397,7 +395,7 @@ static bool _pam_tdb_userhash_get_salt(struct ptdb_context *ctx,
 		free(tmp);
 	}
 
-	return true;
+	return rv;
 }
 
 static bool _pam_tdb_lookup_algo(const char *algo_name, pam_tdb_algo_t **out)
