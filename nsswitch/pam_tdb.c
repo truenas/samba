@@ -1,6 +1,6 @@
 /* pam_tdb module
 
-   Copyright (c) Andrew Walker 2024.
+   Copyright (c) Andrew Walker <awalker@ixsystems.com> 2024.
 
    largely based on pam_winbind and pam_unix. See copyright
    reproduced below
@@ -776,11 +776,11 @@ static int tdb_data_check_password(struct ptdb_context *ctx,
 
 	// advance pointer to where the key is actually located
 	key_ptr++;
-	if (*key_ptr == '\0') {
-		/* no contents after the separator */
+	if (strlen(key_ptr) < MIN_KEY_LEN) {
+		// this is not the key we're looking for.
 		PAM_CTX_DEBUG(ctx, LOG_ERR,
-			      "malformed password lacks contents after "
-			      "DB ID separator.");
+			      "%zu: unexpected key length. API keys are minimum "
+			      "of 64 characters.", strlen(key_ptr));
 		return PAM_AUTH_ERR;
 	}
 

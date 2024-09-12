@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Andrew Walker 2024.
+ * Copyright (c) Andrew Walker <awalker@ixsystems.com> 2024.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -67,6 +67,7 @@
  *
  * Each token:
  * expiry: 8 bytes int64_t (time_t)
+ * db_id: 4 bytes uint32_t
  * hashlen: 1 bytes unsigned
  * hash: <varies>
  */
