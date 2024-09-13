@@ -101,6 +101,13 @@ if bld.CONFIG_SET('WITH_PAM_MODULES') and bld.CONFIG_SET('HAVE_PAM_START'):
 		install_path='${PAMMODULESDIR}'
 		)
 
+	bld.SAMBA_PLUGIN('pamtdb',
+		source='pam_tdb.c',
+		deps='gnutls talloc tdb pam',
+		realname='pam_tdb.so',
+		install_path='${PAMMODULESDIR}'
+		)
+
 if bld.CONFIG_GET("USING_SYSTEM_KRB5"):
     # If we build locator plugins for a
     # system library we should use builtin
