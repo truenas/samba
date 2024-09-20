@@ -146,22 +146,7 @@ static int _pam_tdb_init_context(pam_handle_t *pamh,
 {
 	struct ptdb_context *r = NULL;
 	const char *service = NULL;
-	int ctrl_code;
 	struct stat st;
-
-	if (stat(PAM_TDB_DIR, &st) != 0) {
-		PAM_TDB_DEBUG(pamh, LOG_ERR,"%s: stat() failed: %s\n",
-			      PAM_TDB_DIR, strerror(errno));
-
-		return PAM_AUTHINFO_UNAVAIL;
-	}
-
-	if (!S_ISDIR(st.st_mode)) {
-		PAM_TDB_ERROR(pamh, LOG_ERR, "%s: not a directory\n",
-			      PAM_TDB_DIR);
-
-		return PAM_AUTHINFO_UNAVAIL;
-	}
 
 	r = talloc_zero(NULL, struct ptdb_context);
 	if (!r) {
@@ -174,6 +159,28 @@ static int _pam_tdb_init_context(pam_handle_t *pamh,
 	r->argc = argc;
 	r->argv = argv;
 	r->ctrl = _pam_parse(pamh, flags, argc, argv, r->admin_user);
+
+	/*
+	 * If path doesn't exist we can signal middleware to
+	 * regenerate our pam_tdb file by responding with
+	 * PAM_AUTHINFO_UNAVAIL
+	 */
+	if (stat(PAM_TDB_DIR, &st) != 0) {
+		PAM_TDB_DEBUG(pamh, r->ctrl, LOG_ERR,
+			      "%s: stat() failed: %s\n",
+			      PAM_TDB_DIR, strerror(errno));
+
+		TALLOC_FREE(r);
+		return PAM_AUTHINFO_UNAVAIL;
+	}
+
+	if (!S_ISDIR(st.st_mode)) {
+		PAM_TDB_LOG(pamh, LOG_ERR, "%s: not a directory\n",
+			    PAM_TDB_DIR);
+
+		TALLOC_FREE(r);
+		return PAM_AUTHINFO_UNAVAIL;
+	}
 
 	r->tdb_ctx = tdb_open(PAM_TDB_FILE, 0, 0,
 			      O_RDONLY,
