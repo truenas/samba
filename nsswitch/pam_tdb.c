@@ -147,6 +147,22 @@ static int _pam_tdb_init_context(pam_handle_t *pamh,
 	struct ptdb_context *r = NULL;
 	const char *service = NULL;
 	int ctrl_code;
+	struct stat st;
+
+	if (stat(PAM_TDB_DIR, &st) != 0) {
+		PAM_TDB_DEBUG(pamh, LOG_ERR,
+			      PAM_TDB_DIR ": stat() failed: %s\n",
+			      strerror(errno));
+
+		return PAM_AUTHINFO_UNAVAIL;
+	}
+
+	if (!S_ISDIR(st.st_mode)) {
+		PAM_TDB_ERROR(pamh, LOG_ERR,
+			      PAM_TDB_DIR ": not a directory\n");
+
+		return PAM_AUTHINFO_UNAVAIL;
+	}
 
 	r = talloc_zero(NULL, struct ptdb_context);
 	if (!r) {
