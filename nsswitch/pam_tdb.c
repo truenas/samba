@@ -150,16 +150,15 @@ static int _pam_tdb_init_context(pam_handle_t *pamh,
 	struct stat st;
 
 	if (stat(PAM_TDB_DIR, &st) != 0) {
-		PAM_TDB_DEBUG(pamh, LOG_ERR,
-			      PAM_TDB_DIR ": stat() failed: %s\n",
-			      strerror(errno));
+		PAM_TDB_DEBUG(pamh, LOG_ERR,"%s: stat() failed: %s\n",
+			      PAM_TDB_DIR, strerror(errno));
 
 		return PAM_AUTHINFO_UNAVAIL;
 	}
 
 	if (!S_ISDIR(st.st_mode)) {
-		PAM_TDB_ERROR(pamh, LOG_ERR,
-			      PAM_TDB_DIR ": not a directory\n");
+		PAM_TDB_ERROR(pamh, LOG_ERR, "%s: not a directory\n",
+			      PAM_TDB_DIR);
 
 		return PAM_AUTHINFO_UNAVAIL;
 	}
