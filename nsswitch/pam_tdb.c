@@ -947,7 +947,7 @@ static int tdb_auth_request(struct ptdb_context *ctx,
 				PAM_TDB_LOG(ctx->pamh, LOG_INFO,
 					    "%s: entry is expired",
 					    user);
-				return PAM_AUTH_ERR;
+				return PAM_ACCT_EXPIRED;
 			}
 		}
 		*username_ret = talloc_strdup(ctx, user);
