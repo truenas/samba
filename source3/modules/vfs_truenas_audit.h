@@ -296,7 +296,7 @@ bool tn_add_create_payload(struct smb_filename *smb_fname,
 			   uint32_t create_disposition,
 			   uint32_t create_options,
 			   uint32_t file_attributes,
-			   struct security_descriptor *psd,
+			   const char *sddl_str,
 			   struct json_object *jsobj);
 
 /**

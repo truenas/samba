@@ -15,7 +15,7 @@
  * along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef ___JS_UTILS_H
+#ifndef __JS_UTILS_H
 #define __JS_UTILS_H
 
 /**
