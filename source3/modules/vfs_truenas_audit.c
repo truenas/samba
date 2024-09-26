@@ -644,7 +644,21 @@ static NTSTATUS tn_audit_create_file(vfs_handle_struct *handle,
 	struct json_object msg, entry;
 	struct smb_filename *fname = smb_fname;
 	uint32_t js_flags = FILE_ADD_NAME | FILE_NAME_IS_PATH;
+	char *sddl_str = NULL;
 	bool ok;
+
+	if (sd != NULL) {
+		sddl_str = sddl_encode(handle->conn,
+				       sd,
+				       get_global_sam_sid());
+		if (sddl_str == NULL) {
+			// We want to error out here because we can't
+			// properly audit what ACL is being set on the file.
+			DBG_ERR("Failed to generate SDDL string: %s",
+				strerror(errno));
+			return NT_STATUS_NO_MEMORY;
+		}
+	}
 
 	result = SMB_VFS_NEXT_CREATE_FILE(
 		handle,
@@ -669,11 +683,13 @@ static NTSTATUS tn_audit_create_file(vfs_handle_struct *handle,
 	SMB_VFS_HANDLE_GET_DATA(handle, config, tn_audit_conf_t, return result);
 	if (oplock_request == INTERNAL_OPEN_ONLY) {
 		// This is interal op, don't log
+		TALLOC_FREE(sddl_str);
 		return result;
 	}
 
 	ok = tn_init_json_msg(&msg, &entry);
 	if (!ok) {
+		TALLOC_FREE(sddl_str);
 		return result;
 	}
 
@@ -692,7 +708,7 @@ static NTSTATUS tn_audit_create_file(vfs_handle_struct *handle,
 				   create_disposition,
 				   create_options,
 				   file_attributes,
-				   sd,
+				   sddl_str,
 				   &entry);
 	if (!ok) {
 		goto cleanup;
@@ -711,6 +727,7 @@ static NTSTATUS tn_audit_create_file(vfs_handle_struct *handle,
 	tn_audit_do_log(config, &msg);
 
 cleanup:
+	TALLOC_FREE(sddl_str);
 	json_free(&msg);
 	json_free(&entry);
 	return result;
