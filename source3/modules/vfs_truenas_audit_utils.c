@@ -392,12 +392,11 @@ bool tn_add_create_payload(struct smb_filename *smb_fname,
 			   uint32_t create_disposition,
 			   uint32_t create_options,
 			   uint32_t file_attributes,
-			   struct security_descriptor *psd,
+			   const char *sddl_str,
 			   struct json_object *jsobj)
 {
 	const char *str_create_disposition;
 	const char *str_file_type;
-	char *sd = NULL;
 	int error;
 	struct json_object params;
 	bool ok;
@@ -464,17 +463,13 @@ bool tn_add_create_payload(struct smb_filename *smb_fname,
 
 	error = json_add_object(jsobj, "parameters", &params);
 	if (error) {
-		TALLOC_FREE(sd);
 		return false;
 	}
 
-	if (psd) {
-		sd = sddl_encode(talloc_tos(), psd, get_global_sam_sid());
-		if (sd) {
-			error = json_add_string(jsobj, "sd", sd);
-			if (error) {
-				goto fail;
-			}
+	if (sddl_str) {
+		error = json_add_string(jsobj, "sd", sddl_str);
+		if (error) {
+			return false;
 		}
 	}
 	error = json_add_string(jsobj, "file_type",
@@ -482,19 +477,17 @@ bool tn_add_create_payload(struct smb_filename *smb_fname,
 				"DIRECTORY":
 				"FILE");
 	if (error) {
-		goto fail;
+		return false;
 	}
 
 	ok = tn_add_file_to_object(smb_fname, fsp_ext, "file", js_flags, jsobj);
 	if (!ok) {
-		goto fail;
+		return false;
 	}
 
-	TALLOC_FREE(sd);
 	return true;
 
 fail:
-	TALLOC_FREE(sd);
 	json_free(&params);
 	return false;
 }
