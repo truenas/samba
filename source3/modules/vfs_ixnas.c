@@ -94,6 +94,10 @@ static void _dump_acl_info(zfsacl_t theacl, const char *fn)
 }
 #define dump_acl_info(x) _dump_acl_info(x, __func__)
 
+/*
+ * This function converts a file opened via O_PATH to one opened under
+ * different flags by using procfs.
+ */
 static int ixnas_pathref_reopen(const files_struct *fsp, int flags)
 {
 	int fd_out = -1;
@@ -182,16 +186,17 @@ static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
 	struct ixnas_config_data *config = NULL;
 	int i;
 	bool ok;
-	uint64_t kern_dosmodes = 0;
+	uint64_t kern_dosmode = 0;
+	uint32_t xattr_dosmode = 0;
+	NTSTATUS status;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct ixnas_config_data,
 				return NT_STATUS_INTERNAL_ERROR);
 
-	NTSTATUS status;
 	status = SMB_VFS_NEXT_FGET_DOS_ATTRIBUTES(handle,
 						  fsp,
-						  dosmode);
+						  &xattr_dosmode);
 
 	if (config->dosattrib_xattr) {
 		return status;
@@ -208,22 +213,33 @@ static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
 
 	if (is_named_stream(fsp->fsp_name)) {
 		// Streams don't have separate dos attribute metadata
-		ok = ixnas_get_native_dosmode(fsp->base_fsp, &kern_dosmodes);
+		ok = ixnas_get_native_dosmode(fsp->base_fsp, &kern_dosmode);
 	} else {
-		ok = ixnas_get_native_dosmode(fsp, &kern_dosmodes);
+		ok = ixnas_get_native_dosmode(fsp, &kern_dosmode);
 	}
 
 	if (!ok) {
 		return map_nt_error_from_unix(errno);
 	}
 
+	*dosmode = xattr_dosmode;
+
 	for (i = 0; i < ARRAY_SIZE(dosmode2flag); i++) {
-		if (kern_dosmodes & dosmode2flag[i].flag) {
+		if (kern_dosmode & dosmode2flag[i].flag) {
 			*dosmode |= dosmode2flag[i].dosmode;
 		}
 	}
 
-	if (S_ISDIR(fsp->fsp_name->st.st_ex_mode)) {
+	/*
+	 * Windows default behavior appears to be that the archive bit
+	 * on a directory is only explicitly set by clients. ZFS
+	 * sets this bit when the directory's contents are modified.
+	 *
+	 * This means that we _must_ rely on the xattr-encoded dosmode
+	 * to provide guidance as to whether it is set for the file.
+	 */
+	if (S_ISDIR(fsp->fsp_name->st.st_ex_mode) &&
+	    ((xattr_dosmode & FILE_ATTRIBUTE_ARCHIVE) == 0)) {
 		*dosmode &= ~FILE_ATTRIBUTE_ARCHIVE;
 	}
 
@@ -354,6 +370,15 @@ static bool fsp_set_zfsacl(files_struct *fsp, zfsacl_t zfsacl)
 	return zfsacl_set_file(proc_fd_path, zfsacl);
 }
 
+/*
+ * fsp_get_aclbrand() and path_get_aclbrand() both get the ACL brand on the
+ * underlying filesystem. In almost all cases we rely on the ACL brand we
+ * detected on the initial SMB tree connect, which is preferable to detecting
+ * on a per-file basis. Unfortunately, certain types of users disregard UI
+ * warnings and alerts and nest datasets with different ACL properties (or
+ * mount random filesystems via the unix shell) and so we need to handle the
+ * unexpected if initial attempt to read the file's ACL fails.
+ */
 static int fsp_get_acl_brand(files_struct *fsp)
 {
 	ssize_t rv;
@@ -413,6 +438,7 @@ static int path_get_aclbrand(const char *path)
 	return TRUENAS_ACL_BRAND_NFS4;
 }
 
+/* Convert the native ZFS ACE format to the generic Samba NFSv4 format */
 static bool zfsentry2smbace(zfsacl_entry_t ae, SMB_ACE4PROP_T *aceprop)
 {
 	int i;
@@ -491,6 +517,7 @@ static bool zfsentry2smbace(zfsacl_entry_t ae, SMB_ACE4PROP_T *aceprop)
 	return true;
 }
 
+/* convert Samba's generic NFSv4 ACE format to the native ZFS format */
 static bool smbace2zfsentry(zfsacl_t zfsacl, SMB_ACE4PROP_T *aceprop)
 {
 	bool ok;
@@ -565,6 +592,19 @@ static bool smbace2zfsentry(zfsacl_t zfsacl, SMB_ACE4PROP_T *aceprop)
 	return true;
 }
 
+/*
+ * Determine the DACL type (for generating an NT security descriptor) from
+ * the native ZFS ACL format. If the ZFS ACL encodes a NULL DACL then
+ * dtype_out will be set to IXNAS_NULL_DACL, if it encodes an empty dacl
+ * then dtype_out will be set to IXNAS_EMPTY_DACL, otherwise it will
+ * be set to IXNAS_NORMAL_DACL.
+ *
+ * @param[in]   zfacl Native ZFS ACL
+ * @param[out]  dtype_out DACL type (on success)
+ * @return      boolean - true on success
+ *
+ * NOTE: this may fail if we get a malformed ACL from ZFS.
+ */
 static bool ixnas_zfsacl_get_dacl_type(zfsacl_t zfsacl,
 				       enum ixnas_dacl_type *dtype_out)
 {
@@ -781,6 +821,8 @@ static NTSTATUS ixnas_generate_special_dacl_sd(struct vfs_handle_struct *handle,
 	struct security_ace *nt_ace_list = NULL;
 	struct security_acl *psa = NULL;
 	uint16_t controlflags = SEC_DESC_SELF_RELATIVE | SEC_DESC_DACL_PROTECTED | SEC_DESC_DACL_PRESENT;
+
+	SMB_ASSERT((dtype == IXNAS_EMPTY_DACL) || (dtype == IXNAS_NULL_DACL));
 
 	if (!VALID_STAT(fsp->fsp_name->st)) {
 		status = vfs_stat_fsp(fsp);
@@ -1078,7 +1120,7 @@ static NTSTATUS ixnas_fset_special_dacl(vfs_handle_struct *handle,
 		smb_panic("unexpected ixnas_dacl_type");
 	};
 
-	zfsacl = zfsacl_init(ZFSACL_MAX_ENTRIES, ZFSACL_BRAND_NFSV4);
+	zfsacl = zfsacl_init(1, ZFSACL_BRAND_NFSV4);
 	if (zfsacl == NULL) {
 		DBG_ERR("%s: acl_init failed: %s\n",
 			fsp_str_dbg(fsp), strerror(errno));
