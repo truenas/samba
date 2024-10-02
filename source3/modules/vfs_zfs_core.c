@@ -22,26 +22,12 @@
 #include "system/filesys.h"
 
 #include "lib/util/tevent_ntstatus.h"
-#include "modules/smb_libzfs.h"
+#include "vfs_zfs_core.h"
 
 static int vfs_zfs_core_debug_level = DBGC_VFS;
 
 #undef DBGC_CLASS
 #define DBGC_CLASS vfs_zfs_core_debug_level
-
-
-struct zfs_core_config_data {
-	struct zfs_dataset *ds;
-	struct zfs_dataset *singleton;
-	struct zfs_dataset **created;
-	size_t ncreated;
-	bool zfs_space_enabled;
-	bool zfs_quota_enabled;
-	bool zfs_auto_create;
-	bool checked;
-	const char *dataset_auto_quota;
-	uint64_t base_user_quota;
-};
 
 static struct zfs_dataset *smbfname_to_ds(const struct connection_struct *conn,
 					  struct zfs_core_config_data *config,
@@ -119,11 +105,20 @@ static uint32_t zfs_core_fs_capabilities(struct vfs_handle_struct *handle,
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct zfs_core_config_data,
-				return fscaps);
+				smb_panic(__location__));
 
 	if (!config->zfs_quota_enabled) {
 		fscaps &= ~FILE_VOLUME_QUOTAS;
 	}
+
+	SMB_ASSERT(config->offload_ops != NULL);
+	SMB_ASSERT((config->offload_ops->opmap_type == ZC_OFFLOAD_GENERIC) ||
+		   (config->offload_ops->opmap_type == ZC_OFFLOAD_CLONE));
+
+	if (config->offload_ops->opmap_type == ZC_OFFLOAD_CLONE) {
+		fscaps |= FILE_SUPPORTS_BLOCK_REFCOUNTING;
+	}
+
 	return fscaps;
 }
 
@@ -721,31 +716,39 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 			    handle->conn->connectpath,
 			    &config->ds,
 			    handle->conn->tcon != NULL);
-	if (ret != 0 || (config->ds == NULL)) {
-		config->zfs_space_enabled = false;
-		config->zfs_quota_enabled = false;
+	if (ret != 0) {
 		DBG_ERR("Failed to initialize ZFS data: %s\n",
 			strerror(errno));
 		return ret;
 	}
 
-	if (config->ds->properties->casesens == SMBZFS_INSENSITIVE) {
-		handle->conn->internal_tcon_flags |= TCON_FLAG_CASE_INSENSTIVE_FS;
-	}
+	// We need to initialize the optable regardless of whether this
+	// is a ZFS dataset
+	zfs_core_set_offload_ops(handle, config, config->ds);
 
-	base_quota_str = lp_parm_const_string(SNUM(handle->conn),
+	if (config->ds == NULL) {
+		DBG_ERR("%s: failed to discover dataset settings for connectpath: %s\n",
+			handle->conn->connectpath, strerror(errno));
+
+	} else {
+		if (config->ds->properties->casesens == SMBZFS_INSENSITIVE) {
+			handle->conn->internal_tcon_flags |= TCON_FLAG_CASE_INSENSTIVE_FS;
+		}
+
+		base_quota_str = lp_parm_const_string(SNUM(handle->conn),
 			"zfs_core", "base_user_quota", NULL);
 
-	if (base_quota_str != NULL) {
-		config->base_user_quota = conv_str_size(base_quota_str);
-		set_base_user_quota(handle, config, user);
-        }
+		if (base_quota_str != NULL) {
+			config->base_user_quota = conv_str_size(base_quota_str);
+			set_base_user_quota(handle, config, user);
+		}
 
-	config->zfs_space_enabled = lp_parm_bool(SNUM(handle->conn),
+		config->zfs_space_enabled = lp_parm_bool(SNUM(handle->conn),
 			"zfs_core", "zfs_space_enabled", false);
 
-	config->zfs_quota_enabled = lp_parm_bool(SNUM(handle->conn),
-			"zfs_core", "zfs_quota_enabled", true);
+		config->zfs_quota_enabled = lp_parm_bool(SNUM(handle->conn),
+				"zfs_core", "zfs_quota_enabled", true);
+	}
 
 	SMB_VFS_HANDLE_SET_DATA(handle, config,
 				NULL, struct zfs_core_config_data,
@@ -759,12 +762,16 @@ static struct vfs_fn_pointers zfs_core_fns = {
 	.chdir_fn = zfs_core_chdir,
 	.connect_fn = zfs_core_connect,
 	.renameat_fn = zfs_core_renameat,
+	.offload_read_send_fn = zfs_core_offload_read_send,
+	.offload_read_recv_fn = zfs_core_offload_read_recv,
+	.offload_write_send_fn = zfs_core_offload_write_send,
+	.offload_write_recv_fn = zfs_core_offload_write_recv,
 	.get_quota_fn = zfs_core_get_quota,
 	.set_quota_fn = zfs_core_set_quota,
 	.disk_free_fn = zfs_core_disk_free
 };
 
-NTSTATUS vfs_zfs_core_init(TALLOC_CTX *);
+static_decl_vfs
 NTSTATUS vfs_zfs_core_init(TALLOC_CTX *ctx)
 {
 	NTSTATUS ret = smb_register_vfs(SMB_VFS_INTERFACE_VERSION, "zfs_core",
@@ -774,6 +781,7 @@ NTSTATUS vfs_zfs_core_init(TALLOC_CTX *ctx)
 	}
 
 	vfs_zfs_core_debug_level = debug_add_class("zfs_core");
+
 	if (vfs_zfs_core_debug_level == -1) {
 		vfs_zfs_core_debug_level = DBGC_VFS;
 		DBG_ERR("%s: Couldn't register custom debugging class!\n",

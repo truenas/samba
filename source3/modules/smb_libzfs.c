@@ -102,6 +102,13 @@ static const struct {
 	{SMBZFS_MIXED, "mixed"},
 };
 
+static const struct {
+	enum zfs_feature feature;
+	const char *feature_str;
+} zfs_feature_enum_list[] = {
+	{SMBZFS_BLOCK_CLONING, "feature@block_cloning"},
+};
+
 static const char *user_quota_strings[] =  {
 	"userquota",
 	"userused",
@@ -1841,6 +1848,65 @@ smb_zfs_rollback(smbzhandle_t hdl,
 	zfs_close(snap_handle);
 	ZFS_UNLOCK();
 	return ret;
+}
+bool
+smb_zfs_pool_feature_enabled(struct zfs_dataset *ds,
+			     enum zfs_feature feature,
+			     bool *enabled_out)
+{
+	zfs_handle_t *zfsp = NULL;
+	zpool_handle_t *pool = NULL;
+	char statebuf[64] = {0};
+	int error, i;
+	bool enabled;
+	const char *feature_name = NULL;
+
+	SMB_ASSERT(ds != NULL);
+
+	for (i = 0; i < ARRAY_SIZE(zfs_feature_enum_list); i++) {
+		if (zfs_feature_enum_list[i].feature == feature) {
+			feature_name = zfs_feature_enum_list[i].feature_str;
+			break;
+		}
+	}
+
+	SMB_ASSERT(feature_name != NULL);
+
+	if (ds->zhandle == NULL) {
+		DBG_ERR("%s: no dataset handle.\n", ds->dataset_name);
+		return false;
+	}
+
+	zfsp = get_zhandle_from_smbzhandle(ds->zhandle);
+
+	ZFS_LOCK();
+	pool = zfs_get_pool_handle(zfsp);
+	if (pool == NULL) {
+		ZFS_UNLOCK();
+		DBG_ERR("%s: pool handle not initialized\n", ds->dataset_name);
+		return false;
+	}
+	error = zpool_prop_get_feature(pool, feature_name,
+				       statebuf, sizeof(statebuf));
+	ZFS_UNLOCK();
+
+	if (error) {
+		DBG_ERR("%s: failed to retrieve status of %s: %s\n",
+			ds->dataset_name, feature_name, strerror(error));
+		return false;
+	}
+
+	if (strcmp(statebuf, "enabled") == 0) {
+		*enabled_out = true;
+
+	} else {
+		DBG_INFO("%s: %s on dataset [%s] is not active\n",
+			 statebuf, feature_name, ds->dataset_name);
+
+		*enabled_out = false;
+	}
+
+	return true;
 }
 
 /*

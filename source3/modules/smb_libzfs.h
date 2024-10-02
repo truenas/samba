@@ -76,6 +76,8 @@ enum zfs_quotatype {
 	SMBZFS_GROUP_QUOTA,
 };
 
+enum zfs_feature {SMBZFS_BLOCK_CLONING};
+
 struct zfs_quota {
 	enum zfs_quotatype quota_type;
 	uint64_t bytes;
@@ -353,6 +355,19 @@ int smb_zfs_rollback(smbzhandle_t hdl,
  * @return	0 on success -1 on failure
  */
 int smb_zfs_rollback_last(smbzhandle_t hdl);
+
+/*
+ * Check whether the specified zpool feature is enabled
+ *
+ * @param[in] ds - pointer to fully initialized struct zfs_dataset
+ * @param[in] feature - feature to check
+ * @param[out] enabled - whether feature is enabled
+ *
+ * @return - bool true on success else false
+ */
+bool smb_zfs_pool_feature_enabled(struct zfs_dataset *ds,
+				  enum zfs_feature feature,
+				  bool *enabled_out);
 
 /*
  * Initialize global libzfs handle if necessary and populate
