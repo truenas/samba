@@ -172,6 +172,17 @@ static NTSTATUS smbd_check_access_rights_sd(
 		goto access_denied;
 	}
 
+	/*
+	 * A null DACL grants full access to any user that requests it; normal
+	 * security checking is not performed with respect to the object.
+	 *
+	 * c.f. https://learn.microsoft.com/en-us/windows/win32/secauthz/null-dacls-and-empty-dacls
+	 */
+        if ((conn->aclbrand == TRUENAS_ACL_BRAND_NFS4) &&
+	    (sd->type & SEC_DESC_DACL_PRESENT) && (sd->dacl == NULL)) {
+		return NT_STATUS_OK;
+	}
+
 	status = se_file_access_check(sd,
 				get_current_nttok(conn),
 				use_privs,
