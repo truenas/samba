@@ -410,10 +410,10 @@ typedef union unid_t {
 } unid_t;
 
 enum acl_brand {
-        SMB_ACL_BRAND_POSIX,
-        SMB_ACL_BRAND_NFS40,
-        SMB_ACL_BRAND_NFS41,
-        SMB_ACL_BRAND_NONE,
+	TRUENAS_ACL_BRAND_UNKNOWN,
+	TRUENAS_ACL_BRAND_POSIX,
+	TRUENAS_ACL_BRAND_NFS4,
+	TRUENAS_ACL_BRAND_NONE,
 };
 
 struct fd_handle;
