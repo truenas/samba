@@ -273,7 +273,10 @@ bld.SAMBA3_MODULE('vfs_tmprotect',
 
 bld.SAMBA3_MODULE('vfs_zfs_core',
                  subsystem='vfs',
-                 source='vfs_zfs_core.c',
+                 source='''
+                     vfs_zfs_core.c
+                     vfs_zfs_core_rw.c
+                 ''',
                  deps='smb_libzfs',
                  init_function='',
                  internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_zfs_core'),
