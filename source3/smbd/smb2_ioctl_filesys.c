@@ -196,7 +196,15 @@ static struct tevent_req *fsctl_dup_extents_send(TALLOC_CTX *mem_ctx,
 	src_fid_volatile = BVAL(state->dup_extents.source_fid, 8);
 	src_fsp = file_fsp_get(smb2req, src_fid_persistent, src_fid_volatile);
 	if ((src_fsp == NULL)
+#if 0
 		      || (src_fsp->file_id.devid != dst_fsp->file_id.devid)) {
+#else
+	/*
+	 * ZFS allows block clones between datasets. We should rely on EXDEV errno,
+	 * which indicates an attempt to clone across pool boundary
+	 */
+		      ) {
+#endif
 		/*
 		 * [MS-FSCC] 2.3.8 FSCTL_DUPLICATE_EXTENTS_TO_FILE Reply
 		 * STATUS_INVALID_PARAMETER:
