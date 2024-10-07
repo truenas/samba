@@ -29,72 +29,6 @@ static int vfs_zfs_core_debug_level = DBGC_VFS;
 #undef DBGC_CLASS
 #define DBGC_CLASS vfs_zfs_core_debug_level
 
-static struct zfs_dataset *smbfname_to_ds(const struct connection_struct *conn,
-					  struct zfs_core_config_data *config,
-					  const struct smb_filename *smb_fname)
-{
-	int ret;
-	SMB_STRUCT_STAT sbuf;
-	const SMB_STRUCT_STAT *psbuf = NULL;
-	struct zfs_dataset *resolved = NULL;
-	char *full_path = NULL;
-	char *to_free = NULL;
-	char path[PATH_MAX + 1];
-	int len;
-
-	SMB_ASSERT(config->ds != NULL);
-	if (VALID_STAT(smb_fname->st)) {
-		psbuf = &smb_fname->st;
-	}
-	else {
-		ret = vfs_stat_smb_basename(discard_const(conn),
-					    smb_fname, &sbuf);
-		if (ret != 0) {
-			DBG_ERR("Failed to stat() %s: %s\n",
-				smb_fname_str_dbg(smb_fname), strerror(errno));
-			return NULL;
-		}
-		psbuf = &sbuf;
-	}
-
-	if (psbuf->st_ex_dev == config->ds->devid) {
-		return config->ds;
-	}
-
-	if (config->singleton &&
-	    (config->singleton->devid == psbuf->st_ex_dev)) {
-		return config->singleton;
-	}
-
-	len = full_path_tos(discard_const(conn->cwd_fsp->fsp_name->base_name),
-			    smb_fname->base_name,
-			    path, sizeof(path),
-			    &full_path, &to_free);
-	if (len == -1) {
-		DBG_ERR("Could not allocate memory in full_path_tos.\n");
-		return NULL;
-	}
-
-	/*
-	 * Our current cache of datasets does not contain the path in
-	 * question. Use libzfs to try to get it. Allocate under
-	 * memory context of our dataset list.
-	 */
-	resolved = smb_zfs_path_get_dataset(config, path, true, true, true);
-	if (resolved != NULL) {
-		TALLOC_FREE(config->singleton);
-		TALLOC_FREE(to_free);
-		config->singleton = resolved;
-		return resolved;
-	}
-
-	DBG_ERR("No dataset found for %s with device id: %lu\n",
-		path, psbuf->st_ex_dev);
-	TALLOC_FREE(to_free);
-	errno = ENOENT;
-	return NULL;
-}
-
 static uint32_t zfs_core_fs_capabilities(struct vfs_handle_struct *handle,
 					 enum timestamp_set_resolution *p_ts_res)
 {
@@ -109,6 +43,10 @@ static uint32_t zfs_core_fs_capabilities(struct vfs_handle_struct *handle,
 
 	if (!config->zfs_quota_enabled) {
 		fscaps &= ~FILE_VOLUME_QUOTAS;
+	}
+
+	if (config->zfs_integrity_streams_enabled) {
+		fscaps |= FILE_SUPPORT_INTEGRITY_STREAMS;
 	}
 
 	SMB_ASSERT(config->offload_ops != NULL);
@@ -748,6 +686,9 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 
 		config->zfs_quota_enabled = lp_parm_bool(SNUM(handle->conn),
 				"zfs_core", "zfs_quota_enabled", true);
+
+		config->zfs_integrity_streams_enabled = lp_parm_bool(SNUM(handle->conn),
+				"zfs_core", "zfs_integrity_streams", false);
 	}
 
 	SMB_VFS_HANDLE_SET_DATA(handle, config,
@@ -762,6 +703,7 @@ static struct vfs_fn_pointers zfs_core_fns = {
 	.chdir_fn = zfs_core_chdir,
 	.connect_fn = zfs_core_connect,
 	.renameat_fn = zfs_core_renameat,
+	.fsctl_fn = zfs_core_fsctl,
 	.offload_read_send_fn = zfs_core_offload_read_send,
 	.offload_read_recv_fn = zfs_core_offload_read_recv,
 	.offload_write_send_fn = zfs_core_offload_write_send,

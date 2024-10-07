@@ -91,6 +91,8 @@ struct zfs_dataset_prop
 	enum casesensitivity casesens;
 	bool readonly;
 	bool snapdir_visible;
+	bool checksum_enabled;
+	uint64_t record_size;
 #if 0 /* Properties we may wish to expose in the future */
 	int atime;
 	int exec;
