@@ -614,6 +614,7 @@ static struct zfs_dataset *copy_to_external(TALLOC_CTX *mem_ctx,
 		if (out->properties == NULL) {
 			TALLOC_FREE(out);
 			errno = ENOMEM;
+			DS_UNLOCK();
 			return NULL;
 		}
 		out->properties->casesens = prop_in->casesens;
