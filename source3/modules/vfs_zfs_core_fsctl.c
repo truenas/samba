@@ -45,6 +45,8 @@ static bool zfs_core_get_integrity_info(struct vfs_handle_struct *handle,
 				struct zfs_core_config_data,
 				smb_panic(__location__));
 
+	SMB_ASSERT(info != NULL);
+
 	if (!config->zfs_integrity_streams_enabled) {
 		return false;
 	}
