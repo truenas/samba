@@ -614,10 +614,13 @@ static struct zfs_dataset *copy_to_external(TALLOC_CTX *mem_ctx,
 		if (out->properties == NULL) {
 			TALLOC_FREE(out);
 			errno = ENOMEM;
+			DS_UNLOCK();
 			return NULL;
 		}
 		out->properties->casesens = prop_in->casesens;
 		out->properties->readonly = prop_in->readonly;
+		out->properties->record_size = prop_in->record_size;
+		out->properties->checksum_enabled = prop_in->checksum_enabled;
 		out->properties->snapdir_visible = prop_in->snapdir_visible;
 	}
 	if (open_zhandle) {
@@ -1212,7 +1215,23 @@ zhandle_get_props(struct smbzhandle *zfsp_ext,
 	} else {
 		props->snapdir_visible = false;
 	}
+
+	if (zfs_prop_get(zfsp, ZFS_PROP_CHECKSUM,
+	    buf, sizeof(buf), &sourcetype,
+	    NULL, 0, B_FALSE) != 0) {
+		ZFS_UNLOCK();
+		DBG_ERR("Failed to look up checksum property\n");
+		return -1;
+	}
+
+	if (strcmp(buf, "off") == 0) {
+		props->checksum_enabled = false;
+	} else {
+		props->checksum_enabled = true;
+	}
+
 	props->readonly = zfs_prop_get_int(zfsp, ZFS_PROP_READONLY);
+	props->record_size = zfs_prop_get_int(zfsp, ZFS_PROP_RECORDSIZE);
 #if 0 /* properties we may wish to return in the future */
 	props->exec = zfs_prop_get_int(zfsp, ZFS_PROP_EXEC);
 	props->atime = zfs_prop_get_int(zfsp, ZFS_PROP_ATIME);
