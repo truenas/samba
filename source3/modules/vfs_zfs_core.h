@@ -51,12 +51,25 @@ struct zfs_core_config_data {
 	size_t ncreated;
 	bool zfs_space_enabled;
 	bool zfs_quota_enabled;
+	bool zfs_integrity_streams_enabled;
 	bool zfs_auto_create;
 	bool checked;
 	const char *dataset_auto_quota;
 	uint64_t base_user_quota;
 	const zc_offload_ops_t *offload_ops;
 };
+
+/* vfs_zfs_core_fsctl.c */
+NTSTATUS zfs_core_fsctl(struct vfs_handle_struct *handle,
+			struct files_struct *fsp,
+			TALLOC_CTX *ctx,
+			uint32_t function,
+			uint16_t req_flags,
+			const uint8_t *_in_data,
+			uint32_t in_len,
+			uint8_t **_out_data,
+			uint32_t max_out_len,
+			uint32_t *out_len);
 
 /* vfs_zfs_core_rw.c */
 struct tevent_req *zfs_core_offload_read_send(
@@ -87,3 +100,10 @@ NTSTATUS zfs_core_offload_write_recv(struct vfs_handle_struct *handle,
 void zfs_core_set_offload_ops(struct vfs_handle_struct *handle,
 			      struct zfs_core_config_data *config,
 			      struct zfs_dataset *ds);
+
+struct zfs_dataset *smbfname_to_ds(const struct connection_struct *conn,
+				   struct zfs_core_config_data *config,
+				   const struct smb_filename *smb_fname);
+
+struct zfs_dataset *zfs_core_fsp_get_ds(struct vfs_handle_struct *handle,
+					struct files_struct *fsp);
