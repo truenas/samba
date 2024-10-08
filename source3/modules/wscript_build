@@ -275,7 +275,9 @@ bld.SAMBA3_MODULE('vfs_zfs_core',
                  subsystem='vfs',
                  source='''
                      vfs_zfs_core.c
+                     vfs_zfs_core_fsctl.c
                      vfs_zfs_core_rw.c
+                     vfs_zfs_core_util.c
                  ''',
                  deps='smb_libzfs',
                  init_function='',
