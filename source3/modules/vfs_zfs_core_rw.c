@@ -571,7 +571,7 @@ struct tevent_req *zfs_core_offload_read_send(
 	off_t offset,
 	size_t to_cp)
 {
-	zc_offload_ops_t *ops = zfs_core_handle_get_offload_ops(hdl);
+	const zc_offload_ops_t *ops = zfs_core_handle_get_offload_ops(hdl);
 
 	return ops->read_send(mem_ctx, ev, hdl, fsp, fsctl, ttl, offset, to_cp);
 }

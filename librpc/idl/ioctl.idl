@@ -240,3 +240,30 @@ interface fsctl
 		[charset(UTF16)] uint8 pipe_name[pipe_name_len];
 	} fsctl_pipe_wait;
 }
+
+interface integrity
+{
+	/* MS-FSCC 2.3.73 SET_INTEGRITY_INFORMATION */
+	const uint16 CHECKSUM_TYPE_NONE = 0x0000;
+	const uint16 CHECKSUM_TYPE_CRC32 = 0x0001;
+	const uint16 CHECKSUM_TYPE_CRC64 = 0x0002;
+	/* values between 0x0003 - 0xFFFE reserved for future use */
+	const uint16 CHECKSUM_TYPE_UNCHANGED = 0xFFFF;
+
+	const uint32 FLAG_CHECKSUM_ENFORCEMENT_OFF = 0x00000001;
+
+	typedef [public] struct {
+		uint16 chksum_algo;
+		uint16 reserved;
+		uint32 flags;
+	} fsctl_set_integrity_req;
+
+	/* MS-FSCC 2.3.19 GET_INTEGRITY_INFORMATION */
+	typedef [public] struct {
+		uint16 chksum_algo;
+		uint16 reserved;
+		uint32 flags;
+		uint32 chksum_chunk_sz;
+		uint32 cluster_sz;
+	} integrity_state;
+}
