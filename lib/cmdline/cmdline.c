@@ -135,63 +135,230 @@ void samba_cmdline_set_machine_account_fn(
 	cli_credentials_set_machine_account_fn = fn;
 }
 
+/*
+ * Are the strings p and option equal from the point of view of option
+ * parsing, meaning is the next character '\0' or '='.
+ */
+static bool strneq_cmdline_exact(const char *p, const char *option, size_t len)
+{
+	if (strncmp(p, option, len) == 0) {
+		if (p[len] == 0 || p[len] == '=') {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Return true if the argument to the option should be redacted.
+ *
+ * The option name is presumed to contain the substring "pass". It is checked
+ * against a list of options that specify secrets. If it is there, the value
+ * should be redacted and we return early.
+ *
+ * Otherwise, it is checked against a list of known safe options. If it is
+ * there, we return false.
+ *
+ * If the option is not in either list, we assume it might be secret and
+ * redact the argument, but warn loadly about it. The hope is that developers
+ * will see what they're doing and add the option to the appropriate list.
+ *
+ * If true is returned, *ulen will be set to the apparent length of the
+ * option. It is set to zero if false is returned (we don't need it in that
+ * case).
+ */
+static bool is_password_option(const char *p, size_t *ulen)
+{
+	size_t i, len;
+	static const char *must_burn[] = {
+		"--password",
+		"--newpassword",
+		"--password2",
+		"--adminpass",
+		"--dnspass",
+		"--machinepass",
+		"--krbtgtpass",
+		"--fixed-password",
+	};
+	static const char *allowed[] = {
+		"--bad-password-count-reset",
+		"--badpassword-frequency",
+		"--change-user-password",
+		"--force-initialized-passwords",
+		"--machine-pass",  /* distinct from --machinepass */
+		"--managed-password-interval",
+		"--no-pass",
+		"--no-pass2",
+		"--no-passthrough",
+		"--no-password",
+		"--passcmd",
+		"--passwd",
+		"--passwd_path",
+		"--password-file",
+		"--password-from-stdin",
+		"--random-password",
+		"--smbpasswd-style",
+		"--strip-passed-output",
+		"--with-smbpasswd-file",
+	};
+
+	char *equals = NULL;
+	*ulen = 0;
+
+	for (i = 0; i < ARRAY_SIZE(must_burn); i++) {
+		bool secret;
+		len = strlen(must_burn[i]);
+		secret = strneq_cmdline_exact(p, must_burn[i], len);
+		if (secret) {
+			*ulen = len;
+			return true;
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(allowed); i++) {
+		bool safe;
+		len = strlen(allowed[i]);
+		safe = strneq_cmdline_exact(p, allowed[i], len);
+		if (safe) {
+			return false;
+		}
+	}
+	/*
+	 * We have found a suspicious option, and we need to work out where to
+	 * burn it from. It could be
+	 *
+	 * --secret-password=cow    -> password after '='
+	 * --secret-password        -> password is in next argument.
+	 *
+	 * but we also have the possibility of
+	 *
+	 * --cow=secret-password
+	 *
+	 * that is, the 'pass' in this option string is not in the option but
+	 * the argument to it, which should not be burnt.
+	 */
+	equals = strchr(p, '=');
+	if (equals == NULL) {
+		*ulen = strlen(p);
+	} else {
+		char *pass = (strstr(p, "pass"));
+		if (pass > equals) {
+			/* this is --foo=pass, not --pass=foo */
+			return false;
+		}
+		*ulen = equals - p;
+	}
+	/*
+	 * This message will be seen with Python tools when an option
+	 * is misspelt, but not with C tools, because in C burning
+	 * happens after the command line is parsed, while in Python
+	 * it happens before (on a copy of argv).
+	 *
+	 * In either case it will appear for a newly added option, and
+	 * we hope developers will notice it before pushing.
+	 */
+	DBG_ERR("\nNote for developers: if '%*s' is not misspelt, it should be "
+		"added to the appropriate list in is_password_option().\n\n",
+		(int)(*ulen), p);
+	return true;
+}
+
 bool samba_cmdline_burn(int argc, char *argv[])
 {
 	bool burnt = false;
-	bool found = false;
-	bool is_user = false;
-	char *p = NULL;
 	int i;
-	size_t ulen = 0;
 
 	for (i = 0; i < argc; i++) {
+		bool found = false;
+		bool is_user = false;
+		size_t ulen = 0;
+		char *p = NULL;
+
 		p = argv[i];
 		if (p == NULL) {
-			return false;
+			return burnt;
 		}
 
-		/*
-		 * Take care that this list must be in longest-match
-		 * first order
-		 */
 		if (strncmp(p, "-U", 2) == 0) {
+			/*
+			 * Note: this won't catch combinations of
+			 * short options like
+			 * `samba-tool -NUAdministrator%...`, which is
+			 * not possible in general outside of the
+			 * actual parser (consider for example
+			 * `-NHUroot%password`, which parses as
+			 * `-N -H 'Uroot%password'`). We don't know
+			 * here which short options might take
+			 * arguments.
+			 *
+			 * This is an argument for embedding redaction
+			 * inside the parser (e.g. by adding a flag to
+			 * the option definitions), but we decided not
+			 * to do that in order to share cmdline_burn().
+			 */
 			ulen = 2;
 			found = true;
 			is_user = true;
-		} else if (strncmp(p, "--user", 6) == 0) {
+		} else if (strneq_cmdline_exact(p, "--user", 6)) {
 			ulen = 6;
 			found = true;
 			is_user = true;
-		} else if (strncmp(p, "--password2", 11) == 0) {
-			ulen = 11;
-			found = true;
-		} else if (strncmp(p, "--password", 10) == 0) {
+		} else if (strneq_cmdline_exact(p, "--username", 10)) {
 			ulen = 10;
 			found = true;
-		} else if (strncmp(p, "--newpassword", 13) == 0) {
-			ulen = 13;
-			found = true;
+			is_user = true;
+		} else if (strncmp(p, "--", 2) == 0 && strstr(p, "pass")) {
+			/*
+			 * We have many secret options like --password,
+			 * --adminpass, --newpassword, and we could easily
+			 * add more, so we will use an allowlist to let the
+			 * safe ones through (of which there are also many).
+			 */
+			found = is_password_option(p, &ulen);
 		}
 
 		if (found) {
-			char *q = NULL;
-
 			if (strlen(p) == ulen) {
-				continue;
+				/*
+				 * The option string has no '=', so
+				 * its argument will come in the NEXT
+				 * argv member. If there is one, we
+				 * can just step forward and take it,
+				 * setting ulen to 0.
+				 *
+				 * {"--password=secret"}    --> {"--password"}
+				 * {"--password", "secret"} --> {"--password", ""}
+				 * {"-Uadmin%secret"}       --> {"-Uadmin"}
+				 * {"-U", "admin%secret"}   --> {"-U", "admin"}
+				 */
+				i++;
+				if (i == argc) {
+					/*
+					 * this looks like an invalid
+					 * command line, but that's
+					 * for the caller to decide.
+					 */
+					return burnt;
+				}
+				p = argv[i];
+				if (p == NULL) {
+					return burnt;
+				}
+				ulen = 0;
 			}
 
 			if (is_user) {
-				q = strchr_m(p, '%');
-				if (q != NULL) {
-					p = q;
+				char *q = strchr_m(p, '%');
+				if (q == NULL) {
+					/* -U without '%' has no secret */
+					continue;
 				}
+				p = q;
 			} else {
 				p += ulen;
 			}
 
 			memset_s(p, strlen(p), '\0', strlen(p));
-			found = false;
-			is_user = false;
 			burnt = true;
 		}
 	}
