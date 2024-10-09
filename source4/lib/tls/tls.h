@@ -63,6 +63,11 @@ NTSTATUS tstream_tls_params_client(TALLOC_CTX *mem_ctx,
 				   const char *peer_name,
 				   struct tstream_tls_params **_tlsp);
 
+NTSTATUS tstream_tls_params_client_lpcfg(TALLOC_CTX *mem_ctx,
+					 struct loadparm_context *lp_ctx,
+					 const char *peer_name,
+					 struct tstream_tls_params **tlsp);
+
 NTSTATUS tstream_tls_params_server(TALLOC_CTX *mem_ctx,
 				   const char *dns_host_name,
 				   bool enabled,
@@ -75,6 +80,8 @@ NTSTATUS tstream_tls_params_server(TALLOC_CTX *mem_ctx,
 				   struct tstream_tls_params **_params);
 
 bool tstream_tls_params_enabled(struct tstream_tls_params *params);
+
+const DATA_BLOB *tstream_tls_channel_bindings(struct tstream_context *tls_tstream);
 
 struct tevent_req *_tstream_tls_connect_send(TALLOC_CTX *mem_ctx,
 					     struct tevent_context *ev,

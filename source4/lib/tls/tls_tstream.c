@@ -26,9 +26,11 @@
 #include "../lib/tsocket/tsocket_internal.h"
 #include "../lib/util/util_net.h"
 #include "lib/tls/tls.h"
+#include "lib/param/param.h"
 
 #include <gnutls/gnutls.h>
 #include <gnutls/x509.h>
+#include "lib/crypto/gnutls_helpers.h"
 
 #define DH_BITS 2048
 
@@ -62,19 +64,26 @@ struct tstream_tls {
 
 	gnutls_session_t tls_session;
 
+	bool is_server;
+
 	enum tls_verify_peer_state verify_peer;
 	const char *peer_name;
+
+	DATA_BLOB channel_bindings;
 
 	struct tevent_context *current_ev;
 
 	struct tevent_immediate *retry_im;
 
 	struct {
+		struct tevent_req *mgmt_req;
+	} waiting_flush;
+
+	struct {
 		uint8_t *buf;
 		off_t ofs;
 		struct iovec iov;
 		struct tevent_req *subreq;
-		struct tevent_immediate *im;
 	} push;
 
 	struct {
@@ -121,6 +130,17 @@ static void tstream_tls_retry(struct tstream_context *stream, bool deferred)
 		tstream_context_data(stream,
 		struct tstream_tls);
 
+	if (tlss->push.subreq == NULL && tlss->pull.subreq == NULL) {
+		if (tlss->waiting_flush.mgmt_req != NULL) {
+			struct tevent_req *req = tlss->waiting_flush.mgmt_req;
+
+			tlss->waiting_flush.mgmt_req = NULL;
+
+			tevent_req_done(req);
+			return;
+		}
+	}
+
 	if (tlss->disconnect.req) {
 		tstream_tls_retry_disconnect(stream);
 		return;
@@ -159,9 +179,7 @@ static void tstream_tls_retry_trigger(struct tevent_context *ctx,
 	tstream_tls_retry(stream, true);
 }
 
-static void tstream_tls_push_trigger_write(struct tevent_context *ev,
-					   struct tevent_immediate *im,
-					   void *private_data);
+static void tstream_tls_push_done(struct tevent_req *subreq);
 
 static ssize_t tstream_tls_push_function(gnutls_transport_ptr_t ptr,
 					 const void *buf, size_t size)
@@ -172,6 +190,7 @@ static ssize_t tstream_tls_push_function(gnutls_transport_ptr_t ptr,
 	struct tstream_tls *tlss =
 		tstream_context_data(stream,
 		struct tstream_tls);
+	struct tevent_req *subreq = NULL;
 	uint8_t *nbuf;
 	size_t len;
 
@@ -205,56 +224,7 @@ static ssize_t tstream_tls_push_function(gnutls_transport_ptr_t ptr,
 	tlss->push.buf = nbuf;
 
 	memcpy(tlss->push.buf + tlss->push.ofs, buf, len);
-
-	if (tlss->push.im == NULL) {
-		tlss->push.im = tevent_create_immediate(tlss);
-		if (tlss->push.im == NULL) {
-			errno = ENOMEM;
-			return -1;
-		}
-	}
-
-	if (tlss->push.ofs == 0) {
-		/*
-		 * We'll do start the tstream_writev
-		 * in the next event cycle.
-		 *
-		 * This way we can batch all push requests,
-		 * if they fit into a UINT16_MAX buffer.
-		 *
-		 * This is important as gnutls_handshake()
-		 * had a bug in some versions e.g. 2.4.1
-		 * and others (See bug #7218) and it doesn't
-		 * handle EAGAIN.
-		 */
-		tevent_schedule_immediate(tlss->push.im,
-					  tlss->current_ev,
-					  tstream_tls_push_trigger_write,
-					  stream);
-	}
-
 	tlss->push.ofs += len;
-	return len;
-}
-
-static void tstream_tls_push_done(struct tevent_req *subreq);
-
-static void tstream_tls_push_trigger_write(struct tevent_context *ev,
-					   struct tevent_immediate *im,
-					   void *private_data)
-{
-	struct tstream_context *stream =
-		talloc_get_type_abort(private_data,
-		struct tstream_context);
-	struct tstream_tls *tlss =
-		tstream_context_data(stream,
-		struct tstream_tls);
-	struct tevent_req *subreq;
-
-	if (tlss->push.subreq) {
-		/* nothing todo */
-		return;
-	}
 
 	tlss->push.iov.iov_base = (char *)tlss->push.buf;
 	tlss->push.iov.iov_len = tlss->push.ofs;
@@ -264,13 +234,13 @@ static void tstream_tls_push_trigger_write(struct tevent_context *ev,
 				     tlss->plain_stream,
 				     &tlss->push.iov, 1);
 	if (subreq == NULL) {
-		tlss->error = ENOMEM;
-		tstream_tls_retry(stream, false);
-		return;
+		errno = ENOMEM;
+		return -1;
 	}
 	tevent_req_set_callback(subreq, tstream_tls_push_done, stream);
 
 	tlss->push.subreq = subreq;
+	return len;
 }
 
 static void tstream_tls_push_done(struct tevent_req *subreq)
@@ -449,6 +419,12 @@ static struct tevent_req *tstream_tls_readv_send(TALLOC_CTX *mem_ctx,
 	struct tstream_tls_readv_state *state;
 
 	tlss->read.req = NULL;
+
+	if (tlss->current_ev != ev) {
+		SMB_ASSERT(tlss->push.subreq == NULL);
+		SMB_ASSERT(tlss->pull.subreq == NULL);
+	}
+
 	tlss->current_ev = ev;
 
 	req = tevent_req_create(mem_ctx, &state,
@@ -613,6 +589,12 @@ static struct tevent_req *tstream_tls_writev_send(TALLOC_CTX *mem_ctx,
 	struct tstream_tls_writev_state *state;
 
 	tlss->write.req = NULL;
+
+	if (tlss->current_ev != ev) {
+		SMB_ASSERT(tlss->push.subreq == NULL);
+		SMB_ASSERT(tlss->pull.subreq == NULL);
+	}
+
 	tlss->current_ev = ev;
 
 	req = tevent_req_create(mem_ctx, &state,
@@ -779,6 +761,12 @@ static struct tevent_req *tstream_tls_disconnect_send(TALLOC_CTX *mem_ctx,
 	struct tstream_tls_disconnect_state *state;
 
 	tlss->disconnect.req = NULL;
+
+	if (tlss->current_ev != ev) {
+		SMB_ASSERT(tlss->push.subreq == NULL);
+		SMB_ASSERT(tlss->pull.subreq == NULL);
+	}
+
 	tlss->current_ev = ev;
 
 	req = tevent_req_create(mem_ctx, &state,
@@ -832,6 +820,11 @@ static void tstream_tls_retry_disconnect(struct tstream_context *stream)
 		DEBUG(1,("TLS %s - %s\n", __location__, gnutls_strerror(ret)));
 		tlss->error = EIO;
 		tevent_req_error(req, tlss->error);
+		return;
+	}
+
+	if (tlss->push.subreq != NULL || tlss->pull.subreq != NULL) {
+		tlss->waiting_flush.mgmt_req = req;
 		return;
 	}
 
@@ -896,6 +889,63 @@ bool tstream_tls_params_enabled(struct tstream_tls_params *tls_params)
 	struct tstream_tls_params_internal *tlsp = tls_params->internal;
 
 	return tlsp->tls_enabled;
+}
+
+static NTSTATUS tstream_tls_setup_channel_bindings(struct tstream_tls *tlss)
+{
+	gnutls_datum_t cb = { .size = 0 };
+	int ret;
+
+#ifdef HAVE_GNUTLS_CB_TLS_SERVER_END_POINT
+	ret = gnutls_session_channel_binding(tlss->tls_session,
+					     GNUTLS_CB_TLS_SERVER_END_POINT,
+					     &cb);
+#else /* not HAVE_GNUTLS_CB_TLS_SERVER_END_POINT */
+	ret = legacy_gnutls_server_end_point_cb(tlss->tls_session,
+						tlss->is_server,
+						&cb);
+#endif /* not HAVE_GNUTLS_CB_TLS_SERVER_END_POINT */
+	if (ret != GNUTLS_E_SUCCESS) {
+		return gnutls_error_to_ntstatus(ret,
+				NT_STATUS_CRYPTO_SYSTEM_INVALID);
+	}
+
+	if (cb.size != 0) {
+		/*
+		 * Looking at the OpenLDAP implementation
+		 * for LDAP_OPT_X_SASL_CBINDING_TLS_ENDPOINT
+		 * revealed that we need to prefix it with
+		 * 'tls-server-end-point:'
+		 */
+		const char endpoint_prefix[] = "tls-server-end-point:";
+		size_t prefix_size = strlen(endpoint_prefix);
+		size_t size = prefix_size + cb.size;
+
+		tlss->channel_bindings = data_blob_talloc_named(tlss, NULL, size,
+								"tls_channel_bindings");
+		if (tlss->channel_bindings.data == NULL) {
+			gnutls_free(cb.data);
+			return NT_STATUS_NO_MEMORY;
+		}
+		memcpy(tlss->channel_bindings.data, endpoint_prefix, prefix_size);
+		memcpy(tlss->channel_bindings.data + prefix_size, cb.data, cb.size);
+		gnutls_free(cb.data);
+	}
+
+	return NT_STATUS_OK;
+}
+
+const DATA_BLOB *tstream_tls_channel_bindings(struct tstream_context *tls_tstream)
+{
+	struct tstream_tls *tlss =
+		talloc_get_type(_tstream_context_data(tls_tstream),
+		struct tstream_tls);
+
+	if (tlss == NULL) {
+		return NULL;
+	}
+
+	return &tlss->channel_bindings;
 }
 
 NTSTATUS tstream_tls_params_client(TALLOC_CTX *mem_ctx,
@@ -995,6 +1045,237 @@ NTSTATUS tstream_tls_params_client(TALLOC_CTX *mem_ctx,
 	return NT_STATUS_OK;
 }
 
+NTSTATUS tstream_tls_params_client_lpcfg(TALLOC_CTX *mem_ctx,
+					 struct loadparm_context *lp_ctx,
+					 const char *peer_name,
+					 struct tstream_tls_params **tlsp)
+{
+	TALLOC_CTX *frame = talloc_stackframe();
+	const char *ptr = NULL;
+	char *ca_file = NULL;
+	char *crl_file = NULL;
+	const char *tls_priority = NULL;
+	enum tls_verify_peer_state verify_peer =
+		TLS_VERIFY_PEER_AS_STRICT_AS_POSSIBLE;
+	NTSTATUS status;
+
+	ptr = lpcfg__tls_cafile(lp_ctx);
+	if (ptr != NULL) {
+		ca_file = lpcfg_tls_cafile(frame, lp_ctx);
+		if (ca_file == NULL) {
+			TALLOC_FREE(frame);
+			return NT_STATUS_NO_MEMORY;
+		}
+	}
+
+	ptr = lpcfg__tls_crlfile(lp_ctx);
+	if (ptr != NULL) {
+		crl_file = lpcfg_tls_crlfile(frame, lp_ctx);
+		if (crl_file == NULL) {
+			TALLOC_FREE(frame);
+			return NT_STATUS_NO_MEMORY;
+		}
+	}
+
+	tls_priority = lpcfg_tls_priority(lp_ctx);
+	verify_peer = lpcfg_tls_verify_peer(lp_ctx);
+
+	status = tstream_tls_params_client(mem_ctx,
+					   ca_file,
+					   crl_file,
+					   tls_priority,
+					   verify_peer,
+					   peer_name,
+					   tlsp);
+	TALLOC_FREE(frame);
+	return status;
+}
+
+static NTSTATUS tstream_tls_prepare_gnutls(struct tstream_tls_params *_tlsp,
+					   struct tstream_tls *tlss)
+{
+	struct tstream_tls_params_internal *tlsp = NULL;
+	int ret;
+	unsigned int flags;
+	const char *hostname = NULL;
+
+	if (tlss->is_server) {
+		flags = GNUTLS_SERVER;
+	} else {
+		flags = GNUTLS_CLIENT;
+		/*
+		 * tls_tstream can't properly handle 'New Session Ticket'
+		 * messages sent 'after' the client sends the 'Finished'
+		 * message.  GNUTLS_NO_TICKETS was introduced in GnuTLS 3.5.6.
+		 * This flag is to indicate the session Flag session should not
+		 * use resumption with session tickets.
+		 */
+		flags |= GNUTLS_NO_TICKETS;
+	}
+
+	/*
+	 * Note we need to make sure x509_cred and dh_params
+	 * from tstream_tls_params_internal stay alive for
+	 * the whole lifetime of this session!
+	 *
+	 * See 'man gnutls_credentials_set' and
+	 * 'man gnutls_certificate_set_dh_params'.
+	 *
+	 * Note: here we use talloc_reference() in a way
+	 *       that does not expose it to the caller.
+	 */
+	tlsp = talloc_reference(tlss, _tlsp->internal);
+	if (tlsp == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	tlss->verify_peer = tlsp->verify_peer;
+	if (tlsp->peer_name != NULL) {
+		bool ip = is_ipaddress(tlsp->peer_name);
+
+		tlss->peer_name = talloc_strdup(tlss, tlsp->peer_name);
+		if (tlss->peer_name == NULL) {
+			return NT_STATUS_NO_MEMORY;
+		}
+
+		if (!ip) {
+			hostname = tlss->peer_name;
+		}
+
+		if (tlss->verify_peer < TLS_VERIFY_PEER_CA_AND_NAME) {
+			hostname = NULL;
+		}
+	}
+
+	if (tlss->current_ev != NULL) {
+		tlss->retry_im = tevent_create_immediate(tlss);
+		if (tlss->retry_im == NULL) {
+			return NT_STATUS_NO_MEMORY;
+		}
+	}
+
+	ret = gnutls_init(&tlss->tls_session, flags);
+	if (ret != GNUTLS_E_SUCCESS) {
+		return gnutls_error_to_ntstatus(ret,
+			NT_STATUS_CRYPTO_SYSTEM_INVALID);
+	}
+
+	ret = gnutls_set_default_priority(tlss->tls_session);
+	if (ret != GNUTLS_E_SUCCESS) {
+		return gnutls_error_to_ntstatus(ret,
+			NT_STATUS_CRYPTO_SYSTEM_INVALID);
+	}
+
+	if (strlen(tlsp->tls_priority) > 0) {
+		const char *error_pos = NULL;
+
+		ret = gnutls_priority_set_direct(tlss->tls_session,
+						 tlsp->tls_priority,
+						 &error_pos);
+		if (ret != GNUTLS_E_SUCCESS) {
+			return gnutls_error_to_ntstatus(ret,
+				NT_STATUS_CRYPTO_SYSTEM_INVALID);
+		}
+	}
+
+	ret = gnutls_credentials_set(tlss->tls_session,
+				     GNUTLS_CRD_CERTIFICATE,
+				     tlsp->x509_cred);
+	if (ret != GNUTLS_E_SUCCESS) {
+		return gnutls_error_to_ntstatus(ret,
+				NT_STATUS_CRYPTO_SYSTEM_INVALID);
+	}
+
+	if (hostname != NULL) {
+		ret = gnutls_server_name_set(tlss->tls_session,
+					     GNUTLS_NAME_DNS,
+					     hostname,
+					     strlen(hostname));
+		if (ret != GNUTLS_E_SUCCESS) {
+			return gnutls_error_to_ntstatus(ret,
+					NT_STATUS_CRYPTO_SYSTEM_INVALID);
+		}
+	}
+
+	if (tlss->is_server) {
+		gnutls_certificate_server_set_request(tlss->tls_session,
+						      GNUTLS_CERT_REQUEST);
+		gnutls_dh_set_prime_bits(tlss->tls_session, DH_BITS);
+	}
+
+	return NT_STATUS_OK;
+}
+
+static NTSTATUS tstream_tls_verify_peer(struct tstream_tls *tlss)
+{
+	unsigned int status = UINT32_MAX;
+	bool ip = true;
+	const char *hostname = NULL;
+	int ret;
+
+	if (tlss->verify_peer == TLS_VERIFY_PEER_NO_CHECK) {
+		return NT_STATUS_OK;
+	}
+
+	if (tlss->peer_name != NULL) {
+		ip = is_ipaddress(tlss->peer_name);
+	}
+
+	if (!ip) {
+		hostname = tlss->peer_name;
+	}
+
+	if (tlss->verify_peer == TLS_VERIFY_PEER_CA_ONLY) {
+		hostname = NULL;
+	}
+
+	if (tlss->verify_peer >= TLS_VERIFY_PEER_CA_AND_NAME) {
+		if (hostname == NULL) {
+			DEBUG(1,("TLS %s - no hostname available for "
+				 "verify_peer[%s] and peer_name[%s]\n",
+				 __location__,
+				 tls_verify_peer_string(tlss->verify_peer),
+				 tlss->peer_name));
+			return NT_STATUS_IMAGE_CERT_REVOKED;
+		}
+	}
+
+	ret = gnutls_certificate_verify_peers3(tlss->tls_session,
+					       hostname,
+					       &status);
+	if (ret != GNUTLS_E_SUCCESS) {
+		return gnutls_error_to_ntstatus(ret,
+			NT_STATUS_CRYPTO_SYSTEM_INVALID);
+	}
+
+	if (status != 0) {
+		DEBUG(1,("TLS %s - check failed for "
+			 "verify_peer[%s] and peer_name[%s] "
+			 "status 0x%x (%s%s%s%s%s%s%s%s)\n",
+			 __location__,
+			 tls_verify_peer_string(tlss->verify_peer),
+			 tlss->peer_name,
+			 status,
+			 status & GNUTLS_CERT_INVALID ? "invalid " : "",
+			 status & GNUTLS_CERT_REVOKED ? "revoked " : "",
+			 status & GNUTLS_CERT_SIGNER_NOT_FOUND ?
+				"signer_not_found " : "",
+			 status & GNUTLS_CERT_SIGNER_NOT_CA ?
+				"signer_not_ca " : "",
+			 status & GNUTLS_CERT_INSECURE_ALGORITHM ?
+				"insecure_algorithm " : "",
+			 status & GNUTLS_CERT_NOT_ACTIVATED ?
+				"not_activated " : "",
+			 status & GNUTLS_CERT_EXPIRED ?
+				"expired " : "",
+			 status & GNUTLS_CERT_UNEXPECTED_OWNER ?
+				"unexpected_owner " : ""));
+		return NT_STATUS_IMAGE_CERT_REVOKED;
+	}
+
+	return NT_STATUS_OK;
+}
+
 struct tstream_tls_connect_state {
 	struct tstream_context *tls_stream;
 };
@@ -1007,11 +1288,8 @@ struct tevent_req *_tstream_tls_connect_send(TALLOC_CTX *mem_ctx,
 {
 	struct tevent_req *req;
 	struct tstream_tls_connect_state *state;
-	const char *error_pos;
 	struct tstream_tls *tlss;
-	struct tstream_tls_params_internal *tls_params = NULL;
-	int ret;
-	unsigned int flags = GNUTLS_CLIENT;
+	NTSTATUS status;
 
 	req = tevent_req_create(mem_ctx, &state,
 				struct tstream_tls_connect_state);
@@ -1029,82 +1307,16 @@ struct tevent_req *_tstream_tls_connect_send(TALLOC_CTX *mem_ctx,
 	}
 	ZERO_STRUCTP(tlss);
 	talloc_set_destructor(tlss, tstream_tls_destructor);
-
-	/*
-	 * Note we need to make sure x509_cred and dh_params
-	 * from tstream_tls_params_internal stay alive for
-	 * the whole lifetime of this session!
-	 *
-	 * See 'man gnutls_credentials_set' and
-	 * 'man gnutls_certificate_set_dh_params'.
-	 *
-	 * Note: here we use talloc_reference() in a way
-	 *       that does not expose it to the caller.
-	 *
-	 */
-	tls_params = talloc_reference(tlss, _tls_params->internal);
-	if (tevent_req_nomem(tls_params, req)) {
-		return tevent_req_post(req, ev);
-	}
-
 	tlss->plain_stream = plain_stream;
-	tlss->verify_peer = tls_params->verify_peer;
-	if (tls_params->peer_name != NULL) {
-		tlss->peer_name = talloc_strdup(tlss, tls_params->peer_name);
-		if (tevent_req_nomem(tlss->peer_name, req)) {
-			return tevent_req_post(req, ev);
-		}
-	}
-
+	tlss->is_server = false;
 	tlss->current_ev = ev;
-	tlss->retry_im = tevent_create_immediate(tlss);
-	if (tevent_req_nomem(tlss->retry_im, req)) {
+
+	status = tstream_tls_prepare_gnutls(_tls_params, tlss);
+	if (NT_STATUS_EQUAL(status, NT_STATUS_NO_MEMORY)) {
+		tevent_req_oom(req);
 		return tevent_req_post(req, ev);
 	}
-
-#ifdef GNUTLS_NO_TICKETS
-	/*
-	 * tls_tstream can't properly handle 'New Session Ticket' messages
-	 * sent 'after' the client sends the 'Finished' message.
-	 * GNUTLS_NO_TICKETS was introduced in GnuTLS 3.5.6.  This flag is to
-	 * indicate the session Flag session should not use resumption with
-	 * session tickets.
-	 */
-	flags |= GNUTLS_NO_TICKETS;
-#endif
-
-	ret = gnutls_init(&tlss->tls_session, flags);
-	if (ret != GNUTLS_E_SUCCESS) {
-		DEBUG(0,("TLS %s - %s\n", __location__, gnutls_strerror(ret)));
-		tevent_req_error(req, EINVAL);
-		return tevent_req_post(req, ev);
-	}
-
-	ret = gnutls_set_default_priority(tlss->tls_session);
-	if (ret != GNUTLS_E_SUCCESS) {
-		DBG_ERR("TLS %s - %s. Failed to set default priorities\n",
-			__location__, gnutls_strerror(ret));
-		tevent_req_error(req, EINVAL);
-		return tevent_req_post(req, ev);
-	}
-
-	if (strlen(tls_params->tls_priority) > 0) {
-		ret = gnutls_priority_set_direct(tlss->tls_session,
-						 tls_params->tls_priority,
-						 &error_pos);
-		if (ret != GNUTLS_E_SUCCESS) {
-			DEBUG(0,("TLS %s - %s.  Check 'tls priority' option at '%s'\n",
-				 __location__, gnutls_strerror(ret), error_pos));
-			tevent_req_error(req, EINVAL);
-			return tevent_req_post(req, ev);
-		}
-	}
-
-	ret = gnutls_credentials_set(tlss->tls_session,
-				     GNUTLS_CRD_CERTIFICATE,
-				     tls_params->x509_cred);
-	if (ret != GNUTLS_E_SUCCESS) {
-		DEBUG(0,("TLS %s - %s\n", __location__, gnutls_strerror(ret)));
+	if (!NT_STATUS_IS_OK(status)) {
 		tevent_req_error(req, EINVAL);
 		return tevent_req_post(req, ev);
 	}
@@ -1325,9 +1537,7 @@ struct tevent_req *_tstream_tls_accept_send(TALLOC_CTX *mem_ctx,
 	struct tevent_req *req;
 	struct tstream_tls_accept_state *state;
 	struct tstream_tls *tlss;
-	const char *error_pos;
-	struct tstream_tls_params_internal *tlsp = NULL;
-	int ret;
+	NTSTATUS status;
 
 	req = tevent_req_create(mem_ctx, &state,
 				struct tstream_tls_accept_state);
@@ -1345,69 +1555,19 @@ struct tevent_req *_tstream_tls_accept_send(TALLOC_CTX *mem_ctx,
 	}
 	ZERO_STRUCTP(tlss);
 	talloc_set_destructor(tlss, tstream_tls_destructor);
-
-	/*
-	 * Note we need to make sure x509_cred and dh_params
-	 * from tstream_tls_params_internal stay alive for
-	 * the whole lifetime of this session!
-	 *
-	 * See 'man gnutls_credentials_set' and
-	 * 'man gnutls_certificate_set_dh_params'.
-	 *
-	 * Note: here we use talloc_reference() in a way
-	 *       that does not expose it to the caller.
-	 */
-	tlsp = talloc_reference(tlss, _tlsp->internal);
-	if (tevent_req_nomem(tlsp, req)) {
-		return tevent_req_post(req, ev);
-	}
-
 	tlss->plain_stream = plain_stream;
-
+	tlss->is_server = true;
 	tlss->current_ev = ev;
-	tlss->retry_im = tevent_create_immediate(tlss);
-	if (tevent_req_nomem(tlss->retry_im, req)) {
+
+	status = tstream_tls_prepare_gnutls(_tlsp, tlss);
+	if (NT_STATUS_EQUAL(status, NT_STATUS_NO_MEMORY)) {
+		tevent_req_oom(req);
 		return tevent_req_post(req, ev);
 	}
-
-	ret = gnutls_init(&tlss->tls_session, GNUTLS_SERVER);
-	if (ret != GNUTLS_E_SUCCESS) {
-		DEBUG(0,("TLS %s - %s\n", __location__, gnutls_strerror(ret)));
+	if (!NT_STATUS_IS_OK(status)) {
 		tevent_req_error(req, EINVAL);
 		return tevent_req_post(req, ev);
 	}
-
-	ret = gnutls_set_default_priority(tlss->tls_session);
-	if (ret != GNUTLS_E_SUCCESS) {
-		DBG_ERR("TLS %s - %s. Failed to set default priorities\n",
-			__location__, gnutls_strerror(ret));
-		tevent_req_error(req, EINVAL);
-		return tevent_req_post(req, ev);
-	}
-
-	if (strlen(tlsp->tls_priority) > 0) {
-		ret = gnutls_priority_set_direct(tlss->tls_session,
-						 tlsp->tls_priority,
-						 &error_pos);
-		if (ret != GNUTLS_E_SUCCESS) {
-			DEBUG(0,("TLS %s - %s.  Check 'tls priority' option at '%s'\n",
-				 __location__, gnutls_strerror(ret), error_pos));
-			tevent_req_error(req, EINVAL);
-			return tevent_req_post(req, ev);
-		}
-	}
-
-	ret = gnutls_credentials_set(tlss->tls_session, GNUTLS_CRD_CERTIFICATE,
-				     tlsp->x509_cred);
-	if (ret != GNUTLS_E_SUCCESS) {
-		DEBUG(0,("TLS %s - %s\n", __location__, gnutls_strerror(ret)));
-		tevent_req_error(req, EINVAL);
-		return tevent_req_post(req, ev);
-	}
-
-	gnutls_certificate_server_set_request(tlss->tls_session,
-					      GNUTLS_CERT_REQUEST);
-	gnutls_dh_set_prime_bits(tlss->tls_session, DH_BITS);
 
 	gnutls_transport_set_ptr(tlss->tls_session,
 				 (gnutls_transport_ptr_t)state->tls_stream);
@@ -1431,6 +1591,7 @@ static void tstream_tls_retry_handshake(struct tstream_context *stream)
 		tstream_context_data(stream,
 		struct tstream_tls);
 	struct tevent_req *req = tlss->handshake.req;
+	NTSTATUS status;
 	int ret;
 
 	if (tlss->error != 0) {
@@ -1459,72 +1620,28 @@ static void tstream_tls_retry_handshake(struct tstream_context *stream)
 		return;
 	}
 
-	if (tlss->verify_peer >= TLS_VERIFY_PEER_CA_ONLY) {
-		unsigned int status = UINT32_MAX;
-		bool ip = true;
-		const char *hostname = NULL;
+	status = tstream_tls_verify_peer(tlss);
+	if (NT_STATUS_EQUAL(status, NT_STATUS_IMAGE_CERT_REVOKED)) {
+		tlss->error = EINVAL;
+		tevent_req_error(req, tlss->error);
+		return;
+	}
+	if (!NT_STATUS_IS_OK(status)) {
+		tlss->error = EIO;
+		tevent_req_error(req, tlss->error);
+		return;
+	}
 
-		if (tlss->peer_name != NULL) {
-			ip = is_ipaddress(tlss->peer_name);
-		}
+	status = tstream_tls_setup_channel_bindings(tlss);
+	if (!NT_STATUS_IS_OK(status)) {
+		tlss->error = EIO;
+		tevent_req_error(req, tlss->error);
+		return;
+	}
 
-		if (!ip) {
-			hostname = tlss->peer_name;
-		}
-
-		if (tlss->verify_peer == TLS_VERIFY_PEER_CA_ONLY) {
-			hostname = NULL;
-		}
-
-		if (tlss->verify_peer >= TLS_VERIFY_PEER_CA_AND_NAME) {
-			if (hostname == NULL) {
-				DEBUG(1,("TLS %s - no hostname available for "
-					 "verify_peer[%s] and peer_name[%s]\n",
-					 __location__,
-					 tls_verify_peer_string(tlss->verify_peer),
-					 tlss->peer_name));
-				tlss->error = EINVAL;
-				tevent_req_error(req, tlss->error);
-				return;
-			}
-		}
-
-		ret = gnutls_certificate_verify_peers3(tlss->tls_session,
-						       hostname,
-						       &status);
-		if (ret != GNUTLS_E_SUCCESS) {
-			DEBUG(1,("TLS %s - %s\n", __location__, gnutls_strerror(ret)));
-			tlss->error = EIO;
-			tevent_req_error(req, tlss->error);
-			return;
-		}
-
-		if (status != 0) {
-			DEBUG(1,("TLS %s - check failed for "
-				 "verify_peer[%s] and peer_name[%s] "
-				 "status 0x%x (%s%s%s%s%s%s%s%s)\n",
-				 __location__,
-				 tls_verify_peer_string(tlss->verify_peer),
-				 tlss->peer_name,
-				 status,
-				 status & GNUTLS_CERT_INVALID ? "invalid " : "",
-				 status & GNUTLS_CERT_REVOKED ? "revoked " : "",
-				 status & GNUTLS_CERT_SIGNER_NOT_FOUND ?
-					"signer_not_found " : "",
-				 status & GNUTLS_CERT_SIGNER_NOT_CA ?
-					"signer_not_ca " : "",
-				 status & GNUTLS_CERT_INSECURE_ALGORITHM ?
-					"insecure_algorithm " : "",
-				 status & GNUTLS_CERT_NOT_ACTIVATED ?
-					"not_activated " : "",
-				 status & GNUTLS_CERT_EXPIRED ?
-					"expired " : "",
-				 status & GNUTLS_CERT_UNEXPECTED_OWNER ?
-					"unexpected_owner " : ""));
-			tlss->error = EINVAL;
-			tevent_req_error(req, tlss->error);
-			return;
-		}
+	if (tlss->push.subreq != NULL || tlss->pull.subreq != NULL) {
+		tlss->waiting_flush.mgmt_req = req;
+		return;
 	}
 
 	tevent_req_done(req);
