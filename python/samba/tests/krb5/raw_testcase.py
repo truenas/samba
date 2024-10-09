@@ -54,7 +54,9 @@ from samba.dcerpc.misc import (
     SEC_CHAN_WKSTA,
     SEC_CHAN_BDC,
 )
-
+from samba.dsdb import (
+    UF_SMARTCARD_REQUIRED
+)
 import samba.tests
 from samba.tests import TestCase
 
@@ -65,6 +67,7 @@ from samba.tests.krb5.rfc4120_constants import (
     FX_FAST_ARMOR_AP_REQUEST,
     KDC_ERR_CLIENT_REVOKED,
     KDC_ERR_GENERIC,
+    KDC_ERR_KEY_EXPIRED,
     KDC_ERR_POLICY,
     KDC_ERR_PREAUTH_FAILED,
     KDC_ERR_SKEW,
@@ -407,6 +410,7 @@ class KerberosCredentials(Credentials):
         'spn',
         'tgs_supported_enctypes',
         'upn',
+        'user_account_control'
     ]
 
     non_etype_bits = (
@@ -438,6 +442,8 @@ class KerberosCredentials(Credentials):
         self.sid = None
         self.account_type = None
 
+        self.user_account_control = None
+
         self._private_key = None
 
     def set_as_supported_enctypes(self, value):
@@ -448,6 +454,9 @@ class KerberosCredentials(Credentials):
 
     def set_ap_supported_enctypes(self, value):
         self.ap_supported_enctypes = int(value)
+
+    def set_user_account_control(self, value):
+        self.user_account_control = int(value)
 
     etype_map = collections.OrderedDict([
         (kcrypto.Enctype.AES256,
@@ -4759,7 +4768,10 @@ class RawKerberosTest(TestCase):
 
                 creds = kdc_exchange_dict['creds']
                 nt_password = bytes(ntlm_package.nt_password.hash)
-                self.assertEqual(creds.get_nt_hash(), nt_password)
+                if creds.user_account_control & UF_SMARTCARD_REQUIRED:
+                    self.assertNotEqual(creds.get_nt_hash(), nt_password)
+                else:
+                    self.assertEqual(creds.get_nt_hash(), nt_password)
 
                 lm_password = bytes(ntlm_package.lm_password.hash)
                 self.assertEqual(bytes(16), lm_password)
@@ -5046,6 +5058,8 @@ class RawKerberosTest(TestCase):
                 if ('1' in sent_pac_options
                         and error_code not in (0, KDC_ERR_GENERIC)):
                     expected_patypes += (PADATA_PAC_OPTIONS,)
+            elif error_code == KDC_ERR_KEY_EXPIRED:
+                expected_patypes += (PADATA_PK_AS_REP,)
             elif error_code != KDC_ERR_GENERIC:
                 if expect_etype_info:
                     expected_patypes += (PADATA_ETYPE_INFO,)

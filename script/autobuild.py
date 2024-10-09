@@ -138,6 +138,13 @@ def check_symbols(sofile, expected_symbols=""):
     return "objdump --dynamic-syms " + sofile + " | " + \
            "awk \'$0 !~ /" + expected_symbols + "/ {if ($2 == \"g\" && $3 ~ /D(F|O)/ && $4 ~ /(.bss|.text)/ && $7 !~ /(__gcov_|mangle_path)/) exit 1}\'"
 
+def check_versioned_symbol(sofile, symvol, version):
+    return "objdump --dynamic-syms " + sofile + " | " + \
+           "awk \'$7 == \"" + symvol + "\" { " + \
+                "if ($2 == \"g\" && $3 ~ /D(F|O)/ && $4 ~ /(.bss|.text)/ && " + \
+                     "$6 == \"" + version + "\") print $0 }\'" + \
+                "| wc -l | grep -q \'^1$\'"
+
 if args:
     # If we are only running specific test,
     # do not sleep randomly to wait for it to start
@@ -892,10 +899,10 @@ tasks = {
             ("ldb-make", "cd lib/ldb && make"),
             ("ldb-install", "cd lib/ldb && make install"),
 
-            ("nondevel-configure", samba_libs_envvars + " ./configure --vendor-name=autobuild-TEST-STRING --vendor-patch-revision=5 ${PREFIX}"),
+            ("nondevel-configure", samba_libs_envvars + " ./configure --vendor-suffix=TEST-STRING~5.1.2 ${PREFIX}"),
             ("nondevel-make", "make -j"),
             ("nondevel-check", "./bin/smbd -b | grep WITH_NTVFS_FILESERVER && exit 1; exit 0"),
-            ("nondevel-check", "./bin/smbd --version | grep -e '-autobuild-TEST-STRING-5' && exit 0; exit 1"),
+            ("nondevel-check", "./bin/smbd --version | grep -F 'TEST-STRING~5.1.2' && exit 0; exit 1"),
             ("nondevel-no-libtalloc", "find ./bin | grep -v 'libtalloc-report' | grep 'libtalloc' && exit 1; exit 0"),
             ("nondevel-no-libtdb", "find ./bin | grep -v 'libtdb-wrap' | grep 'libtdb' && exit 1; exit 0"),
             ("nondevel-no-libtevent", "find ./bin | grep -v 'libtevent-util' | grep 'libtevent' && exit 1; exit 0"),
@@ -910,12 +917,16 @@ tasks = {
                 check_symbols("./bin/plugins/libnss_wins.so.2", "_nss_wins_")),
             ("nondevel-no-public-libwbclient",
                 check_symbols("./bin/shared/libwbclient.so.0", "wbc")),
+            ("nondevel-libwbclient-wbcCtxPingDc2@WBCLIENT_0.12",
+                check_versioned_symbol("./bin/shared/libwbclient.so.0", "wbcCtxPingDc2", "WBCLIENT_0.12")),
             ("nondevel-no-public-pam_winbind",
                 check_symbols("./bin/plugins/pam_winbind.so", "pam_sm_")),
             ("nondevel-no-public-winbind_krb5_locator",
                 check_symbols("./bin/plugins/winbind_krb5_locator.so", "service_locator")),
             ("nondevel-no-public-async_dns_krb5_locator",
                 check_symbols("./bin/plugins/async_dns_krb5_locator.so", "service_locator")),
+            ("nondevel-libndr-krb5pac-ndr_pull_PAC_DATA@NDR_KRB5PAC_0.0.1",
+                check_versioned_symbol("./bin/shared/libndr-krb5pac.so.0", "ndr_pull_PAC_DATA", "NDR_KRB5PAC_0.0.1")),
             ("nondevel-install", "make -j install"),
             ("nondevel-dist", "make dist"),
 
