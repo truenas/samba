@@ -57,12 +57,14 @@ bool srv_init_signing(struct smbXsrv_connection *conn);
 /* The following definitions come from smbd/aio.c  */
 
 struct aio_extra;
+struct io_pool_link;
 bool aio_write_through_requested(struct aio_extra *aio_ex);
 NTSTATUS schedule_smb2_aio_read(connection_struct *conn,
 				struct smb_request *smbreq,
 				files_struct *fsp,
 				TALLOC_CTX *ctx,
 				DATA_BLOB *preadbuf,
+				struct io_pool_link *lnk,
 				off_t startpos,
 				size_t smb_maxcnt);
 NTSTATUS schedule_aio_smb2_write(connection_struct *conn,
