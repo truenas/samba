@@ -52,7 +52,7 @@ static int io_buffer_destroy(struct io_pool_link *lnk)
 	return 0;
 }
 
-bool link_io_buffer_blob(TALLOC_CTX *mem_ctx, DATA_BLOB *buf)
+static struct io_pool_link *link_io_buffer_blob(TALLOC_CTX *mem_ctx, DATA_BLOB *buf)
 {
 	struct io_pool_link *lnk = NULL;
 
@@ -60,11 +60,11 @@ bool link_io_buffer_blob(TALLOC_CTX *mem_ctx, DATA_BLOB *buf)
 
 	lnk = talloc_zero(mem_ctx, struct io_pool_link);
 	if (lnk == NULL) {
-		return false;
+		return lnk;
 	}
 	lnk->to_free = buf->data;
 	talloc_set_destructor(lnk, io_buffer_destroy);
-	return true;
+	return lnk;
 }
 
 static bool link_io_buffer(TALLOC_CTX *mem_ctx)
@@ -123,6 +123,7 @@ static bool init_io_pool(struct smbd_server_connection *sconn)
 		if (sconn->io_memory_pool == NULL) {
 			return false;
 		}
+		talloc_set_name(sconn->io_memory_pool, "TrueNAS Memory Pool");
 	}
 
 	if (io_buffer_timer == NULL) {
@@ -139,10 +140,13 @@ static bool init_io_pool(struct smbd_server_connection *sconn)
 }
 
 bool io_pool_alloc_blob(struct connection_struct *conn,
+			TALLOC_CTX *mem_ctx,
 			size_t buflen,
-			DATA_BLOB *out)
+			DATA_BLOB *out,
+			struct io_pool_link **lnk_out)
 {
 	DATA_BLOB buf = { 0 };
+	struct io_pool_link *lnk = NULL;
 
 	if (!init_io_pool(conn->sconn)) {
 		return false;
@@ -153,7 +157,14 @@ bool io_pool_alloc_blob(struct connection_struct *conn,
 		return false;
 	}
 
+	lnk = link_io_buffer_blob(mem_ctx, &buf);
+	if (lnk == NULL) {
+		data_blob_free(&buf);
+		return false;
+	}
+
 	*out = buf;
+	*lnk_out = lnk;
 	alloc_cnt += 1;
 	return true;
 }
