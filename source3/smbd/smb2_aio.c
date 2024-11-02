@@ -308,6 +308,7 @@ NTSTATUS schedule_smb2_aio_read(connection_struct *conn,
 				files_struct *fsp,
 				TALLOC_CTX *ctx,
 				DATA_BLOB *preadbuf,
+				struct io_pool_link *lnk,
 				off_t startpos,
 				size_t smb_maxcnt)
 {
@@ -356,7 +357,7 @@ NTSTATUS schedule_smb2_aio_read(connection_struct *conn,
 
 	/* Create the out buffer. */
 
-	if (!io_pool_alloc_blob(conn, smb_maxcnt, preadbuf)) {
+	if (!io_pool_alloc_blob(conn, ctx, smb_maxcnt, preadbuf, &lnk)) {
 		return NT_STATUS_NO_MEMORY;
 	}
 
