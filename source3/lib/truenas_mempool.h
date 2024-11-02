@@ -17,37 +17,27 @@
  * along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
 
-
-/**
- * @brief Link the specified data blob to the specified memory context
- *	  This is done so that when the specified context is freed
- *	  the buffer associated the the specified DATA_BLOB is also
- *	  freed. This may be used in lieu of talloc_steal of the buffer,
- *	  and is required when memory pool is in use in order to ensure
- *	  that memory is released to the pool c.f. documentation for
- *	  talloc_pool(). A DATA_BLOB must be linked to no more than
- *	  one talloc context.
- *
- * @param[in]	ctx		The talloc context for the link
- * @param[in]	buf		Buffer to link to the context
- *
- * @return	true on success false on failure.
- */
-bool link_io_buffer_blob(TALLOC_CTX *mem_ctx, DATA_BLOB *buf);
+struct io_pool_link;
 
 /**
  * @brief Allocate a DATA_BLOB with a buffer size specified by buflen
- * 	  using memory in the io_memory_pool.
+ * 	  using memory in the io_memory_pool. The buffer will be freed
+ *	  when lnk_out is freed. lnk_out is allocated under the specified
+ *	  mem_ctx.
  *
  * @param[in]	conn		The current tree connection
+ * @param[in]   mem_ctx		Memory context under which to free buffer.
  * @param[in]	buflen		size of buffer to allocate
- * @param[buf]	out 		New DATA_BLOB with buffer
+ * @param[out]	buf 		New DATA_BLOB with buffer
+ * @param[out]	lnk_out 	Autofree linkage for data blob buffer
  *
  * @return	true on success false on failure.
  */
 bool io_pool_alloc_blob(struct connection_struct *conn,
+			TALLOC_CTX *mem_ctx,
 			size_t buflen,
-			DATA_BLOB *out);
+			DATA_BLOB *out,
+			struct io_pool_link **lnk_out);
 
 void *_io_pool_calloc_size(struct connection_struct *conn, size_t size,
 			   const char *name, const char *location);
