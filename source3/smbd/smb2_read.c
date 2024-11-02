@@ -31,7 +31,6 @@
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_SMB2
-#define OP_USES_MEMORY_POOL 0x01
 
 static struct tevent_req *smbd_smb2_read_send(TALLOC_CTX *mem_ctx,
 					      struct tevent_context *ev,
@@ -195,8 +194,8 @@ struct smbd_smb2_read_state {
 	DATA_BLOB out_headers;
 	uint8_t _out_hdr_buf[NBT_HDR_SIZE + SMB2_HDR_BODY + 0x10];
 	DATA_BLOB out_data;
+	struct io_pool_link *io_lnk;
 	uint32_t out_remaining;
-	uint32_t op_flags;
 };
 
 static int smb2_smb2_read_state_deny_destructor(struct smbd_smb2_read_state *state)
@@ -544,6 +543,7 @@ static struct tevent_req *smbd_smb2_read_send(TALLOC_CTX *mem_ctx,
 				fsp,
 				state,
 				&state->out_data,
+				state->io_lnk,
 				(off_t)in_offset,
 				(size_t)in_length);
 
@@ -552,10 +552,13 @@ static struct tevent_req *smbd_smb2_read_send(TALLOC_CTX *mem_ctx,
 		 * Doing an async read, allow this
 		 * request to be canceled
 		 */
-		state->op_flags |= OP_USES_MEMORY_POOL;
 		tevent_req_set_cancel_fn(req, smbd_smb2_read_cancel);
 		return req;
 	}
+
+	// free initial data blob
+	TALLOC_FREE(state->io_lnk);
+	state->out_data = data_blob_null;
 
 	if (!NT_STATUS_EQUAL(status, NT_STATUS_RETRY)) {
 		/* Real error in setting up aio. Fail. */
@@ -591,12 +594,11 @@ static struct tevent_req *smbd_smb2_read_send(TALLOC_CTX *mem_ctx,
 	}
 
 	/* Ok, read into memory. Allocate the out buffer. */
-	if (!io_pool_alloc_blob(fsp->conn, in_length, &state->out_data)) {
+	if (!io_pool_alloc_blob(fsp->conn, state, in_length, &state->out_data,
+				&state->io_lnk)) {
 		tevent_req_nomem(NULL, req);
 		return tevent_req_post(req, ev);
 	}
-
-	state->op_flags |= OP_USES_MEMORY_POOL;
 
 	nread = read_file(fsp,
 			  (char *)state->out_data.data,
@@ -674,13 +676,10 @@ static NTSTATUS smbd_smb2_read_recv(struct tevent_req *req,
 
 	*out_data = state->out_data;
 
-	if (state->op_flags & OP_USES_MEMORY_POOL) {
-		if (!link_io_buffer_blob(mem_ctx, out_data)) {
-			smb_panic("Failed to link aio buffer\n");
-		}
-	} else {
-		talloc_steal(mem_ctx, out_data->data);
-	}
+	// Reparent the io_lnk to the longer-lived memory context for the
+	// SMB response. The io_lnk controls when the read buffer is returned
+	// to memory pool.
+	talloc_steal(mem_ctx, state->io_lnk);
 
 	*out_remaining = state->out_remaining;
 
