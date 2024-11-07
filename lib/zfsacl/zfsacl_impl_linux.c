@@ -4,7 +4,7 @@
 #include <assert.h>
 #include "replace.h"
 #include "zfsacl.h"
-#define ACL4_MAX_ENTRIES 64
+#define ACL4_MAX_ENTRIES ZFSACL_MAX_ENTRIES
 #define ACL4_XATTR "system.nfs4_acl_xdr"
 #define ACL4_METADATA (sizeof(uint) * 2)
 
