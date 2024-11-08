@@ -605,7 +605,7 @@ static struct tevent_req *smbd_smb2_read_send(TALLOC_CTX *mem_ctx,
 	}
 
 	/* Ok, read into memory. Allocate the out buffer. */
-	if (!io_pool_alloc_blob(fsp->conn, state, in_length, &state->out_data,
+	if (!io_pool_alloc_blob(fsp->conn, smb2req, in_length, &state->out_data,
 				&state->io_lnk)) {
 		tevent_req_nomem(NULL, req);
 		return tevent_req_post(req, ev);
