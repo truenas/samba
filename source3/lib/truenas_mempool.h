@@ -38,31 +38,3 @@ bool io_pool_alloc_blob(struct connection_struct *conn,
 			size_t buflen,
 			DATA_BLOB *out,
 			struct io_pool_link **lnk_out);
-
-void *_io_pool_calloc_size(struct connection_struct *conn, size_t size,
-			   const char *name, const char *location);
-
-/**
- * @brief Allocate a specified amount of zero-initialized memory with the
- *	  specified name using the io_memory_pool.
- *
- * @param[in]	conn		The current tree connection
- * @param[in]	size		size of allocation
- * @param[in]	name 		Name to use for new talloc chunk
- *
- * @return	Pointer to new talloc chunk, NULL on error.
- */
-#define io_pool_calloc_size(conn, size, name)\
-	_io_pool_calloc_size(conn, size, name, __location__)
-
-/**
- * @brief Allocate a zero-initialized memory chunk of the specified
- * 	  type.
- *
- * @param[in]	conn		The current tree connection
- * @param[in]	type		Type of memory to allocate
- *
- * @return	Pointer to new talloc chunk, NULL on error.
- */
-#define io_pool_calloc(conn, type)\
-	(type *)io_pool_calloc_size(conn, sizeof(type), #type)
