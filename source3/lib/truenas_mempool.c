@@ -31,7 +31,7 @@ static uint alloc_cnt;
 static struct tevent_timer *io_buffer_timer;
 static struct timespec last_alloc;
 
-struct io_pool_link { uint8_t *to_free; };
+struct io_pool_link { DATA_BOB *to_free; };
 
 static int io_buffer_destroy(struct io_pool_link *lnk)
 {
@@ -45,7 +45,7 @@ static int io_buffer_destroy(struct io_pool_link *lnk)
 	 * a different memory context.
 	 */
 	if (lnk->to_free) {
-		TALLOC_FREE(lnk->to_free);
+		data_blob_free(&lnk);
 	}
 	SMB_ASSERT(alloc_cnt > 0);
 	alloc_cnt -= 1;
