@@ -31,7 +31,7 @@ static uint alloc_cnt;
 static struct tevent_timer *io_buffer_timer;
 static struct timespec last_alloc;
 
-struct io_pool_link { uint8_t *to_free; };
+struct io_pool_link { DATA_BLOB to_free; };
 
 static int io_buffer_destroy(struct io_pool_link *lnk)
 {
@@ -44,9 +44,7 @@ static int io_buffer_destroy(struct io_pool_link *lnk)
 	 * to allow a mechanism to effectively reparent the buffer under
 	 * a different memory context.
 	 */
-	if (lnk->to_free) {
-		TALLOC_FREE(lnk->to_free);
-	}
+	data_blob_free(&lnk->to_free);
 	SMB_ASSERT(alloc_cnt > 0);
 	alloc_cnt -= 1;
 	return 0;
@@ -62,7 +60,7 @@ static struct io_pool_link *link_io_buffer_blob(TALLOC_CTX *mem_ctx, DATA_BLOB *
 	if (lnk == NULL) {
 		return lnk;
 	}
-	lnk->to_free = buf->data;
+	lnk->to_free = *buf;
 	talloc_set_destructor(lnk, io_buffer_destroy);
 	return lnk;
 }
@@ -148,48 +146,27 @@ bool io_pool_alloc_blob(struct connection_struct *conn,
 	DATA_BLOB buf = { 0 };
 	struct io_pool_link *lnk = NULL;
 
+	alloc_cnt += 1;
+
 	if (!init_io_pool(conn->sconn)) {
+		alloc_cnt -= 1;
 		return false;
 	}
 
 	buf = data_blob_talloc(conn->sconn->io_memory_pool, NULL, buflen);
 	if (buf.data == NULL) {
+		alloc_cnt -= 1;
 		return false;
 	}
 
 	lnk = link_io_buffer_blob(mem_ctx, &buf);
 	if (lnk == NULL) {
 		data_blob_free(&buf);
+		alloc_cnt -= 1;
 		return false;
 	}
 
-	*out = buf;
+	*out = lnk->to_free;
 	*lnk_out = lnk;
-	alloc_cnt += 1;
 	return true;
-}
-
-void *_io_pool_calloc_size(struct connection_struct *conn, size_t size,
-			   const char *name, const char *location)
-{
-	void *out = NULL;
-
-	if (!init_io_pool(conn->sconn)) {
-		return NULL;
-	}
-
-	out = talloc_zero_size(conn, size);
-	if (out == NULL) {
-		return NULL;
-	}
-
-	talloc_set_name_const(out, name ? name : location);
-	alloc_cnt += 1;
-
-	if (!link_io_buffer(out)) {
-		TALLOC_FREE(out);
-		return NULL;
-	}
-
-	return out;
 }
