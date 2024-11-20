@@ -412,8 +412,13 @@ bool vfs_valid_allocation_range(off_t offset, size_t length)
 {
 	/*
 	 * See MAXFILESIZE in [MS-FSA] 2.1.5.3 Server Requests a Write
+	 *
+	 * Packet captures on ReFS showed successful writes to offsets
+	 * greater than MAXFILESIZE in MS-FSA and so we boost this to
+	 * 64 TiB which seems like a reasonable upper-bound for VEEAM
+	 * workloads.
 	 */
-	static const uint64_t maxfilesize = 0xfffffff0000;
+	static const uint64_t maxfilesize = 0x0000400000000000;
 	uint64_t last_byte_ofs;
 	bool ok;
 
