@@ -1915,7 +1915,8 @@ smb_zfs_pool_feature_enabled(struct zfs_dataset *ds,
 		return false;
 	}
 
-	if (strcmp(statebuf, "enabled") == 0) {
+	if ((strcmp(statebuf, "enabled") == 0) ||
+	    (strcmp(statebuf, "active") == 0)) {
 		*enabled_out = true;
 
 	} else {
