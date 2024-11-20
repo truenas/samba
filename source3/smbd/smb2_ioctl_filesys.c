@@ -734,6 +734,193 @@ static NTSTATUS fsctl_qar(TALLOC_CTX *mem_ctx,
 	return status;
 }
 
+static off_t fsctl_qfr_valid_data_len(struct files_struct * fsp,
+                                      off_t curr_off_in,
+                                      off_t max_off)
+{
+	/*
+	 * MS-FSCC 2.4.48 defines the file data length as follows:
+	 * A file's valid data length is the length, in bytes, of the data that
+	 * has been written to the file. This valid data extends from the
+	 * beginning of the file to the last byte in the file that has not been
+	 * zeroed or left uninitialized.
+	 *
+	 * For the purposes of this function we scan for a hole at the end of
+	 * the file and return its offset as the end of the valid data.
+	 */
+	off_t curr_off = curr_off_in;
+	off_t out = max_off;
+	off_t hole_off;
+	off_t data_off;
+
+	while (curr_off <= max_off) {
+		/* seek next data */
+		data_off = SMB_VFS_LSEEK(fsp, curr_off, SEEK_DATA);
+		if ((data_off == -1) && (errno == ENXIO)) {
+			/* no data from curr_off to EOF */
+			return curr_off == curr_off_in ? curr_off : curr_off -1;
+		} else if (data_off == -1) {
+			DBG_ERR("%s: lseek data failed: %s\n",
+				fsp_str_dbg(fsp), strerror(errno));
+			return max_off;
+		}
+
+		hole_off = SMB_VFS_LSEEK(fsp, data_off, SEEK_HOLE);
+		if (hole_off == -1) {
+			DBG_ERR("%s: lseek data failed: %s\n",
+				fsp_str_dbg(fsp), strerror(errno));
+			return max_off;
+		}
+
+		curr_off = hole_off;
+	}
+
+	return out;
+}
+
+static NTSTATUS fsctl_qfr(TALLOC_CTX *mem_ctx,
+			  struct tevent_context *ev,
+			  struct files_struct *fsp,
+			  DATA_BLOB *in_input,
+			  size_t in_max_output,
+			  DATA_BLOB *out_output)
+{
+	/*
+	 * Respond to request to return a list of file regions based on a
+	 * specified usage paramter for `fsp` (target of FSCTL). The
+	 * If file region input is omitted then information for the entire size
+	 * of the file is returned.
+	 *
+	 * Focus of implementation is FILE_REGION_USAGE_VALID_CACHED_DATA, which
+	 * is NTFS-specfic response that provides "valid data length" for the
+	 * specified file and range.
+	 */
+	struct fsctl_query_file_regions_req qfr_req;
+	struct fsctl_query_file_regions_rsp qfr_rsp;
+	struct file_region_info region;
+	uint64_t max_off;
+	enum ndr_err_code ndr_ret;
+	DATA_BLOB output = {0};
+	int ret;
+	NTSTATUS status;
+	SMB_STRUCT_STAT sbuf;
+	off_t len_out;
+
+	if (fsp == NULL) {
+		return NT_STATUS_FILE_CLOSED;
+	}
+
+	/* READ_DATA permission is required */
+	status = check_any_access_fsp(fsp, FILE_READ_DATA);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+
+	/* must have enough space for at least one range */
+	if (in_max_output < sizeof(struct file_region_info)) {
+		DBG_WARNING("QFR max %lu insufficient for one region\n",
+			    (unsigned long)in_max_output);
+		return NT_STATUS_BUFFER_TOO_SMALL;
+	}
+
+	/* get up-to-date info on file size */
+	ret = SMB_VFS_FSTAT(fsp, &sbuf);
+	if (ret == -1) {
+		status = map_nt_error_from_unix_common(errno);
+		DBG_WARNING("%s: fstat failed: %s\n",
+			    fsp_str_dbg(fsp),
+			    strerror(errno));
+		return status;
+	}
+
+	if (in_input->length == 0) {
+		/*
+		 * If no FILE_REGION_INPUT data parameter is specified
+		 * then information for the entire size of file is returned
+		 */
+		len_out = fsctl_qfr_valid_data_len(fsp, 0, sbuf.st_ex_size);
+		region = (struct file_region_info){
+			.file_offset = 0,
+			.length = len_out,
+			.desired_usage = FILE_REGION_USAGE_VALID_CACHED_DATA,
+		};
+	} else {
+		/*
+		 * At this point we know client submitted with optional
+		 * FILE_REGION_INPUT parameter that specifies offset and length
+		 * to check explicitly.
+		 */
+		ndr_ret = ndr_pull_struct_blob(in_input, mem_ctx, &qfr_req,
+		    (ndr_pull_flags_fn_t)ndr_pull_fsctl_query_file_regions_req);
+		if (ndr_ret != NDR_ERR_SUCCESS) {
+			DBG_ERR("Failed to unmarshall QFR req\n");
+			return NT_STATUS_INVALID_PARAMETER;
+		}
+
+		/*
+		 * If FILE_REGION_INPUT object is specified, then the desired_usage
+		 * must be set to FILE_REGION_VALID_CACHED_DATA or
+		 * FILE_REGION_USAGE_VALID_NONCACHED_DATA, otherwise fail with
+		 * NT_STATUS_INVALID_PARAMETER
+		 * MS-FSCC 2.3.55
+		 */
+		if ((qfr_req.desired_usage != FILE_REGION_USAGE_VALID_CACHED_DATA) &&
+		    (qfr_req.desired_usage != FILE_REGION_USAGE_VALID_NONCACHED_DATA)) {
+			return NT_STATUS_INVALID_PARAMETER;
+		}
+
+		if ((qfr_req.length == 0)
+		 || (sbuf.st_ex_size == 0)
+		 || (qfr_req.file_offset >= sbuf.st_ex_size)) {
+			/* zero length range or after EOF, no regions to return */
+			return NT_STATUS_OK;
+		}
+
+		/* check for integer overflow */
+		if (qfr_req.file_offset + qfr_req.length < qfr_req.file_offset) {
+			return NT_STATUS_INVALID_PARAMETER;
+		}
+
+		max_off = MIN(sbuf.st_ex_size,
+			      qfr_req.file_offset + qfr_req.length) - 1;
+
+		/*
+		 * Provide file's "valid data length", for the region
+		 * of the file provided by the offset and length.
+		 * This to the last byte of the specified region that is
+		 * non-zero.
+		 */
+		len_out = fsctl_qfr_valid_data_len(fsp, qfr_req.file_offset, max_off);
+
+		region = (struct file_region_info){
+			.file_offset = qfr_req.file_offset,
+			.length = len_out,
+			.desired_usage = FILE_REGION_USAGE_VALID_CACHED_DATA,
+		};
+	}
+
+	qfr_rsp = (struct fsctl_query_file_regions_rsp){
+		.total_region_entry_cnt = 1,
+		.region_entry_cnt = 1,
+		.region = &region
+	};
+
+	ndr_ret = ndr_push_struct_blob(
+		&output, mem_ctx, &qfr_rsp,
+		(ndr_push_flags_fn_t)(ndr_push_fsctl_query_file_regions_rsp)
+	);
+
+	if (ndr_ret != NDR_ERR_SUCCESS) {
+		DBG_ERR("%s: failed to marshall query file regions response\n",
+			fsp_str_dbg(fsp));
+		return NT_STATUS_INTERNAL_ERROR;
+	}
+
+	*out_output = output;
+
+	return NT_STATUS_OK;
+}
+
 static void smb2_ioctl_filesys_dup_extents_done(struct tevent_req *subreq);
 
 struct tevent_req *smb2_ioctl_filesys(uint32_t ctl_code,
@@ -795,6 +982,16 @@ struct tevent_req *smb2_ioctl_filesys(uint32_t ctl_code,
 		return req;
 		break;
 	}
+	case FSCTL_QUERY_FILE_REGIONS:
+		status = fsctl_qfr(state, ev, state->fsp,
+				   &state->in_input,
+				   state->in_max_output,
+				   &state->out_output);
+		if (!tevent_req_nterror(req, status)) {
+			tevent_req_done(req);
+		}
+		return tevent_req_post(req, ev);
+		break;
 	default: {
 		uint8_t *out_data = NULL;
 		uint32_t out_data_len = 0;
