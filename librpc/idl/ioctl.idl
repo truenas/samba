@@ -208,6 +208,37 @@ interface resiliency
 	} network_resiliency_request;
 }
 
+interface file_regions
+{
+	const uint32 FILE_REGION_USAGE_VALID_CACHED_DATA = 0x00000001;  // NTFS
+	const uint32 FILE_REGION_USAGE_VALID_NONCACHED_DATA = 0x00000002;  // REFS
+
+	/* 2.3.55 QUERY_FILE_REGIONS Request*/
+	typedef [public] struct {
+		hyper file_offset;
+		hyper length;
+		uint32 desired_usage;
+		uint32 reserved;
+	} fsctl_query_file_regions_req;
+
+	/* 2.3.56.1 FILE_REGION_INFO */
+	typedef [public] struct {
+		hyper file_offset;
+		hyper length;
+		uint32 desired_usage;
+		uint32 reserved;
+	} file_region_info;
+
+	/* 2.3.56 QUERY_FILE_REGIONS Reply */
+	typedef [public] struct {
+		uint32 flags;
+		uint32 total_region_entry_cnt;
+		uint32 region_entry_cnt;
+		uint32 reserved;
+		file_region_info region[region_entry_cnt];
+	} fsctl_query_file_regions_rsp;
+}
+
 interface trim
 {
 	/* MS-FSCC 2.3.73.1 FILE_LEVEL_TRIM_RANGE */
