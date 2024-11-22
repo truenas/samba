@@ -498,8 +498,9 @@ static struct tevent_req *smbd_smb2_read_send(TALLOC_CTX *mem_ctx,
 		struct tevent_req *subreq = NULL;
 		bool ok;
 
-		state->out_data = data_blob_talloc(state, NULL, in_length);
-		if (in_length > 0 && tevent_req_nomem(state->out_data.data, req)) {
+		if (!io_pool_alloc_blob(fsp->conn, smb2req, in_length, &state->out_data,
+					&state->io_lnk)) {
+			tevent_req_nomem(NULL, req);
 			return tevent_req_post(req, ev);
 		}
 
