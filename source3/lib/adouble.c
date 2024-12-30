@@ -2180,10 +2180,9 @@ static ssize_t ad_read_meta(vfs_handle_struct *handle,
 	ok = ad_unpack(ad, ADEID_NUM_XATTR, AD_DATASZ_XATTR);
 	if (!ok) {
 		DBG_WARNING(
-			"Invalid AppleDouble xattr metadata (%s) in file: %s - "
+			"Invalid AppleDouble xattr metadata in file: %s - "
 			"Consider deleting the corrupted file.\n",
-			smb_fname->base_name,
-			ad->ad_fsp->fsp_name->base_name);
+			smb_fname->base_name);
 		errno = EINVAL;
 		rc = -1;
 		goto exit;
