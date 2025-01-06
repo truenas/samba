@@ -853,10 +853,7 @@ class WSDHttpMessageHandler(WSDMessageHandler):
 
         fmt = '{0}/Domain:{1}' if args.domain else '{0}/Workgroup:{1}'
         value = args.domain if args.domain else args.workgroup.upper()
-        if args.domain:
-            dh = args.hostname if args.preserve_case else args.hostname.lower()
-        else:
-            dh = args.hostname if args.preserve_case else args.hostname.upper()
+        dh = args.hostname if args.preserve_case else args.hostname.upper()
 
         ElementTree.SubElement(host, PUB_COMPUTER).text = fmt.format(dh, value)
 
