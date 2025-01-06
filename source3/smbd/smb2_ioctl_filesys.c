@@ -750,7 +750,7 @@ static off_t fsctl_qfr_valid_data_len(struct files_struct * fsp,
 		data_off = SMB_VFS_LSEEK(fsp, curr_off, SEEK_DATA);
 		if ((data_off == -1) && (errno == ENXIO)) {
 			/* no data from curr_off to EOF */
-			return curr_off == curr_off_in ? curr_off : curr_off -1;
+			return curr_off;
 		} else if (data_off == -1) {
 			DBG_ERR("%s: lseek data failed: %s\n",
 				fsp_str_dbg(fsp), strerror(errno));
@@ -768,6 +768,30 @@ static off_t fsctl_qfr_valid_data_len(struct files_struct * fsp,
 	}
 
 	return out;
+}
+
+static NTSTATUS null_qfr_response(TALLOC_CTX *mem_ctx,
+				  struct files_struct *fsp,
+				  DATA_BLOB *out_output)
+{
+	enum ndr_err_code ndr_ret;
+	struct fsctl_query_file_regions_rsp qfr_rsp = {0};
+	DATA_BLOB output = {0};
+
+	ndr_ret = ndr_push_struct_blob(
+		&output, mem_ctx, &qfr_rsp,
+		(ndr_push_flags_fn_t)(ndr_push_fsctl_query_file_regions_rsp)
+	);
+
+	if (ndr_ret != NDR_ERR_SUCCESS) {
+		DBG_ERR("%s: failed to marshall query file regions response\n",
+			fsp_str_dbg(fsp));
+		return NT_STATUS_INTERNAL_ERROR;
+	}
+
+	*out_output = output;
+
+	return NT_STATUS_OK;
 }
 
 static NTSTATUS fsctl_qfr(TALLOC_CTX *mem_ctx,
@@ -797,6 +821,7 @@ static NTSTATUS fsctl_qfr(TALLOC_CTX *mem_ctx,
 	NTSTATUS status;
 	SMB_STRUCT_STAT sbuf;
 	off_t len_out;
+	uint32_t desired_usage = 0;
 
 	if (fsp == NULL) {
 		return NT_STATUS_FILE_CLOSED;
@@ -829,6 +854,9 @@ static NTSTATUS fsctl_qfr(TALLOC_CTX *mem_ctx,
 		/*
 		 * If no FILE_REGION_INPUT data parameter is specified
 		 * then information for the entire size of file is returned
+		 *
+		 * Some applications (for example Solidworks) may send INT64_MAX
+		 * as the length to denote the entirety of the file.
 		 */
 		len_out = fsctl_qfr_valid_data_len(fsp, 0, sbuf.st_ex_size);
 		region = (struct file_region_info){
@@ -861,11 +889,21 @@ static NTSTATUS fsctl_qfr(TALLOC_CTX *mem_ctx,
 			return NT_STATUS_INVALID_PARAMETER;
 		}
 
-		if ((qfr_req.length == 0)
-		 || (sbuf.st_ex_size == 0)
-		 || (qfr_req.file_offset >= sbuf.st_ex_size)) {
-			/* zero length range or after EOF, no regions to return */
-			return NT_STATUS_OK;
+		/*
+		 * Although this is not specified in MS-FSCC, Windows servers return
+		 * STATUS_INVALID_PARAMETER if zero-length region is specified
+		 */
+		if (qfr_req.length == 0) {
+			return NT_STATUS_INVALID_PARAMETER;
+		}
+
+		if (qfr_req.file_offset > sbuf.st_ex_size) {
+			/*
+			 * When FSCTL specifies an offset beyond EOF Windows server
+			 * responds with STATUS_OK and a zeroed-out response buffer
+			 * and no range_info items.
+			 */
+			return null_qfr_response(mem_ctx, fsp, out_output);
 		}
 
 		/* check for integer overflow */
@@ -873,21 +911,31 @@ static NTSTATUS fsctl_qfr(TALLOC_CTX *mem_ctx,
 			return NT_STATUS_INVALID_PARAMETER;
 		}
 
-		max_off = MIN(sbuf.st_ex_size,
-			      qfr_req.file_offset + qfr_req.length) - 1;
+		if (sbuf.st_ex_size == 0) {
+			/*
+			 * Windows server leaves desired_usage in range_info
+			 * data as 0 if the file is zero-length.
+			 */
+			len_out = 0;
+		} else {
+			max_off = MIN(sbuf.st_ex_size,
+				      qfr_req.file_offset + qfr_req.length);
 
-		/*
-		 * Provide file's "valid data length", for the region
-		 * of the file provided by the offset and length.
-		 * This to the last byte of the specified region that is
-		 * non-zero.
-		 */
-		len_out = fsctl_qfr_valid_data_len(fsp, qfr_req.file_offset, max_off);
-
+			/*
+			 * Provide file's "valid data length", for the region
+			 * of the file provided by the offset and length.
+			 * This to the last byte of the specified region that is
+			 * non-zero.
+			 */
+			len_out = fsctl_qfr_valid_data_len(fsp,
+							   qfr_req.file_offset,
+							   max_off);
+			desired_usage = FILE_REGION_USAGE_VALID_CACHED_DATA;
+		}
 		region = (struct file_region_info){
 			.file_offset = qfr_req.file_offset,
 			.length = len_out,
-			.desired_usage = FILE_REGION_USAGE_VALID_CACHED_DATA,
+			.desired_usage = desired_usage,
 		};
 	}
 
