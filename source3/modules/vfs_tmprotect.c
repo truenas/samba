@@ -38,8 +38,6 @@ static int vfs_tmprotect_debug_level = DBGC_VFS;
 
 struct tmprotect_config_data {
 	struct smbzhandle *hdl;
-	const char **inclusions;
-	const char **exclusions;
 	struct snap_filter *filter;
 	int retention;
 	int min_snaps;
@@ -441,8 +439,10 @@ static void tmprotect_disconnect(vfs_handle_struct *handle)
 static int tmprotect_connect(struct vfs_handle_struct *handle,
 			     const char *service, const char *user)
 {
-	int ret;
+	int ret, saved_errno;
 	struct tmprotect_config_data *config = NULL;
+	const char **inclusions = NULL;
+	const char **exclusions = NULL;
 
 	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
 	if (ret != 0) {
@@ -456,15 +456,6 @@ static int tmprotect_connect(struct vfs_handle_struct *handle,
 		return -1;
 	}
 
-<<<<<<< HEAD
-	config->inclusions = lp_parm_string_list(SNUM(handle->conn),
-						 TMPROTECT_MODULE,
-						 "include", default_prefix);
-
-	config->exclusions = lp_parm_string_list(SNUM(handle->conn),
-						 TMPROTECT_MODULE,
-						 "exclude", empty_list);
-=======
 	config->filter = talloc_zero(config, struct snap_filter);
 	if (config->filter == NULL) {
 		DBG_ERR("talloc_zero() failed\n");
@@ -495,7 +486,6 @@ static int tmprotect_connect(struct vfs_handle_struct *handle,
 			goto disconnect_out;
 		}
 	}
->>>>>>> 6ee06818705 (NAS-116503 / s3:smb_libzfs - add file-based functions and various improvements (#109))
 
 	config->retention = lp_parm_int(SNUM(handle->conn),
 					TMPROTECT_MODULE,
@@ -510,6 +500,14 @@ static int tmprotect_connect(struct vfs_handle_struct *handle,
 				NULL, struct tmprotect_config_data,
 				return -1);
 	return 0;
+
+disconnect_out:
+
+	TALLOC_FREE(config);
+	saved_errno = errno;
+	SMB_VFS_NEXT_DISCONNECT(handle);
+	errno = saved_errno;
+	return -1;
 }
 
 static struct vfs_fn_pointers tmprotect_fns = {

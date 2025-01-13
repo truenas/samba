@@ -48,8 +48,6 @@
  *    shadow_copy_zfs_get_shadow_copy_zfs_data()
  */
 
-static const char *null_string = NULL;
-static const char **empty_list = &null_string;
 static int vfs_shadow_copy_zfs_debug_level = DBGC_VFS;
 
 #undef DBGC_CLASS
@@ -89,9 +87,6 @@ struct shadow_copy_zfs_config {
 
 	int			timedelta;
 	/* Snapshot parameters */
-	bool 			ignore_empty_snaps;
-	const char 		**inclusions;
-	const char 		**exclusions;
 	struct snap_filter	*filter;
 	struct snapshot_list 	*snapshots;
 	struct snapshot_data	*shadow_connectpath;
@@ -1630,14 +1625,10 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 				const char *service, const char *user)
 {
 	struct shadow_copy_zfs_config *config = NULL;
-<<<<<<< HEAD
-	int ret;
-=======
 	const char **exclusions = NULL;
 	const char **inclusions = NULL;
 	int ret, saved_errno;
 	int memcache_sz;
->>>>>>> 6ee06818705 (NAS-116503 / s3:smb_libzfs - add file-based functions and various improvements (#109))
 
 	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
 	if (ret < 0) {
@@ -1664,15 +1655,9 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 
 	if (ret != 0) {
 		DBG_ERR("Failed to initialize zfs: %s\n", strerror(errno));
-		return -1;
+		goto disconnect_out;
 	}
 
-<<<<<<< HEAD
-	config->inclusions = lp_parm_string_list(SNUM(handle->conn), "shadow",
-						"include", empty_list);
-	config->exclusions = lp_parm_string_list(SNUM(handle->conn), "shadow",
-						 "exclude", empty_list);
-=======
 	inclusions = lp_parm_string_list(SNUM(handle->conn), "shadow",
 					 "include", NULL);
 	if (inclusions != NULL) {
@@ -1693,7 +1678,6 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 			goto disconnect_out;
 		}
 	}
->>>>>>> 6ee06818705 (NAS-116503 / s3:smb_libzfs - add file-based functions and various improvements (#109))
 
 	config->filter->ignore_empty_snaps = lp_parm_bool(SNUM(handle->conn), "shadow",
 						"ignore_empty_snaps", true);
@@ -1701,19 +1685,24 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 	config->timedelta = lp_parm_int(SNUM(handle->conn),
 					"shadow", "snap_timedelta", 30);
 
-<<<<<<< HEAD
-=======
 	memcache_sz = lp_parm_int(SNUM(handle->conn),
 				  "shadow", "cache_size", 512);
 
 	config->zcache = memcache_init(handle->conn, (memcache_sz * 1024));
->>>>>>> 6ee06818705 (NAS-116503 / s3:smb_libzfs - add file-based functions and various improvements (#109))
 
 	SMB_VFS_HANDLE_SET_DATA(handle, config, NULL,
 				struct shadow_copy_zfs_config,
 				return -1);
 
 	return 0;
+
+disconnect_out:
+
+	TALLOC_FREE(config);
+	saved_errno = errno;
+	SMB_VFS_NEXT_DISCONNECT(handle);
+	errno = saved_errno;
+	return -1;
 }
 
 static struct vfs_fn_pointers vfs_shadow_copy_zfs_fns = {
