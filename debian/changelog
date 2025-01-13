@@ -1,3 +1,10 @@
+samba (2:4.21.3+ix-0) unstable; urgency=medium
+
+ * Initial samba 4.21 port
+
+ -- Andrew Walker <awalker@ixsystems.com>  Mon, 13 Jan 2025 17:00:00 +0000
+
+
 samba (2:4.20.5+ix-2) unstable; urgency=medium
 
  * Fix memory context for IPC read allocations
