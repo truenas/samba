@@ -82,6 +82,9 @@ def configure(conf):
 
 def build(bld):
     bld.env.LDB_PACKAGE_VERSION = LDB_VERSION
+    bld.env.PACKAGE_VERSION = LDB_VERSION
+    bld.env.PKGCONFIGDIR = '${LIBDIR}/pkgconfig'
+    private_library = False
 
     # we're not currently linking against the ldap libs, but ldb.pc.in
     # has @LDAP_LIBS@
@@ -143,7 +146,7 @@ def build(bld):
                       public_headers_install=True,
                       pc_files='ldb.pc',
                       vnum=LDB_VERSION,
-                      private_library=False,
+                      private_library=private_library,
                       manpages='man/ldb.3',
                       abi_directory='ABI',
                       abi_match = abi_match)
