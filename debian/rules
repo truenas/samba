@@ -67,6 +67,8 @@ conf_args = \
 		--disable-cups \
 		--disable-iprint \
 		--vendor-suffix=truenas \
+		--without-ldb-lmdb \
+		--private-libraries='!ldb' \
 		--disable-cephfs
 
 ifeq ($(DEB_HOST_ARCH_OS), linux)

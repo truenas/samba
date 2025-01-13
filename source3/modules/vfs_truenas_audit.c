@@ -335,7 +335,7 @@ static int tn_audit_connect(vfs_handle_struct *handle,
 	const char **watch_list = NULL;
 	const char **ignore_list = NULL;
 
-	if (!handle->conn->sconn->using_smb2) {
+	if (!conn_using_smb2(handle->conn->sconn)) {
 		DBG_ERR("%s: user connected to service [%s] via SMB1 protocol. "
 			"SMB1 connections are not permitted to shares where "
 			"auditing is enabled.\n", user, svc);
