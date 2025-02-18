@@ -76,6 +76,12 @@ enum zfs_quotatype {
 	SMBZFS_GROUP_QUOTA,
 };
 
+enum zfs_snapdir_type {
+	SMBZFS_SNAPDIR_HIDDEN,
+	SMBZFS_SNAPDIR_VISIBLE,
+	SMBZFS_SNAPDIR_DISABLED
+};
+
 enum zfs_feature {SMBZFS_BLOCK_CLONING};
 
 struct zfs_quota {
@@ -89,8 +95,8 @@ struct zfs_quota {
 struct zfs_dataset_prop
 {
 	enum casesensitivity casesens;
+	enum zfs_snapdir_type snapdir;
 	bool readonly;
-	bool snapdir_visible;
 	bool checksum_enabled;
 	uint64_t record_size;
 #if 0 /* Properties we may wish to expose in the future */
