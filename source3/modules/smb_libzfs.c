@@ -621,7 +621,7 @@ static struct zfs_dataset *copy_to_external(TALLOC_CTX *mem_ctx,
 		out->properties->readonly = prop_in->readonly;
 		out->properties->record_size = prop_in->record_size;
 		out->properties->checksum_enabled = prop_in->checksum_enabled;
-		out->properties->snapdir_visible = prop_in->snapdir_visible;
+		out->properties->snapdir = prop_in->snapdir;
 	}
 	if (open_zhandle) {
 		out->zhandle = smbzhandle_dup(out, ds_in->ds->zhandle);
@@ -1211,9 +1211,11 @@ zhandle_get_props(struct smbzhandle *zfsp_ext,
 		return -1;
 	}
 	if (strcmp(buf, "visible") == 0) {
-		props->snapdir_visible = true;
+		props->snapdir = SMBZFS_SNAPDIR_VISIBLE;
+	} else if (strcmp(buf, "disabled") == 0) {
+		props->snapdir = SMBZFS_SNAPDIR_DISABLED;
 	} else {
-		props->snapdir_visible = false;
+		props->snapdir = SMBZFS_SNAPDIR_HIDDEN;
 	}
 
 	if (zfs_prop_get(zfsp, ZFS_PROP_CHECKSUM,

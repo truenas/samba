@@ -474,7 +474,7 @@ static bool shadow_copy_zfs_update_snaplist(struct vfs_handle_struct *handle,
 	} else {
 		ds = shadow_fsp_to_dataset(handle, config, fsp);
 	}
-	if (!ds || ds->properties->snapdir_visible) {
+	if (!ds || (ds->properties->snapdir != SMBZFS_SNAPDIR_HIDDEN)) {
 		*snapp = NULL;
 		return false;
 	}
