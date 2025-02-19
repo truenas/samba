@@ -1712,7 +1712,7 @@ static bool lp_add_ipc(const char *ipc_name, bool guest_ok)
 		return false;
 	}
 
-	lpcfg_string_set(ServicePtrs[i], &ServicePtrs[i]->path, tmpdir());
+	lpcfg_string_set(ServicePtrs[i], &ServicePtrs[i]->path, "/var/empty");
 	lpcfg_string_set(ServicePtrs[i], &ServicePtrs[i]->comment, comment);
 	lpcfg_string_set(ServicePtrs[i], &ServicePtrs[i]->fstype, "IPC");
 	ServicePtrs[i]->max_connections = 0;
