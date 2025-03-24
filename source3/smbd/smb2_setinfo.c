@@ -199,12 +199,14 @@ static bool delay_rename_lease_break_fn(
 	uint32_t e_lease_type, break_to;
 	bool ours, stale;
 
-	ours = smb2_lease_equal(fsp_client_guid(fsp),
-				&fsp->lease->lease.lease_key,
-				&e->client_guid,
-				&e->lease_key);
-	if (ours) {
-		return false;
+	if (fsp->lease != NULL) {
+		ours = smb2_lease_equal(fsp_client_guid(fsp),
+					&fsp->lease->lease.lease_key,
+					&e->client_guid,
+					&e->lease_key);
+		if (ours) {
+			return false;
+		}
 	}
 
 	e_lease_type = get_lease_type(e, fsp->file_id);
