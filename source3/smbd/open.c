@@ -3906,6 +3906,7 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 	bool def_acl = False;
 	bool posix_open = False;
 	bool new_file_created = False;
+	bool oplocks_enabled = true;
 	bool first_open_attempt = true;
 	bool is_twrp = (smb_fname_atname->twrp != 0);
 	NTSTATUS fsp_open = NT_STATUS_ACCESS_DENIED;
@@ -4025,8 +4026,9 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 		}
 	}
 
+	oplocks_enabled = lp_oplocks(SNUM(conn));
 	/* ignore any oplock requests if oplocks are disabled */
-	if (!lp_oplocks(SNUM(conn)) ||
+	if (!oplocks_enabled ||
 	    IS_VETO_OPLOCK_PATH(conn, smb_fname->base_name)) {
 		/* Mask off everything except the private Samba bits. */
 		oplock_request &= SAMBA_PRIVATE_OPLOCK_MASK;
@@ -4425,6 +4427,7 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 		keep_locked = true;
 	}
 
+	/* Do not request lease when oplocks disabled for share */
 	lck_state = (struct open_ntcreate_lock_state) {
 		.fsp			= fsp,
 		.object_type		= "file",
@@ -4434,7 +4437,7 @@ static NTSTATUS open_file_ntcreate(connection_struct *conn,
 		.open_access_mask	= open_access_mask,
 		.share_access		= share_access,
 		.oplock_request		= oplock_request,
-		.lease			= lease,
+		.lease			= oplocks_enabled ? lease : NULL,
 		.first_open_attempt	= first_open_attempt,
 		.keep_locked		= keep_locked,
 	};
