@@ -2439,14 +2439,16 @@ cBytesSector=%u, cUnitTotal=%u, cUnitAvail=%d\n", (unsigned int)bsize, (unsigned
 			 * share backed by NTFS atop spinning rust.
 			 */
 			DEBUG(5, ("SMB_FS_SECTOR_SIZE_INFORMATION:"));
+			uint block_size;
+			block_size = lp_block_size(snum);
 			/* logical_bytes_per_sector */
 			SIVAL(pdata, 0, bytes_per_sector);
 			/* phys_bytes_per_sector_atomic */
-			SIVAL(pdata, 4, bytes_per_sector);
+			SIVAL(pdata, 4, block_size);
 			/* phys_bytes_per_sector_perf */
 			SIVAL(pdata, 8, bytes_per_sector);
 			/* fs_effective_phys_bytes_per_sector_atomic */
-			SIVAL(pdata, 12, bytes_per_sector);
+			SIVAL(pdata, 12, block_size);
 			/* flags */
 			SIVAL(pdata, 16, SSINFO_FLAGS_ALIGNED_DEVICE
 				| SSINFO_FLAGS_PARTITION_ALIGNED_ON_DEVICE);
