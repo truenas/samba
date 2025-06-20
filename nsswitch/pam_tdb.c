@@ -19,6 +19,7 @@ typedef struct {
 	uint32_t min_iter;
 } pam_tdb_algo_t;
 
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 pam_tdb_algo_t algo_table[] = {
 	{"pbkdf2-sha256", GNUTLS_MAC_SHA256, 29000},
@@ -1011,9 +1012,12 @@ int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 	char *username_ret = NULL;
 	struct ptdb_context *ctx = NULL;
 
+	pthread_mutex_lock(&g_lock);
+
 	retval = _pam_tdb_init_context(pamh, flags, argc, argv,
 				       PAM_TDB_AUTHENTICATE, &ctx);
 	if (retval != PAM_SUCCESS) {
+		pthread_mutex_unlock(&g_lock);
 		return retval;
 	}
 
@@ -1026,6 +1030,9 @@ int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 		PAM_CTX_DEBUG(ctx, LOG_DEBUG,
 			      "can not get the username");
 		retval = PAM_SERVICE_ERR;
+		tdb_close(ctx->tdb_ctx);
+		ctx->tdb_ctx = NULL;
+		pthread_mutex_unlock(&g_lock);
 		goto out;
 	}
 
@@ -1035,6 +1042,14 @@ int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 	 * by the TrueNAS middlware when generating an API key.
 	 */
 	retval = _tdb_read_password(ctx, username, &password);
+
+	/* Close up tdb resources and release pthread lock so that
+	 * other threads can authenticate
+	 */
+	tdb_close(ctx->tdb_ctx);
+	ctx->tdb_ctx = NULL;
+	pthread_mutex_unlock(&g_lock);
+
 	if (retval != PAM_SUCCESS) {
 		PAM_CTX_DEBUG(ctx, LOG_ERR,
 			      "Could not retrieve user's password");
