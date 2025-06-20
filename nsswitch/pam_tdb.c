@@ -19,6 +19,7 @@ typedef struct {
 	uint32_t min_iter;
 } pam_tdb_algo_t;
 
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 pam_tdb_algo_t algo_table[] = {
 	{"pbkdf2-sha256", GNUTLS_MAC_SHA256, 29000},
@@ -878,7 +879,7 @@ static int tdb_auth_request(struct ptdb_context *ctx,
 {
 	TDB_DATA key, val;
 	time_t expiry = 0;
-	int pam_ret;
+	int pam_ret = PAM_SUCCESS;
 	enum TDB_ERROR tdberr;
 	char *pass_copy = NULL;
 
@@ -896,15 +897,26 @@ static int tdb_auth_request(struct ptdb_context *ctx,
 				      "%s: entry does not exist\n",
 				      user);
 
-			return PAM_USER_UNKNOWN;
+			pam_ret = PAM_USER_UNKNOWN;
 		default:
 			PAM_CTX_DEBUG(ctx, LOG_ERR,
 				      "%s: failed to fetch entry: %d: %s\n",
 				      user, tdberr,
 				      tdb_errorstr(ctx->tdb_ctx));
-			return PAM_AUTHINFO_UNAVAIL;
+			pam_ret = PAM_AUTHINFO_UNAVAIL;
 		}
 	}
+
+	/*
+	 * By this point we're done with the TDB file. We want to release resources
+	 * quickly so that we don't block other threads for failure delay
+	 */
+	tdb_close(ctx->tdb_ctx);
+	ctx->tdb_ctx = NULL;
+	pthread_mutex_unlock(&g_lock);
+
+	if (pam_ret != PAM_SUCCESS)
+		return pam_ret;
 
 	/*
 	 * The password string from PAM is potentially concatenation of
@@ -1011,9 +1023,12 @@ int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 	char *username_ret = NULL;
 	struct ptdb_context *ctx = NULL;
 
+	pthread_mutex_lock(&g_lock);
+
 	retval = _pam_tdb_init_context(pamh, flags, argc, argv,
 				       PAM_TDB_AUTHENTICATE, &ctx);
 	if (retval != PAM_SUCCESS) {
+		pthread_mutex_unlock(&g_lock);
 		return retval;
 	}
 
@@ -1026,7 +1041,7 @@ int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 		PAM_CTX_DEBUG(ctx, LOG_DEBUG,
 			      "can not get the username");
 		retval = PAM_SERVICE_ERR;
-		goto out;
+		goto err;
 	}
 
 	/*
@@ -1035,11 +1050,12 @@ int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 	 * by the TrueNAS middlware when generating an API key.
 	 */
 	retval = _tdb_read_password(ctx, username, &password);
+
 	if (retval != PAM_SUCCESS) {
 		PAM_CTX_DEBUG(ctx, LOG_ERR,
 			      "Could not retrieve user's password");
 		retval = PAM_AUTHTOK_ERR;
-		goto out;
+		goto err;
 	}
 
 	PAM_CTX_DEBUG(ctx, LOG_INFO,
@@ -1053,8 +1069,16 @@ int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 			      "Returned user was '%s'", username_ret);
 	}
 	password = NULL;
+	PAM_CTX_DEBUG(ctx, LOG_DEBUG, "[pamh: %p] LEAVE: %s\n",
+		      ctx, "pam_sm_authenticate");
 
-out:
+	TALLOC_FREE(ctx);
+	return retval;
+
+err:
+	tdb_close(ctx->tdb_ctx);
+	ctx->tdb_ctx = NULL;
+	pthread_mutex_unlock(&g_lock);
 	PAM_CTX_DEBUG(ctx, LOG_DEBUG, "[pamh: %p] LEAVE: %s\n",
 		      ctx, "pam_sm_authenticate");
 
