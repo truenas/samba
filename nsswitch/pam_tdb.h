@@ -42,6 +42,7 @@
 #include "system/time.h"
 #include <fcntl.h>
 #include <talloc.h>
+#include <pthread.h>
 #include <tdb.h>
 #include <security/pam_appl.h>
 #include <security/pam_modules.h>
