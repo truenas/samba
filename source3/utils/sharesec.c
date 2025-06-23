@@ -36,6 +36,8 @@ struct cli_state;
 #include "audit_logging.h" /* various JSON helpers */
 #include "auth/common_auth.h"
 #endif /* [HAVE_JANSSON] */
+#include "lib/smbconf/smbconf.h"
+#include "lib/smbconf/smbconf_init.h"
 
 static TALLOC_CTX *ctx;
 
@@ -332,6 +334,80 @@ static int view_sharesec_sddl(const char *sharename)
 	return 0;
 }
 
+static bool registry_share(const char *sharename)
+{
+	sbcErr err;
+	TALLOC_CTX *mem_ctx = talloc_stackframe();
+	struct smbconf_ctx *conf_ctx;
+	bool ret_status = true;
+
+	err = smbconf_init(mem_ctx, &conf_ctx, "registry:");
+	if (!SBC_ERROR_IS_OK(err)) {
+		DEBUG(0, ("Unable to init smbconf registry. Err:%s\n",
+		      sbcErrorString(err)));
+		ret_status = false;
+		goto out;
+	}
+
+	if(!smbconf_share_exists(conf_ctx, sharename)) {
+		ret_status = false;
+		goto done;
+	}
+done:
+	smbconf_shutdown(conf_ctx);
+out:
+	talloc_free(mem_ctx);
+	return ret_status;
+}
+
+static bool txt_share(const char *sharename)
+{
+	sbcErr err;
+	TALLOC_CTX *mem_ctx = talloc_stackframe();
+	struct smbconf_ctx *conf_ctx;
+	bool ret_status = true;
+	char *fconf_path;
+
+	fconf_path = talloc_asprintf(mem_ctx, "file:%s", get_dyn_CONFIGFILE());
+	if (fconf_path == NULL)	{
+		DEBUG(0, ("Not enough memory for conf file path"));
+		ret_status = false;
+		goto out;
+	}
+
+	err = smbconf_init(mem_ctx, &conf_ctx, fconf_path);
+	if (!SBC_ERROR_IS_OK(err)) {
+		DEBUG(0, ("Unable to init smbconf file. Err:%s\n",
+		      sbcErrorString(err)));
+		ret_status = false;
+		goto out;
+	}
+
+	if(!smbconf_share_exists(conf_ctx, sharename)) {
+		ret_status = false;
+		goto done;
+	}
+done:
+	smbconf_shutdown(conf_ctx);
+out:
+	talloc_free(mem_ctx);
+	return ret_status;
+}
+
+static bool share_exists(const char *sharename)
+{
+	bool ret_status = false;
+
+	if ((lp_config_backend() == CONFIG_BACKEND_REGISTRY) ||
+	    (lp_registry_shares() == true))
+		ret_status = registry_share(sharename);
+
+	if (!ret_status) {
+		ret_status = txt_share(sharename);
+	}
+	return ret_status;
+}
+
 /********************************************************************
   main program
 ********************************************************************/
@@ -559,7 +635,10 @@ int main(int argc, const char *argv[])
 
 	setlinebuf(stdout);
 
-	lp_load_with_registry_shares(get_dyn_CONFIGFILE());
+	if (mode == SMB_ACL_VIEW_ALL)
+		lp_load_with_registry_shares(get_dyn_CONFIGFILE());
+	else
+		lp_load_with_registry_without_shares(get_dyn_CONFIGFILE());
 
 	/* check for initializing secrets.tdb first */
 
@@ -601,6 +680,7 @@ int main(int argc, const char *argv[])
 			const char *service = lp_servicename(frame, lp_sub, i);
 
 			if (service == NULL) {
+				TALLOC_FREE(frame);
 				continue;
 			}
 
@@ -640,9 +720,7 @@ int main(int argc, const char *argv[])
 
 	fstrcpy(sharename, poptGetArg(pc));
 
-	snum = lp_servicenumber( sharename );
-
-	if ( snum == -1 && !force_acl ) {
+	if (!share_exists(sharename)) {
 		fprintf( stderr, "Invalid sharename: %s\n", sharename);
 		retval = -1;
 		goto done;

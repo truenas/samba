@@ -26,6 +26,7 @@ import datetime
 import errno
 import io
 import os
+from hashlib import sha1
 
 import ldb
 from samba import credentials, nttime2float
@@ -37,6 +38,7 @@ from samba.netcmd import Command, CommandError
 from samba.samdb import SamDB
 from samba.nt_time import timedelta_from_nt_time_delta, nt_time_from_datetime
 from samba.gkdi import MAX_CLOCK_SKEW
+from samba._glue import crypt
 
 # python[3]-gpgme is abandoned since ubuntu 1804 and debian 9
 # have to use python[3]-gpg instead
@@ -132,9 +134,7 @@ def get_crypt_value(alg, utf8pw, rounds=0):
     else:
         crypt_salt = "$%s$%s$" % (alg, b64salt)
 
-    crypt_value = crypt.crypt(utf8pw, crypt_salt)
-    if crypt_value is None:
-        raise NotImplementedError("crypt.crypt(%s) returned None" % (crypt_salt))
+    crypt_value = crypt(utf8pw, crypt_salt)
     expected_len = len(crypt_salt) + algs[alg]["length"]
     if len(crypt_value) != expected_len:
         raise NotImplementedError("crypt.crypt(%s) returned a value with length %d, expected length is %d" % (
@@ -142,35 +142,18 @@ def get_crypt_value(alg, utf8pw, rounds=0):
     return crypt_value
 
 
-try:
-    import hashlib
-    hashlib.sha1()
-    virtual_attributes["virtualSSHA"] = {
-    }
-except ImportError as e:
-    reason = "hashlib.sha1()"
-    reason += " required"
-    disabled_virtual_attributes["virtualSSHA"] = {
-        "reason": reason,
-    }
+
+virtual_attributes["virtualSSHA"] = {}
 
 for (alg, attr) in [("5", "virtualCryptSHA256"), ("6", "virtualCryptSHA512")]:
     try:
-        import crypt
         get_crypt_value(alg, "")
-        virtual_attributes[attr] = {
-        }
-    except ImportError as e:
-        reason = "crypt"
-        reason += " required"
+    except (ValueError, OSError):
         disabled_virtual_attributes[attr] = {
-            "reason": reason,
+            "reason": f"modern '${alg}$' salt in crypt(3) required"
         }
-    except NotImplementedError as e:
-        reason = "modern '$%s$' salt in crypt(3) required" % (alg)
-        disabled_virtual_attributes[attr] = {
-            "reason": reason,
-        }
+        continue
+    virtual_attributes[attr] = {}
 
 # Add the wDigest virtual attributes, virtualWDigest01 to virtualWDigest29
 for x in range(1, 30):
@@ -745,7 +728,7 @@ class GetPasswordCommand(Command):
                 if u8 is None:
                     continue
                 salt = os.urandom(4)
-                h = hashlib.sha1()
+                h = sha1()
                 h.update(u8)
                 h.update(salt)
                 bv = h.digest() + salt
