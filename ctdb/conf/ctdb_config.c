@@ -106,6 +106,14 @@ static void setup_config_pointers(struct conf_context *conf)
 				    FAILOVER_CONF_SECTION,
 				    FAILOVER_CONF_DISABLED,
 				    &ctdb_config.failover_disabled);
+	conf_assign_integer_pointer(conf,
+				    FAILOVER_CONF_SECTION,
+				    FAILOVER_CONF_SHUTDOWN_EXTRA_TIMEOUT,
+				    &ctdb_config.shutdown_extra_timeout);
+	conf_assign_integer_pointer(conf,
+				    FAILOVER_CONF_SECTION,
+				    FAILOVER_CONF_SHUTDOWN_FAILOVER_TIMEOUT,
+				    &ctdb_config.shutdown_failover_timeout);
 
 	/*
 	 * Legacy

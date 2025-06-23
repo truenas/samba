@@ -50,4 +50,16 @@ void failover_conf_init(struct conf_context *conf)
 			    FAILOVER_CONF_DISABLED,
 			    false,
 			    check_static_boolean_change);
+
+	conf_define_integer(conf,
+			    FAILOVER_CONF_SECTION,
+			    FAILOVER_CONF_SHUTDOWN_EXTRA_TIMEOUT,
+			    0,
+			    NULL);
+
+	conf_define_integer(conf,
+			    FAILOVER_CONF_SECTION,
+			    FAILOVER_CONF_SHUTDOWN_FAILOVER_TIMEOUT,
+			    10,
+			    NULL);
 }

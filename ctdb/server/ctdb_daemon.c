@@ -23,6 +23,7 @@
 #include "system/wait.h"
 #include "system/time.h"
 
+#include <errno.h>
 #include <talloc.h>
 /* Allow use of deprecated function tevent_loop_allow_nesting() */
 #define TEVENT_DEPRECATED
@@ -41,6 +42,7 @@
 #include "ctdb_client.h"
 
 #include "protocol/protocol.h"
+#include "protocol/protocol_basic.h"
 #include "protocol/protocol_api.h"
 
 #include "common/rb_tree.h"
@@ -50,7 +52,9 @@
 #include "common/logging.h"
 #include "common/pidfile.h"
 #include "common/sock_io.h"
+#include "common/srvid.h"
 
+#include "conf/ctdb_config.h"
 #include "conf/node.h"
 
 struct ctdb_client_pid_list {
@@ -2219,15 +2223,234 @@ done:
 	return ret;
 }
 
-void ctdb_shutdown_sequence(struct ctdb_context *ctdb, int exit_code)
+/*
+ * Construct a SRVID for accepting replies to this ctdbd.  The bottom
+ * 24 bits of the PNN are used in the top half.  extra_mask is used in
+ * the bottom half.
+ */
+
+static uint64_t ctdb_srvid_id(struct ctdb_context *ctdb, uint32_t extra_mask)
 {
-	if (ctdb->runstate == CTDB_RUNSTATE_SHUTDOWN) {
-		DEBUG(DEBUG_NOTICE,("Already shutting down so will not proceed.\n"));
+	uint64_t pnn_mask = (uint64_t)(ctdb->pnn & 0xFFFFFF) << 32;
+
+	return CTDB_SRVID_SERVER_RANGE | pnn_mask | extra_mask;
+}
+
+/*
+ * Do a takeover run on shutdown
+ *
+ * This allows for a graceful transition of resources to another node.
+ * This ensures all nodes go into grace for NFS and, with an extra
+ * timeout, allows data transfer for SMB durable handles.
+ *
+ * Nodes need to be in CTDB_RUNSTATE_RUNNING to host public IP
+ * addresses.  So, this node will release all IPs.  The good news is
+ * that a node can remain leader when in CTDB_RUNSTATE_SHUTDOWN, so
+ * shutting down the cluster will not be adversely delayed by this.
+ * The only issue to guard against is delaying shutdown of this node
+ * if it is the only node and doesn't have CTDB_CAP_RECMASTER, in
+ * which case there is no node to do the takeover run.  Hence, the
+ * timeout.
+ */
+
+struct shutdown_takeover_state {
+	bool takeover_done;
+	bool timed_out;
+	struct tevent_timer *te;
+	unsigned int leader_broadcast_count;
+};
+
+static void shutdown_takeover_handler(uint64_t srvid,
+				      TDB_DATA data,
+				      void *private_data)
+{
+	struct shutdown_takeover_state *state = private_data;
+	int32_t result = 0;
+	size_t count = 0;
+	int ret = 0;
+
+	ret = ctdb_int32_pull(data.dptr, data.dsize, &result, &count);
+	if (ret == EMSGSIZE) {
+		/*
+		 * Can't happen unless there's bug somewhere else, so
+		 * just ignore - ctdb_shutdown_takeover() will
+		 * probably time out...
+		 */
+		DBG_WARNING("Wrong size for result\n");
 		return;
 	}
 
-	DEBUG(DEBUG_ERR,("Shutdown sequence commencing.\n"));
+	if (result == -1) {
+		/*
+		 * No early return - can't afford endless retries
+		 * during shutdown...
+		 */
+		DBG_WARNING("Takeover run failed\n");
+	} else {
+		DBG_NOTICE("Takeover run successful by node=%"PRIi32"\n",
+			   result);
+	}
+
+	state->takeover_done = true;
+}
+
+static void shutdown_timeout_handler(struct tevent_context *ev,
+				     struct tevent_timer *te,
+				     struct timeval yt,
+				     void *private_data)
+{
+	struct shutdown_takeover_state *state = private_data;
+
+	TALLOC_FREE(state->te);
+	state->timed_out = true;
+}
+
+static void shutdown_leader_handler(uint64_t srvid,
+				    TDB_DATA data,
+				    void *private_data)
+{
+	struct shutdown_takeover_state *state = private_data;
+	uint32_t pnn = 0;
+	size_t count = 0;
+	int ret = 0;
+
+	ret = ctdb_uint32_pull(data.dptr, data.dsize, &pnn, &count);
+	if (ret == EMSGSIZE) {
+		/*
+		 * Can't happen unless there's bug somewhere else, so
+		 * just ignore
+		 */
+		DBG_WARNING("Wrong size for result\n");
+		return;
+	}
+
+	DBG_DEBUG("Leader broadcast received from node=%"PRIu32"\n", pnn);
+	state->leader_broadcast_count++;
+}
+
+static void ctdb_shutdown_takeover(struct ctdb_context *ctdb)
+{
+	struct shutdown_takeover_state state = {
+		.takeover_done = false,
+		.timed_out = false,
+		.te = NULL,
+		.leader_broadcast_count = 0,
+	};
+	/*
+	 * This one is memcpy()ed onto the wire, so initialise below
+	 * after ZERO_STRUCT(), to keep things valgrind clean
+	 */
+	struct ctdb_srvid_message rd;
+	struct TDB_DATA rddata = {
+		.dptr = (uint8_t *)&rd,
+		.dsize = sizeof(rd),
+	};
+	int ret = 0;
+
+	if (ctdb_config.shutdown_failover_timeout <= 0) {
+		return;
+	}
+
+	ZERO_STRUCT(rd);
+	rd = (struct ctdb_srvid_message) {
+		.pnn = ctdb->pnn,
+		.srvid = ctdb_srvid_id(ctdb, 0),
+	};
+
+	ret = srvid_register(ctdb->srv,
+			     ctdb->srv,
+			     rd.srvid,
+			     shutdown_takeover_handler,
+			     &state);
+	if (ret != 0) {
+		DBG_WARNING("Failed to register takeover run handler\n");
+		return;
+	}
+
+	state.te = tevent_add_timer(
+		ctdb->ev,
+		ctdb->srv,
+		timeval_current_ofs(ctdb_config.shutdown_failover_timeout, 0),
+		shutdown_timeout_handler,
+		&state);
+	if (state.te == NULL) {
+		DBG_WARNING("Failed to set shutdown timeout\n");
+		goto done;
+	}
+
+	ret = srvid_register(ctdb->srv,
+			     ctdb->srv,
+			     CTDB_SRVID_LEADER,
+			     shutdown_leader_handler,
+			     &state);
+	if (ret != 0) {
+		/* Leader broadcasts provide extra information, so no
+		 * problem if they can't be monitored...
+		 */
+		DBG_WARNING("Failed to register leader handler\n");
+	}
+
+	ret = ctdb_daemon_send_message(ctdb,
+				       CTDB_BROADCAST_CONNECTED,
+				       CTDB_SRVID_TAKEOVER_RUN,
+				       rddata);
+	if (ret != 0) {
+		DBG_WARNING("Failed to send IP takeover run request\n");
+		goto done;
+	}
+
+	while (!state.takeover_done && !state.timed_out) {
+		tevent_loop_once(ctdb->ev);
+	}
+
+	if (state.takeover_done) {
+		goto done;
+	}
+
+	if (state.timed_out) {
+		DBG_WARNING("Timed out waiting for takeover run "
+			    "(%u leader broadcasts received)\n",
+			    state.leader_broadcast_count);
+	}
+done:
+	srvid_deregister(ctdb->srv, CTDB_SRVID_TAKEOVER_RUN, &state);
+	srvid_deregister(ctdb->srv, CTDB_SRVID_LEADER, &state);
+	TALLOC_FREE(state.te);
+
+	if (!state.takeover_done || ctdb_config.shutdown_extra_timeout <= 0) {
+		return;
+	}
+
+	state.timed_out = false;
+	state.te = tevent_add_timer(
+		ctdb->ev,
+		ctdb->srv,
+		timeval_current_ofs(ctdb_config.shutdown_extra_timeout, 0),
+		shutdown_timeout_handler,
+		&state);
+	if (state.te == NULL) {
+		DBG_WARNING("Failed to set extra timeout\n");
+		return;
+	}
+
+	DBG_NOTICE("Waiting %ds for shutdown extra timeout\n",
+		   ctdb_config.shutdown_extra_timeout);
+	while (!state.timed_out) {
+		tevent_loop_once(ctdb->ev);
+	}
+	DBG_INFO("shutdown extra timeout complete\n");
+}
+
+void ctdb_shutdown_sequence(struct ctdb_context *ctdb, int exit_code)
+{
+	if (ctdb->runstate == CTDB_RUNSTATE_SHUTDOWN) {
+		D_NOTICE("Already shutting down so will not proceed.\n");
+		return;
+	}
+
+	D_ERR("Shutdown sequence commencing.\n");
 	ctdb_set_runstate(ctdb, CTDB_RUNSTATE_SHUTDOWN);
+	ctdb_shutdown_takeover(ctdb);
 	ctdb_stop_recoverd(ctdb);
 	ctdb_stop_keepalive(ctdb);
 	ctdb_stop_monitoring(ctdb);
@@ -2237,7 +2460,7 @@ void ctdb_shutdown_sequence(struct ctdb_context *ctdb, int exit_code)
 		ctdb->methods->shutdown(ctdb);
 	}
 
-	DEBUG(DEBUG_ERR,("Shutdown sequence complete, exiting.\n"));
+	D_ERR("Shutdown sequence complete, exiting.\n");
 	exit(exit_code);
 }
 

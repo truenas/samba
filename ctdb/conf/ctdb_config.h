@@ -43,6 +43,8 @@ struct ctdb_config {
 
 	/* Failover */
 	bool failover_disabled;
+	int shutdown_extra_timeout;
+	int shutdown_failover_timeout;
 
 	/* Legacy */
 	bool realtime_scheduling;
