@@ -1322,9 +1322,11 @@ class cmd_backup(GPOCommand):
             self.outf.write('\nAttempting to generalize XML entities:\n')
             entities = cmd_backup.generalize_xml_entities(self.outf, gpodir,
                                                           gpodir)
-            import operator
-            ents = "".join('<!ENTITY {} "{}\n">'.format(ent[1].strip('&;'), ent[0]) \
-                             for ent in sorted(entities.items(), key=operator.itemgetter(1)))
+
+            ent_list = [(v, k) for k, v in entities.items()]
+            ent_list.sort()
+            ents = "".join(f'<!ENTITY {ent.strip("&;")} "{val}">\n'
+                           for ent, val in ent_list)
 
             if ent_file:
                 with open(ent_file, 'w') as f:
@@ -1651,8 +1653,8 @@ class cmd_restore(cmd_create):
                 entities_content = entities_file.read()
 
                 # Do a basic regex test of the entities file format
-                if re.match(r'(\s*<!ENTITY\s*[a-zA-Z0-9_]+\s*.*?>)+\s*\Z',
-                            entities_content, flags=re.MULTILINE) is None:
+                if re.match(r'(\s*<!ENTITY\s+[a-zA-Z0-9_]+\s+.*?>)+\s*\Z',
+                            entities_content, flags=re.MULTILINE|re.DOTALL) is None:
                     raise CommandError("Entities file does not appear to "
                                        "conform to format\n"
                                        'e.g. <!ENTITY entity "value">')
@@ -3808,7 +3810,9 @@ samba-tool gpo manage motd set {31B2F340-016D-11D2-945F-00C04FB984F9} "Message f
             return
 
         try:
-            xml_data = ET.fromstring(conn.loadfile(vgp_xml))
+            xml_data = ET.ElementTree(ET.fromstring(conn.loadfile(vgp_xml)))
+            policysetting = xml_data.getroot().find('policysetting')
+            data = policysetting.find('data')
         except NTSTATUSError as e:
             if e.args[0] in [NT_STATUS_OBJECT_NAME_INVALID,
                              NT_STATUS_OBJECT_NAME_NOT_FOUND,
@@ -3834,7 +3838,9 @@ samba-tool gpo manage motd set {31B2F340-016D-11D2-945F-00C04FB984F9} "Message f
             else:
                 raise
 
-        text = ET.SubElement(data, 'text')
+        text = data.find('text')
+        if text is None:
+            text = ET.SubElement(data, 'text')
         text.text = value
 
         out = BytesIO()

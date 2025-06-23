@@ -88,13 +88,18 @@ ssize_t pwrite_fsync_recv(struct tevent_req *req, int *perr);
 
 /* The following definitions come from smbd/blocking.c  */
 
-NTSTATUS smbd_do_locks_try(
-	struct files_struct *fsp,
-	uint16_t num_locks,
-	struct smbd_lock_element *locks,
-	uint16_t *blocker_idx,
-	struct server_id *blocking_pid,
-	uint64_t *blocking_smblctx);
+struct smbd_do_locks_state {
+	uint16_t num_locks;
+	struct smbd_lock_element *locks;
+	NTSTATUS status;
+	uint16_t blocker_idx;
+	struct server_id blocking_pid;
+	uint64_t blocking_smblctx;
+};
+
+NTSTATUS smbd_do_locks_try(struct byte_range_lock *br_lck,
+			   struct smbd_do_locks_state *state);
+
 struct tevent_req *smbd_smb1_do_locks_send(
 	TALLOC_CTX *mem_ctx,
 	struct tevent_context *ev,
@@ -1179,6 +1184,8 @@ NTSTATUS vfs_fstreaminfo(struct files_struct *fsp,
 void init_smb_file_time(struct smb_file_time *ft);
 int vfs_fake_fd(void);
 int vfs_fake_fd_close(int fd);
+uint32_t vfs_get_fs_capabilities(struct connection_struct *conn,
+				 enum timestamp_set_resolution *ts_res);
 
 /* The following definitions come from smbd/avahi_register.c */
 

@@ -32,6 +32,9 @@ void brl_shutdown(void);
 
 unsigned int brl_num_locks(const struct byte_range_lock *brl);
 struct files_struct *brl_fsp(struct byte_range_lock *brl);
+void brl_req_set(struct byte_range_lock *br_lck,
+		 TALLOC_CTX *req_mem_ctx,
+		 const struct GUID *req_guid);
 TALLOC_CTX *brl_req_mem_ctx(const struct byte_range_lock *brl);
 const struct GUID *brl_req_guid(const struct byte_range_lock *brl);
 
@@ -63,7 +66,8 @@ bool brl_unlock(struct byte_range_lock *br_lck,
 bool brl_unlock_windows_default(struct byte_range_lock *br_lck,
 				const struct lock_struct *plock);
 bool brl_locktest(struct byte_range_lock *br_lck,
-		  const struct lock_struct *rw_probe);
+		  const struct lock_struct *rw_probe,
+		  bool upgradable);
 NTSTATUS brl_lockquery(struct byte_range_lock *br_lck,
 		uint64_t *psmblctx,
 		struct server_id pid,
@@ -71,8 +75,16 @@ NTSTATUS brl_lockquery(struct byte_range_lock *br_lck,
 		br_off *psize,
 		enum brl_type *plock_type,
 		enum brl_flavour lock_flav);
-bool brl_mark_disconnected(struct files_struct *fsp);
-bool brl_reconnect_disconnected(struct files_struct *fsp);
+
+struct brl_connectstate {
+	bool ok;
+	struct files_struct *fsp;
+};
+
+bool brl_mark_disconnected(struct files_struct *fsp,
+			   struct byte_range_lock *br_lck);
+bool brl_reconnect_disconnected(struct files_struct *fsp,
+				struct byte_range_lock *br_lck);
 void brl_close_fnum(struct byte_range_lock *br_lck);
 int brl_forall(void (*fn)(struct file_id id, struct server_id pid,
 			  enum brl_type lock_type,
@@ -80,14 +92,19 @@ int brl_forall(void (*fn)(struct file_id id, struct server_id pid,
 			  br_off start, br_off size,
 			  void *private_data),
 	       void *private_data);
-struct byte_range_lock *brl_get_locks_for_locking(TALLOC_CTX *mem_ctx,
-						  files_struct *fsp,
-						  TALLOC_CTX *req_mem_ctx,
-						  const struct GUID *req_guid);
+struct share_mode_lock;
+typedef void (*share_mode_do_locked_brl_fn_t)(
+	struct share_mode_lock *lck,
+	struct byte_range_lock *br_lck, /* br_lck can be NULL */
+	void *private_data);
+NTSTATUS share_mode_do_locked_brl(files_struct *fsp,
+		 share_mode_do_locked_brl_fn_t fn,
+		 void *private_data);
 struct byte_range_lock *brl_get_locks(TALLOC_CTX *mem_ctx,
 					files_struct *fsp);
 struct byte_range_lock *brl_get_locks_readonly(files_struct *fsp);
 bool brl_cleanup_disconnected(struct file_id fid, uint64_t open_persistent_id);
+void brl_set_modified(struct byte_range_lock *br_lck, bool modified);
 
 /* The following definitions come from locking/locking.c  */
 
@@ -108,7 +125,7 @@ NTSTATUS query_lock(files_struct *fsp,
 			uint64_t *poffset,
 			enum brl_type *plock_type,
 			enum brl_flavour lock_flav);
-NTSTATUS do_lock(files_struct *fsp,
+NTSTATUS do_lock(struct byte_range_lock *br_lck,
 		 TALLOC_CTX *req_mem_ctx,
 		 const struct GUID *req_guid,
 		 uint64_t smblctx,
@@ -118,7 +135,7 @@ NTSTATUS do_lock(files_struct *fsp,
 		 enum brl_flavour lock_flav,
 		 struct server_id *pblocker_pid,
 		 uint64_t *psmblctx);
-NTSTATUS do_unlock(files_struct *fsp,
+NTSTATUS do_unlock(struct byte_range_lock *br_lck,
 		   uint64_t smblctx,
 		   uint64_t count,
 		   uint64_t offset,

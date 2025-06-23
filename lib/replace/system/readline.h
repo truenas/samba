@@ -1,14 +1,14 @@
 #ifndef _system_readline_h
 #define _system_readline_h
-/* 
+/*
    Unix SMB/CIFS implementation.
 
    Readline wrappers
-   
+
      ** NOTE! The following LGPL license applies to the replace
      ** library. This does NOT imply that all of Samba is released
      ** under the LGPL
-   
+
    This library is free software; you can redistribute it and/or
    modify it under the terms of the GNU Lesser General Public
    License as published by the Free Software Foundation; either
@@ -46,7 +46,9 @@
 #endif
 
 #ifdef HAVE_NEW_LIBREADLINE
-#ifdef HAVE_CPPFUNCTION
+#if defined(HAVE_RL_COMPLETION_FUNC_T)
+#  define RL_COMPLETION_CAST (rl_completion_func_t *)
+#elif defined(HAVE_CPPFUNCTION)
 #  define RL_COMPLETION_CAST (CPPFunction *)
 #elif defined(HAVE_RL_COMPLETION_T)
 #  define RL_COMPLETION_CAST (rl_completion_t *)

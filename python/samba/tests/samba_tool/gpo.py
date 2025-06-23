@@ -141,21 +141,27 @@ source_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../
 provision_path = os.path.join(source_path, "source4/selftest/provisions/")
 
 def has_difference(path1, path2, binary=True, xml=True, sortlines=False):
-    """Use this function to determine if the GPO backup differs from another.
+    """Use this function to determine if the GPO backup differs from
+    another. It can compare pairs of files or pairs of directories.
 
     xml=True checks whether any xml files are equal
     binary=True checks whether any .SAMBABACKUP files are equal
+    sortlines=True ignore order of lines in comparison of single
+    files.
+
+    returns None if there is no difference between the paths,
+    otherwise *something*.
     """
     if os.path.isfile(path1):
-        if sortlines:
-            file1 = open(path1).readlines()
-            file1.sort()
-            file2 = open(path1).readlines()
-            file2.sort()
-            if file1 != file2:
-                return path1
+        with open(path1) as f1, open(path2) as f2:
+            lines1 = f1.readlines()
+            lines2 = f2.readlines()
 
-        elif open(path1).read() != open(path2).read():
+        if sortlines:
+            lines1.sort()
+            lines2.sort()
+
+        if lines1 != lines2:
             return path1
 
         return None
@@ -1571,6 +1577,42 @@ class GpoCmdTestCase(SambaToolCmdTest):
                                                  (os.environ["USERNAME"],
                                                  os.environ["PASSWORD"]))
         self.assertNotIn(text, out, 'The test entry was still found!')
+
+    def test_vgp_motd_set_thrice(self):
+        url = f'ldap://{os.environ["SERVER"]}'
+        creds = f'-U{os.environ["USERNAME"]}%{os.environ["PASSWORD"]}'
+        old_version = gpt_ini_version(self.gpo_guid)
+
+        for i in range(1, 4):
+            msg = f"message {i}\n"
+            result, out, err = self.runcmd("gpo", "manage", "motd", "set",
+                                           "-H", url,
+                                           creds,
+                                           self.gpo_guid,
+                                           msg.format(i))
+
+            self.assertCmdSuccess(result, out, err, f'MOTD set {i} failed')
+            self.assertEqual(err, "", f"not expecting errors (round {i})")
+            new_version = gpt_ini_version(self.gpo_guid)
+            self.assertGreater(new_version, old_version,
+                               f'GPT.INI was not updated in round {i}')
+            old_version = new_version
+
+            result, out, err = self.runcmd("gpo", "manage", "motd", "list",
+                                           "-H", url,
+                                           creds,
+                                           self.gpo_guid)
+
+            self.assertCmdSuccess(result, out, err, f'MOTD list {i} failed')
+            self.assertIn(msg, out)
+
+        # unset, by setting with no value
+        result, out, err = self.runcmd("gpo", "manage", "motd", "set",
+                                       "-H", url,
+                                       creds,
+                                       self.gpo_guid)
+        self.assertCmdSuccess(result, out, err, f'MOTD set {i} failed')
+        self.assertEqual(err, "", f"not expecting errors (round {i})")
 
     def test_vgp_motd(self):
         lp = LoadParm()

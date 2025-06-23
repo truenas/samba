@@ -363,6 +363,9 @@ static int cephwrap_statvfs(struct vfs_handle_struct *handle,
 	statbuf->TotalFileNodes = statvfs_buf.f_files;
 	statbuf->FreeFileNodes = statvfs_buf.f_ffree;
 	statbuf->FsIdentifier = statvfs_buf.f_fsid;
+	statbuf->FsCapabilities =
+		FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES;
+
 	DBG_DEBUG("[CEPH] f_bsize: %ld, f_blocks: %ld, f_bfree: %ld, "
 		  "f_bavail: %ld\n",
 		  (long int)statvfs_buf.f_bsize,
@@ -377,9 +380,7 @@ static uint32_t cephwrap_fs_capabilities(
 	struct vfs_handle_struct *handle,
 	enum timestamp_set_resolution *p_ts_res)
 {
-	uint32_t caps = FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES;
-
-	*p_ts_res = TIMESTAMP_SET_NT_OR_BETTER;
+	uint32_t caps = vfs_get_fs_capabilities(handle->conn, p_ts_res);
 
 	return caps;
 }
