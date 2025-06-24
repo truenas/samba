@@ -383,7 +383,7 @@ static int streams_xattr_fstatat(struct vfs_handle_struct *handle,
 
 	*sbuf = fsp->fsp_name->st;
 
-	size = get_xattr_size_fsp(fsp, xattr_name);
+	size = get_xattr_size_fsp(handle, fsp, xattr_name);
 	if (size == -1) {
 		errno = ENOENT;
 		ret = -1;

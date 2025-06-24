@@ -444,7 +444,7 @@ static bool add_session_counters(tn_audit_conf_t *config,
 				 struct json_object *jsobj)
 {
 	int error;
-	char buf[20];
+	char buf[26];
 
 	snprintf(buf, sizeof(buf), "%zu", config->op_cnt.create);
 	error = json_add_string(jsobj, "create", buf);
@@ -929,7 +929,8 @@ static int tn_audit_renameat(vfs_handle_struct *handle,
 			     files_struct *srcfsp,
 			     const struct smb_filename *smb_fname_src,
 			     files_struct *dstfsp,
-			     const struct smb_filename *smb_fname_dst)
+			     const struct smb_filename *smb_fname_dst,
+			     const struct vfs_rename_how *rhow)
 {
 	/*
 	 * Sample `event_data`
@@ -982,7 +983,8 @@ static int tn_audit_renameat(vfs_handle_struct *handle,
 				srcfsp,
 				smb_fname_src,
 				dstfsp,
-				smb_fname_dst);
+				smb_fname_dst,
+				rhow);
 
 	if (result == -1) {
 		TALLOC_FREE(full_fname_src);

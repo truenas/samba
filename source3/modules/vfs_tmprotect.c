@@ -239,6 +239,7 @@ static bool parse_history(const char *history_path, size_t *cntp, time_t *timest
 				begin, strerror(errno));
 			free(line);
 			success = false;
+			break;
 		}
 
 		cnt++;
