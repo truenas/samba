@@ -361,7 +361,7 @@ typedef struct tnaudit_offload_read_state {
 	DATA_BLOB token;
 } tn_offload_read_t;
 
-typedef struct tnaudt_offload_write_state {
+typedef struct tnaudit_offload_write_state {
 	struct vfs_handle_struct *handle;
 	off_t copied;
 	struct files_struct *dst_fsp;

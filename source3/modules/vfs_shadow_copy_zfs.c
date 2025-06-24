@@ -183,7 +183,7 @@ static bool open_snapdir(struct shadow_copy_fsp_ext *ext)
 		talloc_set_destructor(snapdir, snapdir_open_destructor);
 	}
 
-	if (snapdir->mp_fd -1) {
+	if (snapdir->mp_fd == -1) {
 		/*
 		 * If we fail to open, keep struct around so that we can
 		 * avoid list churn / memory allocations
@@ -870,7 +870,8 @@ static int shadow_copy_zfs_renameat(vfs_handle_struct *handle,
 				    files_struct *srcfsp,
 				    const struct smb_filename *smb_fname_src,
 				    files_struct *dstfsp,
-				    const struct smb_filename *smb_fname_dst)
+				    const struct smb_filename *smb_fname_dst,
+				    const struct vfs_rename_how *rhow)
 {
 	int ret_src, ret_dst;
 
@@ -887,7 +888,7 @@ static int shadow_copy_zfs_renameat(vfs_handle_struct *handle,
 		return -1;
 	}
 
-	return SMB_VFS_NEXT_RENAMEAT(handle, srcfsp, smb_fname_src, dstfsp, smb_fname_dst);
+	return SMB_VFS_NEXT_RENAMEAT(handle, srcfsp, smb_fname_src, dstfsp, smb_fname_dst, rhow);
 }
 
 static int shadow_copy_zfs_symlinkat(vfs_handle_struct *handle,

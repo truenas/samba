@@ -49,7 +49,7 @@
 #include <linux/magic.h>
 #endif
 
-static NTSTATUS inherit_new_acl(files_struct *dirfsp, files_struct *fsp);
+NTSTATUS inherit_new_acl(files_struct *dirfsp, files_struct *fsp);
 
 extern const struct generic_mapping file_generic_mapping;
 
