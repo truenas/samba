@@ -348,6 +348,12 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 		pathref = c_fsp;
 	}
 
+	if (pathref) {
+		fd_close(pathref);
+		file_free(NULL, pathref);
+		pathref = NULL;
+	}
+
 	error = chdir(handle->conn->connectpath);
 	if (error != 0) {
 		DBG_ERR("failed to chdir into [%s]: %s\n",
@@ -491,6 +497,9 @@ static int zfs_core_chdir(vfs_handle_struct *handle,
 			SNUM(handle->conn),
 			"force unknown acl user", "true"
 		);
+
+		SMB_ASSERT(config->ncreated > 0);
+
 		become_root();
 		ok = zfs_inherit_acls(handle, config);
 		unbecome_root();
@@ -549,7 +558,8 @@ static int zfs_core_renameat(vfs_handle_struct *handle,
 			     files_struct *srcfsp,
 			     const struct smb_filename *smb_fname_src,
 			     files_struct *dstfsp,
-			     const struct smb_filename *smb_fname_dst)
+			     const struct smb_filename *smb_fname_dst,
+			     const struct vfs_rename_how *rhow)
 {
 	int result = 1;
 	struct zfs_core_config_data *config = NULL;
@@ -560,12 +570,13 @@ static int zfs_core_renameat(vfs_handle_struct *handle,
 				struct zfs_core_config_data,
 				return -1);
 
-	if (config->ds->properties->casesens != SMBZFS_INSENSITIVE) {
+	if ((config->ds->properties->casesens != SMBZFS_INSENSITIVE) || rhow->flags) {
 		return SMB_VFS_NEXT_RENAMEAT(handle,
 					     srcfsp,
 					     smb_fname_src,
 					     dstfsp,
-					     smb_fname_dst);
+					     smb_fname_dst,
+					     rhow);
 	}
 
 	if (is_named_stream(smb_fname_src) || is_named_stream(smb_fname_dst)) {
@@ -585,7 +596,8 @@ static int zfs_core_renameat(vfs_handle_struct *handle,
 					     srcfsp,
 					     smb_fname_src,
 					     dstfsp,
-					     smb_fname_dst);
+					     smb_fname_dst,
+					     rhow);
 	}
 
 	dstid = SMB_VFS_FS_FILE_ID(handle->conn, &smb_fname_src->st);

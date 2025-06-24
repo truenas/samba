@@ -312,9 +312,9 @@ static bool zc_copy_file_range_impl(int fd_in,
 		 * assert and hopefully get corefile for investigation
 		 */
 		SMB_ASSERT(rv != 0);
+		SMB_ASSERT(rv <= remaining);
 
 		nwritten += rv;
-		SMB_ASSERT(remaining - rv >= 0);
 		remaining -= rv;
 	}
 
@@ -467,6 +467,7 @@ static struct tevent_req *zc_clone_offload_write_send(struct vfs_handle_struct *
 			// Windows server actually responds with NT_STATUS_INVALID_HANDLE
 			// despite documentation to the contrary
 			tevent_req_nterror(req, NT_STATUS_INVALID_HANDLE);
+			break;
 		case EOPNOTSUPP:
 			tevent_req_nterror(req, NT_STATUS_INVALID_DEVICE_REQUEST);
 			break;
