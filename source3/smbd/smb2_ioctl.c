@@ -71,6 +71,7 @@ NTSTATUS smbd_smb2_request_process_ioctl(struct smbd_smb2_request *req)
 	uint32_t data_length_out;
 	uint32_t data_length_tmp;
 	uint32_t data_length_max;
+	uint32_t defer_time = 1000;
 	struct tevent_req *subreq;
 
 	status = smbd_smb2_request_verify_sizes(req, 0x39);
@@ -212,6 +213,8 @@ NTSTATUS smbd_smb2_request_process_ioctl(struct smbd_smb2_request *req)
 				NT_STATUS_INVALID_PARAMETER);
 		}
 		break;
+	case FSCTL_SRV_REQUEST_RESUME_KEY:
+		defer_time = 0;
 	default:
 		in_fsp = file_fsp_smb2(req, in_file_id_persistent,
 				       in_file_id_volatile);
@@ -247,7 +250,7 @@ NTSTATUS smbd_smb2_request_process_ioctl(struct smbd_smb2_request *req)
 
 	tevent_req_set_callback(subreq, smbd_smb2_request_ioctl_done, req);
 
-	return smbd_smb2_request_pending_queue(req, subreq, 1000);
+	return smbd_smb2_request_pending_queue(req, subreq, defer_time);
 }
 
 /*
