@@ -339,7 +339,7 @@ static int sys_statx(int dirfd, const char *path, int flags,
 		     bool fake_dir_create_times)
 {
 	int ret;
-	struct statx statbuf
+	struct statx statbuf;
 
 	ret = statx(dirfd, path, flags, STATX_MNT_ID, &statbuf);
 	if (ret == 0) {
