@@ -119,7 +119,7 @@ static int ixnas_pathref_reopen(const files_struct *fsp, int flags)
 
 static int procfs_get_native_dosmode(struct files_struct *fsp, uint64_t *_dosmode)
 {
-	int fd;
+	int fd, err;
 
 	fd = ixnas_pathref_reopen(fsp, O_RDONLY);
 	if ((fd == -1) && (errno == EACCES)) {
@@ -1743,7 +1743,7 @@ static int ixnas_openat(vfs_handle_struct *handle,
 		.resolve = how->resolve | VFS_OPEN_HOW_TRUENAS_ABE
 	};
 
-	if (!fsp.fsp_flags.is_pathref) {
+	if (!fsp->fsp_flags.is_pathref) {
 		return SMB_VFS_NEXT_OPENAT(handle,
 					   dirfsp,
 					   fsp,
