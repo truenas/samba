@@ -393,7 +393,7 @@ int sys_fstatat(int fd,
 		int flags,
 		bool fake_dir_create_times)
 {
-	return sys_statx(fd, pathname, flags, fake_dir_create_times); 
+	return sys_statx(fd, pathname, flags, sbuf, fake_dir_create_times); 
 }
 
 /*******************************************************************
