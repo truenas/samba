@@ -303,12 +303,54 @@ void init_stat_ex_from_stat (struct stat_ex *dst,
 #else
 	dst->st_ex_flags = 0;
 #endif
+	dst->st_ex_mnt_id = 0;
+}
 
-#ifdef HAVE_STAT_ST_GEN
-	dst->st_ex_gen = src->st_gen;
-#else
-	dst->st_ex_gen = 0;
-#endif
+static inline struct timespec get_timespec_from_stx(struct statx_timestamp sts)
+{
+	return (struct timespec){.tv_sec = sts.tv_sec, .tv_nsec = sts.tv_nsec};
+}
+
+void init_stat_ex_from_statx(struct stat_ex *dst,
+			     const struct statx *src,
+			     bool fake_dir_create_times)
+{
+	dst->st_ex_dev = makedev(src->stx_dev_major, src->stx_dev_minor);
+	dst->st_ex_ino = src->stx_ino;
+	dst->st_ex_mode = src->stx_mode;
+	dst->st_ex_nlink = src->stx_nlink;
+	dst->st_ex_uid = src->stx_uid;
+	dst->st_ex_gid = src->stx_gid;
+	dst->st_ex_rdev = makedev(src->stx_rdev_major, src->stx_rdev_minor);
+	dst->st_ex_size = src->stx_size;
+	dst->st_ex_atime = get_timespec_from_stx(src->stx_atime);
+	dst->st_ex_mtime = get_timespec_from_stx(src->stx_mtime);
+	dst->st_ex_ctime = get_timespec_from_stx(src->stx_ctime);
+	dst->st_ex_btime = get_timespec_from_stx(src->stx_btime);
+	dst->st_ex_iflags = 0;
+	dst->st_ex_blksize = src->stx_blksize;
+	dst->st_ex_blocks = src->stx_blocks;
+	dst->st_ex_flags = src->stx_attributes;
+	dst->st_ex_mnt_id = src->stx_mnt_id;
+}
+
+static int sys_statx(int dirfd, const char *path, int flags,
+		     SMB_STRUCT_STAT *sbuf,
+		     bool fake_dir_create_times)
+{
+	int ret;
+	struct statx statbuf
+
+	ret = statx(dirfd, path, flags, STATX_MNT_ID, &statbuf);
+	if (ret == 0) {
+		// Preserve samba behavior of zeroing out dir size
+		if (S_ISDIR(statbuf.stx_mode)) {
+			statbuf.stx_mode = 0;
+		}
+		init_stat_ex_from_statx(sbuf, &statbuf, fake_dir_create_times);
+	}
+
+	return ret;
 }
 
 /*******************************************************************
@@ -318,17 +360,7 @@ A stat() wrapper.
 int sys_stat(const char *fname, SMB_STRUCT_STAT *sbuf,
 	     bool fake_dir_create_times)
 {
-	int ret;
-	struct stat statbuf;
-	ret = stat(fname, &statbuf);
-	if (ret == 0) {
-		/* we always want directories to appear zero size */
-		if (S_ISDIR(statbuf.st_mode)) {
-			statbuf.st_size = 0;
-		}
-		init_stat_ex_from_stat(sbuf, &statbuf, fake_dir_create_times);
-	}
-	return ret;
+	return statx(AT_FDCWD, fname, 0, sbuf, fake_dir_create_times);
 }
 
 /*******************************************************************
@@ -337,37 +369,18 @@ int sys_stat(const char *fname, SMB_STRUCT_STAT *sbuf,
 
 int sys_fstat(int fd, SMB_STRUCT_STAT *sbuf, bool fake_dir_create_times)
 {
-	int ret;
-	struct stat statbuf;
-	ret = fstat(fd, &statbuf);
-	if (ret == 0) {
-		/* we always want directories to appear zero size */
-		if (S_ISDIR(statbuf.st_mode)) {
-			statbuf.st_size = 0;
-		}
-		init_stat_ex_from_stat(sbuf, &statbuf, fake_dir_create_times);
-	}
-	return ret;
+	return statx(fd, "", AT_EMPTY_PATH, sbuf, fake_dir_create_times);
 }
 
 /*******************************************************************
  An lstat() wrapper.
 ********************************************************************/
 
-int sys_lstat(const char *fname,SMB_STRUCT_STAT *sbuf,
+int sys_lstat(const char *fname, SMB_STRUCT_STAT *sbuf,
 	      bool fake_dir_create_times)
 {
-	int ret;
-	struct stat statbuf;
-	ret = lstat(fname, &statbuf);
-	if (ret == 0) {
-		/* we always want directories to appear zero size */
-		if (S_ISDIR(statbuf.st_mode)) {
-			statbuf.st_size = 0;
-		}
-		init_stat_ex_from_stat(sbuf, &statbuf, fake_dir_create_times);
-	}
-	return ret;
+	return statx(AT_FDCWD, fname, AT_SYMLINK_NO_FOLLOW, sbuf,
+		     fake_dir_create_times);
 }
 
 /*******************************************************************
@@ -380,20 +393,7 @@ int sys_fstatat(int fd,
 		int flags,
 		bool fake_dir_create_times)
 {
-	int ret;
-	struct stat statbuf;
-
-	ret = fstatat(fd, pathname, &statbuf, flags);
-	if (ret != 0) {
-		return -1;
-	}
-
-	/* we always want directories to appear zero size */
-	if (S_ISDIR(statbuf.st_mode)) {
-		statbuf.st_size = 0;
-	}
-	init_stat_ex_from_stat(sbuf, &statbuf, fake_dir_create_times);
-	return 0;
+	return statx(fd, pathname, flags, fake_dir_create_times); 
 }
 
 /*******************************************************************
