@@ -379,7 +379,7 @@ int sys_fstat(int fd, SMB_STRUCT_STAT *sbuf, bool fake_dir_create_times)
 int sys_lstat(const char *fname, SMB_STRUCT_STAT *sbuf,
 	      bool fake_dir_create_times)
 {
-	return sys_statx(AT_FDCWD, fname, AT_SYMLINK_NO_FOLLOW, sbuf,
+	return sys_statx(AT_FDCWD, fname, AT_SYMLINK_NOFOLLOW, sbuf,
 		     fake_dir_create_times);
 }
 
