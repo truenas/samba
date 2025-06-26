@@ -582,7 +582,7 @@ static bool set_process_capability(enum smbd_capability capability,
 				   bool enable)
 {
 	/* "5" is the number of "num_cap_vals++" below */
-	cap_value_t cap_vals[5] = {0};
+	cap_value_t cap_vals[6] = {0};
 	size_t num_cap_vals = 0;
 
 	cap_t cap;
@@ -637,6 +637,11 @@ static bool set_process_capability(enum smbd_capability capability,
 		case DAC_OVERRIDE_CAPABILITY:
 #ifdef CAP_DAC_OVERRIDE
 			cap_vals[num_cap_vals++] = CAP_DAC_OVERRIDE;
+#endif
+			break;
+		case DAC_READ_SEARCH:
+#ifdef CAP_DAC_READ_SEARCH
+			cap_vals[num_cap_vals++] = CAP_DAC_READ_SEARCH;
 #endif
 	}
 

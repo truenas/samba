@@ -1733,6 +1733,7 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 
 static int ixnas_openat(vfs_handle_struct *handle,
 			const struct files_struct *dirfsp,
+			const struct smb_filename *smb_fname,
 			files_struct *fsp,
 			const struct vfs_open_how *how)
 {
@@ -1746,6 +1747,7 @@ static int ixnas_openat(vfs_handle_struct *handle,
 	if (!fsp->fsp_flags.is_pathref) {
 		return SMB_VFS_NEXT_OPENAT(handle,
 					   dirfsp,
+					   smb_fname,
 					   fsp,
 					   how);
 	}
@@ -1756,6 +1758,7 @@ static int ixnas_openat(vfs_handle_struct *handle,
 		// this *should* be a relatively rare edge-case
 		return SMB_VFS_NEXT_OPENAT(handle,
 					   dirfsp,
+					   smb_fname,
 					   fsp,
 					   how);
 	}
