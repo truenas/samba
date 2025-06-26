@@ -938,6 +938,7 @@ bool is_visible_fsp(struct files_struct *fsp)
 	if (!hide_unreadable &&
 	    !hide_unwriteable &&
 	    !hide_special &&
+	    fsp->conn->aclbrand != TRUENAS_ACL_BRAND_NFS4 &&
 	    (hide_new_files_timeout == 0))
 	{
 		return true;
