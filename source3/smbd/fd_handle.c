@@ -174,7 +174,7 @@ int fsp_reopen_pathref_from_kern_fh(struct files_struct *fsp, int flags)
 {
 	int fd;
 
-	if (!fsp->flags.is_pathref || fsp->fh->kern_fh->handle_bytes == 0) {
+	if (!fsp->fsp_flags.is_pathref || fsp->fh->kern_fh->handle_bytes == 0) {
 		errno = EOPNOTSUPP;
 		return -1;
 	}
