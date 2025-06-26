@@ -360,7 +360,7 @@ A stat() wrapper.
 int sys_stat(const char *fname, SMB_STRUCT_STAT *sbuf,
 	     bool fake_dir_create_times)
 {
-	return statx(AT_FDCWD, fname, 0, sbuf, fake_dir_create_times);
+	return sys_statx(AT_FDCWD, fname, 0, sbuf, fake_dir_create_times);
 }
 
 /*******************************************************************
@@ -369,7 +369,7 @@ int sys_stat(const char *fname, SMB_STRUCT_STAT *sbuf,
 
 int sys_fstat(int fd, SMB_STRUCT_STAT *sbuf, bool fake_dir_create_times)
 {
-	return statx(fd, "", AT_EMPTY_PATH, sbuf, fake_dir_create_times);
+	return sys_statx(fd, "", AT_EMPTY_PATH, sbuf, fake_dir_create_times);
 }
 
 /*******************************************************************
@@ -379,7 +379,7 @@ int sys_fstat(int fd, SMB_STRUCT_STAT *sbuf, bool fake_dir_create_times)
 int sys_lstat(const char *fname, SMB_STRUCT_STAT *sbuf,
 	      bool fake_dir_create_times)
 {
-	return statx(AT_FDCWD, fname, AT_SYMLINK_NO_FOLLOW, sbuf,
+	return sys_statx(AT_FDCWD, fname, AT_SYMLINK_NO_FOLLOW, sbuf,
 		     fake_dir_create_times);
 }
 
@@ -393,7 +393,7 @@ int sys_fstatat(int fd,
 		int flags,
 		bool fake_dir_create_times)
 {
-	return statx(fd, pathname, flags, fake_dir_create_times); 
+	return sys_statx(fd, pathname, flags, fake_dir_create_times); 
 }
 
 /*******************************************************************
