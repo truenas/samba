@@ -20,6 +20,12 @@
 #include "includes.h"
 #include "fd_handle.h"
 
+#define __NR_NAME_TO_HANDLE_AT 303
+#define __NR_OPEN_BY_HANDLE_AT 304
+#define INIT_HANDLE_SZ 128 // MAX_HANDLE_SZ as of 6.13 kernel
+#define AT_HANDLE_FID AT_REMOVEDIR
+
+
 struct fd_handle {
 	size_t ref_count;
 	int fd;
@@ -32,6 +38,7 @@ struct fd_handle {
 	 */
 	uint32_t private_options;
 	uint64_t gen_id;
+	struct file_handle *kern_fh; /* kernel file handle */
 };
 
 static int fd_handle_destructor(struct fd_handle *fh)
@@ -49,6 +56,12 @@ struct fd_handle *fd_handle_create(TALLOC_CTX *mem_ctx)
 		return NULL;
 	}
 	fh->fd = -1;
+
+	fh->kern_fh = talloc_zero_size(fh, INIT_HANDLE_SZ);
+	if (fh->kern_fh == NULL) {
+		TALLOC_FREE(fh);
+		return NULL;
+	}
 
 	talloc_set_destructor(fh, fd_handle_destructor);
 
@@ -144,4 +157,31 @@ void fsp_set_fd(struct files_struct *fsp, int fd)
 		   fd == AT_FDCWD);
 
 	fsp->fh->fd = fd;
+
+	if (fd != 0 && fd != AT_FDCWD &&  // Need a valid fd
+	    fsp->fsp_name && fsp->fsp_name->st.st_ex_mnt_id && // and some mount info 
+	    fsp->conn->internal_tcon_flags & TCON_FLAG_SUPPORTS_FHANDLE) {
+		int err;
+		uint64_t mntid = fsp->fsp_name->st.st_ex_mnt_id; 
+		err = syscall(__NR_NAME_TO_HANDLE_AT,
+			      fd, "", fsp->fh->kern_fh,
+			      fsp->fsp_name->st.st_ex_mnt_id, AT_EMPTY_PATH);
+		SMB_ASSERT(err == 0);
+	}
+}
+
+int fsp_reopen_pathref_from_kern_fh(struct files_struct *fsp, int flags)
+{
+	int fd;
+
+	if (!fsp->flags.is_pathref || fsp->fh->kern_fh->handle_bytes == 0) {
+		errno = EOPNOTSUPP;
+		return -1;
+	}
+
+	set_effective_capability(DAC_READ_SEARCH);
+	fd = syscall(__NR_OPEN_BY_HANDLE_AT, fsp->fh->fd, fsp->fh->kern_fh, flags);
+	drop_effective_capability(DAC_READ_SEARCH);
+
+	return fd;
 }
