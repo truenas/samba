@@ -1752,7 +1752,7 @@ static int ixnas_openat(vfs_handle_struct *handle,
 					   how);
 	}
 
-	fd = SMB_VFS_NEXT_OPENAT(handle, dirfsp, fsp, &tmp_how);
+	fd = SMB_VFS_NEXT_OPENAT(handle, dirfsp, smb_fname, fsp, &tmp_how);
 	if ((fd == -1) && (errno == EACCES)) {
 		// attempt to open pathref fd O_RDONLY failed
 		// this *should* be a relatively rare edge-case
