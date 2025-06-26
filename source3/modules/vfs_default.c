@@ -616,7 +616,8 @@ static int vfswrap_openat(vfs_handle_struct *handle,
 	START_PROFILE(syscall_openat);
 
 	if (how->resolve & ~(VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS |
-			     VFS_OPEN_HOW_WITH_BACKUP_INTENT)) {
+			     VFS_OPEN_HOW_WITH_BACKUP_INTENT |
+			     VFS_OPEN_HOW_TRUENAS_ABE)) {
 		errno = ENOSYS;
 		result = -1;
 		goto out;
@@ -627,7 +628,9 @@ static int vfswrap_openat(vfs_handle_struct *handle,
 #ifdef O_PATH
 	have_opath = true;
 	if (fsp->fsp_flags.is_pathref) {
-		flags |= O_PATH;
+		if ((how->resolve & VFS_OPEN_HOW_TRUENAS_ABE) == 0) {
+			flags |= O_PATH;
+		}
 	}
 	if (flags & O_PATH) {
 		/*

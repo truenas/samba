@@ -1520,6 +1520,10 @@ NTSTATUS openat_pathref_fsp_lcomp(struct files_struct *dirfsp,
 		return status;
 	}
 
+	if (dirfsp->conn->aclbrand == TRUENAS_ACL_BRAND_NFS4) {
+		how.resolve = VFS_OPEN_HOW_TRUENAS_ABE;
+	}
+
 	fd = smb_vfs_openat_ci(smb_fname_rel,
 			       (ucf_flags & UCF_POSIX_PATHNAMES) ||
 				       conn->case_sensitive,
@@ -1528,6 +1532,23 @@ NTSTATUS openat_pathref_fsp_lcomp(struct files_struct *dirfsp,
 			       smb_fname_rel,
 			       fsp,
 			       &how);
+
+	if ((fd == -1) && (errno == EACCES) &&
+	    (dirfsp->conn->aclbrand == TRUENAS_ACL_BRAND_NFS4)) {
+		/*
+		 * Our attempt to open a "pathref" O_RDONLY failed
+		 * with EACCES. We'll retry with a O_PATH open
+		 */
+		how.resolve = 0;
+		fd = smb_vfs_openat_ci(smb_fname_rel,
+				       (ucf_flags & UCF_POSIX_PATHNAMES) ||
+					       conn->case_sensitive,
+				       conn,
+				       dirfsp,
+				       smb_fname_rel,
+				       fsp,
+				       &how);
+	}
 
 	if ((fd == -1) && (errno == ENOENT)) {
 		status = map_nt_error_from_unix(errno);

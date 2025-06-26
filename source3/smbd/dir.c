@@ -945,6 +945,19 @@ bool is_visible_fsp(struct files_struct *fsp)
 
 	fsp = metadata_fsp(fsp);
 
+	if (fsp->conn->aclbrand == TRUENAS_ACL_BRAND_NFS4) {
+		int fd, open_flags;
+		fd = fsp_get_pathref_fd(fsp);
+
+		if (fd != -1) {
+			open_flags = fcntl(fd, F_GETFL);
+			DBG_ERR("%s: open flags: 0x%08x\n",
+				fsp_str_dbg(fsp), open_flags);
+
+			return open_flags & O_RDONLY;
+		}
+	}
+
 	/* Get the last component of the base name. */
 	last_component = strrchr_m(fsp->fsp_name->base_name, '/');
 	if (!last_component) {
