@@ -167,7 +167,7 @@ void fsp_set_fd(struct files_struct *fsp, int fd)
 		uint64_t mntid = fsp->fsp_name->st.st_ex_mnt_id; 
 		err = syscall(__NR_NAME_TO_HANDLE_AT,
 			      fd, "", fsp->fh->kern_fh,
-			      fsp->fsp_name->st.st_ex_mnt_id, AT_EMPTY_PATH);
+			      &fsp->fsp_name->st.st_ex_mnt_id, AT_EMPTY_PATH);
 
 		DBG_ERR("XXX: %d from %s errno %d\n", err, fsp_str_dbg(fsp), errno);
 	}
