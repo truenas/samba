@@ -47,6 +47,18 @@
    is sure to try and execute them.  These stubs are used to prevent
    this possibility. */
 
+static inline bool must_use_procfd_path(const struct files_struct *fsp)
+{
+	/*
+	 * In TrueNAS in some cases we may have O_RDONLY descriptor in pathref
+	 */
+	if (!fsp->fsp_flags.is_pathref || fsp->aclbrand != TRUENAS_ACL_BRAND_NFS4) {
+		return false;
+	}
+
+	return fcntl(fsp_get_pathref_fd(fsp), F_GETFL) & O_PATH ? true : false;
+}
+
 static int vfswrap_connect(vfs_handle_struct *handle, const char *service, const char *user)
 {
 	bool bval;
@@ -3465,7 +3477,7 @@ static ssize_t vfswrap_fgetxattr(struct vfs_handle_struct *handle,
 
 	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
 
-	if (!fsp->fsp_flags.is_pathref) {
+	if (!must_use_procfd_path(fsp)) {
 		return fgetxattr(fd, name, value, size);
 	}
 
@@ -3785,7 +3797,7 @@ static ssize_t vfswrap_flistxattr(struct vfs_handle_struct *handle, struct files
 
 	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
 
-	if (!fsp->fsp_flags.is_pathref) {
+	if (!must_use_procfd_path(fsp)) {
 		return flistxattr(fd, list, size);
 	}
 

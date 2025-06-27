@@ -347,7 +347,7 @@ static zfsacl_t fsp_get_zfsacl(files_struct *fsp)
 
 	if (!fsp->fsp_flags.is_pathref) {
 		return zfsacl_get_fd(fsp_get_io_fd(fsp), ZFSACL_BRAND_NFSV4);
-	} else if ((fcntl(fsp_get_pathref_fd(fsp), F_GETFL) & O_RDONLY) == 0) {
+	} else if ((fcntl(fsp_get_pathref_fd(fsp), F_GETFL) & O_PATH) == 0) {
 		return zfsacl_get_fd(fsp_get_pathref_fd(fsp), ZFSACL_BRAND_NFSV4);
 	}
 

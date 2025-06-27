@@ -26,7 +26,7 @@
 #define AT_HANDLE_FID AT_REMOVEDIR
 #define FDH_TO_KERN(fhdl) ((struct file_handle *)&fhdl->kern_fh_buf)
 
-typedef char[MAX_HANDLE_SZ] kern_fh_t;
+typedef char filehandlebuf[MAX_HANDLE_SZ];
 
 struct fd_handle {
 	size_t ref_count;
@@ -40,7 +40,7 @@ struct fd_handle {
 	 */
 	uint32_t private_options;
 	uint64_t gen_id;
-	kern_fh_t kern_fh_buf; /* kernel file handle */
+	filehandlebuf kern_fh_buf; /* kernel file handle */
 };
 
 static int fd_handle_destructor(struct fd_handle *fh)
