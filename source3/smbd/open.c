@@ -1170,6 +1170,21 @@ static NTSTATUS fd_open_atomic(struct files_struct *dirfsp,
 	return status;
 }
 
+static inline int reopen_fsp_fast(const struct files_struct *fsp,
+				  const struct vfs_open_how *how)
+{
+	int old_fd, access_mode;
+
+	old_fd = fsp_get_pathref_fd(fsp);
+	access_mode = fcntl(old_fd, F_GETFL);
+	if ((how->flags & access_mode) == how->flags) {
+		// We may have already opened this with correct mode
+		return old_fd; 
+	}	
+
+	return fsp_reopen_pathref_from_kern_fh(fsp, how->flags); 
+}
+
 static NTSTATUS reopen_from_fsp(struct files_struct *dirfsp,
 				struct smb_filename *smb_fname,
 				struct files_struct *fsp,
@@ -1200,11 +1215,15 @@ static NTSTATUS reopen_from_fsp(struct files_struct *dirfsp,
 
 		fsp->fsp_flags.is_pathref = false;
 
-		new_fd = SMB_VFS_OPENAT(fsp->conn,
-					fsp->conn->cwd_fsp,
-					&proc_fname,
-					fsp,
-					how);
+		new_fd = reopen_fsp_fast(fsp, how);
+		if (new_fd == -1) {
+			// fhandle may not have been valid
+			new_fd = SMB_VFS_OPENAT(fsp->conn,
+						fsp->conn->cwd_fsp,
+						&proc_fname,
+						fsp,
+						how);
+		}
 		if (new_fd == -1) {
 #if defined(HAVE_FSTATFS) && defined(HAVE_LINUX_MAGIC_H)
 			if (S_ISDIR(fsp->fsp_name->st.st_ex_mode) &&
@@ -1232,9 +1251,11 @@ static NTSTATUS reopen_from_fsp(struct files_struct *dirfsp,
 			return status;
 		}
 
-		status = fd_close(fsp);
-		if (!NT_STATUS_IS_OK(status)) {
-			return status;
+		if (old_fd != new_fd) {
+			status = fd_close(fsp);
+			if (!NT_STATUS_IS_OK(status)) {
+				return status;
+			}
 		}
 
 		fsp_set_fd(fsp, new_fd);
