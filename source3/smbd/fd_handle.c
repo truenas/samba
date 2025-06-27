@@ -158,7 +158,9 @@ void fsp_set_fd(struct files_struct *fsp, int fd)
 
 	fsp->fh->fd = fd;
 
-	if (fd != 0 && fd != AT_FDCWD &&  // Need a valid fd
+	DBG_ERR("XXX: setting %d on %s\n", fd, fsp_str_dbg(fsp));
+
+	if (fd != -1 && fd != AT_FDCWD &&  // Need a valid fd
 	    fsp->fsp_name && fsp->fsp_name->st.st_ex_mnt_id && // and some mount info 
 	    fsp->conn->internal_tcon_flags & TCON_FLAG_SUPPORTS_FHANDLE) {
 		int err;
@@ -166,6 +168,8 @@ void fsp_set_fd(struct files_struct *fsp, int fd)
 		err = syscall(__NR_NAME_TO_HANDLE_AT,
 			      fd, "", fsp->fh->kern_fh,
 			      fsp->fsp_name->st.st_ex_mnt_id, AT_EMPTY_PATH);
+
+		DBG_ERR("XXX: %d from %s errno %d\n", err, fsp_str_dbg(fsp), errno);
 		SMB_ASSERT(err == 0);
 	}
 }
