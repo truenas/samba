@@ -24,6 +24,7 @@
 #define __NR_OPEN_BY_HANDLE_AT 304
 #define MAX_HANDLE_SZ 128 // MAX_HANDLE_SZ as of 6.13 kernel
 #define AT_HANDLE_FID AT_REMOVEDIR
+#define FDH_TO_KERN(fhdl) ((struct file_handle *)&fhdl->kern_fh_buf)
 
 typedef char[MAX_HANDLE_SZ] kern_fh_t;
 
@@ -161,7 +162,7 @@ void fsp_set_fd(struct files_struct *fsp, int fd)
 		int err;
 		uint64_t mntid = fsp->fsp_name->st.st_ex_mnt_id; 
 		err = syscall(__NR_NAME_TO_HANDLE_AT,
-			      fd, "", (struct file_handle *)&fsp->fh->kern_fh,
+			      fd, "", FDH_TO_KERN(fsp->fh),
 			      &fsp->fsp_name->st.st_ex_mnt_id, AT_EMPTY_PATH);
 
 		DBG_ERR("XXX: %d from %s errno %d\n", err, fsp_str_dbg(fsp), errno);
@@ -171,14 +172,15 @@ void fsp_set_fd(struct files_struct *fsp, int fd)
 int fsp_reopen_pathref_from_kern_fh(struct files_struct *fsp, int flags)
 {
 	int fd;
+	struct file_handle *kern_fh = FDH_TO_KERN(fsp->fh);
 
-	if (!fsp->fsp_flags.is_pathref || fsp->fh->kern_fh->handle_bytes == 0) {
+	if (!fsp->fsp_flags.is_pathref || kern_fh->handle_bytes == 0) {
 		errno = EOPNOTSUPP;
 		return -1;
 	}
 
 	set_effective_capability(DAC_READ_SEARCH);
-	fd = syscall(__NR_OPEN_BY_HANDLE_AT, fsp->fh->fd, (struct file_handle *)&fsp->fh->kern_fh, flags);
+	fd = syscall(__NR_OPEN_BY_HANDLE_AT, fsp->fh->fd, kern_fh, flags);
 	drop_effective_capability(DAC_READ_SEARCH);
 
 	return fd;
