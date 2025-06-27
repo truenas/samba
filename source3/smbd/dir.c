@@ -955,7 +955,9 @@ bool is_visible_fsp(struct files_struct *fsp)
 			DBG_ERR("%s: open flags: 0x%08x\n",
 				fsp_str_dbg(fsp), open_flags);
 
-			return open_flags & O_RDONLY ? true : false;
+			// the open falls-back to O_PATH if
+			// user doesn't have read access
+			return open_flags & O_PATH ? false : true;
 		}
 	}
 
