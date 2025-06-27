@@ -691,6 +691,8 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 				"zfs_core", "zfs_integrity_streams", false);
 	}
 
+	handle->conn->intenral_tcon_flags |= TCON_FLAG_SUPPORTS_FHANDLE;
+
 	SMB_VFS_HANDLE_SET_DATA(handle, config,
 				NULL, struct zfs_core_config_data,
 				return -1);
