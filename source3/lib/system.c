@@ -345,7 +345,7 @@ static int sys_statx(int dirfd, const char *path, int flags,
 	if (ret == 0) {
 		// Preserve samba behavior of zeroing out dir size
 		if (S_ISDIR(statbuf.stx_mode)) {
-			statbuf.stx_mode = 0;
+			statbuf.stx_size = 0;
 		}
 		init_stat_ex_from_statx(sbuf, &statbuf, fake_dir_create_times);
 	}
