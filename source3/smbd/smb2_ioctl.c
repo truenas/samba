@@ -213,8 +213,6 @@ NTSTATUS smbd_smb2_request_process_ioctl(struct smbd_smb2_request *req)
 				NT_STATUS_INVALID_PARAMETER);
 		}
 		break;
-	case FSCTL_SRV_REQUEST_RESUME_KEY:
-		defer_time = 0;
 	default:
 		in_fsp = file_fsp_smb2(req, in_file_id_persistent,
 				       in_file_id_volatile);
@@ -222,6 +220,10 @@ NTSTATUS smbd_smb2_request_process_ioctl(struct smbd_smb2_request *req)
 			return smbd_smb2_request_error(req, NT_STATUS_FILE_CLOSED);
 		}
 		break;
+	}
+
+	if (in_ctl_code == FSCTL_SRV_REQUEST_RESUME_KEY) {
+		defer_time = 0;
 	}
 
 	subreq = smbd_smb2_ioctl_send(req, req->sconn->ev_ctx,
