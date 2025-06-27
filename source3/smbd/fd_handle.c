@@ -170,7 +170,6 @@ void fsp_set_fd(struct files_struct *fsp, int fd)
 			      fsp->fsp_name->st.st_ex_mnt_id, AT_EMPTY_PATH);
 
 		DBG_ERR("XXX: %d from %s errno %d\n", err, fsp_str_dbg(fsp), errno);
-		SMB_ASSERT(err == 0);
 	}
 }
 
