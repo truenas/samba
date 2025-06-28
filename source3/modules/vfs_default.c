@@ -52,7 +52,7 @@ static inline bool must_use_procfd_path(const struct files_struct *fsp)
 	/*
 	 * In TrueNAS in some cases we may have O_RDONLY descriptor in pathref
 	 */
-	if (!fsp->fsp_flags.is_pathref || fsp->aclbrand != TRUENAS_ACL_BRAND_NFS4) {
+	if (!fsp->fsp_flags.is_pathref || fsp->conn->aclbrand != TRUENAS_ACL_BRAND_NFS4) {
 		return false;
 	}
 
