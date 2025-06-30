@@ -717,6 +717,11 @@ struct tevent_req *smb2_ioctl_network_fs(uint32_t ctl_code,
 		}
 		tevent_req_set_callback(
 			subreq, smb2_ioctl_network_fs_offload_read_done, req);
+
+		if (!tevent_req_in_progess(subreq)) {
+			tevent_req_notify_callback(subreq);
+			return tevent_req_post(req, ev);
+		}
 		return req;
 
 	default: {
