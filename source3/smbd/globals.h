@@ -529,6 +529,7 @@ struct smbXsrv_connection {
 		 * but with reversed value...
 		 */
 		bool got_authenticated_session;
+		uint32_t next_sendmsg_completion;
 	} smb2;
 };
 
@@ -616,6 +617,8 @@ struct smbd_smb2_request {
 	struct smbXsrv_connection *xconn;
 
 	struct smbd_smb2_send_queue queue_entry;
+
+	uint32_t sendmsg_completion_id;
 
 	/* the session the request operates on, maybe NULL */
 	struct smbXsrv_session *session;

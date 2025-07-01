@@ -307,9 +307,14 @@ static NTSTATUS smbd_initialize_smb2(struct smbXsrv_connection *xconn,
 	if (xconn->smb2.credits.bitmap == NULL) {
 		return NT_STATUS_NO_MEMORY;
 	}
+	xconn->smb2.next_sendmsg_completion = 1;
 
 	tevent_fd_set_close_fn(xconn->transport.fde, NULL);
 	TALLOC_FREE(xconn->transport.fde);
+
+	if (setsockopt(xconn->transport.sock, SOL_SOCKET, SO_ZEROCOPY, &rc, sizeof(rc))) {
+		DBG_ERR("XXX: Failed to set SO_ZEROCOPY: %s\n", strerror(errno));
+	}
 
 	xconn->transport.fde = tevent_add_fd(
 					xconn->client->raw_ev_ctx,
@@ -377,6 +382,10 @@ static int smbd_smb2_request_destructor(struct smbd_smb2_request *req)
 {
 	TALLOC_FREE(req->first_enc_key);
 	TALLOC_FREE(req->last_sign_key);
+	DBG_ERR("XXX: destructor %p\n", req);
+	if (req->sendmsg_completion_id) {
+		DBG_ERR("XXX: Freeing %p without completion\n");
+	}
 	return 0;
 }
 
@@ -4809,6 +4818,7 @@ static NTSTATUS smbd_smb2_advance_send_queue(struct smbXsrv_connection *xconn,
 	DLIST_REMOVE(xconn->smb2.send_queue, e);
 
 	if (e->ack.req == NULL) {
+		DBG_ERR("XXX: %p no ack required\n, e");
 		*_e = NULL;
 		talloc_free(e->mem_ctx);
 		return NT_STATUS_OK;
@@ -5169,6 +5179,58 @@ got_full:
 	return NT_STATUS_OK;
 }
 
+static bool is_zerocopy_notification(struct msghdr *msg, struct smbXsrc_connection *xconn)
+{
+	struct sock_extended_err *serr;
+	struct smbd_smb2_request *cur = NULL;
+	struct cmsghdr *cm;
+	uint32_t hi, low, range;
+	int ret, zerocopy;
+
+
+	cm = CMSG_FIRSTHDR(msg);
+	if (!cm) {
+		DBG_ERR("No cmsg\n");
+		return false;
+	}
+
+	serr = (void *)CMSG_DATA(cm);
+	if (serr->ee_origin != SO_EE_ORIGIN_ZEROCOPY) {
+		zerocopied("XXX: unexpected origin\n");
+		return false;
+	}
+
+	SMB_ASSERT(serr->ee_errno == 0);
+	hi = serr->ee_data;
+	lo = serr->ee_info;
+	if (lo != xconn->smb2.next_sendmsg_completion) {
+		DBG_ERR("XXX: %u high did not match expected: %u\n",
+			hi, xconn->smb2.next_sendmsg_completion);
+	}
+
+	// For now we want to detect when we free a SMB request without
+	// receiving a completion message
+	for (cur = xconn->smb2.requests; cur; cur = cur->next) {
+		if (cur->sendmsg_completion_id == lo) {
+			DBG_ERR("XXX: %p notification for req\n", cur);
+			cur->sendmsg_completion_id = 0;
+			break;
+		}
+	}
+
+	if (!cur) {
+		DBG_ERR("XXX: no corresponding message found\n");
+	}
+
+	range = hi - lo + 1;
+
+	xconn->smb2.next_sendmsg_completion = hi++;
+
+	DBG_ERR("XXX: zerocopy completed %u (h=%u l=%u)\n", range, hi, lo);
+
+	return true;
+}
+
 static NTSTATUS smbd_smb2_io_handler(struct smbXsrv_connection *xconn,
 				     uint16_t fde_flags)
 {
@@ -5234,6 +5296,7 @@ again:
 #ifdef MSG_DONTWAIT
 	recvmsg_flags |= MSG_DONTWAIT;
 #endif
+	recvmsg_flags |= MSG_ERRQUEUE;
 
 	ret = recvmsg(xconn->transport.sock, &state->msg, recvmsg_flags);
 	if (ret == 0) {
@@ -5255,6 +5318,11 @@ again:
 							status);
 		return status;
 	}
+
+	if (is_zerocopy_notification(&state->msg, xconn)) {
+		goto again;
+	}
+
 
 	status = smbd_smb2_advance_incoming(xconn, ret);
 	if (NT_STATUS_EQUAL(status, NT_STATUS_PENDING)) {
