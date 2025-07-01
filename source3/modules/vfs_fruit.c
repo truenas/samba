@@ -4780,7 +4780,7 @@ static struct tevent_req *fruit_offload_read_send(
 	}
 	tevent_req_set_callback(subreq, fruit_offload_read_done, req);
 
-	if (!tevent_eq_is_in_progress(subreq)) {
+	if (!tevent_req_is_in_progress(subreq)) {
 		fruit_offload_read_done(subreq);
 		tevent_req_post(req, ev);
 	}
