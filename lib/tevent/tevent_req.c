@@ -409,6 +409,10 @@ void _tevent_req_set_callback(struct tevent_req *req,
 	req->async.fn = fn;
 	req->async.fn_name = fn_name;
 	req->async.private_data = pvt;
+
+	if (req->internal.status == TEVENT_REQ_DONE) {
+		tevent_req_notify_callback(req);
+	}
 }
 
 void *_tevent_req_callback_data(struct tevent_req *req)
