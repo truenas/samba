@@ -418,7 +418,6 @@ bool vfs_valid_allocation_range(off_t offset, size_t length)
 	 * 64 TiB which seems like a reasonable upper-bound for VEEAM
 	 * workloads.
 	 */
-	static const uint64_t maxfilesize = 0x0000400000000000;
 	uint64_t last_byte_ofs;
 	bool ok;
 
@@ -432,7 +431,7 @@ bool vfs_valid_allocation_range(off_t offset, size_t length)
 	}
 
 	last_byte_ofs = offset + length;
-	if (last_byte_ofs > maxfilesize) {
+	if (last_byte_ofs > INT64_MAX) {
 		return false;
 	}
 

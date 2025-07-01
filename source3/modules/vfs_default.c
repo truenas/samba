@@ -2384,6 +2384,15 @@ static NTSTATUS vfswrap_offload_fast_copy(struct tevent_req *req, int fsctl)
 				  (intmax_t)state->remaining,
 				  strerror(errno));
 			switch (errno) {
+			case EFBIG:
+				/*
+				 * MS-FSA 2.1.5.9.21 if range being written in invalid
+				 * then the opeation must fail with STATUS_INVALID_PARAMETER
+				 * EFBIG is set in this circumstance and so we need to manually
+				 * convert errno to status code (since it's non-standard).
+				 */
+				status = NT_STATUS_INVALID_PARAMETER;
+				break;
 			case EOPNOTSUPP:
 			case ENOSYS:
 				try_copy_file_range = false;
@@ -2556,7 +2565,21 @@ static void vfswrap_offload_write_write_done(struct tevent_req *subreq)
 	TALLOC_FREE(subreq);
 	if (nwritten == -1) {
 		DBG_ERR("write failed: %s\n", strerror(aio_state.error));
-		tevent_req_nterror(req, map_nt_error_from_unix(aio_state.error));
+		/*
+		 * MS-FSA 2.1.5.9.21 if range being written in invalid
+		 * then the opeation must fail with STATUS_INVALID_PARAMETER
+		 * EFBIG is set in this circumstance and so we need to manually
+		 * convert errno to status code (since it's non-standard).
+		 */
+		switch (aio_state.error) {
+		case EFBIG:
+			status = NT_STATUS_INVALID_PARAMETER;
+			break;
+		case default:
+			status = map_nt_error_from_unix(aio_state.error);
+
+		}
+		tevent_req_nterror(req, status);
 		return;
 	}
 	if (nwritten != state->next_io_size) {
