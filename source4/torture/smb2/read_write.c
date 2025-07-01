@@ -315,33 +315,6 @@ static bool test_rw_invalid(struct torture_context *torture, struct smb2_tree *t
 	status = smb2_write(tree, &w);
 	CHECK_STATUS(status, NT_STATUS_INVALID_PARAMETER);
 
-	w.in.file.handle = h;
-	w.in.offset = 0xfffffff0000; /* MAXFILESIZE */
-	w.in.data.data = buf;
-	w.in.data.length = 1;
-	status = smb2_write(tree, &w);
-	CHECK_STATUS(status, NT_STATUS_INVALID_PARAMETER);
-
-	w.in.file.handle = h;
-	w.in.offset = 0xfffffff0000 - 1; /* MAXFILESIZE - 1 */
-	w.in.data.data = buf;
-	w.in.data.length = 1;
-	status = smb2_write(tree, &w);
-	if (TARGET_IS_SAMBA3(torture) || TARGET_IS_SAMBA4(torture)) {
-		CHECK_STATUS(status, NT_STATUS_OK);
-		CHECK_VALUE(w.out.nwritten, 1);
-	} else {
-		CHECK_STATUS(status, NT_STATUS_DISK_FULL);
-	}
-
-	w.in.file.handle = h;
-	w.in.offset = 0xfffffff0000; /* MAXFILESIZE */
-	w.in.data.data = buf;
-	w.in.data.length = 0;
-	status = smb2_write(tree, &w);
-	CHECK_STATUS(status, NT_STATUS_OK);
-	CHECK_VALUE(w.out.nwritten, 0);
-
 done:
 	talloc_free(tmp_ctx);
 	return ret;

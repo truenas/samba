@@ -2575,7 +2575,7 @@ static void vfswrap_offload_write_write_done(struct tevent_req *subreq)
 		case EFBIG:
 			status = NT_STATUS_INVALID_PARAMETER;
 			break;
-		case default:
+		default:
 			status = map_nt_error_from_unix(aio_state.error);
 
 		}
