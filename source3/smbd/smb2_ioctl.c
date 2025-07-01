@@ -222,10 +222,6 @@ NTSTATUS smbd_smb2_request_process_ioctl(struct smbd_smb2_request *req)
 		break;
 	}
 
-	if (in_ctl_code == FSCTL_SRV_REQUEST_RESUME_KEY) {
-		defer_time = 0;
-	}
-
 	subreq = smbd_smb2_ioctl_send(req, req->sconn->ev_ctx,
 				      req, in_fsp,
 				      in_ctl_code,
