@@ -25,6 +25,13 @@ struct fd_handle {
 	int fd;
 	uint64_t position_information;
 	off_t pos;
+	/*
+	 * NT Create options, but we only look at
+	 * NTCREATEX_FLAG_DENY_DOS and
+	 * NTCREATEX_FLAG_DENY_FCB.
+	 */
+	uint32_t private_options;
+	int status_flags;  /* TrueNAS */
 	uint64_t gen_id;
 };
 
@@ -121,6 +128,7 @@ void fsp_set_fd(struct files_struct *fsp, int fd)
 	 * where the assignment is done is in fd_open(), but some VFS
 	 * modules do it anyway.
 	 */
+	bool fd_changed = fsp->fh->fd != fd;
 
 	SMB_ASSERT(fsp->fh->fd == -1 ||
 		   fsp->fh->fd == fd ||
@@ -128,4 +136,69 @@ void fsp_set_fd(struct files_struct *fsp, int fd)
 		   fd == AT_FDCWD);
 
 	fsp->fh->fd = fd;
+
+	/* TrueNAS changes */
+	if (fd_changed || fsp->fh->status_flags == 0) {
+		if (fsp->fh->fd == -1 || fsp->fh->fd == AT_FDCWD) {
+			fsp->fh->status_flags = 0;
+		} else {
+			fsp->fh->status_flags = fcntl(fd, F_GETFL);
+		}
+	}
+}
+
+/* TrueNAS changes */
+int fsp_get_status_flags(const struct files_struct *fsp)
+{
+	return fsp->fh->status_flags;
+}
+
+/*
+ * There are various places where if the pathref was O_PATH we'd have
+ * to make a call through procfs to perform an operation because the
+ * access mode for the fd is incorrect for the syscall (for example
+ * getxattr, listxattr, reading ACLs). This provides a quick check of
+ * our stored status flags for the fd and replies whether the desired
+ * access will require using the procfd path e.g.
+ * getxattr(/proc/self/fd/<fd>). The use for this is limited in scope
+ * and new usage should be carefully validated.
+ */
+bool fsp_must_use_procfd_path(const struct files_struct *fsp,
+			      int desired_access)
+{
+	int status = fsp_get_status_flags(fsp);
+
+	if (status == 0) {
+		return true;
+	}
+
+	if (desired_access == O_RDONLY) {
+		// Allow O_DIRECTORY to fulfill request for O_RDONLY
+		return status & (O_PATH | O_RDWR | O_WRONLY) == 0;
+
+	}
+
+	return status & desired_access == 0;
+}
+
+/*
+ * This is a check for whether the fd in the fd_handle is suitable
+ * for performing fd-based syscalls that require minimally O_RDONLY
+ * access mode. This is specifically to be used in places where
+ * the VFS would need to perform a path-based syscall through a
+ * procfd path (/proc/self/fd/<fd>) as an optimization to avoid
+ * unnecessary lookups
+ */
+bool fsp_has_read_access(const struct files_struct *fsp)
+{
+	if (!fsp->fsp_flags.is_pathref) {
+		/*
+		 * This is not an O_PATH open and so we can
+		 * use it with fgetxattr, flistxattr, and ioctl
+		 * calls
+		 */
+		return true;
+	}
+
+	return !fsp_must_use_procfd_path(fsp, O_RDONLY);
 }
