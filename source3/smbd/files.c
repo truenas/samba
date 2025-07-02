@@ -927,7 +927,12 @@ static int smb_vfs_openat_ci(TALLOC_CTX *mem_ctx,
 	bool ok;
 
 	fd = SMB_VFS_OPENAT(conn, dirfsp, smb_fname_rel, fsp, how);
-	if ((fd >= 0) || case_sensitive) {
+	/*
+	 * A positive result or ENOENT on case insensitive filesystem is
+	 * authoritative.
+	 */
+	if ((fd >= 0) || case_sensitive ||
+	    (conn->internal_tcon_flags & TCON_FLAG_CASE_INSENSTIVE_FS)) {
 		return fd;
 	}
 	if (errno != ENOENT) {
