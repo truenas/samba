@@ -711,6 +711,7 @@ typedef struct files_struct {
 #define TCON_FLAG_STREAMS_XATTR		0x02
 #define TCON_FLAG_STREAMS_FILE		0x04
 #define TCON_FLAG_CASE_INSENSTIVE_FS	0x08
+#define TCON_FLAG_TRUENAS_ABE		0x10
 
 struct vuid_cache_entry {
 	struct auth_session_info *session_info;
@@ -943,6 +944,7 @@ struct vfs_aio_state {
 
 #define VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS 1
 #define VFS_OPEN_HOW_WITH_BACKUP_INTENT 2
+#define VFS_OPEN_HOW_TRUENAS_ABE 3
 
 struct vfs_open_how {
 	int flags;

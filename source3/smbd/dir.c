@@ -915,6 +915,7 @@ bool is_visible_fsp(struct files_struct *fsp)
 	if (!hide_unreadable &&
 	    !hide_unwriteable &&
 	    !hide_special &&
+	    (fsp->conn->internal_tcon_flags & TCON_FLAG_TRUENAS_ABE) == 0 &&
 	    (hide_new_files_timeout == 0))
 	{
 		return true;
@@ -976,6 +977,22 @@ bool is_visible_fsp(struct files_struct *fsp)
 		double age = timespec_elapsed(&fsp->fsp_name->st.st_ex_mtime);
 
 		if (age < (double)hide_new_files_timeout) {
+			return false;
+		}
+	}
+
+	if (fsp->conn->internal_tcon_flags & TCON_FLAG_TRUENAS_ABE) {
+		/*
+		 * The SMB share connection has the TrueNAS ABE flag
+		 * set. This means we try to do access-based enumeration
+		 * on the filesystem (determined by whether the current
+		 * credentials could open the specified file without
+		 * resorting to O_PATH). If O_PATH was required then
+		 * use lacks read access, and thus file should not be
+		 * visible.
+		 */
+		int status_flags = fsp_get_status_flags(fsp);
+		if (status_flags & O_PATH) {
 			return false;
 		}
 	}
