@@ -47,5 +47,5 @@ void fsp_set_fd(struct files_struct *fsp, int fd);
 int fsp_get_status_flags(const struct files_struct *fsp);
 bool fsp_must_use_procfd_path(const struct files_struct *fsp,
 			      int desired_access);
-bool fsp_has_read_access(const struct *fsp);
+bool fsp_has_read_access(const struct files_struct *fsp);
 #endif
