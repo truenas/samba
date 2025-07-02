@@ -114,29 +114,36 @@ static int ixnas_pathref_reopen(const files_struct *fsp, int flags)
 	return fd_out;
 }
 
+static int procfs_get_native_dosmode(struct files_struct *fsp, uint64_t *_dosmode)
+{
+	int fd, err;
+
+	fd = ixnas_pathref_reopen(fsp, O_RDONLY);
+	if ((fd == -1) && (errno == EACCES)) {
+		become_root();
+		fd = ixnas_pathref_reopen(fsp, O_RDONLY);
+		unbecome_root();
+	}
+
+	if (fd == -1) {
+		DBG_WARNING("%s: open() failed: %s\n",
+			    fsp_str_dbg(fsp), strerror(errno));
+		return -1;
+	}
+
+	err = ioctl(fd, ZFS_IOC_GETDOSFLAGS, _dosmode);
+	close(fd);
+
+	return err;
+}
+
 static bool ixnas_get_native_dosmode(struct files_struct *fsp, uint64_t *_dosmode)
 {
 	int err;
-	if (!fsp->fsp_flags.is_pathref) {
-		err = ioctl(fsp_get_io_fd(fsp), ZFS_IOC_GETDOSFLAGS, _dosmode);
+	if (fsp_has_read_access(fsp)) {
+		err = ioctl(fsp_get_pathref_fd(fsp), ZFS_IOC_GETDOSFLAGS, _dosmode);
 	} else {
-		int fd;
-
-		fd = ixnas_pathref_reopen(fsp, O_RDONLY);
-		if ((fd == -1) && (errno == EACCES)) {
-			become_root();
-			fd = ixnas_pathref_reopen(fsp, O_RDONLY);
-			unbecome_root();
-		}
-
-		if (fd == -1) {
-			DBG_WARNING("%s: open() failed: %s\n",
-				    fsp_str_dbg(fsp), strerror(errno));
-			return false;
-		}
-
-		err = ioctl(fd, ZFS_IOC_GETDOSFLAGS, _dosmode);
-		close(fd);
+		err = procfs_get_native_dosmode(fsp, _dosmode);
 	}
 	if (err) {
 		DBG_ERR("%s: ioctl() to get dos flags failed: %s\n",
@@ -208,13 +215,7 @@ static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
 		}
 	}
 
-	if (is_named_stream(fsp->fsp_name)) {
-		// Streams don't have separate dos attribute metadata
-		ok = ixnas_get_native_dosmode(fsp->base_fsp, &kern_dosmode);
-	} else {
-		ok = ixnas_get_native_dosmode(fsp, &kern_dosmode);
-	}
-
+	ok = ixnas_get_native_dosmode(metadata_fsp(fsp), &kern_dosmode);
 	if (!ok) {
 		return map_nt_error_from_unix(errno);
 	}
@@ -330,8 +331,8 @@ static zfsacl_t fsp_get_zfsacl(files_struct *fsp)
 	const char *proc_fd_path = NULL;
 	struct sys_proc_fd_path_buf buf;
 
-	if (!fsp->fsp_flags.is_pathref) {
-		return zfsacl_get_fd(fsp_get_io_fd(fsp), ZFSACL_BRAND_NFSV4);
+	if (fsp_has_read_access(fsp)) {
+		return zfsacl_get_fd(fsp_get_pathref_fd(fsp), ZFSACL_BRAND_NFSV4);
 	}
 
 	SMB_ASSERT(fsp->fsp_flags.have_proc_fds);
@@ -877,11 +878,11 @@ static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 				struct ixnas_config_data,
 				return NT_STATUS_INTERNAL_ERROR);
 
-	to_check = fsp->base_fsp ? fsp->base_fsp : fsp;
+	to_check = metadata_fsp(fsp);
 	zfsacl = fsp_get_zfsacl(to_check);
 	if (zfsacl == NULL) {
 		if ((errno == EINVAL) || (errno == EOPNOTSUPP)) {
-			switch (fsp_get_acl_brand(fsp)) {
+			switch (fsp_get_acl_brand(to_check)) {
 			case TRUENAS_ACL_BRAND_POSIX:
 			case TRUENAS_ACL_BRAND_UNKNOWN:
 				status = SMB_VFS_NEXT_FGET_NT_ACL(handle, fsp, security_info, mem_ctx, ppdesc);
@@ -890,7 +891,7 @@ static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 				}
 				return status;
 			case TRUENAS_ACL_BRAND_NONE:
-				zfsacl = fsp_get_zfsacl_from_mode(fsp);
+				zfsacl = fsp_get_zfsacl_from_mode(to_check);
 				if (zfsacl == NULL) {
 					return map_nt_error_from_unix(errno);
 				}
@@ -1480,11 +1481,57 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 				NULL, struct ixnas_config_data,
 				return -1);
 
+	if (lp_parm_bool(SNUM(handle->conn), "ixnas", "truenas_abe", true)) {
+		/*
+		 * The support team requested that ABE be enabled by default
+		 * on NFSv4 ACL shares in order to preserve FreeBSD behavior
+		 * and better align with enterprise customer expectations
+		 */
+		handle->conn->internal_tcon_flags |= TCON_FLAG_TRUENAS_ABE;
+	}
+
 	return 0;
 }
 
+static int ixnas_openat(vfs_handle_struct *handle,
+			const struct files_struct *dirfsp,
+			const struct smb_filename *smb_fname,
+			files_struct *fsp,
+			const struct vfs_open_how *how)
+{
+	int fd;
+	struct vfs_open_how tmp_how = {
+		.flags = how->flags,
+		.mode = how->mode,
+		.resolve = how->resolve | VFS_OPEN_HOW_TRUENAS_ABE
+	};
+
+	if (!fsp->fsp_flags.is_pathref) {
+		return SMB_VFS_NEXT_OPENAT(handle,
+					   dirfsp,
+					   smb_fname,
+					   fsp,
+					   how);
+	}
+
+	fd = SMB_VFS_NEXT_OPENAT(handle, dirfsp, smb_fname, fsp, &tmp_how);
+	if ((fd == -1) && (errno == EACCES)) {
+		// attempt to open pathref fd O_RDONLY failed
+		// this *should* be a relatively rare edge-case
+		return SMB_VFS_NEXT_OPENAT(handle,
+					   dirfsp,
+					   smb_fname,
+					   fsp,
+					   how);
+	}
+
+	return fd;
+}
+
+
 static struct vfs_fn_pointers ixnas_fns = {
 	.connect_fn = ixnas_connect,
+	.openat_fn = ixnas_openat,
 	/* dosmode_enabled */
 	.fget_dos_attributes_fn = ixnas_fget_dos_attributes,
 	.fset_dos_attributes_fn = ixnas_fset_dos_attributes,

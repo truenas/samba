@@ -619,7 +619,8 @@ static int vfswrap_openat(vfs_handle_struct *handle,
 	SMB_ASSERT((dirfd != -1) || (smb_fname->base_name[0] == '/'));
 
 	if (how->resolve & ~(VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS |
-			     VFS_OPEN_HOW_WITH_BACKUP_INTENT)) {
+			     VFS_OPEN_HOW_WITH_BACKUP_INTENT |
+			     VFS_OPEN_HOW_TRUENAS_ABE)) {
 		errno = ENOSYS;
 		result = -1;
 		goto out;
@@ -630,7 +631,9 @@ static int vfswrap_openat(vfs_handle_struct *handle,
 #ifdef O_PATH
 	have_opath = true;
 	if (fsp->fsp_flags.is_pathref) {
-		flags |= O_PATH;
+		if ((how->resolve & VFS_OPEN_HOW_TRUENAS_ABE) == 0) {
+			flags |= O_PATH;
+		}
 	}
 	if (flags & O_PATH) {
 		/*
@@ -3539,7 +3542,7 @@ static ssize_t vfswrap_fgetxattr(struct vfs_handle_struct *handle,
 
 	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
 
-	if (!fsp->fsp_flags.is_pathref) {
+	if (fsp_has_read_access(fsp)) {
 		return fgetxattr(fd, name, value, size);
 	}
 
@@ -3859,7 +3862,7 @@ static ssize_t vfswrap_flistxattr(struct vfs_handle_struct *handle, struct files
 
 	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
 
-	if (!fsp->fsp_flags.is_pathref) {
+	if (fsp_has_read_access(fsp)) {
 		return flistxattr(fd, list, size);
 	}
 
