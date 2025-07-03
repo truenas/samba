@@ -286,7 +286,11 @@ NTSTATUS get_real_filename_full_scan_at(struct files_struct *dirfsp,
 	 * good to search for a name. If a case variation of the name was
 	 * there, then the original stat(2) would have found it.
 	 */
-	if (!mangled && !(conn->fs_capabilities & FILE_CASE_SENSITIVE_SEARCH)) {
+	/* TrueNAS -- if the ZFS dataset is case-insensitive and name isn't
+	 * mangled it would have been picked up in initial stat(2) as well.
+	 */
+	if (!mangled && (!(conn->fs_capabilities & FILE_CASE_SENSITIVE_SEARCH) ||
+	    (conn->internal_tcon_flags & TCON_FLAG_CASE_INSENSTIVE_FS))) {
 		return NT_STATUS_OBJECT_NAME_NOT_FOUND;
 	}
 
