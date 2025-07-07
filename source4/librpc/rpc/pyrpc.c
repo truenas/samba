@@ -17,6 +17,8 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#define SOURCE4_LIBRPC_INTERNALS 1
+
 #include "lib/replace/system/python.h"
 #include "python/py3compat.h"
 #include "includes.h"
@@ -130,12 +132,30 @@ static PyObject *py_iface_transfer_syntax(PyObject *obj, void *closure)
 static PyObject *py_iface_session_key(PyObject *obj, void *closure)
 {
 	dcerpc_InterfaceObject *iface = (dcerpc_InterfaceObject *)obj;
-	DATA_BLOB session_key;
+	TALLOC_CTX *frame = talloc_stackframe();
+	DATA_BLOB session_key = { .length = 0, };
+	static PyObject *session_key_obj = NULL;
+	NTSTATUS status;
 
-	NTSTATUS status = dcerpc_fetch_session_key(iface->pipe, &session_key);
-	PyErr_NTSTATUS_IS_ERR_RAISE(status);
+	if (iface->binding_handle == NULL) {
+		PyErr_SetNTSTATUS(NT_STATUS_NO_USER_SESSION_KEY);
+		TALLOC_FREE(frame);
+		return NULL;
+	}
 
-	return PyBytes_FromStringAndSize((const char *)session_key.data, session_key.length);
+	status = dcerpc_binding_handle_transport_session_key(iface->binding_handle,
+							     frame,
+							     &session_key);
+	if (!NT_STATUS_IS_OK(status)) {
+		PyErr_SetNTSTATUS(status);
+		TALLOC_FREE(frame);
+		return NULL;
+	}
+
+	session_key_obj = PyBytes_FromStringAndSize((const char *)session_key.data,
+						     session_key.length);
+	TALLOC_FREE(frame);
+	return session_key_obj;
 }
 
 static PyObject *py_iface_user_session_key(PyObject *obj, void *closure)
@@ -143,30 +163,18 @@ static PyObject *py_iface_user_session_key(PyObject *obj, void *closure)
 	dcerpc_InterfaceObject *iface = (dcerpc_InterfaceObject *)obj;
 	TALLOC_CTX *mem_ctx;
 	NTSTATUS status;
-	struct gensec_security *security = NULL;
 	DATA_BLOB session_key = data_blob_null;
 	static PyObject *session_key_obj = NULL;
 
-	if (iface->pipe == NULL) {
+	if (iface->binding_handle == NULL) {
 		PyErr_SetNTSTATUS(NT_STATUS_NO_USER_SESSION_KEY);
 		return NULL;
 	}
-
-	if (iface->pipe->conn == NULL) {
-		PyErr_SetNTSTATUS(NT_STATUS_NO_USER_SESSION_KEY);
-		return NULL;
-	}
-
-	if (iface->pipe->conn->security_state.generic_state == NULL) {
-		PyErr_SetNTSTATUS(NT_STATUS_NO_USER_SESSION_KEY);
-		return NULL;
-	}
-
-	security = iface->pipe->conn->security_state.generic_state;
-
 	mem_ctx = talloc_new(NULL);
 
-	status = gensec_session_key(security, mem_ctx, &session_key);
+	status = dcerpc_binding_handle_auth_session_key(iface->binding_handle,
+							mem_ctx,
+							&session_key);
 	if (!NT_STATUS_IS_OK(status)) {
 		talloc_free(mem_ctx);
 		PyErr_SetNTSTATUS(status);
@@ -296,7 +304,7 @@ static PyObject *py_iface_transport_encrypted(PyObject *self)
 {
 	dcerpc_InterfaceObject *iface = (dcerpc_InterfaceObject *)self;
 
-	if (dcerpc_transport_encrypted(iface->pipe)) {
+	if (dcerpc_binding_handle_transport_encrypted(iface->binding_handle)) {
 		Py_RETURN_TRUE;
 	}
 

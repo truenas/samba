@@ -32,6 +32,14 @@
 #include "../librpc/ndr/libndr.h"
 #include "../librpc/rpc/rpc_common.h"
 
+#ifdef SOURCE4_LIBRPC_INTERNALS
+#define SOURCE4_LIBRPC_INTERNALS_BEGIN
+#define SOURCE4_LIBRPC_INTERNALS_END
+#else /* SOURCE4_LIBRPC_INTERNALS */
+#define SOURCE4_LIBRPC_INTERNALS_BEGIN struct {
+#define SOURCE4_LIBRPC_INTERNALS_END } internal;
+#endif /* not SOURCE4_LIBRPC_INTERNALS */
+
 struct tevent_context;
 struct tevent_req;
 struct dcerpc_binding_handle;
@@ -46,6 +54,8 @@ struct dcecli_connection;
 struct gensec_settings;
 struct cli_credentials;
 struct dcecli_security {
+	SOURCE4_LIBRPC_INTERNALS_BEGIN
+
 	enum dcerpc_AuthType auth_type;
 	enum dcerpc_AuthLevel auth_level;
 	uint32_t auth_context_id;
@@ -61,6 +71,7 @@ struct dcecli_security {
 
 	bool verified_bitmask1;
 
+	SOURCE4_LIBRPC_INTERNALS_END
 };
 
 /*
@@ -68,6 +79,8 @@ struct dcecli_security {
 */
 struct rpc_request;
 struct dcecli_connection {
+	SOURCE4_LIBRPC_INTERNALS_BEGIN
+
 	uint32_t call_id;
 	uint32_t srv_max_xmit_frag;
 	uint32_t srv_max_recv_frag;
@@ -114,6 +127,8 @@ struct dcecli_connection {
 
 	/* the negotiated bind time features */
 	uint16_t bind_time_features;
+
+	SOURCE4_LIBRPC_INTERNALS_END
 };
 
 /*
@@ -121,6 +136,8 @@ struct dcecli_connection {
 */
 struct dcerpc_pipe {
 	struct dcerpc_binding_handle *binding_handle;
+
+	SOURCE4_LIBRPC_INTERNALS_BEGIN
 
 	uint32_t context_id;
 
@@ -146,6 +163,8 @@ struct dcerpc_pipe {
 	bool timed_out;
 
 	bool verified_pcontext;
+
+	SOURCE4_LIBRPC_INTERNALS_END
 };
 
 /* default timeout for all rpc requests, in seconds */
@@ -180,9 +199,6 @@ NTSTATUS dcerpc_pipe_open_smb2(struct dcerpc_pipe *p,
 			       const char *pipe_name);
 NTSTATUS dcerpc_bind_auth_none(struct dcerpc_pipe *p,
 			       const struct ndr_interface_table *table);
-NTSTATUS dcerpc_fetch_session_key(struct dcerpc_pipe *p,
-				  DATA_BLOB *session_key);
-bool dcerpc_transport_encrypted(struct dcerpc_pipe *p);
 struct composite_context;
 NTSTATUS dcerpc_secondary_connection_recv(struct composite_context *c,
 					  struct dcerpc_pipe **p2);

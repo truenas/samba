@@ -22,6 +22,8 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#define SOURCE4_LIBRPC_INTERNALS 1
+
 #include "includes.h"
 #include "lib/events/events.h"
 #include "libcli/composite/composite.h"
@@ -722,38 +724,6 @@ NTSTATUS dcecli_generic_session_key(struct dcecli_connection *c,
 	}
 
 	return dcerpc_generic_session_key(session_key);
-}
-
-/*
-  fetch the user session key - may be default (above) or the SMB session key
-
-  The key is always truncated to 16 bytes 
-*/
-_PUBLIC_ NTSTATUS dcerpc_fetch_session_key(struct dcerpc_pipe *p,
-					   DATA_BLOB *session_key)
-{
-	NTSTATUS status;
-	status = p->conn->security_state.session_key(p->conn, session_key);
-	if (!NT_STATUS_IS_OK(status)) {
-		return status;
-	}
-
-	session_key->length = MIN(session_key->length, 16);
-
-	return NT_STATUS_OK;
-}
-
-_PUBLIC_ bool dcerpc_transport_encrypted(struct dcerpc_pipe *p)
-{
-	if (p == NULL) {
-		return false;
-	}
-
-	if (p->conn == NULL) {
-		return false;
-	}
-
-	return p->conn->transport.encrypted;
 }
 
 /*

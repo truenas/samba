@@ -29,31 +29,42 @@
 #include "../librpc/ndr/libndr.h"
 #include "rpc_client/rpc_transport.h"
 
+#ifdef SOURCE3_LIBRPC_INTERNALS
+#define SOURCE3_LIBRPC_INTERNALS_BEGIN
+#define SOURCE3_LIBRPC_INTERNALS_END
+#else /* SOURCE3_LIBRPC_INTERNALS */
+#define SOURCE3_LIBRPC_INTERNALS_BEGIN struct {
+#define SOURCE3_LIBRPC_INTERNALS_END } internal;
+#endif /* not SOURCE3_LIBRPC_INTERNALS */
+
 struct dcerpc_binding_handle;
+
+struct rpc_client_association;
+struct rpc_client_connection;
 
 struct rpc_pipe_client {
 	struct rpc_pipe_client *prev, *next;
 
-	struct rpc_cli_transport *transport;
-	struct dcerpc_binding_handle *binding_handle;
-
-	/*
-	 * This is per association_group, but
-	 * for now we only have one connection
-	 * per association_group.
-	 */
-	uint16_t bind_time_features;
-
-	struct ndr_syntax_id abstract_syntax;
-	struct ndr_syntax_id transfer_syntax;
-	bool verified_pcontext;
-
+	char *printer_username;
 	char *desthost;
 	char *srv_name_slash;
 
-	uint16_t max_xmit_frag;
+	struct dcerpc_binding_handle *binding_handle;
 
+	SOURCE3_LIBRPC_INTERNALS_BEGIN
+
+	struct cli_state *np_cli;
+
+	struct rpc_client_association *assoc;
+	struct rpc_client_connection *conn;
 	struct pipe_auth_data *auth;
+
+	uint16_t pres_context_id;
+	const struct ndr_interface_table *table;
+	struct ndr_syntax_id transfer_syntax;
+	bool verified_pcontext;
+
+	SOURCE3_LIBRPC_INTERNALS_END
 };
 
 #endif /* _RPC_CLIENT_H */

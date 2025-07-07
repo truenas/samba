@@ -1145,7 +1145,8 @@ bool test_many_LookupSids(struct dcerpc_pipe *p,
 	struct lsa_SidArray sids;
 	int i;
 	struct dcerpc_binding_handle *b = p->binding_handle;
-	enum dcerpc_transport_t transport = dcerpc_binding_get_transport(p->binding);
+	enum dcerpc_transport_t transport =
+		dcerpc_binding_handle_get_transport(b);
 
 	torture_comment(tctx, "\nTesting LookupSids with lots of SIDs\n");
 
@@ -1730,8 +1731,9 @@ static bool test_CreateSecret(struct dcerpc_pipe *p,
 		torture_assert_ntstatus_ok(tctx, r2.out.result,
 					   "OpenSecret failed");
 
-		torture_assert_ntstatus_ok(tctx, dcerpc_fetch_session_key(p, &session_key),
-					   "dcerpc_fetch_session_key failed");
+		torture_assert_ntstatus_ok(tctx,
+			dcerpc_binding_handle_transport_session_key(b, tctx, &session_key),
+			"transport_session_key failed");
 
 		enc_key = sess_encrypt_string(secret1, &session_key);
 
@@ -4658,9 +4660,9 @@ static bool test_CreateTrustedDomainEx_common(struct dcerpc_pipe *p,
 	domsid = talloc_array(tctx, struct dom_sid *, num_trusts);
 	trustdom_handle = talloc_array(tctx, struct policy_handle, num_trusts);
 
-	status = dcerpc_fetch_session_key(p, &session_key);
+	status = dcerpc_binding_handle_transport_session_key(b, tctx, &session_key);
 	if (!NT_STATUS_IS_OK(status)) {
-		torture_comment(tctx, "dcerpc_fetch_session_key failed - %s\n", nt_errstr(status));
+		torture_comment(tctx, "transport_session_key failed - %s\n", nt_errstr(status));
 		return false;
 	}
 
@@ -5315,7 +5317,7 @@ bool torture_rpc_lsa(struct torture_context *tctx)
 	torture_assert_ntstatus_ok(tctx, status, "Error connecting to server");
 
 	b = p->binding_handle;
-	transport = dcerpc_binding_get_transport(p->binding);
+	transport = dcerpc_binding_handle_get_transport(b);
 
 	/* Test lsaLookupSids3 and lsaLookupNames4 over tcpip */
 	if (transport == NCACN_IP_TCP) {
@@ -5415,7 +5417,7 @@ bool torture_rpc_lsa_get_user(struct torture_context *tctx)
 	torture_assert_ntstatus_ok(tctx, status, "Error connecting to server");
 
 	b = p->binding_handle;
-	transport = dcerpc_binding_get_transport(p->binding);
+	transport = dcerpc_binding_handle_get_transport(b);
 
 	if (transport == NCACN_IP_TCP) {
 		if (!test_GetUserName_fail(b, tctx)) {
@@ -5439,7 +5441,7 @@ static bool testcase_LookupNames(struct torture_context *tctx,
 	struct lsa_TransNameArray tnames;
 	struct lsa_TransNameArray2 tnames2;
 	struct dcerpc_binding_handle *b = p->binding_handle;
-	enum dcerpc_transport_t transport = dcerpc_binding_get_transport(p->binding);
+	enum dcerpc_transport_t transport = dcerpc_binding_handle_get_transport(b);
 
 	if (transport != NCACN_NP && transport != NCALRPC) {
 		torture_comment(tctx, "testcase_LookupNames is only available "
@@ -5530,7 +5532,7 @@ static bool testcase_TrustedDomains(struct torture_context *tctx,
 	struct lsa_trustdom_state *state =
 		talloc_get_type_abort(data, struct lsa_trustdom_state);
 	struct dcerpc_binding_handle *b = p->binding_handle;
-	enum dcerpc_transport_t transport = dcerpc_binding_get_transport(p->binding);
+	enum dcerpc_transport_t transport = dcerpc_binding_handle_get_transport(b);
 
 	if (transport != NCACN_NP && transport != NCALRPC) {
 		torture_comment(tctx, "testcase_TrustedDomains is only available "
@@ -5605,7 +5607,7 @@ static bool testcase_Privileges(struct torture_context *tctx,
 {
 	struct policy_handle *handle;
 	struct dcerpc_binding_handle *b = p->binding_handle;
-	enum dcerpc_transport_t transport = dcerpc_binding_get_transport(p->binding);
+	enum dcerpc_transport_t transport = dcerpc_binding_handle_get_transport(b);
 
 	if (transport != NCACN_NP && transport != NCALRPC) {
 		torture_skip(tctx, "testcase_Privileges is only available "

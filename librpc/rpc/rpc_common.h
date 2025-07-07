@@ -172,13 +172,23 @@ enum dcerpc_transport_t dcerpc_transport_by_tower(const struct epm_tower *tower)
 struct dcerpc_binding_handle_ops {
 	const char *name;
 
+	const struct dcerpc_binding *(*get_binding)(struct dcerpc_binding_handle *h);
+
 	bool (*is_connected)(struct dcerpc_binding_handle *h);
 	uint32_t (*set_timeout)(struct dcerpc_binding_handle *h,
 				uint32_t timeout);
 
+	bool (*transport_encrypted)(struct dcerpc_binding_handle *h);
+	NTSTATUS (*transport_session_key)(struct dcerpc_binding_handle *h,
+					  TALLOC_CTX *mem_ctx,
+					  DATA_BLOB *session_key);
+
 	void (*auth_info)(struct dcerpc_binding_handle *h,
 			  enum dcerpc_AuthType *auth_type,
 			  enum dcerpc_AuthLevel *auth_level);
+	NTSTATUS (*auth_session_key)(struct dcerpc_binding_handle *h,
+				     TALLOC_CTX *mem_ctx,
+				     DATA_BLOB *session_key);
 
 	struct tevent_req *(*raw_call_send)(TALLOC_CTX *mem_ctx,
 					    struct tevent_context *ev,
@@ -245,14 +255,30 @@ void *_dcerpc_binding_handle_data(struct dcerpc_binding_handle *h);
 _DEPRECATED_ void dcerpc_binding_handle_set_sync_ev(struct dcerpc_binding_handle *h,
 						    struct tevent_context *ev);
 
+const struct dcerpc_binding *dcerpc_binding_handle_get_binding(struct dcerpc_binding_handle *h);
+
+enum dcerpc_transport_t dcerpc_binding_handle_get_transport(struct dcerpc_binding_handle *h);
+
 bool dcerpc_binding_handle_is_connected(struct dcerpc_binding_handle *h);
 
 uint32_t dcerpc_binding_handle_set_timeout(struct dcerpc_binding_handle *h,
 					   uint32_t timeout);
 
+bool dcerpc_binding_handle_transport_encrypted(struct dcerpc_binding_handle *h);
+
+NTSTATUS dcerpc_binding_handle_transport_session_key(
+		struct dcerpc_binding_handle *h,
+		TALLOC_CTX *mem_ctx,
+		DATA_BLOB *session_key);
+
 void dcerpc_binding_handle_auth_info(struct dcerpc_binding_handle *h,
 				     enum dcerpc_AuthType *auth_type,
 				     enum dcerpc_AuthLevel *auth_level);
+
+NTSTATUS dcerpc_binding_handle_auth_session_key(
+		struct dcerpc_binding_handle *h,
+		TALLOC_CTX *mem_ctx,
+		DATA_BLOB *session_key);
 
 struct tevent_req *dcerpc_binding_handle_raw_call_send(TALLOC_CTX *mem_ctx,
 						struct tevent_context *ev,
