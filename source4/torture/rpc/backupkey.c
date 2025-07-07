@@ -605,6 +605,8 @@ static DATA_BLOB *encrypt_blob_pk(struct torture_context *tctx,
 static struct bkrp_BackupKey *createRetrieveBackupKeyGUIDStruct(struct torture_context *tctx,
 				struct dcerpc_pipe *p, int version, DATA_BLOB *out)
 {
+	const struct dcerpc_binding *bd =
+		dcerpc_binding_handle_get_binding(p->binding_handle);
 	struct dcerpc_binding *binding;
 	struct bkrp_client_side_wrapped data;
 	struct GUID *g = talloc(tctx, struct GUID);
@@ -617,7 +619,7 @@ static struct bkrp_BackupKey *createRetrieveBackupKeyGUIDStruct(struct torture_c
 		return NULL;
 	}
 
-	binding = dcerpc_binding_dup(tctx, p->binding);
+	binding = dcerpc_binding_dup(tctx, bd);
 	if (binding == NULL) {
 		return NULL;
 	}
@@ -1887,8 +1889,9 @@ static bool test_ServerWrap_encrypt_decrypt_manual(struct torture_context *tctx,
 
 	preferred_key.data = r_query_secret.out.new_val->buf->data;
 	preferred_key.length = r_query_secret.out.new_val->buf->size;
-	torture_assert_ntstatus_ok(tctx, dcerpc_fetch_session_key(lsa_p, &session_key),
-				   "dcerpc_fetch_session_key failed");
+	torture_assert_ntstatus_ok(tctx,
+		dcerpc_binding_handle_transport_session_key(lsa_b, tctx, &session_key),
+		"transport_session_key failed");
 
 	torture_assert_ntstatus_ok(tctx,
 				   sess_decrypt_blob(tctx,

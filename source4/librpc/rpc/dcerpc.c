@@ -20,6 +20,8 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#define SOURCE4_LIBRPC_INTERNALS 1
+
 #include "includes.h"
 #include "lib/util/util_file.h"
 #include "system/filesys.h"
@@ -176,6 +178,14 @@ struct dcerpc_bh_state {
 	struct dcerpc_pipe *p;
 };
 
+static const struct dcerpc_binding *dcerpc_bh_get_binding(struct dcerpc_binding_handle *h)
+{
+	struct dcerpc_bh_state *hs = dcerpc_binding_handle_data(h,
+				     struct dcerpc_bh_state);
+
+	return hs->p->binding;
+}
+
 static bool dcerpc_bh_is_connected(struct dcerpc_binding_handle *h)
 {
 	struct dcerpc_bh_state *hs = dcerpc_binding_handle_data(h,
@@ -213,6 +223,61 @@ static uint32_t dcerpc_bh_set_timeout(struct dcerpc_binding_handle *h,
 	return old;
 }
 
+static bool dcerpc_bh_transport_encrypted(struct dcerpc_binding_handle *h)
+{
+	struct dcerpc_bh_state *hs = dcerpc_binding_handle_data(h,
+				     struct dcerpc_bh_state);
+
+	if (hs->p == NULL) {
+		return false;
+	}
+
+	if (hs->p->conn == NULL) {
+		return false;
+	}
+
+	return hs->p->conn->transport.encrypted;
+}
+
+static NTSTATUS dcerpc_bh_transport_session_key(struct dcerpc_binding_handle *h,
+						TALLOC_CTX *mem_ctx,
+						DATA_BLOB *session_key)
+{
+	struct dcerpc_bh_state *hs = dcerpc_binding_handle_data(h,
+				     struct dcerpc_bh_state);
+	struct dcecli_security *sec = NULL;
+	DATA_BLOB sk = { .length = 0, };
+	NTSTATUS status;
+
+	if (hs->p == NULL) {
+		return NT_STATUS_NO_USER_SESSION_KEY;
+	}
+
+	if (hs->p->conn == NULL) {
+		return NT_STATUS_NO_USER_SESSION_KEY;
+	}
+
+	sec = &hs->p->conn->security_state;
+
+	if (sec->session_key == NULL) {
+		return NT_STATUS_NO_USER_SESSION_KEY;
+	}
+
+	status = sec->session_key(hs->p->conn, &sk);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+
+	sk.length = MIN(sk.length, 16);
+
+	*session_key = data_blob_dup_talloc(mem_ctx, sk);
+	if (session_key->length != sk.length) {
+		return NT_STATUS_NO_MEMORY;
+	}
+	talloc_keep_secret(session_key->data);
+	return NT_STATUS_OK;
+}
+
 static void dcerpc_bh_auth_info(struct dcerpc_binding_handle *h,
 				enum dcerpc_AuthType *auth_type,
 				enum dcerpc_AuthLevel *auth_level)
@@ -230,6 +295,44 @@ static void dcerpc_bh_auth_info(struct dcerpc_binding_handle *h,
 
 	*auth_type = hs->p->conn->security_state.auth_type;
 	*auth_level = hs->p->conn->security_state.auth_level;
+}
+
+static NTSTATUS dcerpc_bh_auth_session_key(struct dcerpc_binding_handle *h,
+					   TALLOC_CTX *mem_ctx,
+					   DATA_BLOB *session_key)
+{
+	struct dcerpc_bh_state *hs = dcerpc_binding_handle_data(h,
+				     struct dcerpc_bh_state);
+	struct dcecli_security *sec = NULL;
+	NTSTATUS status;
+
+	if (hs->p == NULL) {
+		return NT_STATUS_NO_USER_SESSION_KEY;
+	}
+
+	if (hs->p->conn == NULL) {
+		return NT_STATUS_NO_USER_SESSION_KEY;
+	}
+
+	sec = &hs->p->conn->security_state;
+
+	if (sec->auth_type == DCERPC_AUTH_TYPE_NONE) {
+		return NT_STATUS_NO_USER_SESSION_KEY;
+	}
+
+	if (sec->generic_state == NULL) {
+		return NT_STATUS_NO_USER_SESSION_KEY;
+	}
+
+	status = gensec_session_key(sec->generic_state,
+				    mem_ctx,
+				    session_key);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+
+	talloc_keep_secret(session_key->data);
+	return NT_STATUS_OK;
 }
 
 struct dcerpc_bh_raw_call_state {
@@ -599,9 +702,13 @@ static NTSTATUS dcerpc_bh_ndr_validate_out(struct dcerpc_binding_handle *h,
 
 static const struct dcerpc_binding_handle_ops dcerpc_bh_ops = {
 	.name			= "dcerpc",
+	.get_binding		= dcerpc_bh_get_binding,
 	.is_connected		= dcerpc_bh_is_connected,
 	.set_timeout		= dcerpc_bh_set_timeout,
+	.transport_encrypted	= dcerpc_bh_transport_encrypted,
+	.transport_session_key	= dcerpc_bh_transport_session_key,
 	.auth_info		= dcerpc_bh_auth_info,
+	.auth_session_key	= dcerpc_bh_auth_session_key,
 	.raw_call_send		= dcerpc_bh_raw_call_send,
 	.raw_call_recv		= dcerpc_bh_raw_call_recv,
 	.disconnect_send	= dcerpc_bh_disconnect_send,
@@ -1258,6 +1365,10 @@ static void dcerpc_bind_recv_handler(struct rpc_request *subreq,
 	b = discard_const_p(struct dcerpc_binding, state->p->binding);
 	status = dcerpc_binding_set_assoc_group_id(b,
 						   pkt->u.bind_ack.assoc_group_id);
+	if (tevent_req_nterror(req, status)) {
+		return;
+	}
+	status = dcerpc_binding_set_abstract_syntax(b, &state->p->syntax);
 	if (tevent_req_nterror(req, status)) {
 		return;
 	}
@@ -2211,6 +2322,7 @@ static void dcerpc_alter_context_recv_handler(struct rpc_request *subreq,
 		struct dcerpc_alter_context_state);
 	struct dcecli_connection *conn = state->p->conn;
 	struct dcecli_security *sec = &conn->security_state;
+	struct dcerpc_binding *b = NULL;
 	NTSTATUS status;
 
 	/*
@@ -2286,6 +2398,15 @@ static void dcerpc_alter_context_recv_handler(struct rpc_request *subreq,
 		if (tevent_req_nterror(req, status)) {
 			return;
 		}
+	}
+
+	/*
+	 * We're the owner of the binding, so we're allowed to modify it.
+	 */
+	b = discard_const_p(struct dcerpc_binding, state->p->binding);
+	status = dcerpc_binding_set_abstract_syntax(b, &state->p->syntax);
+	if (tevent_req_nterror(req, status)) {
+		return;
 	}
 
 	tevent_req_done(req);

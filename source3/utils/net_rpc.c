@@ -214,6 +214,7 @@ int run_rpc_command(struct net_context *c,
 					NCACN_IP_TCP : NCACN_NP,
 					DCERPC_AUTH_TYPE_NTLMSSP,
 					DCERPC_AUTH_LEVEL_PRIVACY,
+					NULL, /* target_service */
 					smbXcli_conn_remote_name(cli->conn),
 					smbXcli_conn_remote_sockaddr(cli->conn),
 					c->creds, &pipe_hnd);
@@ -6118,7 +6119,8 @@ static NTSTATUS rpc_trustdom_add_internals(struct net_context *c,
 
 	init_lsa_String(&lsa_acct_name, acct_name);
 
-	status = cli_get_session_key(frame, pipe_hnd, &session_key);
+	status = dcerpc_binding_handle_transport_session_key(
+				b, frame, &session_key);
 	if (!NT_STATUS_IS_OK(status)) {
 		DEBUG(0,("Error getting session_key of SAM pipe. Error was %s\n",
 			nt_errstr(status)));
@@ -6632,7 +6634,7 @@ static int rpc_trustdom_establish(struct net_context *c, int argc,
 
 	b = pipe_hnd->binding_handle;
 
-	nt_status = dcerpc_lsa_open_policy_fallback(b,
+	nt_status = dcerpc_lsa_open_policy_fallback(pipe_hnd,
 						    frame,
 						    pipe_hnd->srv_name_slash,
 						    true,
@@ -6803,7 +6805,8 @@ static NTSTATUS vampire_trusted_domain(struct rpc_pipe_client *pipe_hnd,
 	data = data_blob(info->password.password->data,
 			 info->password.password->length);
 
-	nt_status = cli_get_session_key(mem_ctx, pipe_hnd, &session_key);
+	nt_status = dcerpc_binding_handle_transport_session_key(
+				b, mem_ctx, &session_key);
 	if (!NT_STATUS_IS_OK(nt_status)) {
 		DEBUG(0, ("Could not retrieve session key: %s\n", nt_errstr(nt_status)));
 		goto done;
@@ -6916,7 +6919,7 @@ static int rpc_trustdom_vampire(struct net_context *c, int argc,
 
 	b = pipe_hnd->binding_handle;
 
-	nt_status = dcerpc_lsa_open_policy_fallback(b,
+	nt_status = dcerpc_lsa_open_policy_fallback(pipe_hnd,
 						    mem_ctx,
 						    pipe_hnd->srv_name_slash,
 						    false,
@@ -7109,7 +7112,7 @@ static int rpc_trustdom_list(struct net_context *c, int argc, const char **argv)
 
 	b = pipe_hnd->binding_handle;
 
-	nt_status = dcerpc_lsa_open_policy_fallback(b,
+	nt_status = dcerpc_lsa_open_policy_fallback(pipe_hnd,
 						    mem_ctx,
 						    pipe_hnd->srv_name_slash,
 						    true,
