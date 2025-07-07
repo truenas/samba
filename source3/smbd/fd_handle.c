@@ -174,11 +174,14 @@ bool fsp_must_use_procfd_path(const struct files_struct *fsp,
 
 	if (desired_access == O_RDONLY) {
 		// Allow O_DIRECTORY to fulfill request for O_RDONLY
-		return status & (O_PATH | O_RDWR | O_WRONLY) == 0;
+		// This means the following open modes cannot meet O_RDONLY
+		// O_PATH -- will fail with permission error
+		// O_RDWR | O_WRONLY -- both can write
+		return (status & (O_PATH | O_RDWR | O_WRONLY)) ? true : false;
 
 	}
 
-	return status & desired_access == 0;
+	return (status & desired_access) ? false : true;
 }
 
 /*
