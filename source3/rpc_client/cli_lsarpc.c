@@ -179,6 +179,7 @@ NTSTATUS dcerpc_lsa_open_policy_fallback(struct dcerpc_binding_handle *h,
 {
 	NTSTATUS status;
 
+#if 0
 	status = dcerpc_lsa_open_policy3(h,
 					 mem_ctx,
 					 srv_name_slash,
@@ -195,6 +196,7 @@ NTSTATUS dcerpc_lsa_open_policy_fallback(struct dcerpc_binding_handle *h,
 				.revision = 1,
 			}
 		};
+#endif
 
 		status = dcerpc_lsa_open_policy2(h,
 						 mem_ctx,
@@ -203,7 +205,7 @@ NTSTATUS dcerpc_lsa_open_policy_fallback(struct dcerpc_binding_handle *h,
 						 desired_access,
 						 pol,
 						 result);
-	}
+//	}
 
 	return status;
 }
