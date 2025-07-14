@@ -898,6 +898,7 @@ static int tdb_auth_request(struct ptdb_context *ctx,
 				      user);
 
 			pam_ret = PAM_USER_UNKNOWN;
+			break;
 		default:
 			PAM_CTX_DEBUG(ctx, LOG_ERR,
 				      "%s: failed to fetch entry: %d: %s\n",
