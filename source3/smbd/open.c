@@ -875,7 +875,7 @@ static int tn_reopen_from_fsp_fast(struct files_struct *fsp,
 {
 	int fd_status;
 
-	if (old_fd == AT_FDCWD) {
+	if ((old_fd == AT_FDCWD) || (old_fd == -1)) {
 		return -1;
 	}
 
