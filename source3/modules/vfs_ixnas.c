@@ -1471,6 +1471,10 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 	config->dosattrib_xattr = lp_parm_bool(SNUM(handle->conn),
 			"ixnas", "dosattrib_xattr", false);
 
+	if (!config->dosattrib_xattr) {
+		lp_do_parameter(SNUM(handle->conn), "kernel dosmodes", "yes");
+	}
+
 	ok = set_acl_parameters(handle, config);
 	if (!ok) {
 		TALLOC_FREE(config);
