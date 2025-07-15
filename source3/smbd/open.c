@@ -945,6 +945,61 @@ static bool fsp_is_automount_mountpoint(struct files_struct *fsp, int old_fd)
 #endif
 }
 
+#define SETFL_MASK (O_APPEND | O_NONBLOCK | O_NDELAY | O_DIRECT)
+#define COMPARE_MASK (O_ACCMODE | O_PATH | O_DIRECTORY | SETFL_MASK)
+
+
+static int tn_reopen_from_fsp_fast(struct files_struct *fsp,
+				   int old_fd,
+				   const struct vfs_open_how *how)
+{
+	int fd_status;
+
+	if ((old_fd == AT_FDCWD) || (old_fd == -1)) {
+		return -1;
+	}
+
+	if (fsp_get_status_flags(fsp) & O_PATH) {
+		// This is an O_PATH open and so no real
+		// hope that it will *actually* match new
+		// access mode.
+		return -1;
+
+	}
+
+	// get current status flags (not cached)
+	fd_status = fcntl(old_fd, F_GETFL);
+	if (fd_status < 0) {
+		DBG_ERR("%s: fcntl() failed on file: %s\n",
+			fsp_str_dbg(fsp), strerror(errno));
+		return -1;
+	}
+
+	if ((fd_status & O_ACCMODE) != (how->flags & O_ACCMODE)) {
+		// access mode mismatch. This needs a reopen
+		return -1;
+	}
+
+	if (how->flags == (fd_status & COMPARE_MASK)) {
+		// current status matches desired one
+		return old_fd;
+	}
+
+	if ((how->flags == O_DIRECTORY) && ((fd_status & O_ACCMODE) == O_RDONLY)) {
+		// caller specified O_DIRECTORY and we're open O_RDONLY
+		// return if stat info shows we're a dir
+		if (S_ISDIR(fsp->fsp_name->st.st_ex_mode)) {
+			return old_fd;
+		}
+	}
+
+	// By this time we have maybe difference in flags that can be managed
+	// by F_SETFL rather than reopening
+	// TODO: add optimized open from struct file_handle here
+	// eventually
+	return -1;
+}
+
 static NTSTATUS reopen_from_fsp_pathref_based(
 	struct files_struct *dirfsp,
 	struct smb_filename *smb_fname,
@@ -970,6 +1025,13 @@ static NTSTATUS reopen_from_fsp_pathref_based(
 	}
 
 	fsp->fsp_flags.is_pathref = false;
+
+	new_fd = tn_reopen_from_fsp_fast(fsp, pathref_fd, how);
+	if (new_fd != -1) {
+		// new access mode matches expected one we can short-circuit
+		// (desired effect is changing is_pathref to false)
+		return NT_STATUS_OK;
+	}
 
 #if defined(HAVE_FSTATFS) && defined(HAVE_LINUX_MAGIC_H)
 	/*
