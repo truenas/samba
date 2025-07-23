@@ -96,6 +96,11 @@ int http_replace_header(TALLOC_CTX *, struct http_header **, const char *, const
 struct http_conn;
 struct tstream_tls_params;
 
+struct tevent_req *http_connect_unix_send(TALLOC_CTX *mem_ctx,
+					  struct tevent_context *ev,
+					  const char *socket_path,
+					  struct cli_credentials *credentials);
+
 struct tevent_req *http_connect_send(TALLOC_CTX *mem_ctx,
 				     struct tevent_context *ev,
 				     const char *http_server,
