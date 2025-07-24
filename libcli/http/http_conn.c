@@ -152,6 +152,7 @@ static void http_connect_unix_done(struct tevent_req *subreq)
 
 	state->http_conn->tstreams.active = state->http_conn->tstreams.raw;
 	DBG_DEBUG("Socket connected\n");
+	tevent_req_done(req);
 }
 
 struct tevent_req *http_connect_send(TALLOC_CTX *mem_ctx,
