@@ -232,6 +232,7 @@ static struct tevent_req *mds_es_connect_send(
 	struct mds_es_connect_state *state = NULL;
 	const char *server_addr = NULL;
 	bool use_tls;
+	bool is_unix;
 	NTSTATUS status;
 
 	req = tevent_req_create(mem_ctx, &state, struct mds_es_connect_state);
@@ -253,6 +254,8 @@ static struct tevent_req *mds_es_connect_send(
 		return tevent_req_post(req, ev);
 	}
 
+	is_unix = *state->server_addr == '/';
+
 	state->server_port = lp_parm_int(
 		mds_es_ctx->mds_ctx->snum,
 		"elasticsearch",
@@ -270,6 +273,12 @@ static struct tevent_req *mds_es_connect_send(
 
 	if (use_tls) {
 		struct loadparm_context *lp_ctx = NULL;
+
+		if (is_unix) {
+			DBG_ERR("TLS may not be used on unix socket\n");
+			tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
+			return tevent_req_post(req, ev);
+		}
 
 		lp_ctx = loadparm_init_s3(state, loadparm_s3_helpers());
 		if (tevent_req_nomem(lp_ctx, req)) {
@@ -289,12 +298,19 @@ static struct tevent_req *mds_es_connect_send(
 		}
 	}
 
-	subreq = http_connect_send(state,
-				   state->ev,
-				   state->server_addr,
-				   state->server_port,
-				   mds_es_ctx->mdssvc_es_ctx->creds,
-				   state->tls_params);
+	if (is_unix) {
+		subreq = http_connect_unix_send(state,
+						state->ev,
+						state->server_addr,
+						mds_es_ctx->mdssvc_es_ctx->creds);
+	} else {
+		subreq = http_connect_send(state,
+					   state->ev,
+					   state->server_addr,
+					   state->server_port,
+					   mds_es_ctx->mdssvc_es_ctx->creds,
+					   state->tls_params);
+	}
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
