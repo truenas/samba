@@ -44,8 +44,116 @@ struct http_connect_state {
 
 static void http_connect_dns_done(struct tevent_req *subreq);
 static void http_connect_tcp_connect(struct tevent_req *req);
+static void http_connect_unix_connect(struct tevent_req *req);
 static void http_connect_tcp_done(struct tevent_req *subreq);
 static void http_connect_tls_done(struct tevent_req *subreq);
+static void http_connect_unix_done(struct tevent_req *subreq);
+
+struct tevent_req *http_connect_unix_send(TALLOC_CTX *mem_ctx,
+					  struct tevent_context *ev,
+					  const char *socket_path,
+					  struct cli_credentials *credentials)
+{
+	struct tevent_req *req = NULL;
+	struct tevent_req *subreq = NULL;
+	struct http_connect_state *state = NULL;
+	int ret;
+
+	DBG_DEBUG("Connecting to [%s] over HTTP\n", socket_path);
+
+	req = tevent_req_create(mem_ctx, &state, struct http_connect_state);
+	if (req == NULL) {
+		return NULL;
+	}
+
+	*state = (struct http_connect_state) {
+		.ev = ev,
+		.credentials = credentials,
+	};
+
+	state->http_server = talloc_strdup(state, socket_path);
+	if (tevent_req_nomem(state->http_server, req)) {
+		return tevent_req_post(req, ev);
+	}
+	state->http_server_ip = state->http_server;
+
+	state->http_conn = talloc_zero(state, struct http_conn);
+	if (tevent_req_nomem(state->http_conn, req)) {
+		return tevent_req_post(req, ev);
+	}
+
+	state->http_conn->send_queue = tevent_queue_create(state->http_conn,
+							   "HTTP unix send queue");
+	if (tevent_req_nomem(state->http_conn->send_queue, req)) {
+		return tevent_req_post(req, ev);
+	}
+
+	ret = tsocket_address_unix_from_path(state, NULL, &state->local_address);
+	if (ret != 0) {
+		tevent_req_error(req, errno);
+		return tevent_req_post(req, ev);
+	}
+
+	http_connect_unix_connect(req);
+	if (!tevent_req_is_in_progress(req)) {
+		return tevent_req_post(req, ev);
+	}
+
+	return req;
+}
+
+static void http_connect_unix_connect(struct tevent_req *req)
+{
+	struct http_connect_state *state = tevent_req_data(
+		req, struct http_connect_state);
+	struct tevent_req *subreq = NULL;
+	int ret;
+
+	ret = tsocket_address_unix_from_path(state,
+					     state->http_server_ip,
+					     &state->remote_address);
+	if (ret != 0) {
+		int saved_errno = errno;
+
+		DBG_ERR("Cannot create remote socket address, error: %s (%d)\n",
+			strerror(errno), errno);
+		tevent_req_error(req, saved_errno);
+		return;
+	}
+
+	subreq = tstream_unix_connect_send(state,
+					   state->ev,
+					   state->local_address,
+					   state->remote_address);
+	if (tevent_req_nomem(subreq, req)) {
+		return;
+	}
+	tevent_req_set_callback(subreq, http_connect_unix_done, req);
+}
+
+static void http_connect_unix_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	struct http_connect_state *state = tevent_req_data(
+		req, struct http_connect_state);
+	int error;
+	int ret;
+
+	ret = tstream_unix_connect_recv(subreq,
+					&error,
+					state->http_conn,
+					&state->http_conn->tstreams.raw);
+	TALLOC_FREE(subreq);
+	if (ret != 0) {
+		tevent_req_error(req, error);
+		return;
+	}
+
+	state->http_conn->tstreams.active = state->http_conn->tstreams.raw;
+	DBG_DEBUG("Socket connected\n");
+	tevent_req_done(req);
+}
 
 struct tevent_req *http_connect_send(TALLOC_CTX *mem_ctx,
 				     struct tevent_context *ev,
