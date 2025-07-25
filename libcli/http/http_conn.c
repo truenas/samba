@@ -83,7 +83,7 @@ struct tevent_req *http_connect_unix_send(TALLOC_CTX *mem_ctx,
 	}
 
 	state->http_conn->send_queue = tevent_queue_create(state->http_conn,
-							   "HTTP send queue");
+							   "HTTP unix send queue");
 	if (tevent_req_nomem(state->http_conn->send_queue, req)) {
 		return tevent_req_post(req, ev);
 	}
