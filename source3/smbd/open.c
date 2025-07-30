@@ -3606,8 +3606,7 @@ static void possibly_set_archive(struct connection_struct *conn,
 	bool set_archive = false;
 	int ret;
 
-	// If kernel dosmodes are enabled then ARCHIVE is set by the FS
-	if ((info == FILE_WAS_OPENED) || lp_kernel_dosmodes(SNUM(conn))) {
+	if (info == FILE_WAS_OPENED) {
 		return;
 	}
 
