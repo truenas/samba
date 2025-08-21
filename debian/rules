@@ -62,7 +62,6 @@ conf_args = \
 		--with-cluster-support \
 		--with-socketpath=/run/ctdb/ctdbd.socket \
 		--with-logdir=/var/log/ctdb \
-		--with-system-mitkrb5 \
 		--enable-etcd-reclock \
 		--disable-cups \
 		--disable-iprint \

@@ -255,6 +255,8 @@ static NTSTATUS generate_krb5_session_info(
 		return NT_STATUS_ACCESS_DENIED;
 	}
 
+	DBG_ERR("XXX: %s, %s, %s\n", ntuser, ntdomain, username);
+
 	status = make_session_info_krb5(mem_ctx,
 					ntuser,
 					ntdomain,

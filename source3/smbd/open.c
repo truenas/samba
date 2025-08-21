@@ -4880,7 +4880,7 @@ static NTSTATUS open_directory(connection_struct *conn,
 	if ((access_mask & SEC_FLAG_SYSTEM_SECURITY) &&
 			!security_token_has_privilege(get_current_nttok(conn),
 					SEC_PRIV_SECURITY)) {
-		DEBUG(10, ("open_directory: open on %s "
+		DEBUG(0, ("open_directory: open on %s "
 			"failed - SEC_FLAG_SYSTEM_SECURITY denied.\n",
 			smb_fname_str_dbg(smb_dname)));
 		return NT_STATUS_PRIVILEGE_NOT_HELD;
@@ -6179,7 +6179,7 @@ static NTSTATUS create_file_unixpath(connection_struct *conn,
 		ok = security_token_has_privilege(get_current_nttok(conn),
 						  SEC_PRIV_SECURITY);
 		if (!ok) {
-			DBG_DEBUG("open on %s failed - "
+			DBG_ERR("open on %s failed - "
 				"SEC_FLAG_SYSTEM_SECURITY denied.\n",
 				smb_fname_str_dbg(smb_fname));
 			status = NT_STATUS_PRIVILEGE_NOT_HELD;
