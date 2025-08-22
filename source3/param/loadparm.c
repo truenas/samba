@@ -1724,6 +1724,7 @@ static bool lp_add_ipc(const char *ipc_name, bool guest_ok)
 	ServicePtrs[i]->printable = false;
 	ServicePtrs[i]->browseable = sDefault.browseable;
 	ServicePtrs[i]->autoloaded = false;
+	ServicePtrs[i]->csc_policy = 3;  // Windows has csc policy disabled for IPC$ share
 
 	DEBUG(3, ("adding IPC service\n"));
 
