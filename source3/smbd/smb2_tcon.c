@@ -418,7 +418,8 @@ static NTSTATUS smbd_smb2_tree_connect(struct smbd_smb2_request *req,
 	}
 
 	if (lp_hide_unreadable(SNUM(tcon->compat)) ||
-	    lp_hide_unwriteable_files(SNUM(tcon->compat))) {
+	    lp_hide_unwriteable_files(SNUM(tcon->compat)) ||
+	    (tcon->compat->internal_tcon_flags & TCON_FLAG_TRUENAS_ABE) == 0) {
 		*out_share_flags |= SMB2_SHAREFLAG_ACCESS_BASED_DIRECTORY_ENUM;
 	}
 
