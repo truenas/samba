@@ -4479,7 +4479,6 @@ int lp_default_server_announce(void)
 	int default_server_announce = 0;
 	default_server_announce |= SV_TYPE_WORKSTATION;
 	default_server_announce |= SV_TYPE_SERVER;
-	default_server_announce |= SV_TYPE_SERVER_UNIX;
 
 	default_server_announce |= SV_TYPE_SERVER_NT;
 	default_server_announce |= SV_TYPE_NT;
