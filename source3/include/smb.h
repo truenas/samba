@@ -433,10 +433,11 @@ char *strdup(char *s);
  *               settings to be configured during share creation. Changing
  *               it to 6.1 to mimic Win2K8R2.
  *
+ * Version 10.0 - Because what could go wrong?
  */
  
-#define SAMBA_MAJOR_NBT_ANNOUNCE_VERSION 0x06
-#define SAMBA_MINOR_NBT_ANNOUNCE_VERSION 0x01
+#define SAMBA_MAJOR_NBT_ANNOUNCE_VERSION 0x0a
+#define SAMBA_MINOR_NBT_ANNOUNCE_VERSION 0x00
 
 /* Browser Election Values */
 #define BROWSER_ELECTION_VERSION	0x010f

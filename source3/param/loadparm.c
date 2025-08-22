@@ -4481,19 +4481,10 @@ int lp_default_server_announce(void)
 	default_server_announce |= SV_TYPE_SERVER;
 	default_server_announce |= SV_TYPE_SERVER_UNIX;
 
-	/* note that the flag should be set only if we have a
-	   printer service but nmbd doesn't actually load the
-	   services so we can't tell   --jerry */
-
-	default_server_announce |= SV_TYPE_PRINTQ_SERVER;
-
 	default_server_announce |= SV_TYPE_SERVER_NT;
 	default_server_announce |= SV_TYPE_NT;
 
 	switch (lp_server_role()) {
-		case ROLE_DOMAIN_MEMBER:
-			default_server_announce |= SV_TYPE_DOMAIN_MEMBER;
-			break;
 		case ROLE_DOMAIN_PDC:
 		case ROLE_IPA_DC:
 			default_server_announce |= SV_TYPE_DOMAIN_CTRL;
