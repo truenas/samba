@@ -516,6 +516,7 @@ static void truenas_audit_authentication_event(
 
 	authentication = json_new_object();
 	if (json_is_invalid(&authentication)) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
@@ -525,101 +526,121 @@ static void truenas_audit_authentication_event(
 		event_id, debug_level, &authentication
 	);
 	if (!ok) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	rc = json_object_del(authentication.root, "version");
 	if (rc != 0) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	rc = json_object_del(authentication.root, "status");
 	if (rc != 0) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	rc = json_object_del(authentication.root, "eventId");
 	if (rc != 0) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	ok = truenas_audit_add_vers(&authentication, "vers");
 	if (!ok) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	wrapper = json_new_object();
 	if (json_is_invalid(&wrapper)) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	rc = json_add_guid(&wrapper, "aid", &msgid);
 	if (rc != 0) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	ok = truenas_audit_add_vers(&wrapper, "vers");
 	if (!ok) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	ok = truenas_audit_add_inet_addr(&wrapper, "addr", ui->remote_host);
 	if (!ok) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	rc = json_add_string(&wrapper, "user", account_name ? account_name : clientAccount);
 	if (rc != 0) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	rc = json_add_string(&wrapper, "sess", NULL);
 	if (rc != 0) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	ok = truenas_audit_add_time(&wrapper, "time");
 	if (!ok) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	rc = json_add_string(&wrapper, "svc", "SMB");
 	if (rc != 0) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	ok = truenas_audit_add_svc_data(&wrapper);
 	if (!ok) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	rc = json_add_string(&wrapper, "event", "AUTHENTICATION");
 	if (rc != 0) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	if (!truenas_audit_add_result(&authentication, status)) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	msg = json_dumps(authentication.root, 0);
 	if (msg == NULL) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	rc = json_add_string(&wrapper, "event_data", msg);
 	free(msg);
 	if (rc != 0) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	rc = json_add_bool(&wrapper, "success", NT_STATUS_IS_OK(status));
 	if (rc != 0) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
 	msg = json_dumps(wrapper.root, 0);
 	if (msg == NULL) {
+		DBG_ERR("XXX: failed\n");
 		goto failure;
 	}
 
