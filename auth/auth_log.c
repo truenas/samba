@@ -429,6 +429,7 @@ static bool truenas_audit_add_inet_addr(struct json_object *object,
 	if (addr == NULL) {
 		error = json_add_string(object, key, NULL);
 		if (error) {
+			DBG_ERR("XXX: HERE\n");
 			return false;
 		}
 		return true;
@@ -436,10 +437,14 @@ static bool truenas_audit_add_inet_addr(struct json_object *object,
 
 	addr_s = tsocket_address_inet_addr_string(addr, talloc_tos());
 	if (addr_s == NULL) {
+		DBG_ERR("XXX: HERE\n");
 		return false;
 	}
 
 	error = json_add_string(object, key, addr_s);
+	if (error) {
+		DBG_ERR("XXX: here: %s\n", addr_s);
+	}
 	TALLOC_FREE(addr_s);
 	return error ? false : true;
 }
