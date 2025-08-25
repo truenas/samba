@@ -772,6 +772,13 @@ static off_t fsctl_qfr_valid_data_len(struct files_struct * fsp,
 			return max_off;
 		}
 
+		if (hole_off <= data_off) {
+			DBG_ERR("lseek inconsistent: hole %lu at or before "
+				"data %lu\n", (unsigned long)hole_off,
+				(unsigned long)data_off);
+			return max_off;
+		}
+
 		curr_off = hole_off;
 	}
 
@@ -846,6 +853,12 @@ static NTSTATUS fsctl_qfr(TALLOC_CTX *mem_ctx,
 		DBG_WARNING("QFR max %lu insufficient for one region\n",
 			    (unsigned long)in_max_output);
 		return NT_STATUS_BUFFER_TOO_SMALL;
+	}
+
+
+	if (fsp_is_alternate_stream(fsp)) {
+		DBG_WARNING("QFR on alternate data stream: %s\n", fsp_str_dbg(fsp));
+		return NT_STATUS_INVALID_PARAMETER;
 	}
 
 	/* get up-to-date info on file size */
@@ -1030,6 +1043,7 @@ struct tevent_req *smb2_ioctl_filesys(uint32_t ctl_code,
 		return req;
 		break;
 	}
+#if 0 // Disable QUERY_FILE_REGIONS support. For details see NAS-132545 and friends
 	case FSCTL_QUERY_FILE_REGIONS:
 		status = fsctl_qfr(state, ev, state->fsp,
 				   &state->in_input,
@@ -1040,6 +1054,7 @@ struct tevent_req *smb2_ioctl_filesys(uint32_t ctl_code,
 		}
 		return tevent_req_post(req, ev);
 		break;
+#endif
 	default: {
 		uint8_t *out_data = NULL;
 		uint32_t out_data_len = 0;
