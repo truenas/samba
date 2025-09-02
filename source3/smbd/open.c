@@ -879,20 +879,13 @@ static int tn_reopen_from_fsp_fast(struct files_struct *fsp,
 		return -1;
 	}
 
-	if (fsp_get_status_flags(fsp) & O_PATH) {
+	fd_status = fsp_get_status_flags(fsp);
+	if (fd_status & O_PATH) {
 		// This is an O_PATH open and so no real
 		// hope that it will *actually* match new
 		// access mode.
 		return -1;
 
-	}
-
-	// get current status flags (not cached)
-	fd_status = fcntl(old_fd, F_GETFL);
-	if (fd_status < 0) {
-		DBG_ERR("%s: fcntl() failed on file: %s\n",
-			fsp_str_dbg(fsp), strerror(errno));
-		return -1;
 	}
 
 	if ((fd_status & O_ACCMODE) != (how->flags & O_ACCMODE)) {
