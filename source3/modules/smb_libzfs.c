@@ -40,7 +40,10 @@
 #include <pthread.h>
 #ifndef FREEBSD_LIBZFS
 #include <mntent.h>
-#ifndef mntent
+#ifndef hasmntopt
+/* Search MNT->mnt_opts for an option matching OPT.
+   Returns the address of the substring, or null if none found.  */
+/* Structure describing a mount table entry.  */
 struct mntent
   {
     char *mnt_fsname;           /* Device or server for filesystem.  */
@@ -50,6 +53,9 @@ struct mntent
     int mnt_freq;               /* Dump frequency (in days).  */
     int mnt_passno;             /* Pass number for `fsck'.  */
   };
+
+char *hasmntopt (const struct mntent *__mnt,
+                 const char *__opt) __THROW;
 #endif
 #endif /* FREEBSD_LIBZFS */
 #include <libzfs/sys/nvpair.h>
@@ -1517,7 +1523,7 @@ struct zfs_dataset *_smb_zfs_fd_get_dataset(TALLOC_CTX *mem_ctx,
 
 static bool check_pattern(char **pattern, const char *snap_name)
 {
-	const char **to_check = NULL;
+	char **to_check = NULL;
 	bool match = false;
 
 	SMB_ASSERT(pattern != NULL);

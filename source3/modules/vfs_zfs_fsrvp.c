@@ -214,7 +214,7 @@ static int zfs_fsrvp_connect(struct vfs_handle_struct *handle,
 
 	if ((strcmp(ds->mountpoint, handle->conn->connectpath) != 0) &&
 	    (strlen(handle->conn->connectpath) > 15) &&
-	    (strnstr(handle->conn->connectpath, "/.zfs/snapshot/", PATH_MAX) == NULL)) {
+	    (strstr(handle->conn->connectpath, "/.zfs/snapshot") == NULL)) {
 		DBG_ERR("Sharing a subdirectory inside a ZFS dataset "
 			"is not permitted.: Connectpath: %s, Mountpoint: %s\n",
 			handle->conn->connectpath, ds->mountpoint);
