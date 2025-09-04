@@ -5703,6 +5703,7 @@ NTSTATUS inherit_new_acl(files_struct *dirfsp, files_struct *fsp)
 	bool try_system = false;
 	const struct dom_sid *SY_U_sid = NULL;
 	const struct dom_sid *SY_G_sid = NULL;
+	struct dom_sid tmp_sid;
 	size_t size = 0;
 	bool ok;
 
@@ -5824,6 +5825,19 @@ NTSTATUS inherit_new_acl(files_struct *dirfsp, files_struct *fsp)
 			group_sid = &token->sids[PRIMARY_USER_SID_INDEX];
 		} else {
 			group_sid = &token->sids[PRIMARY_GROUP_SID_INDEX];
+		}
+	}
+
+	if ((group_sid != NULL) && !IS_DC) {
+		/*
+		 * If the group sid is for DOMAIN_USERS on local server then
+		 * lookup the sid for the gid from the unix token
+		 */
+		struct dom_sid dom_users;
+		sid_compose(&dom_users, get_global_sam_sid(), RID_DOMAIN_USERS);
+		if (dom_sid_equal(dom_users, group_sid)) {
+			gid_to_sid(&tmp_sid, fsp->conn->session_info->unix_token->gid);
+			group_sid = &tmp_sid;
 		}
 	}
 
