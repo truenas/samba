@@ -5835,7 +5835,7 @@ NTSTATUS inherit_new_acl(files_struct *dirfsp, files_struct *fsp)
 		 */
 		struct dom_sid dom_users;
 		sid_compose(&dom_users, get_global_sam_sid(), RID_DOMAIN_USERS);
-		if (dom_sid_equal(dom_users, group_sid)) {
+		if (dom_sid_equal(&dom_users, group_sid)) {
 			gid_to_sid(&tmp_sid, fsp->conn->session_info->unix_token->gid);
 			group_sid = &tmp_sid;
 		}
