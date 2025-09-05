@@ -34,6 +34,7 @@
 #include "../librpc/gen_ndr/idmap.h"
 #include "../librpc/gen_ndr/ioctl.h"
 #include "passdb/lookup_sid.h"
+#include "passdb/machine_sid.h"
 #include "auth.h"
 #include "serverid.h"
 #include "messages.h"
@@ -5834,7 +5835,7 @@ NTSTATUS inherit_new_acl(files_struct *dirfsp, files_struct *fsp)
 		 * lookup the sid for the gid from the unix token
 		 */
 		struct dom_sid dom_users;
-		sid_compose(&dom_users, get_global_sam_sid(), RID_DOMAIN_USERS);
+		sid_compose(&dom_users, get_global_sam_sid(), DOMAIN_RID_USERS);
 		if (dom_sid_equal(&dom_users, group_sid)) {
 			gid_to_sid(&tmp_sid, fsp->conn->session_info->unix_token->gid);
 			group_sid = &tmp_sid;
