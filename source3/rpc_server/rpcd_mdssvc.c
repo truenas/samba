@@ -20,6 +20,7 @@
 #include "rpc_worker.h"
 #include "librpc/gen_ndr/ndr_mdssvc.h"
 #include "librpc/gen_ndr/ndr_mdssvc_scompat.h"
+#include "source3/smbd/proto.h"
 
 static size_t mdssvc_interfaces(
 	const struct ndr_interface_table ***pifaces,
