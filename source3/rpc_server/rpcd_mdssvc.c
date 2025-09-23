@@ -43,6 +43,7 @@ static NTSTATUS mdssvc_servers(
 	bool ok;
 
 	lp_load_with_shares(get_dyn_CONFIGFILE());
+	mangle_reset_cache();
 
 	ok = posix_locking_init(false);
 	if (!ok) {
