@@ -1588,7 +1588,8 @@ NTSTATUS openat_pathref_fsp_lcomp(struct files_struct *dirfsp,
 			       fsp,
 			       &how);
 
-	if ((fd == -1) && (errno == ENOENT)) {
+	if ((fd == -1) &&
+	    ((errno == ENOENT) || (errno == EACCES) || (errno == EPERM))) {
 		status = map_nt_error_from_unix(errno);
 		DBG_DEBUG("smb_vfs_openat(%s/%s) failed: %s\n",
 			  dirfsp->fsp_name->base_name,
