@@ -1142,6 +1142,7 @@ nbt = ["nbt.dgram"]
 vfs = [
     "vfs.fruit",
     "vfs.acl_xattr",
+    "vfs.streams_xattr",
     "vfs.fruit_netatalk",
     "vfs.fruit_file_id",
     "vfs.fruit_timemachine",
@@ -1337,6 +1338,8 @@ for t in tests:
             plansmbtorture4testsuite(t, "fileserver", '//$SERVER_IP/tmp -U$USERNAME%$PASSWORD')
     elif t == "vfs.acl_xattr":
         plansmbtorture4testsuite(t, "nt4_dc", '//$SERVER_IP/tmp -U$USERNAME%$PASSWORD')
+    elif t == "vfs.streams_xattr":
+        plansmbtorture4testsuite(t, "nt4_dc", '//$SERVER_IP/vfs_wo_fruit -U$USERNAME%$PASSWORD')
     elif t == "smb2.compound_find":
         plansmbtorture4testsuite(t, "fileserver", '//$SERVER/compound_find -U$USERNAME%$PASSWORD')
         plansmbtorture4testsuite(t, "fileserver", '//$SERVER_IP/tmp -U$USERNAME%$PASSWORD')
@@ -1886,6 +1889,18 @@ plantestsuite(
      "bin/net",
      "bin/samba-tool",
      '$DNSNAME'])
+
+for auth in ["$DC_USERNAME", "$DOMAIN\\\\$DC_USERNAME", "$DC_USERNAME@$REALM" ]:
+    plantestsuite(
+        "samba3.blackbox.net_ads_kerberos (%s)" % auth,
+        "ad_member:local",
+        [os.path.join(samba3srcdir,
+                      "script/tests/test_net_ads_kerberos.sh"),
+         auth,
+         '$REALM',
+         '$DC_PASSWORD',
+         '$PREFIX',
+         configuration])
 
 plantestsuite("samba3.blackbox.force-user-unlink",
               "maptoguest:local",

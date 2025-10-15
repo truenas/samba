@@ -280,6 +280,15 @@ static bool ads_fill_cldap_reply(ADS_STRUCT *ads,
 		goto out;
 	}
 
+	if (cldap_reply->command == LOGON_SAM_LOGON_PAUSE_RESPONSE ||
+	    cldap_reply->command == LOGON_SAM_LOGON_PAUSE_RESPONSE_EX)
+	{
+		DBG_NOTICE("DC %s in paused state\n", addr);
+		ret = false;
+		goto out;
+	}
+
+
 	/* Fill in the ads->config values */
 
 	ADS_TALLOC_CONST_FREE(ads->config.workgroup);
@@ -520,20 +529,52 @@ again:
 		struct NETLOGON_SAM_LOGON_RESPONSE_EX *cldap_reply = NULL;
 		char server[INET6_ADDRSTRLEN];
 
+		print_sockaddr(server, sizeof(server), &req_sa_list[i]->u.ss);
+
 		if (responses[i] == NULL) {
+			add_failed_connection_entry(
+				domain,
+				server,
+				NT_STATUS_INVALID_NETWORK_RESPONSE);
 			continue;
 		}
-
-		print_sockaddr(server, sizeof(server), &req_sa_list[i]->u.ss);
 
 		if (responses[i]->ntver != NETLOGON_NT_VERSION_5EX) {
 			DBG_NOTICE("realm=[%s] nt_version mismatch: 0x%08x for %s\n",
 				   ads->server.realm,
 				   responses[i]->ntver, server);
+			add_failed_connection_entry(
+				domain,
+				server,
+				NT_STATUS_INVALID_NETWORK_RESPONSE);
 			continue;
 		}
 
 		cldap_reply = &responses[i]->data.nt5_ex;
+
+		if (cldap_reply->pdc_dns_name != NULL) {
+			status = check_negative_conn_cache(
+				domain,
+				cldap_reply->pdc_dns_name);
+			if (!NT_STATUS_IS_OK(status)) {
+				/*
+				 * only use the server if it's not black listed
+				 * by name
+				 */
+				DBG_NOTICE("realm=[%s] server=[%s][%s] "
+					   "black listed: %s\n",
+					   ads->server.realm,
+					   server,
+					   cldap_reply->pdc_dns_name,
+					   nt_errstr(status));
+				/* propagate blacklisting from name to ip */
+				add_failed_connection_entry(domain,
+							    server,
+							    status);
+				retry = true;
+				continue;
+			}
+		}
 
 		/* Returns ok only if it matches the correct server type */
 		ok = ads_fill_cldap_reply(ads,
@@ -571,16 +612,6 @@ again:
 		if (!expired) {
 			goto again;
 		}
-	}
-
-	/* keep track of failures as all were not suitable */
-	for (i = 0; i < num_requests; i++) {
-		char server[INET6_ADDRSTRLEN];
-
-		print_sockaddr(server, sizeof(server), &req_sa_list[i]->u.ss);
-
-		add_failed_connection_entry(domain, server,
-					    NT_STATUS_UNSUCCESSFUL);
 	}
 
 	status = NT_STATUS_NO_LOGON_SERVERS;

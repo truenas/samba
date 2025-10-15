@@ -343,4 +343,3 @@
 
 # We currently don't send referrals for LDAP modify of non-replicated attrs
 ^samba4.ldap.rodc.python\(rodc\).__main__.RodcTests.test_modify_nonreplicated.*
-
