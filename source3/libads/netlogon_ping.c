@@ -588,7 +588,7 @@ struct netlogon_pings_state {
 
 	struct tsocket_address **servers;
 	size_t num_servers;
-	size_t min_servers;
+	size_t wanted_servers;
 	struct timeval timeout;
 	enum client_netlogon_ping_protocol proto;
 	uint32_t required_flags;
@@ -610,7 +610,7 @@ struct tevent_req *netlogon_pings_send(TALLOC_CTX *mem_ctx,
 				       struct tsocket_address **servers,
 				       size_t num_servers,
 				       struct netlogon_ping_filter filter,
-				       size_t min_servers,
+				       size_t wanted_servers,
 				       struct timeval timeout)
 {
 	struct tevent_req *req = NULL;
@@ -626,7 +626,7 @@ struct tevent_req *netlogon_pings_send(TALLOC_CTX *mem_ctx,
 	state->proto = proto;
 	state->servers = servers;
 	state->num_servers = num_servers;
-	state->min_servers = min_servers;
+	state->wanted_servers = wanted_servers;
 	state->timeout = timeout;
 	state->required_flags = filter.required_flags;
 
@@ -685,7 +685,7 @@ struct tevent_req *netlogon_pings_send(TALLOC_CTX *mem_ctx,
 	}
 	state->filter = filter_str;
 
-	for (i = 0; i < min_servers; i++) {
+	for (i = 0; i < wanted_servers; i++) {
 		state->reqs[i] = netlogon_ping_send(state->reqs,
 						    state->ev,
 						    state->servers[i],
@@ -699,7 +699,7 @@ struct tevent_req *netlogon_pings_send(TALLOC_CTX *mem_ctx,
 					netlogon_pings_done,
 					req);
 	}
-	state->num_sent = min_servers;
+	state->num_sent = wanted_servers;
 	if (state->num_sent < state->num_servers) {
 		/*
 		 * After 100 milliseconds fire the next one
@@ -787,23 +787,30 @@ static void netlogon_pings_done(struct tevent_req *subreq)
 	state->num_received += 1;
 
 	if (NT_STATUS_IS_OK(status)) {
+		enum netlogon_command cmd;
 		uint32_t ret_flags;
-		bool ok;
+		bool ok = true;
 
 		switch (response->ntver) {
 		case NETLOGON_NT_VERSION_5EX:
 			ret_flags = response->data.nt5_ex.server_type;
+			cmd = response->data.nt5_ex.command;
+			ok &= !(cmd == LOGON_SAM_LOGON_PAUSE_RESPONSE ||
+				cmd == LOGON_SAM_LOGON_PAUSE_RESPONSE_EX);
 			break;
 		case NETLOGON_NT_VERSION_5:
 			ret_flags = response->data.nt5.server_type;
+			cmd = response->data.nt5.command;
+			ok &= !(cmd == LOGON_SAM_LOGON_PAUSE_RESPONSE ||
+				cmd == LOGON_SAM_LOGON_PAUSE_RESPONSE_EX);
 			break;
 		default:
 			ret_flags = 0;
 			break;
 		}
 
-		ok = check_cldap_reply_required_flags(ret_flags,
-						      state->required_flags);
+		ok &= check_cldap_reply_required_flags(ret_flags,
+						       state->required_flags);
 		if (ok) {
 			state->responses[i] = talloc_move(state->responses,
 							  &response);
@@ -811,21 +818,27 @@ static void netlogon_pings_done(struct tevent_req *subreq)
 		}
 	}
 
-	if (state->num_good_received >= state->min_servers) {
+	if (state->num_good_received >= state->wanted_servers) {
 		tevent_req_done(req);
 		return;
 	}
-	if (state->num_received == state->num_servers) {
+	if (state->num_received < state->num_servers) {
 		/*
-		 * Everybody replied, but we did not get enough good
-		 * answers (see above)
+		 * Wait for more answers
 		 */
-		tevent_req_nterror(req, NT_STATUS_NOT_FOUND);
+		return;
+	}
+	if (state->num_good_received == 1) {
+		/* We require at least one DC */
+		tevent_req_done(req);
 		return;
 	}
 	/*
-	 * Wait for more answers
+	 * Everybody replied, but we did not get a single good
+	 * answers (see above)
 	 */
+	tevent_req_nterror(req, NT_STATUS_NOT_FOUND);
+	return;
 }
 
 NTSTATUS netlogon_pings_recv(struct tevent_req *req,
@@ -849,7 +862,7 @@ NTSTATUS netlogon_pings(TALLOC_CTX *mem_ctx,
 			struct tsocket_address **servers,
 			int num_servers,
 			struct netlogon_ping_filter filter,
-			int min_servers,
+			int wanted_servers,
 			struct timeval timeout,
 			struct netlogon_samlogon_response ***responses)
 {
@@ -868,7 +881,7 @@ NTSTATUS netlogon_pings(TALLOC_CTX *mem_ctx,
 				  servers,
 				  num_servers,
 				  filter,
-				  min_servers,
+				  wanted_servers,
 				  timeout);
 	if (req == NULL) {
 		goto fail;

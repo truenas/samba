@@ -755,6 +755,12 @@ static NTSTATUS make_dc_info_from_cldap_reply(
 
 	char addr[INET6_ADDRSTRLEN];
 
+	if (r->command == LOGON_SAM_LOGON_PAUSE_RESPONSE ||
+	    r->command == LOGON_SAM_LOGON_PAUSE_RESPONSE_EX)
+	{
+		return NT_STATUS_NETLOGON_NOT_STARTED;
+	}
+
 	if (sa != NULL) {
 		print_sockaddr(addr, sizeof(addr), &sa->u.ss);
 		dc_address = addr;
@@ -865,7 +871,7 @@ static NTSTATUS process_dc_dns(TALLOC_CTX *mem_ctx,
 			.domain = domain_name,
 			.required_flags = flags,
 		},
-		1, /* min_servers */
+		1, /* wanted_servers */
 		timeval_current_ofs(MAX(3, lp_ldap_timeout() / 2), 0),
 		&responses);
 
