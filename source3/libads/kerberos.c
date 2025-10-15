@@ -1180,10 +1180,12 @@ static char *get_kdc_ip_string(char *mem_ctx,
 	DBG_DEBUG("%zu additional KDCs to test\n", num_dcs);
 	if (num_dcs == 0) {
 		/*
-		 * We do not have additional KDCs, but we have the one passed
-		 * in via `pss`. So just use that one and leave.
+		 * We do not have additional KDCs, but if we have one passed
+		 * in via `pss` just use that one, otherwise fail
 		 */
-		result = talloc_move(mem_ctx, &kdc_str);
+		if (pss != NULL) {
+			result = talloc_move(mem_ctx, &kdc_str);
+		}
 		goto out;
 	}
 
@@ -1223,19 +1225,48 @@ static char *get_kdc_ip_string(char *mem_ctx,
 					.acct_ctrl = -1,
 					.required_flags = DS_KDC_REQUIRED,
 				},
-				MIN(num_dcs, 3),	   /* min_servers */
+				MIN(num_dcs, 3),	   /* wanted_servers */
 				timeval_current_ofs(3, 0), /* timeout */
 				&responses);
 	TALLOC_FREE(dc_addrs2);
 
 	if (!NT_STATUS_IS_OK(status)) {
 		DBG_DEBUG("netlogon_pings failed: %s\n", nt_errstr(status));
+		/*
+		 * netlogon_pings() failed, but if we have one passed
+		 * in via `pss` just just use that one, otherwise fail
+		 */
+		if (pss != NULL) {
+			result = talloc_move(mem_ctx, &kdc_str);
+		}
 		goto out;
 	}
 
 	for (i=0; i<num_dcs; i++) {
+		struct NETLOGON_SAM_LOGON_RESPONSE_EX *cldap_reply = NULL;
+		char addr[INET6_ADDRSTRLEN];
+
 		if (responses[i] == NULL) {
 			continue;
+		}
+
+		if (responses[i]->ntver != NETLOGON_NT_VERSION_5EX) {
+			continue;
+		}
+
+		print_sockaddr(addr, sizeof(addr), &dc_addrs[i]);
+
+		cldap_reply = &responses[i]->data.nt5_ex;
+
+		if (cldap_reply->pdc_dns_name != NULL) {
+			status = check_negative_conn_cache(
+				realm,
+				cldap_reply->pdc_dns_name);
+			if (!NT_STATUS_IS_OK(status)) {
+				/* propagate blacklisting from name to ip */
+				add_failed_connection_entry(realm, addr, status);
+				continue;
+			}
 		}
 
 		/* Append to the string - inefficient but not done often. */

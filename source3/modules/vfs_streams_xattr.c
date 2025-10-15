@@ -1092,17 +1092,20 @@ static ssize_t streams_xattr_pwrite(vfs_handle_struct *handle,
 
         if ((offset + n) > ea.value.length - config->xattr_compat_bytes) {
 		uint8_t *tmp;
+		size_t new_sz = offset + n + config->xattr_compat_bytes;
 
 		tmp = talloc_realloc(talloc_tos(), ea.value.data, uint8_t,
-					   offset + n + config->xattr_compat_bytes);
+					   new_sz);
 
 		if (tmp == NULL) {
 			TALLOC_FREE(ea.value.data);
                         errno = ENOMEM;
                         return -1;
                 }
+
+		memset(tmp + ea.value.length, 0, new_sz - ea.value.length);
 		ea.value.data = tmp;
-		ea.value.length = offset + n + config->xattr_compat_bytes;
+		ea.value.length = new_sz;
 		if (config->xattr_compat_bytes) {
 			ea.value.data[offset+n] = 0;
 		}
