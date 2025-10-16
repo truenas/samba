@@ -1092,7 +1092,7 @@ static ssize_t streams_xattr_pwrite(vfs_handle_struct *handle,
 
         if ((offset + n) > ea.value.length - config->xattr_compat_bytes) {
 		uint8_t *tmp;
-		size_t new_sz = offset + n + xattr_compat_bytes;
+		size_t new_sz = offset + n + config->xattr_compat_bytes;
 
 		tmp = talloc_realloc(talloc_tos(), ea.value.data, uint8_t,
 					   new_sz);
