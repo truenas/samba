@@ -489,6 +489,7 @@ struct ctdb_dbid {
 #define CTDB_DB_FLAGS_REPLICATED	0x08
 	uint8_t flags;
 };
+#define CTDB_DB_FLAGS_LAST		CTDB_DB_FLAGS_REPLICATED
 
 struct ctdb_dbid_map {
 	uint32_t num;
@@ -730,6 +731,8 @@ struct ctdb_public_ip_list {
 #define NODE_FLAGS_DISABLED		(NODE_FLAGS_UNHEALTHY|NODE_FLAGS_PERMANENTLY_DISABLED)
 #define NODE_FLAGS_INACTIVE		(NODE_FLAGS_DELETED|NODE_FLAGS_DISCONNECTED|NODE_FLAGS_BANNED|NODE_FLAGS_STOPPED)
 
+#define NODE_FLAGS_LAST			NODE_FLAGS_STOPPED
+
 /*
  * Node capabilities
  */
@@ -750,6 +753,8 @@ struct ctdb_public_ip_list {
 #define CTDB_CAP_DEFAULT		(CTDB_CAP_RECMASTER | \
 					 CTDB_CAP_LMASTER   | \
 					 CTDB_CAP_FEATURES)
+
+#define CTDB_CAP_LAST			CTDB_CAP_FRAGMENTED_CONTROLS
 
 struct ctdb_node_and_flags {
 	uint32_t pnn;

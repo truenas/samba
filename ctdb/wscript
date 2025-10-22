@@ -657,6 +657,20 @@ def build(bld):
                      install_path='${BINDIR}',
                      manpages='ctdb.1')
 
+    bld.SAMBA_PYTHON('pyctdb',
+                     source=[
+                         'pyclient/pyclient_client.c',
+                         'pyclient/pyclient_db.c',
+                         'pyclient/pyclient_db_batch.c',
+                         'pyclient/pyclient_db_iter.c',
+                         'pyclient/pyclient_error.c',
+                         'pyclient/pyclient_module.c',
+                     ],
+                     deps='''ctdb-client ctdb-protocol ctdb-protocol-util
+                             ctdb-util ctdb-system samba-util sys_rw
+                             samba-util ctdbd''',
+                     realname='pyctdb.so')
+
     bld.SAMBA_BINARY('ctdb_killtcp',
                      source='tools/ctdb_killtcp.c',
                      deps='''ctdb-protocol-util ctdb-util ctdb-system
