@@ -1043,6 +1043,8 @@ static void vfs_io_uring_disconnect(vfs_handle_struct *handle)
 {
 	struct vfs_io_uring_config *config = NULL;
 
+	SMB_VFS_NEXT_DISCONNECT(handle);
+
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct vfs_io_uring_config,
 				smb_panic(__location__));
