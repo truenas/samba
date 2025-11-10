@@ -879,12 +879,17 @@ static int tn_reopen_from_fsp_fast(struct files_struct *fsp,
 		return -1;
 	}
 
+	if (how->flags & O_DIRECTORY) {
+		// Force opening of new FD to avoid issues with
+		// file position being wrong
+		return -1;
+	}
+
 	if (fsp_get_status_flags(fsp) & O_PATH) {
 		// This is an O_PATH open and so no real
 		// hope that it will *actually* match new
 		// access mode.
 		return -1;
-
 	}
 
 	// get current status flags (not cached)
@@ -903,14 +908,6 @@ static int tn_reopen_from_fsp_fast(struct files_struct *fsp,
 	if (how->flags == (fd_status & COMPARE_MASK)) {
 		// current status matches desired one
 		return old_fd;
-	}
-
-	if ((how->flags == O_DIRECTORY) && ((fd_status & O_ACCMODE) == O_RDONLY)) {
-		// caller specified O_DIRECTORY and we're open O_RDONLY
-		// return if stat info shows we're a dir
-		if (S_ISDIR(fsp->fsp_name->st.st_ex_mode)) {
-			return old_fd;
-		}
 	}
 
 	// By this time we have maybe difference in flags that can be managed

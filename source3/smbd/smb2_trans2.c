@@ -1027,7 +1027,7 @@ static NTSTATUS smbd_marshall_dir_entry(TALLOC_CTX *ctx,
 				    bool check_mangled_names,
 				    bool requires_resume_key,
 				    uint32_t mode,
-				    const char *fname,
+				    const char *fname_in,
 				    const struct smb_filename *smb_fname,
 				    int space_remaining,
 				    uint8_t align,
@@ -1055,6 +1055,7 @@ static NTSTATUS smbd_marshall_dir_entry(TALLOC_CTX *ctx,
 	NTSTATUS status;
 	struct readdir_attr_data *readdir_attr_data = NULL;
 	uint32_t ea_size;
+	const char *fname = NULL;
 
 	if (!(mode & FILE_ATTRIBUTE_DIRECTORY)) {
 		file_size = get_file_size_stat(&smb_fname->st);
@@ -1090,6 +1091,25 @@ static NTSTATUS smbd_marshall_dir_entry(TALLOC_CTX *ctx,
 		dos_filetime_timespec(&mdate_ts);
 		dos_filetime_timespec(&adate_ts);
 		dos_filetime_timespec(&cdate_ts);
+	}
+
+	/* Perform any required translation back to windows for filename */
+	if ((conn->internal_tcon_flags & TCON_FLAG_NO_TRANSLATE) == 0) {
+		status = SMB_VFS_TRANSLATE_NAME(conn,
+						fname_in,
+						vfs_translate_to_windows,
+						ctx,
+						&fname);
+		if (NT_STATUS_EQUAL(status, NT_STATUS_NONE_MAPPED)) {
+			conn->internal_tcon_flags |= TCON_FLAG_NO_TRANSLATE;
+			fname = fname_in;
+		}
+
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
+	} else {
+		fname = fname_in;
 	}
 
 	/* align the record */
@@ -2876,7 +2896,66 @@ char *store_file_unix_basic_info2(connection_struct *conn,
 	return pdata;
 }
 
-static NTSTATUS marshall_stream_info(unsigned int num_streams,
+static NTSTATUS translate_stream_name(connection_struct *conn,
+				      const char *stream_name_in,
+				      char **stream_name_out)
+{
+	char *stream_name = NULL;
+	char *stream_type = NULL;
+	char *mapped_name = NULL;
+	char *tmpname = NULL;
+	char *out = NULL;
+	NTSTATUS status;
+
+	tmpname = talloc_strdup(conn, stream_name_in);
+	if (tmpname == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	if (conn->internal_tcon_flags & TCON_FLAG_NO_TRANSLATE) {
+		*stream_name_out = tmpname;
+		return NT_STATUS_OK;
+	}
+       
+	stream_type = strrchr_m(stream_name, ':');
+	if (stream_type != NULL) {
+		*stream_type = '\0';
+		stream_type += 1;
+	}
+
+	status = SMB_VFS_TRANSLATE_NAME(conn,
+					stream_name,
+					vfs_translate_to_windows,
+					conn,
+					&mapped_name);
+
+	if (NT_STATUS_EQUAL(status, NT_STATUS_NONE_MAPPED)) {
+		conn->internal_tcon_flags |= TCON_FLAG_NO_TRANSLATE;
+		*stream_name_out = tmpname;
+		return NT_STATUS_OK;
+	} else if (!NT_STATUS_IS_OK(status)) {
+		TALLOC_FREE(tmpname);
+		return status;
+	}
+
+	TALLOC_FREE(tmpname);
+
+	if (stream_type != NULL) {
+		out = talloc_asprintf(conn, ":%s:%s", mapped_name, stream_type);
+	} else {
+		out = talloc_asprintf(conn, ":%s", mapped_name);
+	}
+
+	if (out == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	*stream_name_out = out;
+	return status;
+}
+
+static NTSTATUS marshall_stream_info(connection_struct *conn,
+				     unsigned int num_streams,
 				     const struct stream_struct *streams,
 				     char *data,
 				     unsigned int max_data_bytes,
@@ -2893,13 +2972,26 @@ static NTSTATUS marshall_stream_info(unsigned int num_streams,
 		unsigned int next_offset;
 		size_t namelen;
 		smb_ucs2_t *namebuf;
+		char *translated = NULL;
+		NTSTATUS status;
+
+		/*
+		 * Perform any required translation to windows before marshalling
+		 */
+		status = translate_stream_name(conn, streams[i].name, &translated); 
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
 
 		if (!push_ucs2_talloc(talloc_tos(), &namebuf,
-				      streams[i].name, &namelen) ||
+				      translated, &namelen) ||
 		    namelen <= 2)
 		{
+			TALLOC_FREE(translated);
 			return NT_STATUS_INVALID_PARAMETER;
 		}
+
+		TALLOC_FREE(translated);
 
 		/*
 		 * name_buf is now null-terminated, we need to marshall as not
@@ -2979,6 +3071,8 @@ NTSTATUS smbd_do_qfilepathinfo(connection_struct *conn,
 	SMB_STRUCT_STAT *psbuf = NULL;
 	SMB_STRUCT_STAT *base_sp = NULL;
 	char *p;
+	char *tbase_name;
+	char *tstream_name;
 	char *base_name;
 	char *dos_fname;
 	int mode;
@@ -3064,9 +3158,42 @@ NTSTATUS smbd_do_qfilepathinfo(connection_struct *conn,
 		dos_filetime_timespec(&ctime_ts);
 	}
 
-	p = strrchr_m(smb_fname->base_name,'/');
+	/**
+	 * initialize our tbase_name and tstream_name (translated variants)
+	 */
+	if (INFO_LEVEL_IS_UNIX(info_level) ||
+	    ((conn->internal_tcon_flags & TCON_FLAG_NO_TRANSLATE) == 0)) {
+		// We don't really need to perform translation here since
+		// its a posix info level
+		tbase_name = smb_fname->base_name;
+		tstream_name = smb_fname->stream_name;
+	} else {
+		status = SMB_VFS_TRANSLATE_NAME(conn,
+						smb_fname->base_name,
+						vfs_translate_to_windows,
+						mem_ctx,
+						&tbase_name);
+		if (NT_STATUS_EQUAL(status, NT_STATUS_NONE_MAPPED)) {
+			conn->internal_tcon_flags |= TCON_FLAG_NO_TRANSLATE;
+			tbase_name = smb_fname->base_name;
+			tstream_name = smb_fname->stream_name;
+		} else if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		} else if (smb_fname->stream_name != NULL) {
+			status = SMB_VFS_TRANSLATE_NAME(conn,
+							smb_fname->stream_name,
+							vfs_translate_to_windows,
+							mem_ctx,
+							&tstream_name);
+			if (!NT_STATUS_IS_OK(status)) {
+				return status;
+			}
+		}
+	}
+
+	p = strrchr_m(tbase_name,'/');
 	if (p == NULL) {
-		base_name = smb_fname->base_name;
+		base_name = tbase_name;
 	} else {
 		base_name = p+1;
 	}
@@ -3081,13 +3208,13 @@ NTSTATUS smbd_do_qfilepathinfo(connection_struct *conn,
 	} else {
 		dos_fname = talloc_asprintf(mem_ctx,
 				"\\%s",
-				smb_fname->base_name);
+				tbase_name);
 		if (!dos_fname) {
 			return NT_STATUS_NO_MEMORY;
 		}
 		if (is_named_stream(smb_fname)) {
 			dos_fname = talloc_asprintf(dos_fname, "%s",
-						    smb_fname->stream_name);
+						    tstream_name);
 			if (!dos_fname) {
 				return NT_STATUS_NO_MEMORY;
 			}
@@ -3362,7 +3489,7 @@ NTSTATUS smbd_do_qfilepathinfo(connection_struct *conn,
 				return NT_STATUS_INVALID_LEVEL;
 			}
 
-			nfname = talloc_strdup(mem_ctx, smb_fname->base_name);
+			nfname = talloc_strdup(mem_ctx, tbase_name);
 			if (nfname == NULL) {
 				return NT_STATUS_NO_MEMORY;
 			}
@@ -3373,7 +3500,7 @@ NTSTATUS smbd_do_qfilepathinfo(connection_struct *conn,
 			string_replace(nfname, '/', '\\');
 
 			if (fsp_is_alternate_stream(fsp)) {
-				const char *s = smb_fname->stream_name;
+				const char *s = tstream_name;
 				const char *e = NULL;
 				size_t n;
 
@@ -3584,7 +3711,7 @@ NTSTATUS smbd_do_qfilepathinfo(connection_struct *conn,
 				return status;
 			}
 
-			status = marshall_stream_info(num_streams, streams,
+			status = marshall_stream_info(conn, num_streams, streams,
 						      pdata, max_data_bytes,
 						      &data_size);
 

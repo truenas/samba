@@ -422,6 +422,7 @@ char *get_original_lcomp(TALLOC_CTX *ctx,
 {
 	char *last_slash = NULL;
 	char *orig_lcomp;
+	char *translated;
 	NTSTATUS status;
 
 	last_slash = strrchr(filename_in, '/');
@@ -438,7 +439,21 @@ char *get_original_lcomp(TALLOC_CTX *ctx,
 		TALLOC_FREE(orig_lcomp);
 		return NULL;
 	}
-	return orig_lcomp;
+
+	status = SMB_VFS_TRANSLATE_NAME(conn, orig_lcomp,
+					vfs_translate_to_unix,
+					ctx, &translated);
+
+	if (NT_STATUS_EQUAL(status, NT_STATUS_NONE_MAPPED)) {
+		translated = orig_lcomp;
+	} else if (!NT_STATUS_IS_OK(status)) {
+		TALLOC_FREE(orig_lcomp);
+		return NULL;
+	} else {
+		TALLOC_FREE(orig_lcomp);
+	}
+
+	return translated;
 }
 
 /*
@@ -480,7 +495,74 @@ static NTSTATUS get_real_stream_name(
 	return NT_STATUS_OBJECT_NAME_NOT_FOUND;
 }
 
+static bool filename_translate_components(
+	connection_struct *conn,
+	TALLOC_CTX *mem_ctx,
+	const char *dirname_in,
+	const char *fname_in,
+	const char *streamname_in,
+	const char **dirname_out,
+	const char **fname_out,
+	const char **streamname_out)
+{
+	NTSTATUS status;
+
+	if ((dirname_in == NULL) || (fname_in == NULL)) {
+		return false;
+	}
+
+	status = SMB_VFS_TRANSLATE_NAME(conn,
+					dirname_in,
+					vfs_translate_to_unix,
+					mem_ctx,
+					dirname_out);
+	if (NT_STATUS_EQUAL(status, NT_STATUS_NONE_MAPPED)) {
+		/*
+		 * First trip throuh the VFS no translation performed
+		 * We'll set flag to prevent going down this path again
+		 * and pass out our input strings.
+		 */
+		conn->internal_tcon_flags |= TCON_FLAG_NO_TRANSLATE;
+		*dirname_out = dirname_in;
+		*fname_out = fname_in;
+		*streamname_out = streamname_in;
+		return true;
+	}
+
+	if (!NT_STATUS_IS_OK(status)) {
+		return false;
+	}
+
+	status = SMB_VFS_TRANSLATE_NAME(conn,
+					fname_in,
+					vfs_translate_to_unix,
+					mem_ctx,
+					fname_out);
+
+	if (!NT_STATUS_IS_OK(status)) {
+		return false;
+	}
+
+	if (streamname_in == NULL) {
+		return true;
+	}
+
+	status = SMB_VFS_TRANSLATE_NAME(conn,
+					streamname_in,
+					vfs_translate_to_unix,
+					mem_ctx,
+					streamname_out);
+
+	if (!NT_STATUS_IS_OK(status)) {
+		return false;
+	}
+
+	return true;
+}
+
+
 static bool filename_split_lcomp(
+	connection_struct *conn,
 	TALLOC_CTX *mem_ctx,
 	const char *name_in,
 	bool posix,
@@ -492,6 +574,7 @@ static bool filename_split_lcomp(
 	const char *fname_rel = NULL;
 	const char *streamname = NULL;
 	char *dirname = NULL;
+	NTSTATUS status;
 
 	if (name_in[0] == '\0') {
 		fname_rel = ".";
@@ -548,6 +631,34 @@ find_stream:
 	}
 
 done:
+	if (!posix &&
+	    ((conn->internal_tcon_flags & TCON_FLAG_NO_TRANSLATE) == 0)) {
+		/*
+		 * current names are allocated under talloc_tos and so
+		 * they will be freed with tos 
+		 */ 
+		const char *tdname = NULL;
+		const char *tfname = NULL;
+		const char *tsname = NULL;
+		bool ok;
+		ok = filename_translate_components(conn,
+			       			   mem_ctx,
+						   dirname,
+						   fname_rel,
+						   streamname,
+						   &tdname,
+						   &tfname,
+						   &tsname);
+		if (!ok) {
+			TALLOC_FREE(dirname);
+			return false;
+		}
+
+		*_dirname = tdname;
+		*_fname_rel = tfname;
+		*_streamname = tsname;
+		return true;
+	}
 	*_dirname = dirname;
 	*_fname_rel = fname_rel;
 	*_streamname = streamname;
@@ -730,6 +841,7 @@ filename_convert_dirfsp_nosymlink(TALLOC_CTX *mem_ctx,
 	}
 
 	ok = filename_split_lcomp(
+		conn,
 		talloc_tos(),
 		name_in,
 		posix,

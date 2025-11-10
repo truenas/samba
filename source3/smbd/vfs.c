@@ -881,18 +881,8 @@ const char *vfs_readdirname(connection_struct *conn,
 		return(NULL);
 
 	dname = ptr->d_name;
-
-	status = SMB_VFS_TRANSLATE_NAME(conn, dname, vfs_translate_to_windows,
-					talloc_tos(), &translated);
-	if (NT_STATUS_EQUAL(status, NT_STATUS_NONE_MAPPED)) {
-		*talloced = NULL;
-		return dname;
-	}
-	*talloced = translated;
-	if (!NT_STATUS_IS_OK(status)) {
-		return NULL;
-	}
-	return translated;
+	*talloced = NULL;
+	return dname;
 }
 
 /*******************************************************************
@@ -1230,6 +1220,9 @@ NTSTATUS vfs_fstreaminfo(struct files_struct *fsp,
 			unsigned int *num_streams,
 			struct stream_struct **streams)
 {
+	NTSTATUS status;
+	unsigned int i;
+
 	*num_streams = 0;
 	*streams = NULL;
 
