@@ -1873,6 +1873,100 @@ static NTSTATUS catia_read_dfs_pathat(struct vfs_handle_struct *handle,
 	return status;
 }
 
+static uint64_t catia_disk_free(vfs_handle_struct *handle,
+				const struct smb_filename *smb_fname,
+				uint64_t *bsize,
+				uint64_t *dfree,
+				uint64_t *dsize)
+{
+	char *mapped_name = NULL;
+	const char *path = smb_fname->base_name;
+	struct smb_filename *smb_fname_tmp = NULL;
+	int ret;
+	uint64_t dfree_ret;
+
+	ret = catia_string_replace_allocate(handle->conn,
+					    path,
+					    &mapped_name,
+					    vfs_translate_to_unix);
+	if (ret != 0) {
+		errno = ret;
+		return -1;
+	}
+
+	smb_fname_tmp = cp_smb_filename(handle, smb_fname);
+	if (smb_fname_tmp == NULL) {
+		errno = ENOMEM;
+		TALLOC_FREE(mapped_name);
+		ret = -1;
+	}
+
+	smb_fname_tmp->base_name = mapped_name;
+
+	dfree_ret = SMB_VFS_NEXT_DISK_FREE(handle, smb_fname_tmp, bsize, dfree,
+				       dsize);
+	TALLOC_FREE(mapped_name);
+	TALLOC_FREE(smb_fname_tmp);
+	return dfree_ret;
+}
+
+static int catia_get_quota(vfs_handle_struct *handle,
+			   const struct smb_filename *smb_fname,
+			   enum SMB_QUOTA_TYPE qtype,
+			   unid_t id,
+			   SMB_DISK_QUOTA *qt)
+{
+	char *mapped_name = NULL;
+	struct smb_filename *smb_fname_tmp = NULL;
+	int ret;
+
+	ret = catia_string_replace_allocate(handle->conn,
+					    smb_fname->base_name,
+					    &mapped_name,
+					    vfs_translate_to_unix);
+	if (ret != 0) {
+		errno = ret;
+		return -1;
+	}
+
+	smb_fname_tmp = cp_smb_filename(talloc_tos(), smb_fname);
+	if (smb_fname_tmp == NULL) {
+		TALLOC_FREE(mapped_name);
+		errno = ENOMEM;
+		return -1;
+	}
+
+	smb_fname_tmp->base_name = mapped_name;
+
+	ret = SMB_VFS_NEXT_GET_QUOTA(handle, smb_fname_tmp, qtype, id, qt);
+
+	TALLOC_FREE(mapped_name);
+	TALLOC_FREE(smb_fname_tmp);
+
+	return ret;
+}
+
+static int catia_get_shadow_copy_data(vfs_handle_struct *handle,
+				      files_struct *fsp,
+				      struct shadow_copy_data *shadow_copy_data,
+				      bool labels)
+{
+	struct catia_cache *cc = NULL;
+	int ret;
+
+	ret = CATIA_FETCH_FSP_PRE_NEXT(talloc_tos(), handle, fsp, &cc);
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = SMB_VFS_NEXT_GET_SHADOW_COPY_DATA(handle, fsp,
+						shadow_copy_data, labels);
+
+	CATIA_FETCH_FSP_POST_NEXT(&cc, fsp);
+
+	return ret;
+}
+
 static struct vfs_fn_pointers vfs_catia_fns = {
 	.connect_fn = catia_connect,
 
@@ -1919,6 +2013,9 @@ static struct vfs_fn_pointers vfs_catia_fns = {
 	.set_compression_fn = catia_set_compression,
 	.create_dfs_pathat_fn = catia_create_dfs_pathat,
 	.read_dfs_pathat_fn = catia_read_dfs_pathat,
+	.disk_free_fn = catia_disk_free,
+	.get_quota_fn = catia_get_quota,
+	.get_shadow_copy_data_fn = catia_get_shadow_copy_data,
 
 	/* NT ACL operations. */
 	.fget_nt_acl_fn = catia_fget_nt_acl,
