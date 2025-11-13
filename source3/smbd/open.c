@@ -955,6 +955,16 @@ static int tn_reopen_from_fsp_fast(struct files_struct *fsp,
 {
 	int fd_status;
 
+	if (fsp->dptr != NULL) {
+		// We have request to reopen a files_struct that
+		// has an open DIR. The primary reason why this
+		// would happen is if we're handling QUERY_DIRECTORY
+		// with flag to SMB2_REOPEN. Returning -1 here
+		// will force us to fd_close the fsp (which closes
+		// the DIR), and then reopen it.
+		return -1;
+	}
+
 	if ((old_fd == AT_FDCWD) || (old_fd == -1)) {
 		return -1;
 	}
