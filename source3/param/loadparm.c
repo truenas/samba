@@ -285,11 +285,41 @@ static bool lp_set_cmdline_helper(const char *pszParmName, const char *pszParmVa
 static void free_param_opts(struct parmlist_entry **popts);
 
 /**
+ * Get the kernel limit of maximum number of file handles a process can allocate
+ */
+static int procfs_get_max_open_files(void)
+{
+	#define PROCFS_NR_OPEN_PATH "/proc/sys/fs/nr_open"
+	FILE *fp = fopen(PROCFS_NR_OPEN_PATH, "r");
+	int ret, procfs_max = MAX_OPEN_FILES;
+
+	if (fp == NULL) {
+		DBG_ERR(PROCFS_NR_OPEN_PATH "Failed to open procfs path "
+			"in order to read current process max open files. "
+			"defaulting to MAX_OPEN_FILES (%u): %s", MAX_OPEN_FILES,
+			strerror(errno));
+		return procfs_max;
+	}
+
+	ret = fscanf(fp, "%d", &procfs_max);
+	fclose(fp);
+	if (ret == -1) {
+		DBG_ERR(PROCFS_NR_OPEN_PATH ": failed to parse procfs path. "
+			"defaulting to MAX_OPEN_FILES (%u): %s", MAX_OPEN_FILES,
+			strerror(errno));
+		return MAX_OPEN_FILES;
+	}
+
+	return procfs_max;
+}
+
+/**
  *  Function to return the default value for the maximum number of open
  *  file descriptors permitted.  This function tries to consult the
  *  kernel-level (sysctl) and ulimit (getrlimit()) values and goes
  *  the smaller of those.
  */
+
 static int max_open_files(void)
 {
 	int sysctl_max = MAX_OPEN_FILES;
@@ -301,6 +331,8 @@ static int max_open_files(void)
 		sysctlbyname("kern.maxfilesperproc", &sysctl_max, &size, NULL,
 			     0);
 	}
+#else
+	sysctl_max = procfs_get_max_open_files();
 #endif
 
 #if (defined(HAVE_GETRLIMIT) && defined(RLIMIT_NOFILE))
