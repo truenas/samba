@@ -923,7 +923,7 @@ struct vfs_aio_state {
 
 #define VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS 1
 #define VFS_OPEN_HOW_WITH_BACKUP_INTENT 2
-#define VFS_OPEN_HOW_TRUENAS_ABE 3
+#define VFS_OPEN_HOW_TRUENAS_ABE 4
 
 struct vfs_open_how {
 	int flags;
