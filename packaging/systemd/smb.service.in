@@ -8,9 +8,9 @@ Requires=winbind.service
 [Service]
 Type=notify
 PIDFile=@PIDDIR@/smbd.pid
-LimitNOFILE=16384
+LimitNOFILE=infinity
 EnvironmentFile=-@SYSCONFDIR@/sysconfig/samba
-ExecStart=@SBINDIR@/smbd --foreground --no-process-group $SMBDOPTIONS
+ExecStart=@SBINDIR@/smbd --foreground --no-process-group
 ExecReload=/bin/kill -HUP $MAINPID
 LimitCORE=infinity
 @systemd_smb_extra@
