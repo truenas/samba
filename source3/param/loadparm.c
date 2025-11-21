@@ -305,7 +305,7 @@ static int procfs_get_max_open_files(void)
 	fclose(fp);
 	if (ret == -1) {
 		DBG_ERR(PROCFS_NR_OPEN_PATH ": failed to parse procfs path. "
-			"defaulting to MAX_OPEN_FILES (%u): %s", MAX_OPEN_FILES,
+			"Defaulting to MAX_OPEN_FILES (%u): %s", MAX_OPEN_FILES,
 			strerror(errno));
 		return MAX_OPEN_FILES;
 	}
