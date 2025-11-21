@@ -133,8 +133,22 @@ class MdssvcTests(RpcInterfaceTestCase):
         exp_json_query = r'''{
           "from": 0, "size": 50, "_source": ["path.real"],
           "query": {
-            "query_string": {
-              "query": "(samba*) AND path.real.fulltext:\"%BASEPATH%\""
+            "bool": {
+              "filter": [
+                {
+                  "prefix": {
+                    "path.real": "%BASEPATH%/"
+                  }
+                }
+              ],
+              "must": [
+                {
+                  "query_string": {
+                    "query": "samba*",
+                    "fields": ["file.filename", "content"]
+                  }
+                }
+              ]
             }
           }
         }'''
@@ -165,8 +179,22 @@ class MdssvcTests(RpcInterfaceTestCase):
         exp_json_query = r'''{
           "from": 0, "size": 50, "_source": ["path.real"],
           "query": {
-            "query_string": {
-              "query": "(file.filename:x\\+x OR file.filename:x\\*x OR file.filename:x=x OR file.filename:x'x OR file.filename:x\\?x OR file.filename:x\\ x OR file.filename:x\\(x OR file.filename:x\\\"x OR file.filename:x\\\\x) AND path.real.fulltext:\"%BASEPATH%\""
+            "bool": {
+              "filter": [
+                {
+                  "prefix": {
+                    "path.real": "%BASEPATH%/"
+                  }
+                }
+              ],
+              "must": [
+                {
+                  "query_string": {
+                    "query": "file.filename:x\\+x OR file.filename:x\\*x OR file.filename:x=x OR file.filename:x'x OR file.filename:x\\?x OR file.filename:x\\ x OR file.filename:x\\(x OR file.filename:x\\\"x OR file.filename:x\\\\x",
+                    "fields": ["file.filename", "content"]
+                  }
+                }
+              ]
             }
           }
         }'''
@@ -207,8 +235,22 @@ class MdssvcTests(RpcInterfaceTestCase):
         exp_json_query = r'''{
           "from": 0, "size": 50, "_source": ["path.real"],
           "query": {
-            "query_string": {
-              "query": "(*samba*) AND path.real.fulltext:\"%BASEPATH%\""
+            "bool": {
+              "filter": [
+                {
+                  "prefix": {
+                    "path.real": "%BASEPATH%/"
+                  }
+                }
+              ],
+              "must": [
+                {
+                  "query_string": {
+                    "query": "*samba*",
+                    "fields": ["file.filename", "content"]
+                  }
+                }
+              ]
             }
           }
         }'''

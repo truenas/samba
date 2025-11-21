@@ -426,6 +426,39 @@
 	    </listitem>
 	  </varlistentry>
 
+	  <varlistentry>
+	    <term>fruit:posix_opens = yes | no</term>
+	    <listitem>
+
+	      <para>When <parameter>fruit:posix_opens</parameter> is set to
+	      <parameter>yes</parameter>, vfs_fruit will internally translate
+	      all filesystem semantics to use POSIX behaviour instead of Windows
+	      behaviour. As Macs are closer to POSIX than Windows with regard
+	      to filesystem semantics, this improves access semantics for
+	      a lot of corner cases.</para>
+	      <para>The default is <emphasis>yes</emphasis>.</para>
+
+            </listitem>
+	  </varlistentry>
+
+	  <varlistentry>
+	    <term>fruit:ignore_zero_aces = yes | no</term>
+	    <listitem>
+
+	      <para>When <parameter>fruit:ignore_zero_aces</parameter> is
+	      enabled, attempts to modify filesystem permissions fail if the ACL
+	      sent over the wire contains no ACEs. This is completely valid
+	      client behaviour, but it means subsequently no further access is
+	      possible to the file, unless permissions get fixed by an
+	      administrator.</para>
+	      <para>This problematic behaviour has been reported for latest
+	      macOS versions and this new option allows to work around
+	      it.</para>
+	      <para>The default is <emphasis>yes</emphasis>.</para>
+
+            </listitem>
+	  </varlistentry>
+
 	</variablelist>
 </refsect1>
 
