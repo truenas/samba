@@ -7840,6 +7840,180 @@ done:
 }
 
 /*
+  test exclusive byte range lock on read-only file
+*/
+static bool test_readonly_exclusive_lock(struct torture_context *tctx,
+					 struct smb2_tree *tree)
+{
+	NTSTATUS status;
+	bool ret = true;
+	struct smb2_handle h;
+	struct smb2_create create;
+	struct smb2_lock lock;
+	struct smb2_lock_element lock_element;
+	const char *fname = "readonly_lock_test.txt";
+
+	torture_comment(tctx, "Testing exclusive lock on read-only opened file\n");
+
+	ret = enable_aapl(tctx, tree);
+	torture_assert_goto(tctx, ret == true, ret, done, "enable_aapl failed");
+
+	/* Clean up any existing file */
+	smb2_util_unlink(tree, fname);
+
+	/* Create the file first with write access to ensure it exists */
+	ZERO_STRUCT(create);
+	create.in.desired_access = SEC_RIGHTS_FILE_ALL;
+	create.in.file_attributes = FILE_ATTRIBUTE_NORMAL;
+	create.in.share_access = NTCREATEX_SHARE_ACCESS_READ |
+				 NTCREATEX_SHARE_ACCESS_WRITE |
+				 NTCREATEX_SHARE_ACCESS_DELETE;
+	create.in.create_disposition = NTCREATEX_DISP_CREATE;
+	create.in.impersonation_level = SMB2_IMPERSONATION_ANONYMOUS;
+	create.in.security_flags = 0;
+	create.in.fname = fname;
+
+	status = smb2_create(tree, tctx, &create);
+	CHECK_STATUS(status, NT_STATUS_OK);
+
+	/* Write some data to the file */
+	status = smb2_util_write(tree, create.out.file.handle, "test data", 0, 9);
+	CHECK_STATUS(status, NT_STATUS_OK);
+
+	/* Close the file */
+	status = smb2_util_close(tree, create.out.file.handle);
+	CHECK_STATUS(status, NT_STATUS_OK);
+
+	/* Now open the file read-only */
+	ZERO_STRUCT(create);
+	create.in.desired_access = SEC_FILE_READ_DATA | SEC_FILE_READ_ATTRIBUTE;
+	create.in.file_attributes = FILE_ATTRIBUTE_NORMAL;
+	create.in.share_access = NTCREATEX_SHARE_ACCESS_READ |
+				 NTCREATEX_SHARE_ACCESS_WRITE |
+				 NTCREATEX_SHARE_ACCESS_DELETE;
+	create.in.create_disposition = NTCREATEX_DISP_OPEN;
+	create.in.impersonation_level = SMB2_IMPERSONATION_ANONYMOUS;
+	create.in.security_flags = 0;
+	create.in.fname = fname;
+
+	status = smb2_create(tree, tctx, &create);
+	CHECK_STATUS(status, NT_STATUS_OK);
+	h = create.out.file.handle;
+
+	torture_comment(tctx, "File opened read-only successfully\n");
+
+	/* Attempt to set an exclusive byte-range lock */
+	ZERO_STRUCT(lock);
+	ZERO_STRUCT(lock_element);
+
+	lock.in.lock_count = 1;
+	lock.in.lock_sequence = 0;
+	lock.in.file.handle = h;
+	lock.in.locks = &lock_element;
+
+	lock_element.offset = 0;
+	lock_element.length = 100;
+	lock_element.flags = SMB2_LOCK_FLAG_EXCLUSIVE | SMB2_LOCK_FLAG_FAIL_IMMEDIATELY;
+
+	torture_comment(tctx, "Attempting to set exclusive lock on read-only file\n");
+
+	status = smb2_lock(tree, &lock);
+	CHECK_STATUS(status, NT_STATUS_OK);
+
+done:
+	/* Close the file */
+	smb2_util_close(tree, h);
+
+	/* Clean up */
+	smb2_util_unlink(tree, fname);
+
+	return ret;
+}
+
+/*
+ * Test case-insensitive file finding with AAPL extensions
+ * Add this function to source4/torture/vfs/fruit.c
+ */
+
+static bool test_case_insensitive_find(struct torture_context *tctx,
+				       struct smb2_tree *tree)
+{
+	NTSTATUS status;
+	bool ret = true;
+	const char *fname = "TestFile.txt";
+	const char *fname_upper = "TESTFILE.TXT";
+	struct smb2_handle testdirh;
+	struct smb2_handle h1;
+	struct smb2_create create;
+	struct smb2_find f;
+	union smb_search_data *d;
+	uint_t count;
+
+	smb2_deltree(tree, BASEDIR);
+
+	status = torture_smb2_testdir(tree, BASEDIR, &testdirh);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"torture_smb2_testdir failed");
+
+	/* Enable AAPL extensions */
+	ret = enable_aapl(tctx, tree);
+	torture_assert_goto(tctx, ret, ret, done,
+			    "enable_aapl failed");
+
+	/* Create test file */
+	ZERO_STRUCT(create);
+	create.in.desired_access = SEC_RIGHTS_FILE_ALL;
+	create.in.file_attributes = FILE_ATTRIBUTE_NORMAL;
+	create.in.share_access = NTCREATEX_SHARE_ACCESS_READ |
+		NTCREATEX_SHARE_ACCESS_WRITE |
+		NTCREATEX_SHARE_ACCESS_DELETE;
+	create.in.create_disposition = NTCREATEX_DISP_CREATE;
+	create.in.impersonation_level = SMB2_IMPERSONATION_ANONYMOUS;
+	create.in.fname = talloc_asprintf(tctx, "%s\\%s", BASEDIR, fname);
+
+	status = smb2_create(tree, tctx, &create);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					talloc_asprintf(tctx, "failed to create %s", fname));
+	h1 = create.out.file.handle;
+
+	/* Close the file */
+	status = smb2_util_close(tree, h1);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"failed to close test file");
+
+	/* Search for file using different case */
+	f = (struct smb2_find) {
+		.in.file.handle = testdirh,
+		.in.pattern = fname_upper,
+		.in.max_response_size = 0x1000,
+		.in.level = SMB2_FIND_ID_BOTH_DIRECTORY_INFO,
+	};
+
+	status = smb2_find_level(tree, tctx, &f, &count, &d);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					talloc_asprintf(tctx, "smb2_find_level failed searching for %s", fname_upper));
+
+	/* Verify we found exactly one file */
+	torture_assert_int_equal_goto(tctx, count, 1, ret, done,
+				      talloc_asprintf(tctx, "Expected 1 file, got %u", count));
+
+	/* Verify the filename matches our original file (case may differ) */
+	torture_assert_str_equal_goto(tctx,
+				      d[0].id_both_directory_info.name.s, fname, ret, done,
+				      talloc_asprintf(tctx, "Found file name '%s' doesn't match expected '%s'",
+						      d[0].directory_info.name.s, fname));
+
+	torture_comment(tctx, "Case-insensitive find test passed: "
+			"searched for '%s', found '%s'\n",
+			fname_upper, d[0].id_both_directory_info.name.s);
+
+done:
+	smb2_util_close(tree, testdirh);
+	smb2_deltree(tree, BASEDIR);
+	return ret;
+}
+
+/*
  * Note: This test depends on "vfs objects = catia fruit streams_xattr".  For
  * some tests torture must be run on the host it tests and takes an additional
  * argument with the local path to the share:
@@ -7885,7 +8059,8 @@ struct torture_suite *torture_vfs_fruit(TALLOC_CTX *ctx)
 	torture_suite_add_1smb2_test(suite, "empty_stream", test_empty_stream);
 	torture_suite_add_1smb2_test(suite, "writing_afpinfo", test_writing_afpinfo);
 	torture_suite_add_1smb2_test(suite, "delete_trigger_convert_sharing_violation", test_delete_trigger_convert_sharing_violation);
-
+	torture_suite_add_1smb2_test(suite, "readonly-exclusive-lock", test_readonly_exclusive_lock);
+	torture_suite_add_1smb2_test(suite, "case_insensitive_find", test_case_insensitive_find);
 	return suite;
 }
 
@@ -8002,7 +8177,7 @@ static bool test_fruit_locking_conflict(struct torture_context *tctx,
 
 	/* Add AD_FILELOCK_RSRC_DENY_WR lock. */
 	el = (struct smb2_lock_element) {
-		.offset = 0xfffffffffffffffc,
+		.offset = 0x7ffffffffffffffc,
 		.length = 1,
 		.flags = SMB2_LOCK_FLAG_EXCLUSIVE,
 	};
