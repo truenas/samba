@@ -296,7 +296,7 @@ static int procfs_get_max_open_files(void)
 	if (fp == NULL) {
 		DBG_ERR(PROCFS_NR_OPEN_PATH "Failed to open procfs path "
 			"in order to read current process max open files. "
-			"defaulting to MAX_OPEN_FILES (%u): %s", MAX_OPEN_FILES,
+			"Defaulting to MAX_OPEN_FILES (%u): %s", MAX_OPEN_FILES,
 			strerror(errno));
 		return procfs_max;
 	}
