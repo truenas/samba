@@ -125,6 +125,7 @@ struct fruit_config_data {
 	bool use_aapl;		/* config from smb.conf */
 	bool use_copyfile;
 	bool readdir_attr_enabled;
+	bool posix_opens;
 	bool unix_info_enabled;
 	bool copyfile_enabled;
 	bool veto_appledouble;
@@ -137,6 +138,7 @@ struct fruit_config_data {
 	bool wipe_intentionally_left_blank_rfork;
 	bool delete_empty_adfiles;
 	bool validate_afpinfo;
+	bool ignore_zero_aces;
 
 	/*
 	 * Additional options, all enabled by default,
@@ -352,6 +354,14 @@ static int init_fruit_config(vfs_handle_struct *handle)
 
 	config->use_copyfile = lp_parm_bool(-1, FRUIT_PARAM_TYPE_NAME,
 					   "copyfile", false);
+
+	config->posix_opens = lp_parm_bool(
+		SNUM(handle->conn), FRUIT_PARAM_TYPE_NAME, "posix_opens", true);
+
+	config->ignore_zero_aces = lp_parm_bool(SNUM(handle->conn),
+						FRUIT_PARAM_TYPE_NAME,
+						"ignore_zero_aces",
+						true);
 
 	config->aapl_zero_file_id =
 	    lp_parm_bool(SNUM(handle->conn), FRUIT_PARAM_TYPE_NAME,
@@ -1811,16 +1821,27 @@ static int fruit_openat(vfs_handle_struct *handle,
 			files_struct *fsp,
 			const struct vfs_open_how *how)
 {
+	struct fruit_config_data *config = NULL;
 	int fd;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct fruit_config_data, return -1);
 
 	DBG_DEBUG("Path [%s]\n", smb_fname_str_dbg(smb_fname));
 
 	if (!is_named_stream(smb_fname)) {
-		return SMB_VFS_NEXT_OPENAT(handle,
-					   dirfsp,
-					   smb_fname,
-					   fsp,
-					   how);
+		fd = SMB_VFS_NEXT_OPENAT(handle,
+					 dirfsp,
+					 smb_fname,
+					 fsp,
+					 how);
+		if (fd == -1) {
+			return -1;
+		}
+		if (config->posix_opens && global_fruit_config.nego_aapl) {
+			fsp->fsp_flags.posix_open = true;
+		}
+		return fd;
 	}
 
 	if (how->resolve != 0) {
@@ -1855,7 +1876,13 @@ static int fruit_openat(vfs_handle_struct *handle,
 	DBG_DEBUG("Path [%s] fd [%d]\n", smb_fname_str_dbg(smb_fname), fd);
 
 	/* Prevent reopen optimisation */
+	if (fd == -1) {
+		return -1;
+	}
 	fsp->fsp_flags.have_proc_fds = false;
+	if (config->posix_opens && global_fruit_config.nego_aapl) {
+		fsp->fsp_flags.posix_open = true;
+	}
 	return fd;
 }
 
@@ -4667,12 +4694,17 @@ static NTSTATUS fruit_fset_nt_acl(vfs_handle_struct *handle,
 				  uint32_t security_info_sent,
 				  const struct security_descriptor *orig_psd)
 {
+	struct fruit_config_data *config = NULL;
 	NTSTATUS status;
 	bool do_chmod;
 	mode_t ms_nfs_mode = 0;
 	int result;
 	struct security_descriptor *psd = NULL;
 	uint32_t orig_num_aces = 0;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct fruit_config_data,
+				return NT_STATUS_UNSUCCESSFUL);
 
 	if (orig_psd->dacl != NULL) {
 		orig_num_aces = orig_psd->dacl->num_aces;
@@ -4684,6 +4716,13 @@ static NTSTATUS fruit_fset_nt_acl(vfs_handle_struct *handle,
 	}
 
 	DBG_DEBUG("%s\n", fsp_str_dbg(fsp));
+
+	if (config->ignore_zero_aces && (psd->dacl->num_aces == 0)) {
+		/*
+		 * Just ignore Set-ACL requests with zero ACEs.
+		 */
+		return NT_STATUS_OK;
+	}
 
 	status = check_ms_nfs(handle, fsp, psd, &ms_nfs_mode, &do_chmod);
 	if (!NT_STATUS_IS_OK(status)) {
