@@ -4706,6 +4706,16 @@ static NTSTATUS fruit_fset_nt_acl(vfs_handle_struct *handle,
 				struct fruit_config_data,
 				return NT_STATUS_UNSUCCESSFUL);
 
+	/*
+	 * Skip special ACL handling if client hasn't opened a with special
+	 * macos create context. Basically, this means skip this logic if we
+	 * have Windows clients. The reason for this is that client applications
+	 * may expect correct NULL / empty DACL handling.
+	 */
+	if (!global_fruit_config.nego_aapl) {
+		return SMB_VFS_NEXT_FSET_NT_ACL(handle, fsp, security_info_sent, orig_psd);
+	}
+
 	if (orig_psd->dacl != NULL) {
 		orig_num_aces = orig_psd->dacl->num_aces;
 	}
