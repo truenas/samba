@@ -36,17 +36,27 @@
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_RPC_SRV
 
-#define MDSSVC_ELASTIC_QUERY_TEMPLATE	\
-	"{"				\
-	"    \"from\": %zu,"		\
-	"    \"size\": %zu,"		\
-	"    \"_source\": [%s],"	\
-	"    \"query\": {"		\
-        "        \"query_string\": {"	\
-	"            \"query\": \"%s\"" \
-	"        }"			\
-	"    }"				\
-	"}"
+#define MDSSVC_ELASTIC_QUERY_TEMPLATE			\
+	"{\n"						\
+	"    \"from\": %zu,\n"				\
+	"    \"size\": %zu,\n"				\
+	"    \"_source\": [%s],\n"			\
+	"    \"query\": {\n"				\
+	"        \"bool\": {\n"				\
+	"            \"filter\": [ {\n"			\
+	"                \"prefix\": {\n"		\
+	"                    \"path.real\": \"%s/\"\n"	\
+	"                }\n"				\
+	"            } ],\n"				\
+	"            \"must\": [ {\n"			\
+        "                \"query_string\": {\n"		\
+	"                    \"query\": \"%s\",\n"	\
+	"                    \"fields\": [%s]\n"	\
+	"                }\n"				\
+	"            } ]\n"				\
+	"        }\n"					\
+	"    }\n"					\
+	"}\n"
 
 #define MDSSVC_ELASTIC_SOURCES \
 	"\"path.real\""
@@ -57,6 +67,7 @@ static bool mdssvc_es_init(struct mdssvc_ctx *mdssvc_ctx)
 	json_error_t json_error;
 	char *default_path = NULL;
 	const char *path = NULL;
+	const char *default_fields = "\"file.filename\", \"content\"";
 
 	mdssvc_es_ctx = talloc_zero(mdssvc_ctx, struct mdssvc_es_ctx);
 	if (mdssvc_es_ctx == NULL) {
@@ -96,6 +107,15 @@ static bool mdssvc_es_init(struct mdssvc_ctx *mdssvc_ctx)
 		return false;
 	}
 	TALLOC_FREE(default_path);
+
+	mdssvc_es_ctx->default_fields = lp_parm_const_string(GLOBAL_SECTION_SNUM,
+							     "elasticsearch",
+							     "default_fields",
+							     default_fields);
+	if (mdssvc_es_ctx->default_fields == NULL) {
+		TALLOC_FREE(mdssvc_es_ctx);
+		return false;
+	}
 
 	mdssvc_ctx->backend_private = mdssvc_es_ctx;
 	return true;
@@ -429,7 +449,6 @@ static bool mds_es_search(struct sl_query *slq)
 	ok = map_spotlight_to_es_query(
 		s,
 		mds_es_ctx->mdssvc_es_ctx->mappings,
-		slq->path_scope,
 		slq->query_string,
 		&s->es_query);
 	if (!ok) {
@@ -632,12 +651,15 @@ static struct tevent_req *mds_es_search_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
-	elastic_query = talloc_asprintf(state,
-					MDSSVC_ELASTIC_QUERY_TEMPLATE,
-					s->from,
-					s->size,
-					MDSSVC_ELASTIC_SOURCES,
-					s->es_query);
+	elastic_query = talloc_asprintf(
+		state,
+		MDSSVC_ELASTIC_QUERY_TEMPLATE,
+		s->from,
+		s->size,
+		MDSSVC_ELASTIC_SOURCES,
+		s->slq->path_scope,
+		s->es_query,
+		s->mds_es_ctx->mdssvc_es_ctx->default_fields);
 	if (tevent_req_nomem(elastic_query, req)) {
 		return tevent_req_post(req, ev);
 	}
