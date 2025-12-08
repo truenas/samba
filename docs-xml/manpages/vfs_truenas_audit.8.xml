@@ -201,7 +201,7 @@
 		<varlistentry>
 		<term>truenas_audit:watch_list = LIST</term>
 		<listitem>
-		<para>List of group names for which to generate audit messages.
+		<para>List of group SIDs for which to generate audit messages.
 		The default is all groups.
 		</para>
 
@@ -211,7 +211,7 @@
 		<varlistentry>
 		<term>truenas_audit:ignore_list = LIST</term>
 		<listitem>
-		<para>List of group names for which to explicitly not generate audit
+		<para>List of group SIDs for which to explicitly not generate audit
 		messages. The default is all groups.
 		NOTE: if user is member of group in watch_list and ignore_list, then
 		SMB operations will be audited.
