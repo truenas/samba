@@ -28,6 +28,8 @@
 #include "lib/param/loadparm.h"
 #include "lib/util/tevent_unix.h"
 #include "libcli/security/sddl.h"
+#include "libcli/security/security.h"
+#include "libcli/security/dom_sid.h"
 #include "passdb/machine_sid.h"
 
 #include <jansson.h>
@@ -181,44 +183,84 @@ static bool tn_audit_do_noop(struct json_object *audit_msg,
 }
 
 enum tn_audit_filter {WATCH_LIST, IGNORE_LIST};
+
+/**
+ * @brief check whether the specified security token has one of the group sids
+ *
+ * This function takes a list of SID strings from the share configuration and
+ * checks whether the user's security token contains the one of the SIDs from
+ * the list.
+ *
+ * @param[in] user - the name of the user connecting to the share
+ * @param[in] grouplist - an array of SID strings (hopefully) in the share config
+ * @param[in] token - intialized security_token structure for SMB session
+ * @param[in] tn_audit_filter - the filter type we're parsing
+ * @param[out] pmatch - boolean set on successful completion of function. Will
+ *             be true if the security token contains at least one SID from the
+ *             input list. Otherwise will be false. Value is indeterminite on failure.
+ * @return true on success, false on error
+ */
 static bool tn_audit_check_group_list(const char *user,
 				      const char **grouplist,
-				      enum tn_audit_filter f)
+				      const struct security_token *token,
+				      enum tn_audit_filter f,
+				      bool *pmatch)
 {
 	bool def = f == WATCH_LIST ? true : false;
 	const char *filter_name = f == WATCH_LIST ? "watch_list" : "ignore_list";
 	int i;
 
 	if (user == NULL) {
-		DBG_ERR("%s: Username is NULL. "
-			"Returning default value of [%s].\n",
-			filter_name, def ? "true": "false");
-		return def;
+		/*
+		 * This is not an expected situation. Username should be set so we'll
+		 * error out.
+		 */
+		DBG_ERR("Username is NULL. Denying access.\n");
+		errno = EINVAL;
+		return false;
 	}
 
 	if (grouplist == NULL) {
+		/*
+		 * This is an expected situation if user has defaults set
+		 */
 		DBG_DEBUG("%s: No grouplist specified. "
 			  "Returning default value of [%s].\n",
 			  filter_name, def ? "true": "false");
-		return def;
+		*pmatch = def;
+		return true;
 	}
+
+	SMB_ASSERT(token != NULL);
 
 	for (i = 0; grouplist && grouplist[i]; i++) {
 		const char *group = grouplist[i];
+		struct dom_sid sid;
+		// Special handling for users who have inserted an explicit wildcard
 		if (strcmp(group, "*") == 0) {
 			DBG_DEBUG("%s: wildcard filter applied\n",
 				  filter_name);
+			*pmatch = true;
 			return true;
 		}
 
-		if (user_in_group(user, group)) {
+		if (!dom_sid_parse(group, &sid)) {
+			DBG_ERR("%s: failed to parse SID. Denying access for user: %s.",
+				group, user);
+			errno = EINVAL;
+			return false;
+		}
+
+		if (security_token_has_sid(token, &sid)) {
 			DBG_DEBUG("%s: user [%s] is in group [%s]\n",
 				  filter_name, user, group);
+			*pmatch = true;
 			return true;
 		}
         }
 
-	return false;
+	*pmatch = false;
+	return true;
 }
 
 static bool tn_audit_backend_init(vfs_handle_struct *handle,
@@ -227,6 +269,7 @@ static bool tn_audit_backend_init(vfs_handle_struct *handle,
 				  tn_audit_conf_t *config)
 {
 	bool enabled = true;
+	bool match, ok;
 	int enumval;
 	const char **watch_list = NULL;
 	const char **ignore_list = NULL;
@@ -235,10 +278,10 @@ static bool tn_audit_backend_init(vfs_handle_struct *handle,
 	enumval = lp_parm_enum(SNUM(handle->conn), MODULE_NAME,
 			       "backend", tn_audit_backends, TN_BACKEND_SYSLOG);
 	if (enumval == -1) {
-                DBG_ERR("value for %s:backend type unknown\n",
+		DBG_ERR("value for %s:backend type unknown\n",
 			MODULE_NAME);
 		return -1;
-        }
+	}
 
 	switch ((enum tn_audit_backend)enumval) {
 	case TN_BACKEND_SYSLOG:
@@ -278,14 +321,30 @@ static bool tn_audit_backend_init(vfs_handle_struct *handle,
 					  MODULE_NAME,
 					  "ignore_list", NULL);
 
-	if (tn_audit_check_group_list(user, ignore_list, IGNORE_LIST)) {
+	ok = tn_audit_check_group_list(user,
+				       ignore_list,
+				       handle->conn->session_info->security_token,
+				       IGNORE_LIST,
+				       &match);
+	if (!ok) {
+		return false;
+	}
+
+	if (match) {
 		enabled = false;
 	}
 
 	if (watch_list) {
-		enabled = tn_audit_check_group_list(user,
-						    watch_list,
-						    WATCH_LIST);
+		ok = tn_audit_check_group_list(user,
+					       watch_list,
+					       handle->conn->session_info->security_token,
+					       WATCH_LIST,
+					       &match);
+		if (!ok) {
+			return false;
+		}
+
+		enabled = match;
 	}
 
 	if (!enabled) {
