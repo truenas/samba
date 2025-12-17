@@ -286,6 +286,7 @@ static bool get_history_full_path(int _fd, struct tmprotect_config_data *config)
 
 	config->history_file = talloc_strndup(config, buf, sz);
 	if (config->history_file == NULL) {
+		DBG_ERR("Memory allocation failure");
 		return false;
 	}
 	return true;
@@ -318,15 +319,14 @@ static int tmprotect_openat(vfs_handle_struct *handle,
 				  smb_fname,
 				  fsp, how);
 
-	if ((ret == -1) ||
-	    (config->history_file != NULL) ||
-	    fsp->fsp_flags.is_pathref) {
+	if ((ret == -1) || (config->history_file != NULL)) {
 		return ret;
 	}
 
 	flen = strlen(fsp->fsp_name->base_name);
 	if ((flen < slen) ||
 	    (strcmp(tm_plist_suffix, fsp->fsp_name->base_name + (flen - slen)) != 0)) {
+		DBG_DEBUG("%s: skipping file\n", fsp_str_dbg(fsp));
 		return ret;
 	}
 
@@ -348,6 +348,8 @@ static int tmprotect_openat(vfs_handle_struct *handle,
 		DBG_ERR("%s: failed to prune snapshots: %s\n",
 			handle->conn->connectpath, strerror(errno));
 	}
+
+	DBG_DEBUG("%s: opened history file\n", config->history_file);
 	return ret;
 }
 
