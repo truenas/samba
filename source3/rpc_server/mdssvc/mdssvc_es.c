@@ -220,6 +220,7 @@ struct mds_es_connect_state {
 };
 
 static void mds_es_http_connect_done(struct tevent_req *subreq);
+static void mds_es_unix_http_connect_done(struct tevent_req *subreq);
 static void mds_es_http_waited(struct tevent_req *subreq);
 
 static struct tevent_req *mds_es_connect_send(
@@ -299,6 +300,7 @@ static struct tevent_req *mds_es_connect_send(
 	}
 
 	if (is_unix) {
+		become_root();
 		subreq = http_connect_unix_send(state,
 						state->ev,
 						state->server_addr,
@@ -312,10 +314,24 @@ static struct tevent_req *mds_es_connect_send(
 					   state->tls_params);
 	}
 	if (tevent_req_nomem(subreq, req)) {
+		if (is_unix) {
+			unbecome_root();
+		}
 		return tevent_req_post(req, ev);
 	}
-	tevent_req_set_callback(subreq, mds_es_http_connect_done, req);
+
+	if (is_unix) {
+		tevent_req_set_callback(subreq, mds_es_unix_http_connect_done, req);
+	} else {
+		tevent_req_set_callback(subreq, mds_es_http_connect_done, req);
+	}
 	return req;
+}
+
+static void mds_es_unix_http_connect_done(struct tevent_req *subreq)
+{
+	unbecome_root();
+	mds_es_http_connect_done(subreq);
 }
 
 static void mds_es_http_connect_done(struct tevent_req *subreq)
