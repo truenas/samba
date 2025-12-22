@@ -162,13 +162,8 @@ static bool ixnas_set_native_dosmode(struct files_struct *fsp, uint64_t dosmode)
 		int fd;
 		fd = ixnas_pathref_reopen(fsp, O_RDWR);
 		if (fd == -1) {
-			if ((errno != EACCES) && (errno != EPERM)) {
-				DBG_WARNING("%s: open() failed: %s\n",
-					    fsp_str_dbg(fsp), strerror(errno));
-			} else {
-				DBG_DEBUG("Setting dosmode failed for %s: %s\n",
-					  fsp_str_dbg(fsp), strerror(errno));
-			}
+			DBG_WARNING("%s: open() failed: %s\n",
+				    fsp_str_dbg(fsp), strerror(errno));
 			return false;
 		}
 		err = ioctl(fd, ZFS_IOC_SETDOSFLAGS, &dosmode);
