@@ -156,3 +156,5 @@ usr/lib/*/libsamba-errors.so
 usr/lib/*/libndr-standard.so
 usr/lib/*/libsmbldap.so
 usr/lib/*/pkgconfig/*
+usr/share/locale/*/LC_MESSAGES/pam_winbind.mo
+usr/share/locale/*/LC_MESSAGES/net.mo
