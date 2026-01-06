@@ -1,3 +1,10 @@
+samba (2:4.23.4+ix-0) unstable; urgency=medium
+
+ * Update to samba 4.23.4
+
+ -- Andrew Walker <awalker@ixsystems.com>  Tue, 06 Jan 2026 17:00:00 +0000
+
+
 samba (2:4.22.3+ix-0) unstable; urgency=medium
 
  * Update to samba 4.22.3

@@ -17,6 +17,7 @@ DEB_HOST_ARCH_CPU ?= $(shell dpkg-architecture -qDEB_HOST_ARCH_CPU)
 export PYSHORT=python3
 export PYTHON=$(shell which $(PYSHORT))
 export PYTHON_CONFIG="$(PYTHON)-config"
+
 #WAF := $(PYTHON) ./buildtools/bin/waf -v
 WAF = make
 WAF_NO_PARALLEL := $(WAF) -j 1
@@ -63,13 +64,14 @@ conf_args = \
 		--with-socketpath=/run/ctdb/ctdbd.socket \
 		--with-logdir=/var/log/ctdb \
 		--with-system-mitkrb5 \
-		--enable-etcd-reclock \
 		--disable-cups \
 		--disable-iprint \
 		--vendor-suffix=truenas \
 		--without-ldb-lmdb \
 		--private-libraries='!ldb' \
-		--disable-cephfs
+		--disable-cephfs \
+		--pythondir=/usr/lib/python3/dist-packages \
+		--pythonarchdir=/usr/lib/python3/dist-packages \
 
 ifeq ($(DEB_HOST_ARCH_OS), linux)
 	conf_args += \
