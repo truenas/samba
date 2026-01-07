@@ -214,9 +214,9 @@ struct sys_proc_fd_path_buf {
 bool sys_have_proc_fds(void);
 char *sys_proc_fd_path(int fd, struct sys_proc_fd_path_buf *buf);
 
-struct stat;
+struct statx;
 void init_stat_ex_from_stat (struct stat_ex *dst,
-			    const struct stat *src,
+			    const struct statx *src,
 			    bool fake_dir_create_times);
 
 /* The following definitions come from lib/system_smbd.c  */
