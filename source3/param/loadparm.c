@@ -852,6 +852,7 @@ void loadparm_s3_init_globals(struct loadparm_context *lp_ctx,
 	Globals.clustering = false;
 	Globals.ctdb_timeout = 0;
 	Globals.ctdb_locktime_warn_threshold = 0;
+	Globals.truenas_stateful_failover = false;
 
 	Globals.winbind_cache_time = 300;	/* 5 minutes */
 	Globals.winbind_reconnect_delay = 30;	/* 30 seconds */
