@@ -1,0 +1,20 @@
+<samba:parameter name="truenas stateful failover"
+                 context="G"
+                 type="boolean"
+                 xmlns:samba="http://www.samba.org/samba/DTD/samba-doc">
+<description>
+	<para>This parameter controls whether TrueNAS stateful failover
+	functionality is enabled.
+	</para>
+
+	<para>When enabled, this allows TrueNAS to maintain state information
+	during a failover event, ensuring continuity of SMB sessions and locks
+	across High Availability failover operations.
+	</para>
+
+	<para>This parameter should only be set to <value type="example">yes</value>
+	on TrueNAS systems configured for High Availability.
+	</para>
+</description>
+<value type="default">no</value>
+</samba:parameter>
