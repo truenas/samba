@@ -191,6 +191,15 @@
 #define SMBD_VOLATILE_TDB_FLAGS \
 	(TDB_DEFAULT|TDB_VOLATILE|TDB_CLEAR_IF_FIRST|TDB_INCOMPATIBLE_HASH)
 
+/*
+ * tdb flags for TrueNAS HA when truenas_stateful_failover is enabled.
+ * Removes TDB_CLEAR_IF_FIRST to allow state to survive server restarts,
+ * enabling durable handle reconnection after reboot/failover.
+ * Keeps TDB_VOLATILE for performance (per-hashchain freelist optimization).
+ */
+#define SMBD_TRUENAS_HA_TDB_FLAGS \
+	(TDB_DEFAULT|TDB_VOLATILE|TDB_INCOMPATIBLE_HASH)
+
 /* Characters we disallow in sharenames. */
 #define INVALID_SHARENAME_CHARS "%<>*?|/\\+=;:\","
 

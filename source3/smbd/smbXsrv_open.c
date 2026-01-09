@@ -68,7 +68,7 @@ NTSTATUS smbXsrv_open_global_init(void)
 
 	db_ctx = db_open(NULL, global_path,
 			 SMBD_VOLATILE_TDB_HASH_SIZE,
-			 SMBD_VOLATILE_TDB_FLAGS,
+			 smbd_tdb_flags(),
 			 O_RDWR | O_CREAT, 0600,
 			 DBWRAP_LOCK_ORDER_1,
 			 DBWRAP_FLAG_NONE);
@@ -1673,4 +1673,137 @@ NTSTATUS smbXsrv_replay_cleanup(const struct GUID *client_guid,
 			nt_errstr(status));
 	}
 	return status;
+}
+
+struct smbXsrv_open_cleanup_startup_state {
+	uint32_t num_scanned;
+	uint32_t num_deleted;
+	uint32_t num_kept;
+};
+
+static int smbXsrv_open_cleanup_startup_fn(
+	struct db_record *rec,
+	struct smbXsrv_open_global0 *global,
+	TDB_DATA *rc_open_global_key,
+	void *private_data)
+{
+	struct smbXsrv_open_cleanup_startup_state *state = private_data;
+	TDB_DATA key = dbwrap_record_get_key(rec);
+	bool delete_entry = false;
+	const char *reason = NULL;
+	NTSTATUS status;
+
+	state->num_scanned++;
+
+	/* Skip replay cache entries */
+	if (rc_open_global_key != NULL) {
+		return 0;
+	}
+
+	if (global == NULL) {
+		reason = "corrupted record";
+		delete_entry = true;
+		goto do_delete;
+	}
+
+	if (!global->durable) {
+		reason = "non-durable handle";
+		delete_entry = true;
+		goto do_delete;
+	}
+
+	if (!server_id_is_disconnected(&global->server_id)) {
+		/*
+		 * Handle not marked disconnected. Either:
+		 * - Orphaned from crashed process
+		 * - Stale PID that got reused (unlikely but possible)
+		 */
+		if (serverid_exists(&global->server_id)) {
+			reason = "active handle after reboot (PID collision?)";
+		} else {
+			reason = "orphaned handle (not marked disconnected)";
+		}
+		delete_entry = true;
+		goto do_delete;
+	}
+
+	/* Valid disconnected durable handle - keep it */
+	DBG_ERR("Keeping valid durable handle [0x%08x], "
+		  "disconnected %"PRIi64"s ago (timeout %"PRIu32"s)\n",
+		  global->open_global_id,
+		  tdiff/1000000,
+		  global->durable_timeout_msec / 1000);
+	state->num_kept++;
+	return 0;
+
+do_delete:
+	DBG_ERR("Deleting stale entry [0x%08x]: %s\n",
+		 global ? global->open_global_id : 0,
+		 reason);
+
+	/* Delete the open_global entry */
+	status = dbwrap_record_delete(rec);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("Failed to delete record %s: %s\n",
+			tdb_data_dbg(key),
+			nt_errstr(status));
+		return -1;
+	}
+
+	/* Clean up replay cache if present */
+	if (global != NULL &&
+	    !GUID_all_zero(&global->create_guid)) {
+		(void)smbXsrv_replay_cleanup(&global->client_guid,
+					     &global->create_guid);
+	}
+
+	state->num_deleted++;
+	return 0;
+}
+
+/*
+ * Cleanup stale entries from persistent TDBs at server startup.
+ *
+ * When truenas_stateful_failover is enabled, TDB databases persist across
+ * restarts to allow durable handle reconnection. This function removes:
+ * - Non-durable handles (don't survive restarts)
+ * - Orphaned handles from crashed processes
+ * - Expired durable handles (timeout exceeded)
+ * - Corrupted/unparseable entries
+ *
+ * Also cleans up associated byte range locks and replay cache entries.
+ *
+ * Note: Share mode entries are left for lazy cleanup since they require
+ * more complex locking logic and are harmless when orphaned.
+ */
+NTSTATUS smbXsrv_open_cleanup_stale_at_startup(void)
+{
+	struct smbXsrv_open_cleanup_startup_state state = { 0 };
+	NTSTATUS status;
+
+	if (!lp_truenas_stateful_failover()) {
+		/* With volatile TDBs, TDB_CLEAR_IF_FIRST handles cleanup */
+		return NT_STATUS_OK;
+	}
+
+	DBG_NOTICE("TrueNAS HA: Cleaning up stale durable handles\n");
+
+	status = smbXsrv_open_global_traverse(
+		smbXsrv_open_cleanup_startup_fn,
+		&state);
+
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("TrueNAS HA: Cleanup traverse failed: %s\n",
+			nt_errstr(status));
+		return status;
+	}
+
+	DBG_NOTICE("TrueNAS HA: Cleanup complete - "
+		   "scanned %"PRIu32" entries, kept %"PRIu32" valid, "
+		   "deleted %"PRIu32" stale entries\n",
+		   state.num_scanned,
+		   state.num_kept,
+		   state.num_deleted);
+
+	return NT_STATUS_OK;
 }

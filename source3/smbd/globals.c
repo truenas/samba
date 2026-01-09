@@ -121,3 +121,11 @@ struct GUID smbd_request_guid(struct smb_request *smb1req, uint16_t idx)
 
 	return v;
 }
+
+int smbd_tdb_flags(void)
+{
+	if (lp_truenas_stateful_failover()) {
+		return SMBD_TRUENAS_HA_TDB_FLAGS;
+	}
+	return SMBD_VOLATILE_TDB_FLAGS;
+}

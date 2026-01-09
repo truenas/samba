@@ -126,7 +126,7 @@ static bool locking_init_internal(bool read_only)
 
 	backend = db_open(NULL, db_path,
 			  SMBD_VOLATILE_TDB_HASH_SIZE,
-			  SMBD_VOLATILE_TDB_FLAGS |
+			  smbd_tdb_flags() |
 			  TDB_SEQNUM,
 			  read_only?O_RDONLY:O_RDWR|O_CREAT, 0644,
 			  DBWRAP_LOCK_ORDER_NONE,

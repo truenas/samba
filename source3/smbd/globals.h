@@ -832,6 +832,11 @@ extern struct smbXsrv_client *global_smbXsrv_client;
 
 void smbd_init_globals(void);
 
+#define SMBD_TRUENAS_HA_TDB_FLAGS \
+       (TDB_DEFAULT|TDB_VOLATILE|TDB_INCOMPATIBLE_HASH)
+int smbd_tdb_flags(void);
+
+
 /****************************************************************************
  The buffer we keep around whilst an aio request is in process.
 *****************************************************************************/

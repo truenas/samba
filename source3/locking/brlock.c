@@ -349,7 +349,7 @@ void brl_init(bool read_only)
 		return;
 	}
 
-	tdb_flags = SMBD_VOLATILE_TDB_FLAGS | TDB_SEQNUM;
+	tdb_flags = smbd_tdb_flags() | TDB_SEQNUM;
 
 	db_path = lock_path(talloc_tos(), "brlock.tdb");
 	if (db_path == NULL) {

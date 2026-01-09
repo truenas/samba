@@ -2475,6 +2475,13 @@ quic_disabled:
 		exit_daemon("Samba cannot init global open", map_errno_from_nt_status(status));
 	}
 
+	status = smbXsrv_open_cleanup_stale_at_startup();
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("Warning: TrueNAS HA cleanup failed: %s\n",
+			nt_errstr(status));
+		/* Non-fatal - continue startup */
+	}
+
 	if (lp_clustering() && !lp_allow_unsafe_cluster_upgrade()) {
 		status = smbd_claim_version(msg_ctx, samba_version_string());
 		if (!NT_STATUS_IS_OK(status)) {
