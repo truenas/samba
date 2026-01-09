@@ -44,7 +44,7 @@ conf_args = \
 		--with-winbind \
 		--without-ad-dc \
 		--with-quotas \
-		--with-shared-modules=idmap_rid,idmap_ad,idmap_ldap,auth_samba4,vfs_nfs4acl_xattr \
+		--with-shared-modules=idmap_rid,idmap_ad,idmap_ldap,auth_samba4,vfs_nfs4acl_xattr,!vfs_snapper \
 		--with-automount \
 		--with-ldap \
 		--with-ads \
@@ -70,6 +70,7 @@ conf_args = \
 		--without-ldb-lmdb \
 		--private-libraries='!ldb' \
 		--disable-cephfs \
+		--disable-glusterfs \
 		--pythondir=/usr/lib/python3/dist-packages \
 		--pythonarchdir=/usr/lib/python3/dist-packages \
 
