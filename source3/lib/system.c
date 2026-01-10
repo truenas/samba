@@ -51,6 +51,12 @@
      expansions/etc make sense to the OS should be acceptable to Samba.
 */
 
+static inline
+struct timespec stx_timestamp_to_timespec(const struct statx_timestamp sts)
+{
+	return (struct timespec){.tv_sec = sts.tv_sec, .tv_nsec = sts.tv_nsec};
+}
+
 /*******************************************************************
 A send wrapper that will deal with EINTR or EAGAIN or EWOULDBLOCK.
 ********************************************************************/
@@ -190,7 +196,7 @@ static void make_create_timespec(const struct statx *pst, struct stat_ex *dst,
 	}
 
 	dst->st_ex_iflags &= ~ST_EX_IFLAG_CALCULATED_BTIME;
-	dst->st_ex_btime = pst->stx_btime;
+	dst->st_ex_btime = stx_timestamp_to_timespec(pst->stx_btime);
 }
 
 /****************************************************************************
@@ -247,12 +253,6 @@ void copy_stat_ex_timestamps(struct stat_ex *st,
 	if (!is_omit_timespec(&ft->mtime)) {
 		st->st_ex_mtime = ft->mtime;
 	}
-}
-
-static inline
-struct timespec stx_timestamp_to_timespec(const struct statx_timestamp sts)
-{
-	return (struct timespec){.tv_sec = sts.tv_sec, .tv_nsec = sts.tv_nsec};
 }
 
 void init_stat_ex_from_stat (struct stat_ex *dst,
