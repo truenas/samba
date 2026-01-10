@@ -274,13 +274,19 @@ void init_stat_ex_from_stat (struct stat_ex *dst,
 	make_create_timespec(src, dst, fake_dir_create_times);
 	dst->st_ex_blksize = src->stx_blksize;
 	dst->st_ex_blocks = src->stx_blocks;
+#ifdef STATX_CHANGE_COOKIE
 	dst->st_ex_change_cookie = src->stx_change_cookie;
+#endif
 	dst->st_ex_mnt_id = src->stx_mnt_id;
 	dst->st_ex_attributes = src->stx_attributes;
 }
 
+#ifdef STATX_CHANGE_COOKIE
 #define TNSTATX_FLAGS (STATX_BASIC_STATS|STATX_BTIME|STATX_MNT_ID_UNIQUE| \
 	STATX_CHANGE_COOKIE)
+#else
+#define TNSTATX_FLAGS (STATX_BASIC_STATS|STATX_BTIME|STATX_MNT_ID_UNIQUE)
+#endif
 
 /*******************************************************************
 A stat() wrapper.
