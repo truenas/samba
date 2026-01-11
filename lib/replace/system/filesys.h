@@ -278,6 +278,8 @@ long rep_openat2(int dirfd, const char *pathname,
 	rep_openat2(dirfd, pathname, how, size)
 #endif /* !HAVE_OPENAT2 */
 
+#include <linux/stat.h>
+
 #ifdef DISABLE_OPATH
 /*
  * Without O_PATH, the kernel
