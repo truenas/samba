@@ -51,6 +51,12 @@
      expansions/etc make sense to the OS should be acceptable to Samba.
 */
 
+static inline
+struct timespec stx_timestamp_to_timespec(const struct statx_timestamp sts)
+{
+	return (struct timespec){.tv_sec = sts.tv_sec, .tv_nsec = sts.tv_nsec};
+}
+
 /*******************************************************************
 A send wrapper that will deal with EINTR or EAGAIN or EWOULDBLOCK.
 ********************************************************************/
@@ -180,37 +186,17 @@ static struct timespec calc_create_time_stat_ex(const struct stat_ex *st)
  use the best approximation.
 ****************************************************************************/
 
-static void make_create_timespec(const struct stat *pst, struct stat_ex *dst,
+static void make_create_timespec(const struct statx *pst, struct stat_ex *dst,
 				 bool fake_dir_create_times)
 {
-	if (S_ISDIR(pst->st_mode) && fake_dir_create_times) {
+	if (S_ISDIR(pst->stx_mode) && fake_dir_create_times) {
 		dst->st_ex_btime.tv_sec = 315493200L;          /* 1/1/1980 */
 		dst->st_ex_btime.tv_nsec = 0;
 		return;
 	}
 
 	dst->st_ex_iflags &= ~ST_EX_IFLAG_CALCULATED_BTIME;
-
-#if defined(HAVE_STRUCT_STAT_ST_BIRTHTIMESPEC_TV_NSEC)
-	dst->st_ex_btime = pst->st_birthtimespec;
-#elif defined(HAVE_STRUCT_STAT_ST_BIRTHTIMENSEC)
-	dst->st_ex_btime.tv_sec = pst->st_birthtime;
-	dst->st_ex_btime.tv_nsec = pst->st_birthtimenspec;
-#elif defined(HAVE_STRUCT_STAT_ST_BIRTHTIME)
-	dst->st_ex_btime.tv_sec = pst->st_birthtime;
-	dst->st_ex_btime.tv_nsec = 0;
-#else
-	dst->st_ex_btime = calc_create_time_stat(pst);
-	dst->st_ex_iflags |= ST_EX_IFLAG_CALCULATED_BTIME;
-#endif
-
-	/* Deal with systems that don't initialize birthtime correctly.
-	 * Pointed out by SATOH Fumiyasu <fumiyas@osstech.jp>.
-	 */
-	if (null_timespec(dst->st_ex_btime)) {
-		dst->st_ex_btime = calc_create_time_stat(pst);
-		dst->st_ex_iflags |= ST_EX_IFLAG_CALCULATED_BTIME;
-	}
+	dst->st_ex_btime = stx_timestamp_to_timespec(pst->stx_btime);
 }
 
 /****************************************************************************
@@ -270,46 +256,37 @@ void copy_stat_ex_timestamps(struct stat_ex *st,
 }
 
 void init_stat_ex_from_stat (struct stat_ex *dst,
-			    const struct stat *src,
+			    const struct statx *src,
 			    bool fake_dir_create_times)
 {
-	dst->st_ex_dev = src->st_dev;
-	dst->st_ex_ino = src->st_ino;
-	dst->st_ex_mode = src->st_mode;
-	dst->st_ex_nlink = src->st_nlink;
-	dst->st_ex_uid = src->st_uid;
-	dst->st_ex_gid = src->st_gid;
-	dst->st_ex_rdev = src->st_rdev;
-	dst->st_ex_size = src->st_size;
-	dst->st_ex_atime = get_atimespec(src);
-	dst->st_ex_mtime = get_mtimespec(src);
-	dst->st_ex_ctime = get_ctimespec(src);
+	dst->st_ex_dev = makedev(src->stx_dev_major, src->stx_dev_minor);
+	dst->st_ex_ino = src->stx_ino;
+	dst->st_ex_mode = src->stx_mode;
+	dst->st_ex_nlink = src->stx_nlink;
+	dst->st_ex_uid = src->stx_uid;
+	dst->st_ex_gid = src->stx_gid;
+	dst->st_ex_rdev = makedev(src->stx_rdev_major, src->stx_rdev_minor);
+	dst->st_ex_size = src->stx_size;
+	dst->st_ex_atime = stx_timestamp_to_timespec(src->stx_atime);
+	dst->st_ex_mtime = stx_timestamp_to_timespec(src->stx_mtime);
+	dst->st_ex_ctime = stx_timestamp_to_timespec(src->stx_ctime);
 	dst->st_ex_iflags = 0;
 	make_create_timespec(src, dst, fake_dir_create_times);
-#ifdef HAVE_STAT_ST_BLKSIZE
-	dst->st_ex_blksize = src->st_blksize;
-#else
-	dst->st_ex_blksize = STAT_ST_BLOCKSIZE;
+	dst->st_ex_blksize = src->stx_blksize;
+	dst->st_ex_blocks = src->stx_blocks;
+#ifdef STATX_CHANGE_COOKIE
+	dst->st_ex_change_cookie = src->stx_change_cookie;
 #endif
-
-#ifdef HAVE_STAT_ST_BLOCKS
-	dst->st_ex_blocks = src->st_blocks;
-#else
-	dst->st_ex_blocks = src->st_size / dst->st_ex_blksize + 1;
-#endif
-
-#ifdef HAVE_STAT_ST_FLAGS
-	dst->st_ex_flags = src->st_flags;
-#else
-	dst->st_ex_flags = 0;
-#endif
-
-#ifdef HAVE_STAT_ST_GEN
-	dst->st_ex_gen = src->st_gen;
-#else
-	dst->st_ex_gen = 0;
-#endif
+	dst->st_ex_mnt_id = src->stx_mnt_id;
+	dst->st_ex_attributes = src->stx_attributes;
 }
+
+#ifdef STATX_CHANGE_COOKIE
+#define TNSTATX_FLAGS (STATX_BASIC_STATS|STATX_BTIME|STATX_MNT_ID_UNIQUE| \
+	STATX_CHANGE_COOKIE)
+#else
+#define TNSTATX_FLAGS (STATX_BASIC_STATS|STATX_BTIME|STATX_MNT_ID_UNIQUE)
+#endif
 
 /*******************************************************************
 A stat() wrapper.
@@ -319,12 +296,12 @@ int sys_stat(const char *fname, SMB_STRUCT_STAT *sbuf,
 	     bool fake_dir_create_times)
 {
 	int ret;
-	struct stat statbuf;
-	ret = stat(fname, &statbuf);
+	struct statx statbuf;
+	ret = statx(AT_FDCWD, fname, 0, TNSTATX_FLAGS, &statbuf);
 	if (ret == 0) {
 		/* we always want directories to appear zero size */
-		if (S_ISDIR(statbuf.st_mode)) {
-			statbuf.st_size = 0;
+		if (S_ISDIR(statbuf.stx_mode)) {
+			statbuf.stx_size = 0;
 		}
 		init_stat_ex_from_stat(sbuf, &statbuf, fake_dir_create_times);
 	}
@@ -338,12 +315,12 @@ int sys_stat(const char *fname, SMB_STRUCT_STAT *sbuf,
 int sys_fstat(int fd, SMB_STRUCT_STAT *sbuf, bool fake_dir_create_times)
 {
 	int ret;
-	struct stat statbuf;
-	ret = fstat(fd, &statbuf);
+	struct statx statbuf;
+	ret = statx(fd, "", AT_EMPTY_PATH, TNSTATX_FLAGS, &statbuf);
 	if (ret == 0) {
 		/* we always want directories to appear zero size */
-		if (S_ISDIR(statbuf.st_mode)) {
-			statbuf.st_size = 0;
+		if (S_ISDIR(statbuf.stx_mode)) {
+			statbuf.stx_size = 0;
 		}
 		init_stat_ex_from_stat(sbuf, &statbuf, fake_dir_create_times);
 	}
@@ -358,12 +335,12 @@ int sys_lstat(const char *fname,SMB_STRUCT_STAT *sbuf,
 	      bool fake_dir_create_times)
 {
 	int ret;
-	struct stat statbuf;
-	ret = lstat(fname, &statbuf);
+	struct statx statbuf;
+	ret = statx(AT_FDCWD, fname, AT_SYMLINK_NOFOLLOW, TNSTATX_FLAGS, &statbuf);
 	if (ret == 0) {
 		/* we always want directories to appear zero size */
-		if (S_ISDIR(statbuf.st_mode)) {
-			statbuf.st_size = 0;
+		if (S_ISDIR(statbuf.stx_mode)) {
+			statbuf.stx_size = 0;
 		}
 		init_stat_ex_from_stat(sbuf, &statbuf, fake_dir_create_times);
 	}
@@ -381,16 +358,16 @@ int sys_fstatat(int fd,
 		bool fake_dir_create_times)
 {
 	int ret;
-	struct stat statbuf;
+	struct statx statbuf;
 
-	ret = fstatat(fd, pathname, &statbuf, flags);
+	ret = statx(fd, pathname, flags, TNSTATX_FLAGS, &statbuf);
 	if (ret != 0) {
 		return -1;
 	}
 
 	/* we always want directories to appear zero size */
-	if (S_ISDIR(statbuf.st_mode)) {
-		statbuf.st_size = 0;
+	if (S_ISDIR(statbuf.stx_mode)) {
+		statbuf.stx_size = 0;
 	}
 	init_stat_ex_from_stat(sbuf, &statbuf, fake_dir_create_times);
 	return 0;

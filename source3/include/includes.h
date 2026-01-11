@@ -185,7 +185,6 @@ typedef sig_atomic_t volatile SIG_ATOMIC_T;
 struct stat_ex {
 	dev_t		st_ex_dev;
 	ino_t		st_ex_ino;
-	uint64_t	st_ex_gen;
 	mode_t		st_ex_mode;
 	nlink_t		st_ex_nlink;
 	uid_t		st_ex_uid;
@@ -203,6 +202,9 @@ struct stat_ex {
 
 	uint32_t	st_ex_flags;
 	uint32_t	st_ex_iflags;
+	uint64_t	st_ex_mnt_id;
+	uint64_t	st_ex_change_cookie;
+	uint64_t	st_ex_attributes;
 };
 
 typedef struct stat_ex SMB_STRUCT_STAT;
