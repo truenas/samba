@@ -1728,11 +1728,7 @@ static int smbXsrv_open_cleanup_startup_fn(
 	}
 
 	/* Valid disconnected durable handle - keep it */
-	DBG_ERR("Keeping valid durable handle [0x%08x], "
-		  "disconnected %"PRIi64"s ago (timeout %"PRIu32"s)\n",
-		  global->open_global_id,
-		  tdiff/1000000,
-		  global->durable_timeout_msec / 1000);
+	DBG_ERR("Keeping valid durable handle [0x%08x]\n", global->open_global_id);
 	state->num_kept++;
 	return 0;
 
