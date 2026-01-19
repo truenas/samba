@@ -45,16 +45,8 @@ bool setup_batch_op_type(PyObject *module_ref)
 	pyctdb_mod_state_t *state = pyctdb_get_state(module_ref);
 	PyTypeObject *batch_op_type;
 
-	batch_op_type = PyMem_RawMalloc(sizeof(PyTypeObject));
-	if (batch_op_type == NULL) {
-		PyErr_NoMemory();
-		return false;
-	}
-
-	if (PyStructSequence_InitType2(batch_op_type, &batch_op_desc) < 0) {
-		PyMem_RawFree(batch_op_type);
-		return false;
-	}
+	batch_op_type = PyStructSequence_NewType(&batch_op_desc);
+        PYCTDB_ASSERT(batch_op_type, "Failed to allocate batch_op_type");
 
 	state->py_batch_op_type = batch_op_type;
 
