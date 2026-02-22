@@ -30,6 +30,7 @@ typedef struct {
 	PyObject_HEAD
 	struct wbcInterfaceDetails *iface_details;
 	struct wbcContext *ctx;
+	PyMutex lock;
 } py_wbclient;
 
 typedef struct {
@@ -127,7 +128,11 @@ static PyObject *py_wbc_getpwuid(PyObject *obj, PyObject *args)
 	PyObject *py_pwd = NULL;
 	wbc_status = WBC_ERR_UNKNOWN_FAILURE;
 
+	Py_BEGIN_ALLOW_THREADS
+	PyMutex_Lock(&self->wbclient->lock);
 	wbc_status = wbcCtxGetpwuid(self->wbclient->ctx, self->id, &pwd);
+	PyMutex_Unlock(&self->wbclient->lock);
+	Py_END_ALLOW_THREADS
 	if (!WBC_ERROR_IS_OK(wbc_status)) {
 		set_exc_from_wbcerrno(wbc_status, "wbcCtxGetpwuid failed");
 		return NULL;
@@ -154,7 +159,11 @@ static PyObject *py_wbc_getgrgid(PyObject *obj, PyObject *args)
 	PyObject *py_grp = NULL;
 	wbc_status = WBC_ERR_UNKNOWN_FAILURE;
 
+	Py_BEGIN_ALLOW_THREADS
+	PyMutex_Lock(&self->wbclient->lock);
 	wbc_status = wbcCtxGetgrgid(self->wbclient->ctx, self->id, &grp);
+	PyMutex_Unlock(&self->wbclient->lock);
+	Py_END_ALLOW_THREADS
 	if (!WBC_ERROR_IS_OK(wbc_status)) {
 		set_exc_from_wbcerrno(wbc_status, "wbcCtxGetgrgid failed");
 		return NULL;
@@ -227,16 +236,22 @@ static bool parse_sid_info(py_uid_gid *self)
 		return true;
 	}
 
+	Py_BEGIN_ALLOW_THREADS
 	wbc_status = wbcStringToSid(self->sid, &sid);
+	Py_END_ALLOW_THREADS
 	if (!WBC_ERROR_IS_OK(wbc_status)) {
 		set_exc_from_wbcerrno(wbc_status, "wbcStringToSid failed");
 		return false;
 	}
 
+	Py_BEGIN_ALLOW_THREADS
+	PyMutex_Lock(&self->wbclient->lock);
 	wbc_status = wbcCtxLookupSid(
 		self->wbclient->ctx,
 		&sid, &domain, &name, &stype
 	);
+	PyMutex_Unlock(&self->wbclient->lock);
+	Py_END_ALLOW_THREADS
 	if (!WBC_ERROR_IS_OK(wbc_status)) {
 		set_exc_from_wbcerrno(wbc_status, "wbcCtxLookupSid failed");
 		return false;
@@ -455,9 +470,13 @@ static PyObject *wbclient_domain_users(PyObject *obj, PyObject *args)
 	PyObject *pyusers = NULL;
 	py_wbdomain *self = (py_wbdomain *)obj;
 
+	Py_BEGIN_ALLOW_THREADS
+	PyMutex_Lock(&self->wbclient->lock);
 	wbc_status = wbcCtxListUsers(
 		self->wbclient->ctx, self->domain, &num_users, &users
 	);
+	PyMutex_Unlock(&self->wbclient->lock);
+	Py_END_ALLOW_THREADS
 	if (!WBC_ERROR_IS_OK(wbc_status)) {
 		set_exc_from_wbcerrno(wbc_status, "wbcListUsers failed");
 		return NULL;
@@ -476,9 +495,13 @@ static PyObject *wbclient_domain_groups(PyObject *obj, PyObject *args)
 	PyObject *pygroups = NULL;
 	py_wbdomain *self = (py_wbdomain *)obj;
 
+	Py_BEGIN_ALLOW_THREADS
+	PyMutex_Lock(&self->wbclient->lock);
 	wbc_status = wbcCtxListGroups(
 		self->wbclient->ctx, self->domain, &num_groups, &groups
 	);
+	PyMutex_Unlock(&self->wbclient->lock);
+	Py_END_ALLOW_THREADS
 	if (!WBC_ERROR_IS_OK(wbc_status)) {
 		set_exc_from_wbcerrno(wbc_status, "wbcListGroups failed");
 		return NULL;
@@ -495,8 +518,12 @@ static PyObject *wbclient_check_secret(PyObject *obj, PyObject *args)
 	struct wbcAuthErrorInfo *error = NULL;
 	py_wbdomain *self = (py_wbdomain *)obj;
 
+	Py_BEGIN_ALLOW_THREADS
+	PyMutex_Lock(&self->wbclient->lock);
 	wbc_status = wbcCtxCheckTrustCredentials(
 		self->wbclient->ctx, self->domain, &error);
+	PyMutex_Unlock(&self->wbclient->lock);
+	Py_END_ALLOW_THREADS
 	if (wbc_status == WBC_ERR_AUTH_ERROR) {
 		char *errstr = NULL;
 		if (asprintf(&errstr,
@@ -531,9 +558,13 @@ static PyObject *wbclient_ping_dc(PyObject *obj, PyObject *args)
 	py_wbdomain *self = (py_wbdomain *)obj;
 	PyObject *out = NULL;
 
+	Py_BEGIN_ALLOW_THREADS
+	PyMutex_Lock(&self->wbclient->lock);
 	wbc_status = wbcCtxPingDc2(
 		self->wbclient->ctx, self->domain, &error, &dc_name
 	);
+	PyMutex_Unlock(&self->wbclient->lock);
+	Py_END_ALLOW_THREADS
 	if (wbc_status == WBC_ERR_AUTH_ERROR) {
 		wbcFreeMemory(dc_name);
 		if (asprintf(&errstr,
@@ -722,9 +753,13 @@ static PyObject *wbclient_domain_info(PyObject *obj, PyObject *argsunused)
 	PyObject *out = NULL;
 	struct wbcDomainInfo *dinfo = NULL;
 
+	Py_BEGIN_ALLOW_THREADS
+	PyMutex_Lock(&self->wbclient->lock);
 	wbc_status = wbcCtxDomainInfo(
 		self->wbclient->ctx, self->domain, &dinfo
 	);
+	PyMutex_Unlock(&self->wbclient->lock);
+	Py_END_ALLOW_THREADS
 	if (!WBC_ERROR_IS_OK(wbc_status)) {
 		set_exc_from_wbcerrno(wbc_status, "wbcDomainInfo failed");
 		return NULL;
@@ -775,10 +810,14 @@ static PyObject *wbclient_dc_name(PyObject *obj, PyObject *argsunused)
 	 * NOTE: wbcCtxDcInfo retieves current DC from gencache
 	 * and so there will be at most one DC in the response.
 	 */
+	Py_BEGIN_ALLOW_THREADS
+	PyMutex_Lock(&self->wbclient->lock);
 	wbc_status = wbcCtxDcInfo(
 		self->wbclient->ctx, self->domain,
 		&num_dcs, &dc_names, &dc_ips
 	);
+	PyMutex_Unlock(&self->wbclient->lock);
+	Py_END_ALLOW_THREADS
 	if (!WBC_ERROR_IS_OK(wbc_status)) {
 		set_exc_from_wbcerrno(wbc_status, "wbcCtxDcInfo failed");
 		return NULL;
@@ -960,9 +999,13 @@ static PyObject *wbclient_iter_domains(struct domain_iter_info *iter_info)
 	struct wbcDomainInfo *domain_list = NULL;
 	PyObject *out = NULL;
 
+	Py_BEGIN_ALLOW_THREADS
+	PyMutex_Lock(&iter_info->client->lock);
 	wbc_status = wbcCtxListTrusts(
 		iter_info->client->ctx, &domain_list, &num_domains
 	);
+	PyMutex_Unlock(&iter_info->client->lock);
+	Py_END_ALLOW_THREADS
 	if (!WBC_ERROR_IS_OK(wbc_status)) {
 		set_exc_from_wbcerrno(wbc_status, "wbcListTrusts failed");
 		return NULL;
@@ -1084,7 +1127,9 @@ static bool pysidlist_to_sids(PyObject *sidlist,
 			return false;
 		}
 
+		Py_BEGIN_ALLOW_THREADS
 		wbc_status = wbcStringToSid(decoded_sid, &sids[num_sids]);
+		Py_END_ALLOW_THREADS
 		if (!WBC_ERROR_IS_OK(wbc_status)) {
 			free(sids);
 			set_exc_from_wbcerrno(wbc_status, "wbcStringToSid failed");
@@ -1142,7 +1187,11 @@ static PyObject *py_sids_to_xids(py_wbclient *client,
 		return PyErr_NoMemory();
 	}
 
+	Py_BEGIN_ALLOW_THREADS
+	PyMutex_Lock(&client->lock);
 	wbc_status = wbcCtxSidsToUnixIds(client->ctx, sids, num_sids, unix_ids);
+	PyMutex_Unlock(&client->lock);
+	Py_END_ALLOW_THREADS
 	if (!WBC_ERROR_IS_OK(wbc_status)) {
 		free(unix_ids);
 		set_exc_from_wbcerrno(wbc_status, "wbcSidsToUnixIds failed");
@@ -1375,7 +1424,11 @@ static PyObject *xidlist_to_pysids(py_wbclient *client,
 		return NULL;
 	}
 
+	Py_BEGIN_ALLOW_THREADS
+	PyMutex_Lock(&client->lock);
 	wbc_status = wbcCtxUnixIdsToSids(client->ctx, xids, cnt, sids);
+	PyMutex_Unlock(&client->lock);
+	Py_END_ALLOW_THREADS
 	if (!WBC_ERROR_IS_OK(wbc_status)) {
 		free(sids);
 		set_exc_from_wbcerrno(wbc_status, "wbcUnixIdsToSids failed");
@@ -1509,7 +1562,11 @@ static bool name_to_unixid_and_sid(py_wbclient *self,
 		domain[PTR_DIFF(p, full_name)] = '\0';
 	}
 
+	Py_BEGIN_ALLOW_THREADS
+	PyMutex_Lock(&self->lock);
 	wbc_status = wbcCtxLookupName(self->ctx, domain, user, &sid, &type);
+	PyMutex_Unlock(&self->lock);
+	Py_END_ALLOW_THREADS
 	if (!WBC_ERROR_IS_OK(wbc_status)) {
 		set_exc_from_wbcerrno(wbc_status, "wbcCtxLookupName failed");
 		return false;
@@ -1521,7 +1578,11 @@ static bool name_to_unixid_and_sid(py_wbclient *self,
 		return false;
 	}
 
+	Py_BEGIN_ALLOW_THREADS
+	PyMutex_Lock(&self->lock);
 	wbc_status = wbcCtxSidsToUnixIds(self->ctx, &sid, 1, xid);
+	PyMutex_Unlock(&self->lock);
+	Py_END_ALLOW_THREADS
 	if (!WBC_ERROR_IS_OK(wbc_status)) {
 		set_exc_from_wbcerrno(wbc_status, "wbcCtxSidsToUnixIds failed");
 		return false;
@@ -1671,7 +1732,9 @@ static int py_wbclient_init(PyObject *obj,
 	struct wbcInterfaceDetails *details = NULL;
 	py_wbclient *self = (py_wbclient *)obj;
 
+	Py_BEGIN_ALLOW_THREADS
 	self->ctx = wbcCtxCreate();
+	Py_END_ALLOW_THREADS
 	if (self->ctx == NULL) {
 		PyErr_Format(
 			PyExc_RuntimeError,
@@ -1681,7 +1744,11 @@ static int py_wbclient_init(PyObject *obj,
 		return -1;
 	}
 
+	Py_BEGIN_ALLOW_THREADS
+	PyMutex_Lock(&self->lock);
 	wbc_status = wbcCtxInterfaceDetails(self->ctx, &details);
+	PyMutex_Unlock(&self->lock);
+	Py_END_ALLOW_THREADS
 	if (!WBC_ERROR_IS_OK(wbc_status)) {
 		set_exc_from_wbcerrno(wbc_status, "wbcInterfaceDetails failed");
 		return -1;
@@ -1694,10 +1761,11 @@ static int py_wbclient_init(PyObject *obj,
 
 static void py_wbclient_dealloc(py_wbclient *self)
 {
+	Py_BEGIN_ALLOW_THREADS
 	wbcFreeMemory(self->iface_details);
-	self->iface_details = NULL;
-
 	wbcCtxFree(self->ctx);
+	Py_END_ALLOW_THREADS
+	self->iface_details = NULL;
 	self->ctx = NULL;
         Py_TYPE(self)->tp_free((PyObject *)self);
 }
@@ -1724,7 +1792,9 @@ static PyObject *py_validate_sid(PyObject *obj, PyObject *args)
 		return NULL;
 	}
 
+	Py_BEGIN_ALLOW_THREADS
 	wbc_status = wbcStringToSid(sid, &domsid);
+	Py_END_ALLOW_THREADS
 	if (!WBC_ERROR_IS_OK(wbc_status)) {
 		Py_RETURN_FALSE;
 	}
