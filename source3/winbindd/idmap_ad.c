@@ -364,24 +364,27 @@ static NTSTATUS idmap_ad_get_tldap_ctx(TALLOC_CTX *mem_ctx,
 		return NT_STATUS_DOMAIN_CONTROLLER_NOT_FOUND;
 	}
 
-	sitename = sitename_fetch(talloc_tos(), lp_realm());
+	/* Create a private krb5.conf file for domain if allowed by smb.conf */
+	if (lp_create_krb5_conf()) {
+		sitename = sitename_fetch(talloc_tos(), lp_realm());
 
-	/*
-	 * create_local_private_krb5_conf_for_domain() can deal with
-	 * sitename==NULL
-	 */
-	if (strequal(domname, lp_realm()) || strequal(domname, lp_workgroup()))
-	{
-		pdcaddr = &dcaddr;
-	}
+		/*
+		 * create_local_private_krb5_conf_for_domain() can deal with
+		 * sitename==NULL
+		 */
+		if (strequal(domname, lp_realm()) || strequal(domname, lp_workgroup()))
+		{
+			pdcaddr = &dcaddr;
+		}
 
-	ok = create_local_private_krb5_conf_for_domain(
-		lp_realm(), lp_workgroup(), sitename, pdcaddr);
-	TALLOC_FREE(sitename);
-	if (!ok) {
-		DBG_DEBUG("Could not create private krb5.conf\n");
-		TALLOC_FREE(dcinfo);
-		return NT_STATUS_DOMAIN_CONTROLLER_NOT_FOUND;
+		ok = create_local_private_krb5_conf_for_domain(
+			lp_realm(), lp_workgroup(), sitename, pdcaddr);
+		TALLOC_FREE(sitename);
+		if (!ok) {
+			DBG_DEBUG("Could not create private krb5.conf\n");
+			TALLOC_FREE(dcinfo);
+			return NT_STATUS_DOMAIN_CONTROLLER_NOT_FOUND;
+		}
 	}
 
 	status = open_socket_out(&dcaddr, tcp_port, 10000, &fd);
