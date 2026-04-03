@@ -4487,6 +4487,29 @@ static NTSTATUS fruit_create_file(vfs_handle_struct *handle,
 		goto fail;
 	}
 
+	/*
+	 * For directory FSPs opened without fd-requiring access (e.g.
+	 * DELETE|READ_ATTR), open_directory() does not call reopen_from_fsp()
+	 * and therefore fruit_openat() is never invoked for the main FSP.
+	 * This means fsp_flags.posix_open stays false even though sub-entries
+	 * inside the directory do get posix_open=true via fruit_openat().
+	 *
+	 * file_find_subpath() requires *both* dir_fsp and the sub-entry to
+	 * have posix_open=true before skipping the sub-entry (commit
+	 * 6e662bf5781). Without this, an open sub-entry such as a
+	 * com.apple.TimeMachine.sync.* directory blocks the final
+	 * .incomplete -> .sparsebundle rename with STATUS_ACCESS_DENIED.
+	 *
+	 * Set posix_open here, before the early return for directories, so
+	 * that the main directory FSP carries the same flag as its children.
+	 */
+	if (fsp->fsp_flags.is_directory &&
+	    config->posix_opens &&
+	    global_fruit_config.nego_aapl)
+	{
+		fsp->fsp_flags.posix_open = true;
+	}
+
 	if (is_named_stream(smb_fname) || fsp->fsp_flags.is_directory) {
 		return status;
 	}
