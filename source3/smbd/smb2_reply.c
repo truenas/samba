@@ -1371,7 +1371,7 @@ NTSTATUS rename_internals_fsp(connection_struct *conn,
 				true : conn->case_preserve;
 	struct vfs_rename_how rhow = { .flags = 0, };
 
-	if (file_has_open_streams(fsp)) {
+	if (!fsp->fsp_flags.posix_open && file_has_open_streams(fsp)) {
 		return NT_STATUS_ACCESS_DENIED;
 	}
 
