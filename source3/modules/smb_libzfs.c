@@ -925,32 +925,32 @@ smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 	if (zfsp == NULL) {
 		DBG_ERR("Failed to obtain zhandle on %s: %s\n",
 			parent, strerror(errno));
-		goto unlock_out;
+		goto fail;
 	}
 
 	target_ds = get_target_name(tmp_ctx, zfsp, path);
 	if (target_ds == NULL) {
 		zfs_close(zfsp);
-		goto unlock_out;
+		goto fail;
 	}
 	zfs_close(zfsp);
 
 	if (to_create > 1 && create_ancestors) {
 		rv = zfs_create_ancestors(lz, target_ds);
 		if (rv != 0 ) {
-			goto unlock_out;
+			goto fail;
 		}
 	}
 	else if (to_create > 1) {
 		DBG_ERR("Unable to create dataset [%s] due to "
 			"missing ancestor datasets.", target_ds);
 		errno = ENOENT;
-		goto unlock_out;
+		goto fail;
 	}
 
 	error = create_dataset_internal(lz, target_ds, quota);
 	if (error) {
-		goto unlock_out;
+		goto fail;
 	}
 
 	ok = path_to_dataset_list(mem_ctx, path, &ds_array,
@@ -958,13 +958,12 @@ smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 	if (!ok) {
 		DBG_ERR("Failed to generate dataset list for %s\n",
 			path);
-		goto unlock_out;
+		goto fail;
 	}
 
 	*_array_out = ds_array;
 	*_nentries = nentries;
 	rv = 0;
-unlock_out:
 fail:
 	TALLOC_FREE(tmp_ctx);
 	return rv;
