@@ -54,6 +54,7 @@ char *hasmntopt (const struct mntent *__mnt,
 #include "lib/util/debug.h"
 #include "lib/util/discard.h"
 #include "lib/util/dlinklist.h"
+#include "lib/util/fault.h"
 #include "lib/util/memcache.h"
 #include "lib/util/memory.h"
 #include "lib/util/unix_match.h"
