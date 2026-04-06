@@ -88,8 +88,6 @@ struct zfs_quota {
 	enum zfs_quotatype quota_type;
 	uint64_t bytes;
 	uint64_t bytes_used;
-	uint64_t obj;
-	uint64_t obj_used;
 };
 
 struct zfs_dataset_prop

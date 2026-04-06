@@ -103,15 +103,11 @@ static const struct {
 static const char *user_quota_strings[] =  {
 	"userquota",
 	"userused",
-	"userobjquota",
-	"userobjused"
 };
 
 static const char *group_quota_strings[] =  {
 	"groupquota",
 	"groupused",
-	"groupobjquota",
-	"groupobjused"
 };
 
 static libzfs_handle_t *g_libzfs_handle;
@@ -600,7 +596,7 @@ smb_zfs_get_quota(smbzhandle_t hdl,
 	size_t blocksize = 1024;
 	zfs_handle_t *zfsp = NULL;
 	char req[ZFS_MAXPROPLEN] = { 0 };
-	uint64_t rv[4] = { 0 };
+	uint64_t rv[2] = { 0 };
 
 	zfsp = get_zhandle_from_smbzhandle(hdl);
 	cached = smb_zfs_get_cached_quota(hdl->dev_id, xid, quota_type, qt);
@@ -630,8 +626,6 @@ smb_zfs_get_quota(smbzhandle_t hdl,
 
 	qt->bytes = rv[0] / blocksize;
 	qt->bytes_used = rv[1] / blocksize;
-	qt->obj = rv[2];
-	qt->obj_used = rv[3];
 	qt->quota_type = quota_type;
 	smb_zfs_set_cached_quota(hdl->dev_id, xid, quota_type, qt, true);
 	return 0;
@@ -643,7 +637,6 @@ smb_zfs_set_quota(smbzhandle_t hdl, uint64_t xid, struct zfs_quota qt)
 	int rv;
 	zfs_handle_t *zfsp = NULL;
 	char qr[ZFS_MAXPROPLEN] = { 0 };
-	char qr_obj[ZFS_MAXPROPLEN] = { 0 };
 	char quota[ZFS_MAXPROPLEN] = { 0 };
 
 	if (xid == 0) {
@@ -657,11 +650,9 @@ smb_zfs_set_quota(smbzhandle_t hdl, uint64_t xid, struct zfs_quota qt)
 	switch (qt.quota_type) {
 	case SMBZFS_USER_QUOTA:
 		snprintf(qr, sizeof(qr), "userquota@%lu", xid);
-		snprintf(qr_obj, sizeof(qr_obj), "userobj@%lu", xid);
 		break;
 	case SMBZFS_GROUP_QUOTA:
 		snprintf(qr, sizeof(qr), "groupquota@%lu", xid);
-		snprintf(qr_obj, sizeof(qr_obj), "groupobj@%lu", xid);
 		break;
 	default:
 		DBG_ERR("Received unknown quota type (%d)\n", qt.quota_type);
@@ -673,13 +664,6 @@ smb_zfs_set_quota(smbzhandle_t hdl, uint64_t xid, struct zfs_quota qt)
 	rv = zfs_prop_set(zfsp, qr, quota);
 	if (rv != 0) {
 		DBG_ERR("Failed to set (%s = %s)\n", qr, quota);
-		return -1;
-	}
-
-	snprintf(quota, sizeof(quota), "%lu", qt.obj);
-	rv = zfs_prop_set(zfsp, qr_obj, quota);
-	if (rv != 0) {
-		DBG_ERR("Failed to set (%s = %s)\n", qr_obj, quota);
 		return -1;
 	}
 
