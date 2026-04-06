@@ -154,9 +154,9 @@ static int zfs_core_get_quota(struct vfs_handle_struct *handle,
 	qt->hardlimit = zfs_qt.bytes;
 	qt->softlimit = zfs_qt.bytes;
 	qt->curblocks = zfs_qt.bytes_used;
-	qt->ihardlimit = zfs_qt.obj;
-	qt->isoftlimit = zfs_qt.obj;
-	qt->curinodes = zfs_qt.obj_used;
+	qt->ihardlimit = 0;
+	qt->isoftlimit = 0;
+	qt->curinodes = 0;
 	qt->qtype = qtype;
 	qt->qflags = QUOTAS_DENY_DISK|QUOTAS_ENABLED;
 
@@ -195,7 +195,6 @@ static int zfs_core_set_quota(struct vfs_handle_struct *handle,
 	}
 
 	zq.bytes = qt->hardlimit * qt->bsize;
-	zq.obj = qt->ihardlimit;
 
 	switch (qtype) {
 	case SMB_USER_QUOTA_TYPE:
@@ -457,7 +456,6 @@ static int set_base_user_quota(vfs_handle_struct *handle,
 
 	if (zq.bytes == 0) {
 		zq.bytes = config->base_user_quota;
-		zq.obj = 0;
 		ret = smb_zfs_set_quota(config->ds->zhandle,
 				        current_user, zq);
 		if (ret != 0) {

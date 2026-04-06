@@ -88,8 +88,6 @@ struct zfs_quota {
 	enum zfs_quotatype quota_type;
 	uint64_t bytes;
 	uint64_t bytes_used;
-	uint64_t obj;
-	uint64_t obj_used;
 };
 
 struct zfs_dataset_prop
@@ -99,11 +97,6 @@ struct zfs_dataset_prop
 	bool readonly;
 	bool checksum_enabled;
 	uint64_t record_size;
-#if 0 /* Properties we may wish to expose in the future */
-	int atime;
-	int exec;
-	int setuid;
-#endif
 };
 
 struct zfs_dataset
@@ -335,34 +328,6 @@ int smb_zfs_delete_snapshots(struct snapshot_list *snaps);
 int smb_zfs_snapshot(smbzhandle_t hdl,
 		     const char *snapshot_name,
 		     bool recursive);
-
-/*
- * Roll back to named snapshot. This is a destructive process.
- * Roll back specified dataset handle to specified snapshot
- * snapshot, discarding any data changes since then and making it the
- * active dataset.
- *
- * Any snapshots and bookmarks more recent than the target are
- * destroyed, along with their dependents (i.e. clones).
- *
- * @param[in]	smblibzfsp		smblibzfs handle struct
- * @param[in]	snapshot_name		name to give snapshot
- * @param[in]	force			forcibly unmount cloned filesystems
- *
- * @return	0 on success -1 on failure
- */
-int smb_zfs_rollback(smbzhandle_t hdl,
-		     const char *snapshot_name,
-		     bool force);
-
-/*
- * Roll back to the last successful snapshot. This is a destructive process. All
- * data from after the last snapshot was taken will be destroyed.
- *
- * @param[in]	hdl			target ZFS dataset handle
- * @return	0 on success -1 on failure
- */
-int smb_zfs_rollback_last(smbzhandle_t hdl);
 
 /*
  * Check whether the specified zpool feature is enabled
