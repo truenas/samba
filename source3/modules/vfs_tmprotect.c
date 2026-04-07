@@ -117,6 +117,11 @@ static bool prune_snapshots(vfs_handle_struct *handle,
 			DBG_INFO("Appending [%s] to list of snapshots "
 				 "to be deleted.\n", entry->name);
 			del_entry = talloc_zero(talloc_tos(), struct snapshot_entry);
+			if (del_entry == NULL) {
+				TALLOC_FREE(snapshots);
+				TALLOC_FREE(to_delete);
+				return false;
+			}
 			strlcpy(del_entry->name, entry->name,
 				sizeof(del_entry->name));
 			DLIST_ADD(to_delete->entries, del_entry);
@@ -228,7 +233,7 @@ static bool parse_history(const char *history_path, size_t *cntp, time_t *timest
 		time_t tm_int;
 
 		begin = strstr(line, "<date>");
-		if (begin == NULL || begin == line) {
+		if (begin == NULL) {
 			DBG_DEBUG("skipping line: %s\n", line);
 			continue;
 		}
@@ -237,7 +242,6 @@ static bool parse_history(const char *history_path, size_t *cntp, time_t *timest
 		if (end == NULL) {
 			DBG_ERR("%s: strptime() failed: %s\n",
 				begin, strerror(errno));
-			free(line);
 			success = false;
 			break;
 		}
@@ -257,7 +261,6 @@ static bool parse_history(const char *history_path, size_t *cntp, time_t *timest
 	}
 
 	*cntp = cnt;
-out:
 	free(line);
 	fclose(history);
 	return success;
@@ -419,7 +422,7 @@ static void tmprotect_disconnect(vfs_handle_struct *handle)
 	 * Refuse to take more frequent snapshots than that.
 	 */
 
-	if ((config->history_file == NULL) || (last_snap + 900 > curtime)) {
+	if (last_snap + 900 > curtime) {
 		DBG_INFO("Refusing to generate new snapshot on disconnect"
 			 "last snapshot is less than 15 minutes old\n");
 		return;
@@ -427,6 +430,10 @@ static void tmprotect_disconnect(vfs_handle_struct *handle)
 	snapshot_name = talloc_asprintf(talloc_tos(), "%s-%lu",
 					TMPROTECT_PREFIX,
 					curtime);
+	if (snapshot_name == NULL) {
+		DBG_ERR("talloc_asprintf() failed\n");
+		return;
+	}
 
 	ret = smb_zfs_snapshot(config->hdl, snapshot_name, false);
 	if (ret != 0) {
@@ -456,14 +463,14 @@ static int tmprotect_connect(struct vfs_handle_struct *handle,
 	if (!config) {
 		DBG_ERR("talloc_zero() failed\n");
 		errno = ENOMEM;
-		return -1;
+		goto disconnect_out;
 	}
 
 	config->filter = talloc_zero(config, struct snap_filter);
 	if (config->filter == NULL) {
 		DBG_ERR("talloc_zero() failed\n");
 		errno = ENOMEM;
-		return -1;
+		goto disconnect_out;
 	}
 
 	inclusions = lp_parm_string_list(SNUM(handle->conn),
