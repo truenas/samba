@@ -181,7 +181,6 @@ ssize_t tn_audit_pread(vfs_handle_struct *handle, files_struct *fsp,
 			      void *data, size_t n, off_t offset)
 {
 	ssize_t result;
-	bool ok;
 
 	result = SMB_VFS_NEXT_PREAD(handle, fsp, data, n, offset);
 
@@ -200,7 +199,6 @@ ssize_t tn_audit_pwrite(vfs_handle_struct *handle, files_struct *fsp,
 			       const void *data, size_t n, off_t offset)
 {
 	ssize_t result;
-	bool ok;
 
 	result = SMB_VFS_NEXT_PWRITE(handle, fsp, data, n, offset);
 
