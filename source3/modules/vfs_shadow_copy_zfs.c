@@ -588,7 +588,7 @@ static bool path_in_ctldir(const char *path, bool *is_snapdir)
 	}
 
 	strlcpy(tmp, path, sizeof(tmp));
-	tmp[PTR_DIFF(p + 4, path)] = '\0';
+	tmp[PTR_DIFF(p + strlen(".zfs"), path)] = '\0';
 	err = stat(tmp, &st);
 	if (err) {
 		DBG_ERR("%s: stat() failed: %s\n", tmp, strerror(errno));
@@ -609,9 +609,15 @@ static void fill_snapshot_from_open_path(const char *path,
 	char tmp[PATH_MAX];
 
 	/*
-	 * path may be something like /mnt/dozer/.zfs/snapshot/t1/testfile
-	 * we want to basically reduce to /mnt/dozer/.zfs/snapshot/t1
-	 * and then look up an existing open
+	 * Reduce the full path to just the snapshot root so we can look up
+	 * an existing O_DIRECTORY open for it.
+	 *
+	 * Examples:
+	 *   /mnt/dozer/.zfs/snapshot/auto-2024-01-01/subdir/file
+	 *     -> /mnt/dozer/.zfs/snapshot/auto-2024-01-01
+	 *
+	 *   /mnt/dozer/.zfs/snapshot/auto-2024-01-01
+	 *     -> /mnt/dozer/.zfs/snapshot/auto-2024-01-01  (unchanged)
 	 */
 	p = strstr(path, SHADOW_COPY_ZFS_SNAP_DIR);
 	SMB_ASSERT(p != NULL);
@@ -621,13 +627,15 @@ static void fill_snapshot_from_open_path(const char *path,
 	/* ZFS ctldir should never be exposed over SMB. */
 	SMB_ASSERT(snap != NULL);
 
+	/* snap now points to the '/' preceding the snapshot name; advance
+	 * past it, then locate the '/' that ends the snapshot name, if any. */
+	snap++;
 	p = strstr(snap, "/");
-	if (p == NULL) {
-		p = snap;
-	}
 
 	strlcpy(tmp, path, sizeof(tmp));
-	tmp[PTR_DIFF(p + 4, path)] = '\0';
+	if (p != NULL) {
+		tmp[PTR_DIFF(p, path)] = '\0';
+	}
 
 	entry = check_for_open(config->opens, tmp);
 
@@ -796,6 +804,7 @@ static char *_do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 	struct snapshot_data snapshots;
 	const char *mpoffset = NULL;
 	int offset;
+	size_t mplen;
 	char *ret = NULL, *res_fname = NULL;
 	char buf[PATH_MAX] = {0};
 	bool found = false;
@@ -832,8 +841,11 @@ static char *_do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 		res_fname++;
 	}
 
-	if (strcmp(handle->conn->connectpath, snapshots.mountpoint) > 0) {
-		mpoffset = handle->conn->connectpath + strlen(snapshots.mountpoint) + 1;
+	mplen = strlen(snapshots.mountpoint);
+	if (strlen(handle->conn->connectpath) > mplen &&
+	    strncmp(handle->conn->connectpath, snapshots.mountpoint, mplen) == 0 &&
+	    handle->conn->connectpath[mplen] == '/') {
+		mpoffset = handle->conn->connectpath + mplen + 1;
 	}
 
 	ret = get_snapshot_path(talloc_tos(), handle->conn->connectpath,
@@ -841,18 +853,21 @@ static char *_do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 				mpoffset, &snapshots.snap, snapshots.sens);
 
 	if (out != NULL) {
-		size_t off = 0;
+		int len;
 		cp_snapshot_data(&snapshots, out);
-		off = snprintf(out->shadow_cp, sizeof(out->shadow_cp),
+		len = snprintf(out->shadow_cp, sizeof(out->shadow_cp),
 			       "%s/%s/%s", snapshots.mountpoint,
 			       SHADOW_COPY_ZFS_SNAP_DIR, snapshots.snap.name);
+		if (len < 0 || (size_t)len >= sizeof(out->shadow_cp)) {
+			DBG_ERR("[%s()]: shadow_cp path truncated\n", location);
+			out->shadow_cp[0] = '\0';
 		/*
 		 * This mountpoint ends up getting stored as part of CWD
 		 * in the chdir() function.
 		 */
-		if (mpoffset) {
-			snprintf(out->shadow_cp + off,
-				 sizeof(out->shadow_cp) - off,
+		} else if (mpoffset) {
+			snprintf(out->shadow_cp + len,
+				 sizeof(out->shadow_cp) - len,
 			         "/%s", mpoffset);
 		}
 	}
@@ -1351,6 +1366,12 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 					     fsp->fsp_name->base_name,
 					     mpoffset, entry, sens);
 
+		if (tmp_file == NULL) {
+			DBG_ERR("get_snapshot_path() failed for snapshot: %s\n",
+				entry->name);
+			continue;
+		}
+
 		DBG_INFO("snapshot[%d]: ts: %ld, gmt: %s, name: %s, "
 			 "createtxg: %ld, path: %s\n",
 			 idx, entry->cr_time, entry->label, entry->name,
@@ -1439,8 +1460,8 @@ static NTSTATUS shadow_copy_zfs_get_real_filename_at(
 	if (conv == NULL) {
 		status = map_nt_error_from_unix(errno);
 		DBG_DEBUG("%s: convert_shadow_zfs_name() failed: %s\n",
-			  fsp_str_dbg(dirfsp), strerror(errno));
-		return map_nt_error_from_unix(errno);
+			  fsp_str_dbg(dirfsp), nt_errstr(status));
+		return status;
 	}
 
 	status = synthetic_pathref(
@@ -1646,7 +1667,7 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 	config->filter = talloc_zero(config, struct snap_filter);
 	if (config->filter == NULL) {
 		errno = ENOMEM;
-		return -1;
+		goto disconnect_out;
 	}
 
 	ret = conn_zfs_init(handle->conn->sconn,
@@ -1690,6 +1711,10 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 				  "shadow", "cache_size", 512);
 
 	config->zcache = memcache_init(handle->conn, (memcache_sz * 1024));
+	if (config->zcache == NULL) {
+		DBG_ERR("memcache_init() failed\n");
+		goto disconnect_out;
+	}
 
 	SMB_VFS_HANDLE_SET_DATA(handle, config, NULL,
 				struct shadow_copy_zfs_config,
