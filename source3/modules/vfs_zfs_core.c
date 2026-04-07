@@ -22,6 +22,7 @@
 #include "system/filesys.h"
 
 #include "lib/util/tevent_ntstatus.h"
+#include "source3/lib/substitute.h"
 #include "vfs_zfs_core.h"
 
 static int vfs_zfs_core_debug_level = DBGC_VFS;
@@ -647,8 +648,6 @@ static bool zfs_fix_connectpath_for_upn(vfs_handle_struct *handle)
 		handle->conn->session_info->info->account_name;
 	const struct loadparm_substitution *lp_sub = NULL;
 	const char *path_template = NULL;
-	char *lower_sanitized = NULL;
-	char *lower_account   = NULL;
 	char *corrected = NULL;
 
 	if (account == NULL || sanitized == NULL) {
@@ -659,7 +658,7 @@ static bool zfs_fix_connectpath_for_upn(vfs_handle_struct *handle)
 			sanitized ? sanitized : "<null>");
 		return false;
 	}
-	if (strcasecmp(account, sanitized) == 0) {
+	if (strcasecmp_m(account, sanitized) == 0) {
 		return true;
 	}
 
@@ -672,17 +671,14 @@ static bool zfs_fix_connectpath_for_upn(vfs_handle_struct *handle)
 		return true;
 	}
 
-	/* %U expands to strlower(sanitized_username) — replace that exact
-	 * string in the already-expanded connectpath with strlower(account). */
-	lower_sanitized = strlower_talloc(talloc_tos(), sanitized);
-	lower_account   = strlower_talloc(talloc_tos(), account);
-	if (lower_sanitized == NULL || lower_account == NULL) {
-		return false;
-	}
-
-	corrected = talloc_string_sub(talloc_tos(),
-				      handle->conn->connectpath,
-				      lower_sanitized, lower_account);
+	corrected = talloc_sub_specified(
+		talloc_tos(),
+		path_template,
+		account, /* DC-resolved SAM account name — used for %U */
+		NULL,
+		handle->conn->session_info->info->domain_name,
+		handle->conn->session_info->unix_token->uid,
+		handle->conn->session_info->unix_token->gid);
 	if (corrected == NULL) {
 		return false;
 	}
