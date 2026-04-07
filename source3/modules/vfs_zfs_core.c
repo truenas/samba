@@ -102,8 +102,7 @@ static int zfs_core_get_quota(struct vfs_handle_struct *handle,
 	struct zfs_core_config_data *config = NULL;
 	struct zfs_dataset *ds = NULL;
 	struct zfs_quota zfs_qt;
-	uint64_t hardlimit, usedspace, xid;
-	hardlimit = usedspace = 0;
+	uint64_t hardlimit = 0, xid;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct zfs_core_config_data,
@@ -262,7 +261,7 @@ static bool get_synthetic_fsp(vfs_handle_struct *handle,
 	fd = open(fname_in, O_DIRECTORY, unix_mode);
 	if (fd == -1) {
 		DBG_ERR("Failed to open %s, mode: 0o%o: %s\n",
-			smb_fname_str_dbg(tmp_fname), unix_mode,
+			fname_in, unix_mode,
 			strerror(errno));
 		file_free(NULL, tmp_fsp);
 		return false;
@@ -279,7 +278,6 @@ static bool get_synthetic_fsp(vfs_handle_struct *handle,
 static bool zfs_inherit_acls(vfs_handle_struct *handle,
 			     struct zfs_core_config_data *config)
 {
-	struct zfs_dataset *ds = NULL;
 	size_t root_len;
 	struct stat st;
 	int error;
@@ -311,10 +309,12 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 	}
 
 	while (idx > 0) {
-		idx--;
-		ds = config->created[idx];
+		struct zfs_dataset *ds = NULL;
 		struct files_struct *c_fsp = NULL;
 		NTSTATUS status;
+
+		idx--;
+		ds = config->created[idx];
 
 		ok = get_synthetic_fsp(handle, ds->mountpoint + root_len, &c_fsp);
 		if (!ok) {
@@ -628,7 +628,6 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 {
 	struct zfs_core_config_data *config = NULL;
 	int ret;
-	const char *dataset_auto_quota = NULL;
 	const char *base_quota_str = NULL;
 
 	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
@@ -640,7 +639,7 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 	if (!config) {
 		DEBUG(0, ("talloc_zero() failed\n"));
 		errno = ENOMEM;
-		return -1;
+		goto disconnect_out;
 	}
 
 	/*
@@ -656,7 +655,7 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 	if (config->zfs_auto_create) {
 		ret = create_zfs_connectpath(handle, config, user);
 		if (ret < 0) {
-			return -1;
+			goto disconnect_out;
 		}
 	}
 
@@ -667,7 +666,7 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 	if (ret != 0) {
 		DBG_ERR("Failed to initialize ZFS data: %s\n",
 			strerror(errno));
-		return ret;
+		goto disconnect_out;
 	}
 
 	// We need to initialize the optable regardless of whether this
@@ -706,6 +705,11 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 				return -1);
 
 	return 0;
+
+disconnect_out:
+	TALLOC_FREE(config);
+	SMB_VFS_NEXT_DISCONNECT(handle);
+	return -1;
 }
 
 static struct vfs_fn_pointers zfs_core_fns = {
