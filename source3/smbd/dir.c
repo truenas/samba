@@ -626,6 +626,22 @@ bool smbd_dirptr_get_entry(TALLOC_CTX *ctx,
 			continue;
 		}
 
+		/*
+		 * If Share is configured not to step into child datasets,
+		 * prevent their mountpoints from appearing in directory listings
+		 * as well. NOTE that actual prevention of traversal is handled
+		 * by RESOLVE_NO_XDEV flag in openat2. This part is merely
+		 * cosmetic
+		 */
+		if (conn->internal_tcon_flags & TCON_FLAG_NOXDEV) {
+			if (smb_fname->st.st_ex_dev != dir_fname->st.st_ex_dev) {
+				TALLOC_FREE(smb_fname);
+				TALLOC_FREE(fname);
+				TALLOC_FREE(dname);
+				continue;
+			}
+		}
+
 		if (!S_ISLNK(smb_fname->st.st_ex_mode)) {
 			goto done;
 		}

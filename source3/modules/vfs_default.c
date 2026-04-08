@@ -620,7 +620,8 @@ static int vfswrap_openat(vfs_handle_struct *handle,
 
 	if (how->resolve & ~(VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS |
 			     VFS_OPEN_HOW_WITH_BACKUP_INTENT |
-			     VFS_OPEN_HOW_TRUENAS_ABE)) {
+			     VFS_OPEN_HOW_TRUENAS_ABE |
+			     VFS_OPEN_HOW_RESOLVE_NO_XDEV)) {
 		errno = ENOSYS;
 		result = -1;
 		goto out;
@@ -655,12 +656,20 @@ static int vfswrap_openat(vfs_handle_struct *handle,
 	}
 #endif
 
-	if (how->resolve & VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS) {
+	if (how->resolve & (VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS |
+			    VFS_OPEN_HOW_RESOLVE_NO_XDEV)) {
 		struct open_how linux_how = {
 			.flags = flags,
 			.mode = mode,
-			.resolve = RESOLVE_NO_SYMLINKS,
+			.resolve = 0,
 		};
+
+		if (how->resolve & VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS) {
+			linux_how.resolve |= RESOLVE_NO_SYMLINKS;
+		}
+		if (how->resolve & VFS_OPEN_HOW_RESOLVE_NO_XDEV) {
+			linux_how.resolve |= RESOLVE_NO_XDEV;
+		}
 
 		result = openat2(dirfd,
 				 smb_fname->base_name,
@@ -669,14 +678,13 @@ static int vfswrap_openat(vfs_handle_struct *handle,
 		if (result == -1) {
 			if (errno == ENOSYS) {
 				/*
-				 * The kernel doesn't support
-				 * openat2(), so indicate to
-				 * the callers that
-				 * VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS
+				 * The kernel doesn't support openat2(), so
+				 * indicate to callers that these resolve flags
 				 * would just be a waste of time.
 				 */
 				fsp->conn->open_how_resolve &=
-					~VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS;
+					~(VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS |
+					  VFS_OPEN_HOW_RESOLVE_NO_XDEV);
 			}
 			goto out;
 		}
