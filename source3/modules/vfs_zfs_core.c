@@ -22,6 +22,7 @@
 #include "system/filesys.h"
 
 #include "lib/util/tevent_ntstatus.h"
+#include "source3/lib/substitute.h"
 #include "vfs_zfs_core.h"
 
 static int vfs_zfs_core_debug_level = DBGC_VFS;
@@ -620,6 +621,99 @@ static int zfs_core_renameat(vfs_handle_struct *handle,
 }
 #endif
 
+/**
+ * When a client authenticates with UPN format (e.g. bob@domain.com),
+ * sanitized_username has '@' mangled to '_', causing %U in the share path
+ * template to expand incorrectly (e.g. "bob_domain.com" instead of "bob").
+ * Re-expand the configured path template using the SAM account_name so the
+ * ZFS dataset is created at the right path.  No-op if account_name matches
+ * sanitized_username, or if the template contains no %U.
+ *
+ * Returns true on success or if no fix is needed, false on error.
+ */
+static bool zfs_fix_connectpath_for_upn(vfs_handle_struct *handle)
+{
+	const char *sanitized =
+		handle->conn->session_info->unix_info->sanitized_username;
+	/*
+	 * account_name is the SAM account name (e.g. "bob") returned by the
+	 * DC in netr_SamBaseInfo.  It is the short-form sAMAccountName, not
+	 * the UPN (bob@domain.com) or a DOMAIN\user string — it is
+	 * server-resolved, not client-supplied.  sanitized_username is
+	 * derived from the client-provided name and is explicitly "potentially
+	 * untrusted" (see auth_util.c).  When a client authenticates with a
+	 * UPN, the '@' is mangled to '_' during sanitization, so the two
+	 * fields differ.
+	 */
+	const char *account =
+		handle->conn->session_info->info->account_name;
+	const char *path_template = NULL;
+	char *lower_account = NULL;
+	char *corrected = NULL;
+
+	if (account == NULL || sanitized == NULL) {
+		DBG_ERR("Missing account info for %s: account_name=%s "
+			"sanitized_username=%s\n",
+			handle->conn->connectpath,
+			account ? account : "<null>",
+			sanitized ? sanitized : "<null>");
+		return false;
+	}
+	if (strcasecmp_m(account, sanitized) == 0) {
+		return true;
+	}
+
+	/*
+	 * Use lpcfg_noop_substitution() to get the raw path template before
+	 * any macro expansion.  loadparm_s3_global_substitution() would
+	 * expand %U to the (mangled) sanitized_username via the current user
+	 * context set by set_current_user_info(), making the %U check below
+	 * always fail.
+	 */
+	path_template = lp_path(talloc_tos(), lpcfg_noop_substitution(),
+				SNUM(handle->conn));
+	if (path_template == NULL) {
+		DBG_ERR("Failed to get path template for share %s\n",
+			handle->conn->connectpath);
+		return false;
+	}
+	if (strstr(path_template, "%U") == NULL) {
+		return true;
+	}
+
+	lower_account = strlower_talloc(talloc_tos(), account);
+	if (lower_account == NULL) {
+		DBG_ERR("strlower_talloc failed for account %s\n", account);
+		return false;
+	}
+	corrected = talloc_sub_specified(
+		talloc_tos(),
+		path_template,
+		lower_account, /* DC-resolved SAM account name — used for %U */
+		NULL,
+		handle->conn->session_info->info->domain_name,
+		handle->conn->session_info->unix_token->uid,
+		handle->conn->session_info->unix_token->gid);
+	TALLOC_FREE(lower_account);
+	if (corrected == NULL) {
+		DBG_ERR("talloc_sub_specified failed for %s\n",
+			handle->conn->connectpath);
+		return false;
+	}
+
+	DBG_NOTICE("UPN login detected: correcting connectpath "
+		   "from '%s' to '%s'\n",
+		   handle->conn->connectpath, corrected);
+
+	if (!set_conn_connectpath(handle->conn, corrected)) {
+		DBG_ERR("set_conn_connectpath failed for %s\n", corrected);
+		TALLOC_FREE(corrected);
+		return false;
+	}
+	TALLOC_FREE(corrected);
+	return true;
+}
+
 static int zfs_core_connect(struct vfs_handle_struct *handle,
 			    const char *service, const char *user)
 {
@@ -650,6 +744,9 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 			"zfs_core", "dataset_auto_quota", NULL);
 
 	if (config->zfs_auto_create) {
+		if (!zfs_fix_connectpath_for_upn(handle)) {
+			goto disconnect_out;
+		}
 		ret = create_zfs_connectpath(handle, config, user);
 		if (ret < 0) {
 			goto disconnect_out;
