@@ -631,23 +631,27 @@ static int zfs_core_renameat(vfs_handle_struct *handle,
  * Re-expand the configured path template using the SAM account_name so the
  * ZFS dataset is created at the right path.  No-op if account_name matches
  * sanitized_username, or if the template contains no %U.
+ *
+ * Returns true on success or if no fix is needed, false on error.
  */
 static bool zfs_fix_connectpath_for_upn(vfs_handle_struct *handle)
 {
 	const char *sanitized =
 		handle->conn->session_info->unix_info->sanitized_username;
 	/*
-	 * account_name is the SAM account name returned by the DC in
-	 * netr_SamBaseInfo — it is server-resolved, not client-supplied.
-	 * sanitized_username is derived from the client-provided name and
-	 * is explicitly "potentially untrusted" (see auth_util.c).  When a
-	 * client authenticates with a UPN (bob@domain.com), the '@' is
-	 * mangled to '_' during sanitization, so the two fields differ.
+	 * account_name is the SAM account name (e.g. "bob") returned by the
+	 * DC in netr_SamBaseInfo.  It is the short-form sAMAccountName, not
+	 * the UPN (bob@domain.com) or a DOMAIN\user string — it is
+	 * server-resolved, not client-supplied.  sanitized_username is
+	 * derived from the client-provided name and is explicitly "potentially
+	 * untrusted" (see auth_util.c).  When a client authenticates with a
+	 * UPN, the '@' is mangled to '_' during sanitization, so the two
+	 * fields differ.
 	 */
 	const char *account =
 		handle->conn->session_info->info->account_name;
-	const struct loadparm_substitution *lp_sub = NULL;
 	const char *path_template = NULL;
+	char *lower_account = NULL;
 	char *corrected = NULL;
 
 	if (account == NULL || sanitized == NULL) {
@@ -662,24 +666,41 @@ static bool zfs_fix_connectpath_for_upn(vfs_handle_struct *handle)
 		return true;
 	}
 
-	lp_sub = loadparm_s3_global_substitution();
-	path_template = lp_path(talloc_tos(), lp_sub, SNUM(handle->conn));
+	/*
+	 * Use lpcfg_noop_substitution() to get the raw path template before
+	 * any macro expansion.  loadparm_s3_global_substitution() would
+	 * expand %U to the (mangled) sanitized_username via the current user
+	 * context set by set_current_user_info(), making the %U check below
+	 * always fail.
+	 */
+	path_template = lp_path(talloc_tos(), lpcfg_noop_substitution(),
+				SNUM(handle->conn));
 	if (path_template == NULL) {
+		DBG_ERR("Failed to get path template for share %s\n",
+			handle->conn->connectpath);
 		return false;
 	}
 	if (strstr(path_template, "%U") == NULL) {
 		return true;
 	}
 
+	lower_account = strlower_talloc(talloc_tos(), account);
+	if (lower_account == NULL) {
+		DBG_ERR("strlower_talloc failed for account %s\n", account);
+		return false;
+	}
 	corrected = talloc_sub_specified(
 		talloc_tos(),
 		path_template,
-		account, /* DC-resolved SAM account name — used for %U */
+		lower_account, /* DC-resolved SAM account name — used for %U */
 		NULL,
 		handle->conn->session_info->info->domain_name,
 		handle->conn->session_info->unix_token->uid,
 		handle->conn->session_info->unix_token->gid);
+	TALLOC_FREE(lower_account);
 	if (corrected == NULL) {
+		DBG_ERR("talloc_sub_specified failed for %s\n",
+			handle->conn->connectpath);
 		return false;
 	}
 
@@ -689,6 +710,7 @@ static bool zfs_fix_connectpath_for_upn(vfs_handle_struct *handle)
 
 	if (!set_conn_connectpath(handle->conn, corrected)) {
 		TALLOC_FREE(corrected);
+		DBG_ERR("set_conn_connectpath failed for %s\n", corrected);
 		return false;
 	}
 	TALLOC_FREE(corrected);
