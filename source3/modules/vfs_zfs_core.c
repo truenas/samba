@@ -709,8 +709,8 @@ static bool zfs_fix_connectpath_for_upn(vfs_handle_struct *handle)
 		   handle->conn->connectpath, corrected);
 
 	if (!set_conn_connectpath(handle->conn, corrected)) {
-		TALLOC_FREE(corrected);
 		DBG_ERR("set_conn_connectpath failed for %s\n", corrected);
+		TALLOC_FREE(corrected);
 		return false;
 	}
 	TALLOC_FREE(corrected);
