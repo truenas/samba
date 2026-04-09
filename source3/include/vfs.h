@@ -719,6 +719,7 @@ typedef struct files_struct {
 #define TCON_FLAG_STREAMS_XATTR		0x02
 #define TCON_FLAG_STREAMS_FILE		0x04
 #define TCON_FLAG_TRUENAS_ABE		0x10
+#define TCON_FLAG_NOXDEV		0x20
 
 struct vuid_cache_entry {
 	struct auth_session_info *session_info;
