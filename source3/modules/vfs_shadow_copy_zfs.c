@@ -1066,6 +1066,15 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 						   smb_fname_in,
 						   fsp, how);
 		}
+
+		/*
+		 * If we're here it means that we've configured the
+		 * share to not allow traversal out of dataset boundaries.
+		 * This means that if we are sharing dozer/SHARE and have
+		 * dozer/SHARE/SUBDATASET, we will not allow opening the
+		 * SUBDATASET. This is related to SMB share contract for
+		 * tiering more than anything else.
+		 */
 		noxdev_how = *how;
 		noxdev_how.resolve |= VFS_OPEN_HOW_RESOLVE_NO_XDEV;
 		return SMB_VFS_NEXT_OPENAT(handle,
