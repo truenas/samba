@@ -86,6 +86,7 @@ struct shadow_copy_zfs_config {
 	struct memcache		*zcache;
 
 	int			timedelta;
+	bool			no_dataset_traversal;
 	/* Snapshot parameters */
 	struct snap_filter	*filter;
 	struct snapshot_list 	*snapshots;
@@ -1043,6 +1044,10 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 	struct snapshot_data data;
 	shadow_fsp_ext_t *fsp_ext = NULL;
 	struct vfs_open_how tmp_how = { .flags = how->flags, .mode = how->mode};
+	struct vfs_open_how noxdev_how;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config, struct shadow_copy_zfs_config,
+				return -1);
 
 	smb_fname = full_path_from_dirfsp_atname(talloc_tos(),
 						 dirfsp,
@@ -1050,14 +1055,33 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 
 	if (!shadow_copy_zfs_match_name(handle, smb_fname)) {
 		TALLOC_FREE(smb_fname);
+		if (!config->no_dataset_traversal ||
+		    is_named_stream(smb_fname_in) ||
+		    ISDOT(smb_fname_in->base_name) ||
+		    strncmp(smb_fname_in->base_name,
+			    "/proc/self/fd/",
+			    sizeof("/proc/self/fd/") - 1) == 0) {
+			return SMB_VFS_NEXT_OPENAT(handle,
+						   dirfsp,
+						   smb_fname_in,
+						   fsp, how);
+		}
+
+		/*
+		 * If we're here it means that we've configured the
+		 * share to not allow traversal out of dataset boundaries.
+		 * This means that if we are sharing dozer/SHARE and have
+		 * dozer/SHARE/SUBDATASET, we will not allow opening the
+		 * SUBDATASET. This is related to SMB share contract for
+		 * tiering more than anything else.
+		 */
+		noxdev_how = *how;
+		noxdev_how.resolve |= VFS_OPEN_HOW_RESOLVE_NO_XDEV;
 		return SMB_VFS_NEXT_OPENAT(handle,
 					   dirfsp,
 					   smb_fname_in,
-					   fsp, how);
+					   fsp, &noxdev_how);
 	}
-
-	SMB_VFS_HANDLE_GET_DATA(handle, config, struct shadow_copy_zfs_config,
-				return -1);
 	/*
 	 * If dirfsp is an open in a snapshot directory, then concatenate the
 	 * dirfsp path with smb_fname relative path, convert into an absolute
@@ -1703,6 +1727,12 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 
 	config->filter->ignore_empty_snaps = lp_parm_bool(SNUM(handle->conn), "shadow",
 						"ignore_empty_snaps", true);
+
+	config->no_dataset_traversal = lp_parm_bool(SNUM(handle->conn), "shadow",
+						     "no_dataset_traversal", false);
+	if (config->no_dataset_traversal) {
+		handle->conn->internal_tcon_flags |= TCON_FLAG_NOXDEV;
+	}
 
 	config->timedelta = lp_parm_int(SNUM(handle->conn),
 					"shadow", "snap_timedelta", 30);
