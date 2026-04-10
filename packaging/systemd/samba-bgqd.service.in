@@ -8,8 +8,7 @@ After=network.target network-online.target
 Type=notify
 LimitNOFILE=16384
 PIDFile=@PIDDIR@/samba-bgqd.pid
-EnvironmentFile=-@SYSCONFDIR@/sysconfig/samba
-ExecStart=@LIBEXECDIR@/samba/samba-bgqd --foreground --no-process-group $SAMBAOPTIONS
+ExecStart=@LIBEXECDIR@/samba/samba-bgqd --foreground --no-process-group
 ExecReload=/bin/kill -HUP $MAINPID
 
 [Install]
