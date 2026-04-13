@@ -7,8 +7,7 @@ After=network.target network-online.target
 [Service]
 Type=notify
 PIDFile=@PIDDIR@/nmbd.pid
-EnvironmentFile=-@SYSCONFDIR@/sysconfig/samba
-ExecStart=@SBINDIR@/nmbd --foreground --no-process-group $NMBDOPTIONS
+ExecStart=@SBINDIR@/nmbd --foreground --no-process-group
 ExecReload=/bin/kill -HUP $MAINPID
 LimitCORE=infinity
 @systemd_nmb_extra@
