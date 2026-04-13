@@ -8,8 +8,7 @@ After=network.target network-online.target
 Type=notify
 PIDFile=@PIDDIR@/samba.pid
 LimitNOFILE=16384
-EnvironmentFile=-@SYSCONFDIR@/sysconfig/samba
-ExecStart=@SBINDIR@/samba --foreground --no-process-group $SAMBAOPTIONS
+ExecStart=@SBINDIR@/samba --foreground --no-process-group
 ExecReload=/bin/kill -HUP $MAINPID
 @systemd_samba_extra@
 

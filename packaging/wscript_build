@@ -20,5 +20,3 @@ if bld.env.with_ctdb:
     if bld.env.systemd_install_services:
         bld.INSTALL_FILES(bld.env.SYSTEMDDIR, srv, flat=True)
 
-if bld.env.systemd_install_services:
-    bld.INSTALL_FILES('${SYSCONFDIR}/sysconfig', 'systemd/samba.sysconfig', destname='samba')
