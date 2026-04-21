@@ -23,12 +23,6 @@ def options(opt):
                         +" Can be given multiple times."),
                   action="append", dest="systemd_smb_extra", default=[])
 
-    gr.add_option('--systemd-nmb-extra',
-                  metavar="Option=Value",
-                  help=("Extra directives added to the nmb service file."
-                        +" Can be used multiple times."),
-                  action="append", dest="systemd_nmb_extra", default=[])
-
     gr.add_option('--systemd-winbind-extra',
                   metavar="Option=Value",
                   help=("Extra directives added to the winbind service file."
@@ -50,7 +44,6 @@ def options(opt):
 def configure(conf):
     conf.env.systemd_install_services = Options.options.systemd_install_services
     conf.env.systemd_smb_extra = '\n'.join(Options.options.systemd_smb_extra)
-    conf.env.systemd_nmb_extra = '\n'.join(Options.options.systemd_nmb_extra)
     conf.env.systemd_winbind_extra = '\n'.join(Options.options.systemd_winbind_extra)
     conf.env.systemd_samba_extra = '\n'.join(Options.options.systemd_samba_extra)
     conf.env.systemd_ctdb_extra = '\n'.join(Options.options.systemd_ctdb_extra)

@@ -1,6 +1,5 @@
 #!/usr/bin/dh-exec --with-scripts=filter-arch
 [linux-any] lib/systemd/system/ctdb.service
-[linux-any] lib/systemd/system/nmbd.service
 [linux-any] lib/systemd/system/samba-bgqd.service
 [linux-any] lib/systemd/system/smbd.service
 [linux-any] lib/systemd/system/winbind.service
@@ -64,7 +63,6 @@ usr/sbin/ctdbd
 usr/sbin/winbindd
 usr/sbin/eventlogadm
 usr/sbin/samba-gpupdate
-usr/sbin/nmbd
 usr/share/man/*
 ctdb/config/ctdb.conf etc/ctdb
 ctdb/config/ctdb.tunables etc/ctdb
