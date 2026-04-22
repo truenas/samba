@@ -1621,6 +1621,13 @@ static int mds_ctx_destructor_cb(struct mds_ctx *mds_ctx)
 	TALLOC_FREE(mds_ctx->ino_path_map);
 
 	if (mds_ctx->conn != NULL) {
+		/*
+		 * VFS modules may hold conn-scoped pathref fsps whose fds
+		 * are not closed by talloc alone. Match close_cnum() ordering:
+		 * close the fsps first, then run the VFS disconnect hooks,
+		 * then free the conn.
+		 */
+		file_close_conn(mds_ctx->conn, SHUTDOWN_CLOSE);
 		SMB_VFS_DISCONNECT(mds_ctx->conn);
 		TALLOC_FREE(mds_ctx->conn);
 	}
