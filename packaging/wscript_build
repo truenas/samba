@@ -5,7 +5,6 @@ systemd_services = [
     'systemd/winbind.service',
     'systemd/samba.service',
     'systemd/samba-bgqd.service',
-    'systemd/wsdd.service',
 ]
 
 for srv in systemd_services:

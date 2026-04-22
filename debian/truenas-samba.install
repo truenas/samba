@@ -3,7 +3,6 @@
 [linux-any] lib/systemd/system/samba-bgqd.service
 [linux-any] lib/systemd/system/smbd.service
 [linux-any] lib/systemd/system/winbind.service
-[linux-any] lib/systemd/system/wsdd.service
 usr/bin/mdsearch
 usr/bin/oLschema2ldif
 usr/bin/regtree
@@ -21,7 +20,6 @@ usr/bin/ldbdel
 usr/bin/smbpasswd
 usr/bin/smbtar
 usr/bin/tdbdump
-usr/bin/wsdd.py
 usr/bin/tdbtool
 usr/bin/net
 usr/bin/smbstatus
