@@ -320,6 +320,12 @@ static int conn_struct_tos_destructor(struct conn_struct_tos *c)
 		vfs_ChDir(c->conn, c->oldcwd_fname);
 		TALLOC_FREE(c->oldcwd_fname);
 	}
+	/*
+	 * VFS modules may hold conn-scoped pathref fsps whose fds are not
+	 * closed by talloc alone. Match close_cnum() ordering before freeing
+	 * the conn.
+	 */
+	file_close_conn(c->conn, SHUTDOWN_CLOSE);
 	SMB_VFS_DISCONNECT(c->conn);
 	conn_free(c->conn);
 	return 0;
