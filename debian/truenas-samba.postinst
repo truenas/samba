@@ -2,23 +2,6 @@
 
 set -e
 
-nmbd_error_handler() {
-    if [ -d /sys/class/net/lo ] && ls /sys/class/net | grep -qv ^lo$; then
-        # https://bugs.debian.org/893762
-        echo 'WARNING: nmbd failed to start as there is no non-loopback interfaces available.'
-        echo 'Either add an interface or set "disable netbios = yes" in smb.conf and run "systemctl mask nmbd"'
-        return 0
-    elif command -v ip > /dev/null && ip a show | grep '^[[:space:]]*inet ' | grep -vq ' lo$'; then
-        # https://bugs.debian.org/859526
-        echo 'WARNING: nmbd failed to start as there is no local IPv4 non-loopback interfaces available.'
-        echo 'Either add an IPv4 address or set "disable netbios = yes" in smb.conf and run "systemctl mask nmbd"'
-        return 0
-    else
-        echo 'ERROR: nmbd failed to start.'
-        return 1 # caught by set -e
-    fi
-}
-
 mask_services() {
     local reason="$1"
     shift
@@ -66,7 +49,6 @@ umask 022
 SERVER_ROLE=`samba-tool testparm --parameter-name="server role"  2>/dev/null | tail -1`
 SERVER_SERVICES=`samba-tool testparm --parameter-name="server services"  2>/dev/null | tail -1`
 DCERPC_ENDPOINT_SERVERS=`samba-tool testparm --parameter-name="dcerpc endpoint servers"  2>/dev/null | tail -1`
-DISABLE_NETBIOS=`samba-tool testparm --parameter-name="disable netbios"  2>/dev/null | tail -1`
 
 mkdir /var/empty
 
@@ -78,9 +60,7 @@ if [ "$SERVER_ROLE" != "active directory domain controller" ] \
     mask_services "Samba is not being run as an AD Domain Controller" samba-ad-dc.service
 fi
 if [ "$SERVER_ROLE" = "active directory domain controller" ]; then
-    mask_services "Samba is being run as an AD Domain Controller" smbd.service nmbd.service
-elif [ "$DISABLE_NETBIOS" = Yes ]; then
-    mask_services "NetBIOS is disabled" nmbd.service
+    mask_services "Samba is being run as an AD Domain Controller" smbd.service
 fi
 
 mask_services "Masking samba-bgqd service" samba-bgqd.service
