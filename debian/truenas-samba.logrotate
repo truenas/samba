@@ -10,18 +10,6 @@
 	notifempty
 }
 
-/var/log/samba/log.nmbd {
-	weekly
-	missingok
-	rotate 7
-	postrotate
-		[ ! -x /usr/bin/smbcontrol ] || [ ! -f /run/samba/nmbd.pid ] || /usr/bin/smbcontrol nmbd reload-config
-	endscript
-	compress
-	delaycompress
-	notifempty
-}
-
 /var/log/samba/log.samba {
 	weekly
 	missingok
