@@ -1,10 +1,8 @@
 #!/usr/bin/dh-exec --with-scripts=filter-arch
 [linux-any] lib/systemd/system/ctdb.service
-[linux-any] lib/systemd/system/nmbd.service
 [linux-any] lib/systemd/system/samba-bgqd.service
 [linux-any] lib/systemd/system/smbd.service
 [linux-any] lib/systemd/system/winbind.service
-[linux-any] lib/systemd/system/wsdd.service
 usr/bin/mdsearch
 usr/bin/oLschema2ldif
 usr/bin/regtree
@@ -22,7 +20,6 @@ usr/bin/ldbdel
 usr/bin/smbpasswd
 usr/bin/smbtar
 usr/bin/tdbdump
-usr/bin/wsdd.py
 usr/bin/tdbtool
 usr/bin/net
 usr/bin/smbstatus
@@ -64,7 +61,6 @@ usr/sbin/ctdbd
 usr/sbin/winbindd
 usr/sbin/eventlogadm
 usr/sbin/samba-gpupdate
-usr/sbin/nmbd
 usr/share/man/*
 ctdb/config/ctdb.conf etc/ctdb
 ctdb/config/ctdb.tunables etc/ctdb
