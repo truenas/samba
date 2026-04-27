@@ -122,13 +122,10 @@ ifeq ($(DEB_HOST_ARCH_OS), linux)
 	# Install systemd configs
 	mkdir -p $(DESTDIR)/lib/systemd/system/
 	# Services fixups
-	mv $(DESTDIR)/lib/systemd/system/nmb.service $(DESTDIR)/lib/systemd/system/nmbd.service
 	mv $(DESTDIR)/lib/systemd/system/smb.service $(DESTDIR)/lib/systemd/system/smbd.service
 	sed -i \
 	  -e 's|/etc/sysconfig/|/etc/default/|' \
-	  -e 's|nmb\.service|nmbd.service|' \
 	  -e 's|smb\.service|smbd.service|' \
-	  $(DESTDIR)/lib/systemd/system/nmbd.service \
 	  $(DESTDIR)/lib/systemd/system/smbd.service \
 	  $(DESTDIR)/lib/systemd/system/winbind.service
 endif
@@ -144,7 +141,6 @@ override_dh_installchangelogs:
 override_dh_installinit:
 ifneq (,$(filter samba, $(shell dh_listpackages)))
 	dh_installinit -ptruenas-samba --name smbd
-	dh_installinit -ptruenas-samba --name nmbd --error-handler nmbd_error_handler
 	dh_installinit -ptruenas-samba --name winbindd
 	mkdir -p $(CURDIR)/debian/ctdb/etc/init.d
 	install -m755 ctdb/config/ctdb.init $(CURDIR)/debian/ctdb/etc/init.d/ctdb
