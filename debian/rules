@@ -44,7 +44,8 @@ conf_args = \
 		--with-winbind \
 		--without-ad-dc \
 		--with-quotas \
-		--with-shared-modules=idmap_rid,idmap_ad,idmap_ldap,auth_samba4,vfs_nfs4acl_xattr,!vfs_snapper \
+		--with-shared-modules=idmap_rid,idmap_ad,idmap_ldap,vfs_nfs4acl_xattr,!vfs_snapper \
+		--with-static-modules=vfs_zfs_core,vfs_io_uring,vfs_streams_xattr,vfs_shadow_copy_zfs,vfs_ixnas,vfs_fruit \
 		--with-automount \
 		--with-ldap \
 		--with-ads \
@@ -59,7 +60,6 @@ conf_args = \
 		--disable-avahi \
 		--disable-rpath \
 		--disable-rpath-install \
-		--minimum-library-version="$(shell ./debian/autodeps.py --minimum-library-version)" \
 		--with-cluster-support \
 		--with-socketpath=/run/ctdb/ctdbd.socket \
 		--with-logdir=/var/log/ctdb \
