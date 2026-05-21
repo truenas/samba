@@ -132,6 +132,7 @@ struct fruit_config_data {
 	bool aapl_zero_file_id;
 	const char *model;
 	char *macmeta_streamname;
+	char *rsrc_streamname;	/* pre-computed AFP_AfpResource xattr name */
 	bool time_machine;
 	off_t time_machine_max_size;
 	bool convert_adouble;
@@ -392,6 +393,8 @@ static int init_fruit_config(vfs_handle_struct *handle)
 	if (lp_parm_bool(SNUM(handle->conn), FRUIT_PARAM_TYPE_NAME, "streamname_optimization", true)) {
 		config->macmeta_streamname = talloc_asprintf(config, "%s%s%s",
 		    prefix, "AFP_AfpInfo", store_stream_type ? ":$DATA" : "");
+		config->rsrc_streamname = talloc_asprintf(config, "%s%s%s",
+		    prefix, "AFP_AfpResource", store_stream_type ? ":$DATA" : "");
 	}
 	tm_size_str = lp_parm_const_string(
 		SNUM(handle->conn), FRUIT_PARAM_TYPE_NAME,
@@ -1149,9 +1152,34 @@ static uint64_t readdir_attr_rfork_size_stream(
 	struct vfs_handle_struct *handle,
 	const struct smb_filename *smb_fname)
 {
+	struct fruit_config_data *config = NULL;
 	struct smb_filename *stream_name = NULL;
 	int ret;
 	uint64_t rfork_size;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct fruit_config_data,
+				return 0);
+
+	/*
+	 * Fast path: the resource fork lives in a single xattr on the
+	 * base file. If the dir-enum entry already has an open pathref,
+	 * read the xattr's value-length directly — one syscall.
+	 * Falls through to the slow path on any unexpected error so
+	 * configurations without streamname_optimization still work.
+	 */
+	if (config->rsrc_streamname != NULL && smb_fname->fsp != NULL) {
+		ssize_t sz = SMB_VFS_FGETXATTR(smb_fname->fsp,
+					       config->rsrc_streamname,
+					       NULL, 0);
+		if (sz >= 0) {
+			return (uint64_t)sz;
+		}
+		if (errno == ENOATTR || errno == ENOTSUP) {
+			return 0;
+		}
+		/* other errors: fall through to slow path */
+	}
 
 	stream_name = synthetic_smb_fname(talloc_tos(),
 					  smb_fname->base_name,
