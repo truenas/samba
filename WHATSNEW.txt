@@ -1,4 +1,182 @@
                    ==============================
+                   Release Notes for Samba 4.22.9
+                           April 09, 2026
+                   ==============================
+
+
+This is the latest stable release of the Samba 4.22 release series.
+
+
+Changes since 4.22.8
+--------------------
+
+o  Ralph Boehme <slow@samba.org>
+   * BUG 15978: leases torture test flappy
+
+o  Volker Lendecke <vl@samba.org>
+   * BUG 16019: incorrect behavior on rpcclient enumport with rpcd_spoolss
+
+o  Noel Power <noel.power@suse.com>
+   * BUG 15789: "use-kerberos=desired" broken
+   * BUG 16042: rpc workers with long living clients grow server  memory keytab
+
+o  Peter Schwenke <pschwenke@ddn.com>
+   * BUG 15938: CTDB's statd_callout fails on sm-notify
+   * BUG 15939: CTDB statd_callout_notify notifies unnecessary clients and loses
+     their state
+
+o  Martin Schwenke <mschwenke@ddn.com>
+   * BUG 15939: CTDB statd_callout_notify notifies unnecessary clients and loses
+     their state
+
+
+#######################################
+Reporting bugs & Development Discussion
+#######################################
+
+Please discuss this release on the samba-technical mailing list or by
+joining the #samba-technical:matrix.org matrix room, or
+#samba-technical IRC channel on irc.libera.chat.
+
+If you do report problems then please try to send high quality
+feedback. If you don't provide vital information to help us track down
+the problem then you will probably be ignored.  All bug reports should
+be filed under the Samba 4.1 and newer product in the project's Bugzilla
+database (https://bugzilla.samba.org/).
+
+
+======================================================================
+== Our Code, Our Bugs, Our Responsibility.
+== The Samba Team
+======================================================================
+
+
+Release notes for older releases follow:
+----------------------------------------
+                   ==============================
+                   Release Notes for Samba 4.22.8
+                         February 19, 2026
+                   ==============================
+
+
+This is the latest stable release of the Samba 4.22 release series.
+
+
+Changes since 4.22.7
+--------------------
+
+o  Ralph Boehme <slow@samba.org>
+   * BUG 15959: New Spotlight default search field incorrectly initialized
+   * BUG 15984: smbd: in contend_dirleases() don't bother checking when not
+     enabled
+
+o  Samuel Cabrero <scabrero@samba.org>
+   * BUG 15979: possible memory leak  on rpc_spoolss
+
+o  Günther Deschner <gd@samba.org>
+   * BUG 15964: "net offlinejoin requestodj" manpage entry incorrectly mentiones
+     provided credentials
+
+o  Pavel Filipenský <pfilipensky@samba.org>
+   * BUG 15972: Winbind group resolution failure
+
+o  Noel Power <noel.power@suse.com>
+   * BUG 15979: possible memory leak  on rpc_spoolss
+
+o  Martin Schwenke <mschwenke@ddn.com>
+   * BUG 15977: ctdbd socket documentation is wrong
+
+o  Michael Tokarev <mjt@tls.msk.ru>
+   * BUG 15790: Bind dlz 9.20
+
+
+#######################################
+Reporting bugs & Development Discussion
+#######################################
+
+Please discuss this release on the samba-technical mailing list or by
+joining the #samba-technical:matrix.org matrix room, or
+#samba-technical IRC channel on irc.libera.chat.
+
+If you do report problems then please try to send high quality
+feedback. If you don't provide vital information to help us track down
+the problem then you will probably be ignored.  All bug reports should
+be filed under the Samba 4.1 and newer product in the project's Bugzilla
+database (https://bugzilla.samba.org/).
+
+
+======================================================================
+== Our Code, Our Bugs, Our Responsibility.
+== The Samba Team
+======================================================================
+
+
+----------------------------------------------------------------------
+                   ==============================
+                   Release Notes for Samba 4.22.7
+                         December 18, 2025
+                   ==============================
+
+
+This is the latest stable release of the Samba 4.22 release series.
+
+
+Changes since 4.22.6
+--------------------
+
+o  Ralph Boehme <slow@samba.org>
+   * BUG 15926: Samba 4.22 breaks Time Machine
+   * BUG 15930: Searching for numbers doesn't work with Spotlight
+   * BUG 15947: mdssvc doesn't support $time.iso dates before 1970
+
+o  Günther Deschner <gd@samba.org>
+   * BUG 15963: Fix winbind cache consistency
+
+o  Pavel Filipenský <pfilipensky@samba.org>
+   * BUG 15940: vfs_recycle does not update mtime
+
+o  Volker Lendecke <vl@samba.org>
+   * BUG 15897: Assert failed: (dirfd != -1) || (smb_fname->base_name[0] == '/')
+     in vfswrap_openat
+   * BUG 15950: ctdb can crash with inconsistent cluster lock configuration
+
+o  Anoop C S <anoopcs@samba.org>
+   * BUG 15897: Assert failed: (dirfd != -1) || (smb_fname->base_name[0] == '/')
+     in vfswrap_openat
+
+o  Andreas Schneider <asn@samba.org>
+   * BUG 15809: samba-bgqd: rework man page
+   * BUG 15936: samba-bgqd can't find [printers] share
+   * BUG 15955: Winbind can hang forever in gssapi if there are network issues.
+   * BUG 15961: libldb requires linking libreplace on Linux
+
+o  Martin Schwenke <mschwenke@ddn.com>
+   * BUG 15935: Crash in ctdbd on failed updateip
+
+
+#######################################
+Reporting bugs & Development Discussion
+#######################################
+
+Please discuss this release on the samba-technical mailing list or by
+joining the #samba-technical:matrix.org matrix room, or
+#samba-technical IRC channel on irc.libera.chat.
+
+If you do report problems then please try to send high quality
+feedback. If you don't provide vital information to help us track down
+the problem then you will probably be ignored.  All bug reports should
+be filed under the Samba 4.1 and newer product in the project's Bugzilla
+database (https://bugzilla.samba.org/).
+
+
+======================================================================
+== Our Code, Our Bugs, Our Responsibility.
+== The Samba Team
+======================================================================
+
+
+----------------------------------------------------------------------
+                   ==============================
                    Release Notes for Samba 4.22.6
                           October 16, 2025
                    ==============================
@@ -59,8 +237,7 @@ database (https://bugzilla.samba.org/).
 ======================================================================
 
 
-Release notes for older releases follow:
-----------------------------------------
+----------------------------------------------------------------------
                    ==============================
                    Release Notes for Samba 4.22.5
                           October 15, 2025
