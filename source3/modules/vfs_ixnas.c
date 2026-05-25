@@ -821,7 +821,6 @@ static NTSTATUS ixnas_generate_special_dacl_sd(struct vfs_handle_struct *handle,
 	NTSTATUS status;
 	struct dom_sid sid_owner, sid_group;
 	size_t sd_size = 0;
-	struct security_ace *nt_ace_list = NULL;
 	struct security_acl *psa = NULL;
 	uint16_t controlflags = SEC_DESC_SELF_RELATIVE | SEC_DESC_DACL_PROTECTED | SEC_DESC_DACL_PRESENT;
 
@@ -1019,7 +1018,7 @@ static bool ixnas_process_smbacl(vfs_handle_struct *handle,
 	zfsacl_t zfsacl;
 	struct SMB4ACE_T *smbace = NULL;
 	bool has_inheritable = false;
-	bool ok;
+	bool ok = false;
 	struct ixnas_config_data *config = NULL;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
@@ -1036,7 +1035,6 @@ static bool ixnas_process_smbacl(vfs_handle_struct *handle,
 	for (smbace=smb_first_ace4(smbacl);
 	     smbace!=NULL;
 	     smbace = smb_next_ace4(smbace)) {
-		bool ok;
 		SMB_ACE4PROP_T *aceprop = smb_get_ace4(smbace);
 
 		ok = smbace2zfsentry(zfsacl, aceprop);
@@ -1103,7 +1101,6 @@ static NTSTATUS ixnas_fset_special_dacl(vfs_handle_struct *handle,
 	 */
 
 	zfsacl_t zfsacl;
-	struct SMB4ACE_T *smbace = NULL;
 	zfsacl_entry_t placeholder_entry = NULL;
 	bool ok;
 	zfsace_permset_t perms;
@@ -1400,8 +1397,6 @@ static bool set_acl_parameters(struct vfs_handle_struct *handle,
 {
 	int ret;
 	char *chkpath = NULL;
-	acl_t zacl;
-	int is_trivial = 0;
 
 	ret = access(handle->conn->connectpath, F_OK);
 	if (ret != 0 && errno == ENOENT) {
@@ -1435,6 +1430,7 @@ static bool set_acl_parameters(struct vfs_handle_struct *handle,
 	handle->conn->aclbrand = path_get_aclbrand(handle->conn->connectpath);
 	if (handle->conn->aclbrand != TRUENAS_ACL_BRAND_NFS4) {
 		DBG_ERR("Connectpath does not support NFSv4 ACLs. Disabling ZFS ACL handling.\n");
+		TALLOC_FREE(chkpath);
 		return false;
 	}
 	TALLOC_FREE(chkpath);
@@ -1483,6 +1479,7 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 	ok = set_acl_parameters(handle, config);
 	if (!ok) {
 		TALLOC_FREE(config);
+		SMB_VFS_NEXT_DISCONNECT(handle);
 		return -1;
 	}
 

@@ -280,7 +280,7 @@ static bool tn_audit_backend_init(vfs_handle_struct *handle,
 	if (enumval == -1) {
 		DBG_ERR("value for %s:backend type unknown\n",
 			MODULE_NAME);
-		return -1;
+		return false;
 	}
 
 	switch ((enum tn_audit_backend)enumval) {
@@ -386,13 +386,11 @@ static int tn_audit_connect(vfs_handle_struct *handle,
 	 *   "vers": {"major": 0, "minor": 1}
 	 * }
 	 */
-	int result, enumval;
+	int result;
 	tn_audit_conf_t *config = NULL;
 	struct json_object msg, entry, js_conn;
 	bool ok;
 	bool enabled;
-	const char **watch_list = NULL;
-	const char **ignore_list = NULL;
 
 	if (!conn_using_smb2(handle->conn->sconn)) {
 		DBG_ERR("%s: user connected to service [%s] via SMB1 protocol. "
@@ -410,13 +408,12 @@ static int tn_audit_connect(vfs_handle_struct *handle,
 	if (config == NULL) {
 		DBG_ERR("talloc_zero() failed\n");
 		errno = ENOMEM;
-		return -1;
+		goto disconnect_out;
 	}
 
 	ok = tn_audit_backend_init(handle, svc, user, config);
 	if (!ok) {
-		TALLOC_FREE(config);
-		return -1;
+		goto disconnect_out;
 	}
 
 	// If we fail to generate our connection info, then
@@ -425,35 +422,30 @@ static int tn_audit_connect(vfs_handle_struct *handle,
 	    &handle->conn->session_info->unique_session_token);
 
 	if (config->conn_info.sess == NULL) {
-		TALLOC_FREE(config);
-		return -1;
+		goto disconnect_out;
 	}
 
 	config->conn_info.user = talloc_strdup(config,
 	    handle->conn->session_info->unix_info->sanitized_username);
 	if (config->conn_info.user == NULL) {
-		TALLOC_FREE(config);
-		return -1;
+		goto disconnect_out;
 	}
 
 	js_conn = json_new_object();
 	if (json_is_invalid(&js_conn)) {
-		TALLOC_FREE(config);
-		return -1;
+		goto disconnect_out;
 	}
 
 	ok = tn_add_connection_info_to_obj(svc, handle->conn,
 					   &js_conn);
 	if (!ok) {
 		json_free(&js_conn);
-		TALLOC_FREE(config);
-		return -1;
+		goto disconnect_out;
 	}
 	config->js_connection = json_to_string(config, &js_conn);
 	json_free(&js_conn);
 	if (config->js_connection == NULL) {
-		TALLOC_FREE(config);
-		return -1;
+		goto disconnect_out;
 	}
 	SMB_VFS_HANDLE_SET_DATA(handle, config, NULL,
 				tn_audit_conf_t, return -1);
@@ -497,6 +489,11 @@ cleanup:
 	json_free(&entry);
 
 	return result;
+
+disconnect_out:
+	TALLOC_FREE(config);
+	SMB_VFS_NEXT_DISCONNECT(handle);
+	return -1;
 }
 
 static bool add_session_counters(tn_audit_conf_t *config,
