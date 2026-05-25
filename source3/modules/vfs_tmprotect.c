@@ -448,6 +448,14 @@ static void tmprotect_deferred_snapshot(struct tevent_context *ev,
 				return);
 
 	/*
+	 * tevent callbacks fire with whatever security context happens to be
+	 * current — typically the last impersonated SMB user. libzfs needs
+	 * root, so drop user impersonation explicitly. Matches the pattern in
+	 * housekeeping_fn / smbd_sig_hup_handler / smbd_conf_updated.
+	 */
+	change_to_root_user();
+
+	/*
 	 * Clear the pointer before tevent destroys `te` after this callback
 	 * returns, so the disconnect path can distinguish "snapshot pending"
 	 * from "snapshot already taken".
