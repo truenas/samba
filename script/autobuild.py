@@ -181,6 +181,16 @@ samba_configure_params = " ${ENABLE_COVERAGE} ${PREFIX} --with-profiling-data --
 # We cannot configure himmelblau on old systems missing openssl 3, with glibc
 # older than version 2.32, or when cargo isn't available.
 himmelblau_configure_params = ''
+
+# To test that waf copes with unknown arguments that look like
+# environment variables, we add a couple of parameters that should be
+# treated environment variables that happen to have no effect.
+#
+# This is for https://bugzilla.samba.org/show_bug.cgi?id=15990: distro
+# build systems do this kind of thing, and older versions of waf
+# allowed it.
+useless_configure_params = " _foobliosity_over_mud=7 GRISHLIHOOD_77=0"
+
 rust_configure_param = ''
 glibc_vers = float('.'.join(get_libc_version().split('.')[:2]))
 cargo = shutil.which('cargo')
@@ -206,13 +216,7 @@ try:
 except ImportError:
     pass
 
-# on ubuntu gcc implies _FORTIFY_SOURCE
-# before 24.04 it was _FORTIFY_SOURCE=2
-# and 24.04 has _FORTIFY_SOURCE=3
-# so we do not specify it explicitly.
 samba_o3_cflags = "-O3"
-if not is_ubuntu:
-    samba_o3_cflags += " -Wp,-D_FORTIFY_SOURCE=2"
 
 def format_option(name, value=None):
     """Format option as str list."""
@@ -288,7 +292,7 @@ tasks = {
     "samba-def-build": {
         "git-clone-required": True,
         "sequence": [
-            ("configure", "./configure.developer" + samba_configure_params),
+            ("configure", "./configure.developer" + samba_configure_params + useless_configure_params),
             ("make", "make -j"),
             ("check-clean-tree", CLEAN_SOURCE_TREE_CMD),
             ("chmod-R-a-w", "chmod -R a-w ."),
