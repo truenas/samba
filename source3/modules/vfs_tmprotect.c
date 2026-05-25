@@ -41,11 +41,14 @@ struct tmprotect_config_data {
 	struct snap_filter *filter;
 	int retention;
 	int min_snaps;
+	int deferred_seconds;
 	bool enabled;
 	char *history_file;
 	time_t last_snap;
 	time_t oldest_snap;
 	time_t last_success;
+	size_t last_count;
+	struct tevent_timer *pending_snap;
 };
 
 static bool init_zfs(vfs_handle_struct *handle,
@@ -344,6 +347,7 @@ static int tmprotect_openat(vfs_handle_struct *handle,
 	ok = parse_history(config->history_file, &cnt, &last_success);
 	if (ok && cnt) {
 		config->last_success = last_success;
+		config->last_count = cnt;
 	}
 
 	ok = prune_snapshots(handle, config);
@@ -381,19 +385,185 @@ static bool history_changed(vfs_handle_struct *handle,
 	return rv;
 }
 
-static void tmprotect_disconnect(vfs_handle_struct *handle)
+static void tmprotect_take_snapshot(vfs_handle_struct *handle,
+				    struct tmprotect_config_data *config)
 {
 	int ret;
 	bool ok;
 	time_t curtime, last_snap;
-	struct tmprotect_config_data *config = NULL;
 	char *snapshot_name = NULL;
 
 	time(&curtime);
+
+	ok = last_snap_ts(handle, config, &last_snap);
+	if (!ok) {
+		DBG_ERR("Failed to look up timestamp for last snapshot\n");
+		return;
+	}
+
+	/*
+	 * Time machine will back up once every 15 minutes by default.
+	 * Refuse to take more frequent snapshots than that.
+	 */
+
+	if (last_snap + 900 > curtime) {
+		DBG_INFO("Refusing to generate new snapshot: "
+			 "last snapshot is less than 15 minutes old\n");
+		return;
+	}
+
+	snapshot_name = talloc_asprintf(talloc_tos(), "%s-%lu",
+					TMPROTECT_PREFIX,
+					curtime);
+	if (snapshot_name == NULL) {
+		DBG_ERR("talloc_asprintf() failed\n");
+		return;
+	}
+
+	ret = smb_zfs_snapshot(config->hdl, snapshot_name, false);
+	if (ret != 0) {
+		DBG_ERR("Failed to generate snapshot on path: %s\n",
+			handle->conn->connectpath);
+		TALLOC_FREE(snapshot_name);
+		return;
+	}
+
+	DBG_INFO("%s: snapshot taken following successful time machine backup\n",
+		 snapshot_name);
+	TALLOC_FREE(snapshot_name);
+}
+
+static void tmprotect_deferred_snapshot(struct tevent_context *ev,
+					struct tevent_timer *te,
+					struct timeval current_time,
+					void *private_data)
+{
+	struct vfs_handle_struct *handle =
+		(struct vfs_handle_struct *)private_data;
+	struct tmprotect_config_data *config = NULL;
+
 	SMB_VFS_HANDLE_GET_DATA(handle,
 				config,
 				struct tmprotect_config_data,
-				NULL);
+				return);
+
+	/*
+	 * tevent callbacks fire with whatever security context happens to be
+	 * current — typically the last impersonated SMB user. libzfs needs
+	 * root, so drop user impersonation explicitly. Matches the pattern in
+	 * housekeeping_fn / smbd_sig_hup_handler / smbd_conf_updated.
+	 */
+	change_to_root_user();
+
+	/*
+	 * Clear the pointer before tevent destroys `te` after this callback
+	 * returns, so the disconnect path can distinguish "snapshot pending"
+	 * from "snapshot already taken".
+	 */
+	config->pending_snap = NULL;
+
+	tmprotect_take_snapshot(handle, config);
+}
+
+static int tmprotect_renameat(vfs_handle_struct *handle,
+			      files_struct *srcfsp,
+			      const struct smb_filename *smb_fname_src,
+			      files_struct *dstfsp,
+			      const struct smb_filename *smb_fname_dst,
+			      const struct vfs_rename_how *how)
+{
+	int ret;
+	struct tmprotect_config_data *config = NULL;
+	size_t cnt = 0, dlen, slen = strlen(tm_plist_suffix);
+	time_t timestamp = 0;
+	bool parse_ok, has_new_backup = false;
+	struct tevent_timer *new_te = NULL;
+
+	ret = SMB_VFS_NEXT_RENAMEAT(handle, srcfsp, smb_fname_src,
+				    dstfsp, smb_fname_dst, how);
+	if (ret != 0) {
+		return ret;
+	}
+
+	SMB_VFS_HANDLE_GET_DATA(handle,
+				config,
+				struct tmprotect_config_data,
+				return ret);
+
+	if (!config->enabled || config->history_file == NULL) {
+		return ret;
+	}
+
+	dlen = strlen(smb_fname_dst->base_name);
+	if ((dlen < slen) ||
+	    (strcmp(tm_plist_suffix,
+		    smb_fname_dst->base_name + (dlen - slen)) != 0)) {
+		return ret;
+	}
+
+	parse_ok = parse_history(config->history_file, &cnt, &timestamp);
+	if (parse_ok && cnt > 0 &&
+	    (cnt > config->last_count || timestamp > config->last_success)) {
+		has_new_backup = true;
+	}
+
+	/*
+	 * Reset the timer on every rename targeting the plist, even when the
+	 * count didn't change: macOS issues a thundering herd of renames on
+	 * backup completion, and the snapshot should fire only once those
+	 * renames have stopped for deferred_seconds.
+	 */
+	if (!has_new_backup && config->pending_snap == NULL) {
+		return ret;
+	}
+
+	new_te = tevent_add_timer(handle->conn->sconn->ev_ctx,
+				  config,
+				  tevent_timeval_current_ofs(config->deferred_seconds, 0),
+				  tmprotect_deferred_snapshot,
+				  handle);
+	if (new_te == NULL) {
+		DBG_ERR("tevent_add_timer() failed; deferred snapshot not "
+			"scheduled, falling back to disconnect-time path\n");
+		return ret;
+	}
+
+	/*
+	 * Free the old timer only after the new one was successfully armed.
+	 * If tevent_add_timer() had failed we'd have returned above with the
+	 * old timer still armed, rather than cancelling it and ending up with
+	 * no scheduled snapshot at all.
+	 */
+	TALLOC_FREE(config->pending_snap);
+	config->pending_snap = new_te;
+
+	/*
+	 * Only commit tracking updates after a timer was successfully armed.
+	 * Updating earlier would make history_changed() return false even
+	 * when no snapshot is pending, losing the disconnect-time fallback.
+	 */
+	if (has_new_backup) {
+		config->last_count = cnt;
+		config->last_success = timestamp;
+		DBG_INFO("Scheduled deferred Time Machine snapshot in %d "
+			 "seconds (plist count=%zu, timestamp=%ld)\n",
+			 config->deferred_seconds, cnt, timestamp);
+	} else {
+		DBG_INFO("Rearmed deferred Time Machine snapshot timer "
+			 "(%d seconds from now)\n", config->deferred_seconds);
+	}
+
+	return ret;
+}
+
+static void tmprotect_disconnect(vfs_handle_struct *handle)
+{
+	struct tmprotect_config_data *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle,
+				config,
+				struct tmprotect_config_data,
+				return);
 
 	/*
 	 * This SMB session may not have been a time machine backup.
@@ -405,44 +575,30 @@ static void tmprotect_disconnect(vfs_handle_struct *handle)
 		return;
 	}
 
-	ok = history_changed(handle, config);
-	if (!ok) {
-		DBG_INFO("No changes recorded in snapshot history file\n");
-		return;
-	}
-
-	ok = last_snap_ts(handle, config, &last_snap);
-	if (!ok) {
-		DBG_ERR("Failed to look up timestamp for last session\n");
+	if (config->pending_snap != NULL) {
+		/*
+		 * The rename hook scheduled a deferred snapshot but the
+		 * client is disconnecting before the timer fires. Take the
+		 * snapshot now and cancel the pending timer.
+		 */
+		DBG_INFO("Disconnecting with deferred snapshot pending; "
+			 "taking snapshot inline\n");
+		TALLOC_FREE(config->pending_snap);
+		tmprotect_take_snapshot(handle, config);
 		return;
 	}
 
 	/*
-	 * Time machine will back up once every 15 minutes by default.
-	 * Refuse to take more frequent snapshots than that.
+	 * Fallback for clients that update the plist in place rather than
+	 * via atomic rename — the rename hook never fired so check the plist
+	 * directly.
 	 */
-
-	if (last_snap + 900 > curtime) {
-		DBG_INFO("Refusing to generate new snapshot on disconnect"
-			 "last snapshot is less than 15 minutes old\n");
-		return;
-	}
-	snapshot_name = talloc_asprintf(talloc_tos(), "%s-%lu",
-					TMPROTECT_PREFIX,
-					curtime);
-	if (snapshot_name == NULL) {
-		DBG_ERR("talloc_asprintf() failed\n");
+	if (!history_changed(handle, config)) {
+		DBG_INFO("No changes recorded in snapshot history file\n");
 		return;
 	}
 
-	ret = smb_zfs_snapshot(config->hdl, snapshot_name, false);
-	if (ret != 0) {
-		DBG_ERR("Failed to generate closing snapshot on path: %s\n",
-			handle->conn->connectpath);
-	}
-
-	DBG_INFO("%s: snapshot taken following successful time machine backup\n",
-		 snapshot_name);
+	tmprotect_take_snapshot(handle, config);
 }
 
 
@@ -506,6 +662,13 @@ static int tmprotect_connect(struct vfs_handle_struct *handle,
 					TMPROTECT_MODULE,
 					"min_snaps", 3);
 
+	config->deferred_seconds = lp_parm_int(SNUM(handle->conn),
+					       TMPROTECT_MODULE,
+					       "deferred_seconds", 60);
+	if (config->deferred_seconds < 1) {
+		config->deferred_seconds = 60;
+	}
+
 	SMB_VFS_HANDLE_SET_DATA(handle, config,
 				NULL, struct tmprotect_config_data,
 				return -1);
@@ -524,6 +687,7 @@ static struct vfs_fn_pointers tmprotect_fns = {
 	.disconnect_fn = tmprotect_disconnect,
 	.connect_fn = tmprotect_connect,
 	.openat_fn = tmprotect_openat,
+	.renameat_fn = tmprotect_renameat,
 };
 
 NTSTATUS vfs_tmprotect_init(TALLOC_CTX *);
