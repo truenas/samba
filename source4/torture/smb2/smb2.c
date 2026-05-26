@@ -184,6 +184,7 @@ NTSTATUS torture_smb2_init(TALLOC_CTX *ctx)
 	torture_suite_add_1smb2_test(suite, "stream-inherit-perms",
 				     test_stream_inherit_perms);
 	torture_suite_add_suite(suite, torture_smb2_ioctl_init(suite));
+	torture_suite_add_suite(suite, torture_smb2_truenas_zerocopy_init(suite));
 	torture_suite_add_simple_test(suite, "set-sparse-ioctl",
 				      test_ioctl_set_sparse);
 	torture_suite_add_simple_test(suite, "zero-data-ioctl",

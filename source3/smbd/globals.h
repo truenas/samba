@@ -25,6 +25,20 @@
 #include "librpc/gen_ndr/smbXsrv.h"
 #include "smbprofile.h"
 
+/*
+ * Defined here (rather than next to aio_extra below) because it is also
+ * embedded by value inside struct samba_uring_splice_op in the io_uring
+ * header included on the next line.
+ */
+struct file_modified_state {
+	bool valid;
+	struct stat_ex st;
+};
+
+#ifdef HAVE_LIBURING
+#include "smbd/smbd_smb2_uring.h"
+#endif
+
 #ifdef USE_DMAPI
 struct smbd_dmapi_context;
 extern struct smbd_dmapi_context *dmapi_ctx;
@@ -528,6 +542,24 @@ struct smbXsrv_connection {
 		 * but with reversed value...
 		 */
 		bool got_authenticated_session;
+
+#ifdef HAVE_LIBURING
+		/*
+		 * Per-xconn io_uring state. Allocated lazily at negprot, freed
+		 * with the xconn talloc context. Opaque to globals.h; defined
+		 * in source3/smbd/smbd_smb2_uring.h.
+		 *
+		 *   enabled            config flags latched once at negprot
+		 *   inflight           bitmask of CQE-pending socket ops
+		 *   signed_alg_cache   list of AF_ALG bind sockets, one per
+		 *                      active signing_key on this xconn
+		 *                      (each session/channel gets one,
+		 *                      reused via accept4)
+		 *   counters           per-mode dispatch counters exposed via
+		 *                      FSCTL_SMBTORTURE_TRUENAS_URING_*
+		 */
+		struct samba_uring_xconn *uring;
+#endif
 	} smb2;
 };
 
@@ -606,6 +638,26 @@ struct smbd_smb2_send_queue {
 	} ack;
 
 	TALLOC_CTX *mem_ctx;
+
+#ifdef HAVE_LIBURING
+	/*
+	 * Back-pointer to the owning xconn. Set at every enqueue site so
+	 * pipelined splice state-machine callbacks can find their xconn
+	 * from the entry alone (callback_data is the entry pointer).
+	 */
+	struct smbXsrv_connection *xconn;
+
+	/*
+	 * Splice description (set only for outbound splice entries; for
+	 * regular sendmsg entries splice.type == SPLICE_OP_NONE, which is
+	 * the zero-init default). The vector/count iovs above are the SMB2
+	 * response header bytes that vmsplice into the pipe before the
+	 * file content; splice.fsp/offset/payload_len describe the file
+	 * region to splice in afterwards. See struct samba_uring_splice_entry
+	 * in smbd/smbd_smb2_uring.h.
+	 */
+	struct samba_uring_splice_entry splice;
+#endif
 };
 
 struct smbd_smb2_request {
@@ -633,6 +685,32 @@ struct smbd_smb2_request {
 	struct tevent_timer *async_te;
 	bool compound_related;
 	NTSTATUS compound_create_err;
+
+#ifdef HAVE_LIBURING
+	/*
+	 * Inbound splice annotation. Set by the dispatcher only when it
+	 * deliberately skips the in-band signature check on a signed WRITE
+	 * PDU whose body bytes are still on the socket (master knob on
+	 * plus short-recvfile -- the body hasn't been recv'd yet, so HMAC
+	 * over an empty body would always fail). The WRITE handler then
+	 * runs the verify-before-write state machine in smb2_aio.c:
+	 *   1. splice socket -> body_pipe (single PDU's worth of bytes)
+	 *   2. tee body_pipe -> alg_pipe; splice alg_pipe -> AF_ALG
+	 *   3. read MAC; compare against the stashed PDU signature
+	 *   4. mismatch -> drain body_pipe + return ACCESS_DENIED
+	 *      match    -> splice body_pipe -> file
+	 *
+	 *   type == SPLICE_OP_NONE       regular dispatch path (signature
+	 *                                checked in-band, or unsigned PDU)
+	 *   type == SPLICE_OP_SIGNED_IN  dispatcher deferred; signing_key
+	 *                                holds the resolved session key for
+	 *                                the verify-before-write step
+	 */
+	struct {
+		enum splice_op_type      type;
+		struct smb2_signing_key *signing_key;
+	} splice_in;
+#endif
 
 	/*
 	 * Give the implementation of an SMB2 req a way to tell the SMB2 request
@@ -835,11 +913,6 @@ void smbd_init_globals(void);
 /****************************************************************************
  The buffer we keep around whilst an aio request is in process.
 *****************************************************************************/
-
-struct file_modified_state {
-	bool valid;
-	struct stat_ex st;
-};
 
 struct aio_extra {
 	files_struct *fsp;

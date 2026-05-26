@@ -21,6 +21,10 @@
 #include "includes.h"
 #include "smbd/smbd.h"
 #include "smbd/globals.h"
+#ifdef HAVE_LIBURING
+#include "lib/truenas_uring.h"
+#include "smbd/smbd_smb2_uring.h"
+#endif
 #include "../libcli/smb/smb_common.h"
 #include "../libcli/smb/smb2_negotiate_context.h"
 #include "../lib/tsocket/tsocket.h"
@@ -619,6 +623,14 @@ NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 		const uint8_t *p;
 		size_t i;
 
+		/*
+		 * AES-GMAC is the SMB3.1.1 preferred signing algorithm and
+		 * the signed splice path now supports it via algif_hash("ghash")
+		 * keyed with H = AES_K(0^128) -- see truenas_smb2_alg_hmac_acquire
+		 * and truenas_smb2_compute_gmac_tag. No filtering: clients that
+		 * prefer GMAC get it, and that's the fast signed path.
+		 */
+
 		if (in_sign_algo->data.length < needed) {
 			return smbd_smb2_request_error(req,
 					NT_STATUS_INVALID_PARAMETER);
@@ -820,6 +832,194 @@ NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 	if (!NT_STATUS_IS_OK(status)) {
 		return smbd_smb2_request_error(req, status);
 	}
+
+#ifdef HAVE_LIBURING
+	/*
+	 * Latch the fork's enable state once, here, onto xconn->smb2.uring.
+	 * After this the per-PDU dispatcher reads booleans from a struct
+	 * rather than re-parsing smb.conf on every request.
+	 *
+	 * The fork exposes one operator-facing knob -- `truenas_uring:enabled`
+	 * (default yes). When set, every fast path (RECVMSG, SENDMSG,
+	 * unsigned/signed splice, SENDMSG_ZC) is eligible; the per-PDU
+	 * dispatcher then picks among them based on the PDU's signing and
+	 * encryption posture. There are no per-path operator overrides.
+	 */
+	{
+		struct samba_uring_xconn *u;
+		/*
+		 * Single master operator-facing knob. Default yes, since this
+		 * is the TrueNAS fork and zero-copy SMB is its raison d'etre.
+		 * Set `truenas_uring:enabled = no` for stock Samba behavior.
+		 *
+		 * All per-path flags below derive from the master. Per-PDU
+		 * dispatch then auto-selects splice (signed or unsigned, per
+		 * the PDU's SMB2_HDR_FLAG_SIGNED bit) or the registered-buffer
+		 * + SEND_ZC path (per the PDU's encryption posture). No
+		 * per-path operator tuning needed.
+		 */
+		const bool enabled = lp_parm_bool(GLOBAL_SECTION_SNUM,
+						  "truenas_uring", "enabled",
+						  true);
+
+		u = talloc_zero(xconn, struct samba_uring_xconn);
+		if (u == NULL) {
+			return smbd_smb2_request_error(req, NT_STATUS_NO_MEMORY);
+		}
+		u->enabled.sendmsg     = enabled;
+		u->enabled.recvmsg     = enabled;
+		u->enabled.splice_send = enabled;
+		u->enabled.splice_recv = enabled;
+		u->enabled.sendmsg_zc  = enabled;
+		u->enabled.zc_min_bytes = (size_t)lp_parm_ulong(
+			GLOBAL_SECTION_SNUM, "io_uring",
+			"send_zc_min_size", 65536);
+		/*
+		 * Recv-side back-pressure cap. Bytes counted across pktbuf
+		 * allocations + encrypted pool slots + encrypted talloc
+		 * fallbacks. 0 disables (no cap; matches stock Samba
+		 * behavior). Default is TURING_MAX_INFLIGHT_BYTES_DEFAULT
+		 * (512 MiB).
+		 */
+		u->max_inflight_bytes = (uint64_t)lp_parm_ulonglong(
+			GLOBAL_SECTION_SNUM, "truenas_uring",
+			"max_inflight_bytes",
+			TURING_MAX_INFLIGHT_BYTES_DEFAULT);
+
+		xconn->smb2.uring = u;
+	}
+#endif
+
+#ifdef HAVE_LIBURING
+	/*
+	 * Encrypted-READ registered buffer pool. Idempotent: the truenas_uring
+	 * is per-tevent_context (= per-process in smbd's fork-per-conn model),
+	 * and register_owned_pool returns -EBUSY on subsequent calls. So
+	 * calling here per xconn is safe; the pool actually lives once per
+	 * process.
+	 */
+	{
+		/*
+		 * Default 32 slots when the fork is enabled. Each slot is
+		 * sized to smb2_max_read + 8 KiB pad (so a full 4-8 MiB
+		 * encrypted READ response fits in one). 32 * 8 MiB = 256 MiB
+		 * of *virtual* address space per worker; physical pages are
+		 * committed lazily on first touch, so an idle worker pays
+		 * almost nothing. Operator can set to 0 to disable, or to
+		 * another value for memory/concurrency trade-offs.
+		 */
+		const bool fork_enabled = lp_parm_bool(
+			GLOBAL_SECTION_SNUM,
+			"truenas_uring", "enabled", true);
+		int pool_count = lp_parm_int(GLOBAL_SECTION_SNUM,
+					     "truenas_uring",
+					     "fixed_buffer_pool_count",
+					     fork_enabled ? 32 : 0);
+		int pool_bufsize = lp_parm_int(GLOBAL_SECTION_SNUM,
+					       "truenas_uring",
+					       "fixed_buffer_pool_bufsize",
+					       1024 * 1024);
+		if (pool_count > 0 && pool_bufsize > 0) {
+			struct truenas_uring *u = truenas_uring_get(
+				req->xconn->client->raw_ev_ctx);
+			if (u != NULL) {
+				(void)truenas_uring_register_owned_pool(
+					u, (unsigned int)pool_count,
+					(size_t)pool_bufsize);
+				/* -EBUSY on subsequent calls is fine. */
+			}
+		}
+	}
+
+	/*
+	 * Splice pipe pool. Idempotent like the registered buffer pool
+	 * above -- truenas_uring_register_pipe_pool returns -EBUSY on
+	 * re-call.
+	 *
+	 * Sizing rationale (K-deep pipelined outbound, single-in-flight
+	 * inbound):
+	 *
+	 *   Per-PDU peak demand (held from setup through SENDING phase):
+	 *     SIGNED_OUT    3 (body + tee + hdr)
+	 *     UNSIGNED_OUT  1
+	 *     SIGNED_IN     2 (body + tee; inbound, at most one at a time)
+	 *     UNSIGNED_IN   1 (inbound, at most one at a time)
+	 *
+	 *   Outbound is pipelined: K concurrent SIGNED_OUTs would hold 3K
+	 *   pipes total, all the way through their SEND_READY wait. The
+	 *   32-slot default gives ~10 deep signed outbound + 2 for any
+	 *   concurrent inbound. Operator can override via
+	 *   `truenas_uring:splice_pipe_pool`; clamped to [3, 4096].
+	 *   Minimum floor of 3 is the SIGNED_OUT requirement -- below it,
+	 *   SIGNED_OUT permanently fails to acquire pipes and silently
+	 *   falls back to the legacy aio path.
+	 *
+	 *   splice_pipe_size defaults to lp_smb2_max_write + 64 KiB (8 MiB
+	 *   + 64 KiB by default). The +64 KiB headroom is required because
+	 *   FETCH must fit the full payload PLUS the SMB2 response header
+	 *   (writev'd into the pipe first) before SEND can start --
+	 *   page-granular pipe slots mean the small header still consumes
+	 *   one full 4 KiB slot, so a pipe sized exactly to max_write
+	 *   deadlocks the trailing splice for the final ~4 KiB. F_SETPIPE_SZ
+	 *   would normally cap at /proc/sys/fs/pipe-max-size (1 MiB stock
+	 *   kernel) but root -- which smbd runs as on TrueNAS -- has
+	 *   CAP_SYS_RESOURCE and bypasses the cap. Worst-case kernel memory
+	 *   per worker is pool_size * pipe_size; e.g. 32 * 8.06 MiB
+	 *   ~= 258 MiB. Pipe pages are lazily faulted -- idle pool is ~free.
+	 */
+	{
+		const int default_count = 32;
+		const int min_count = 3;   /* SIGNED_OUT needs 3 */
+		const int max_count = 4096;
+		int operator_count;
+		int pipe_count;
+		size_t pipe_size;
+
+		operator_count = lp_parm_int(GLOBAL_SECTION_SNUM,
+					     "truenas_uring",
+					     "splice_pipe_pool",
+					     default_count);
+		pipe_count = operator_count;
+		if (pipe_count > 0 && pipe_count < min_count) {
+			DBG_WARNING("truenas_uring:splice_pipe_pool=%d below "
+				    "minimum of %d (SIGNED_OUT needs 3 pipes "
+				    "per PDU); clamping up. To disable the "
+				    "splice path entirely, set the value to 0.\n",
+				    pipe_count, min_count);
+			pipe_count = min_count;
+		}
+		if (pipe_count > max_count) {
+			DBG_WARNING("truenas_uring:splice_pipe_pool=%d above "
+				    "ceiling of %d; clamping down.\n",
+				    pipe_count, max_count);
+			pipe_count = max_count;
+		}
+		/*
+		 * Pipe must hold the response header (writev'd before FETCH)
+		 * PLUS the full payload, because SEND is gated on the entire
+		 * payload being in the pipe (file_done >= payload_len). Pipe
+		 * slots are page-granular: the ~100-byte SMB2 header alone
+		 * consumes one full 4 KiB slot, so a pipe sized exactly to
+		 * max_write can only fit (max_write - PAGE_SIZE) of file
+		 * payload -- the trailing splice for the remaining ~4 KiB
+		 * deadlocks (pipe at max_usage, no draining since SEND hasn't
+		 * started). Add 64 KiB of headroom over max_write so the
+		 * largest legitimate read (and its header) fits with margin.
+		 */
+		pipe_size = (size_t)lp_parm_ulong(
+			GLOBAL_SECTION_SNUM, "truenas_uring",
+			"splice_pipe_size",
+			(unsigned long)lp_smb2_max_write() + 65536);
+		if (pipe_count > 0) {
+			struct truenas_uring *u = truenas_uring_get(
+				req->xconn->client->raw_ev_ctx);
+			if (u != NULL) {
+				(void)truenas_uring_register_pipe_pool(
+					u, (unsigned int)pipe_count, pipe_size);
+			}
+		}
+	}
+#endif
 
 	xconn->smb2.client.capabilities = in_capabilities;
 	xconn->smb2.client.security_mode = in_security_mode;

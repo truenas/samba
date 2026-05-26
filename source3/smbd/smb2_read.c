@@ -26,8 +26,11 @@
 #include "libcli/security/security.h"
 #include "../lib/util/tevent_ntstatus.h"
 #include "rpc_server/srv_pipe_hnd.h"
+#ifdef HAVE_LIBURING
+#include "lib/truenas_uring.h"
+#include "smbd/smbd_smb2_uring.h"
+#endif
 #include "lib/util/sys_rw_data.h"
-#include "source3/lib/truenas_mempool.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_SMB2
@@ -195,8 +198,29 @@ struct smbd_smb2_read_state {
 	DATA_BLOB out_headers;
 	uint8_t _out_hdr_buf[NBT_HDR_SIZE + SMB2_HDR_BODY + 0x10];
 	DATA_BLOB out_data;
-	struct io_pool_link *io_lnk;
 	uint32_t out_remaining;
+#ifdef HAVE_LIBURING
+	/*
+	 * Outbound splice selection for this READ. Picked in the scheduling
+	 * phase (one of the schedule_smb2_*_read helpers); read at queue-
+	 * entry stamping time to copy into queue_entry.splice.
+	 *
+	 *   type == SPLICE_OP_NONE          legacy aio path (or sendfile)
+	 *   type == SPLICE_OP_UNSIGNED_OUT  unsigned: file -> pipe -> socket
+	 *   type == SPLICE_OP_SIGNED_OUT    signed: file -> pipe + tee into
+	 *                                   AF_ALG, patch MAC into header,
+	 *                                   send hdr_pipe then body_pipe to
+	 *                                   socket
+	 *
+	 * signing_key is set iff type == SPLICE_OP_SIGNED_OUT (resolved at
+	 * scheduling time so the splice state machine doesn't have to look
+	 * it up again).
+	 */
+	struct {
+		enum splice_op_type      type;
+		struct smb2_signing_key *signing_key;
+	} splice;
+#endif
 };
 
 static int smb2_smb2_read_state_deny_destructor(struct smbd_smb2_read_state *state)
@@ -378,6 +402,128 @@ static NTSTATUS schedule_smb2_sendfile_read(struct smbd_smb2_request *smb2req,
 	return NT_STATUS_OK;
 }
 
+#ifdef HAVE_LIBURING
+/*
+ * Outbound splice eligibility + state setup (file -> pipe -> socket).
+ * Mirrors the sendfile gates plus the truenas_uring pipe-pool availability
+ * check. On success the caller flips the state to "splice mode" --
+ * smbd_smb2_read_recv later stamps the queue entry's splice fields and
+ * registers a tracker against fsp->aio_requests so SMB2 CLOSE waits for
+ * the splice to complete. Picks SPLICE_OP_SIGNED_OUT or
+ * SPLICE_OP_UNSIGNED_OUT on state->splice.type based on whether the PDU
+ * is signed.
+ *
+ * Filesystem-class hazard: on non-ZFS filesystems (ext4/xfs/btrfs) the
+ * file -> pipe splice via filemap_splice_read has the sendfile-class
+ * page-borrow corruption window (a concurrent writer can mutate the
+ * in-flight bytes -- the splice-borrow regression covered by
+ * source4/torture/local/truenas_uring.c). On ZFS the kernel uses
+ * copy_splice_read which snapshots, so the window doesn't exist. The
+ * TrueNAS fork ships only on ZFS-backed shares, so we don't probe
+ * statfs here: the master knob `truenas_uring:enabled` is the opt-in.
+ */
+static NTSTATUS schedule_smb2_splice_read(struct smbd_smb2_request *smb2req,
+					   struct smbd_smb2_read_state *state)
+{
+	struct smbXsrv_connection *xconn = smb2req->xconn;
+	files_struct *fsp = state->fsp;
+	struct truenas_uring *u;
+	struct truenas_uring_pipe probe;
+	struct lock_struct lock;
+
+	if (!xconn->smb2.uring->enabled.splice_send) {
+		return NT_STATUS_RETRY;
+	}
+
+	/* Splice-incompatible request shapes (mirrors sendfile gates).
+	 *
+	 * Signed-but-unencrypted READs are allowed iff signed splice
+	 * outbound is enabled: the state machine in smb2_server.c tees the
+	 * spliced payload through AF_ALG, patches the MAC into the response
+	 * header, then sends header + payload. Encrypted requests are still
+	 * rejected (those belong to the registered-buffer + SEND_ZC path).
+	 */
+	if (smb2req->do_encryption ||
+	    smbd_smb2_is_compound(smb2req) ||
+	    fsp_is_alternate_stream(fsp) ||
+	    !S_ISREG(fsp->fsp_name->st.st_ex_mode) ||
+	    state->in_offset >= fsp->fsp_name->st.st_ex_size ||
+	    fsp->fsp_name->st.st_ex_size <
+		state->in_offset + state->in_length) {
+		return NT_STATUS_RETRY;
+	}
+	if (smb2req->do_signing) {
+		struct smb2_signing_key *sk;
+		sk = smbd_smb2_signing_key(smb2req->session, xconn, NULL);
+		if (sk == NULL || !smb2_signing_key_valid(sk)) {
+			return NT_STATUS_RETRY;
+		}
+		/* AF_ALG must support the algorithm. SMB3.1.1 AES-GMAC is
+		 * handled via algif_hash("ghash") with the GHASH subkey
+		 * H = AES_K(0^128) -- see truenas_smb2_alg_hmac_acquire for
+		 * the H derivation and splice_signed_compute_gmac_tag for the
+		 * finalize. SMB2.x HMAC-SHA256 and SMB3.0+ AES-CMAC map
+		 * directly to algif_hash bindings of the same name. */
+		switch (sk->sign_algo_id) {
+		case SMB2_SIGNING_HMAC_SHA256:
+		case SMB2_SIGNING_AES128_CMAC:
+		case SMB2_SIGNING_AES128_GMAC:
+			break;
+		default: return NT_STATUS_RETRY;
+		}
+		state->splice.type        = SPLICE_OP_SIGNED_OUT;
+		state->splice.signing_key = sk;
+	}
+
+	/* Pipe pool must be registered with at least one free pipe.
+	 * Probe by acquire+release; the actual acquire happens at flush
+	 * time. (A "peek-free" API would avoid this microscopic dance,
+	 * but probe-then-release is harmless and rare on the happy path.) */
+	u = truenas_uring_get(xconn->client->raw_ev_ctx);
+	if (u == NULL) {
+		return NT_STATUS_RETRY;
+	}
+	probe = truenas_uring_pipe_acquire(u);
+	if (probe.slot < 0) {
+		return NT_STATUS_RETRY;
+	}
+	truenas_uring_pipe_release(u, probe.slot);
+
+	/* Strict-lock check (mirrors schedule_smb2_aio_read's check). */
+	init_strict_lock_struct(fsp,
+				fsp->op->global->open_persistent_id,
+				state->in_offset,
+				state->in_length,
+				READ_LOCK,
+				&lock);
+	if (!SMB_VFS_STRICT_LOCK_CHECK(fsp->conn, fsp, &lock)) {
+		return NT_STATUS_FILE_LOCK_CONFLICT;
+	}
+
+	/*
+	 * Mark splice. out_data.length = in_length (fake -- no buffer) is
+	 * the existing sendfile-hack trigger in smbd_smb2_request_reply
+	 * that chops the data iov off the queue entry, leaving just the
+	 * response header iovs in vector/count. The flush function's
+	 * splice path then vmsplices those iovs into the pipe and appends
+	 * the file payload before splicing pipe -> socket.
+	 */
+	state->out_data.length = state->in_length;
+	state->out_remaining = 0;
+	/*
+	 * Only stamp the UNSIGNED variant here if the signed branch above
+	 * didn't already pick SIGNED_OUT. (NONE is the talloc_zero default.)
+	 */
+	if (state->splice.type == SPLICE_OP_NONE) {
+		state->splice.type = SPLICE_OP_UNSIGNED_OUT;
+	}
+
+	return NT_STATUS_OK;
+}
+
+struct smb2_splice_tracker_state { uint8_t dummy; };
+#endif /* HAVE_LIBURING */
+
 static void smbd_smb2_read_pipe_done(struct tevent_req *subreq);
 
 /*******************************************************************
@@ -508,9 +654,8 @@ static struct tevent_req *smbd_smb2_read_send(TALLOC_CTX *mem_ctx,
 		struct tevent_req *subreq = NULL;
 		struct aio_req_fsp_link *aio_lnk = NULL;
 
-		if (!io_pool_alloc_blob(fsp->conn, smb2req, in_length, &state->out_data,
-					&state->io_lnk)) {
-			tevent_req_nomem(NULL, req);
+		state->out_data = data_blob_talloc(state, NULL, in_length);
+		if (in_length > 0 && tevent_req_nomem(state->out_data.data, req)) {
 			return tevent_req_post(req, ev);
 		}
 
@@ -552,12 +697,31 @@ static struct tevent_req *smbd_smb2_read_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
+#ifdef HAVE_LIBURING
+	/*
+	 * Outbound splice (file -> pipe -> socket): try first for eligible
+	 * requests so the payload never lands in a userspace buffer. On
+	 * TrueNAS this is the only zero-copy outbound path (sendfile is
+	 * forcibly disabled). schedule_smb2_splice_read picks
+	 * SPLICE_OP_SIGNED_OUT or SPLICE_OP_UNSIGNED_OUT internally based
+	 * on the signing posture.
+	 */
+	status = schedule_smb2_splice_read(smb2req, state);
+	if (NT_STATUS_IS_OK(status)) {
+		tevent_req_done(req);
+		return tevent_req_post(req, ev);
+	}
+	if (!NT_STATUS_EQUAL(status, NT_STATUS_RETRY)) {
+		tevent_req_nterror(req, status);
+		return tevent_req_post(req, ev);
+	}
+#endif
+
 	status = schedule_smb2_aio_read(fsp->conn,
 				smbreq,
 				fsp,
 				state,
 				&state->out_data,
-				state->io_lnk,
 				(off_t)in_offset,
 				(size_t)in_length);
 
@@ -569,10 +733,6 @@ static struct tevent_req *smbd_smb2_read_send(TALLOC_CTX *mem_ctx,
 		tevent_req_set_cancel_fn(req, smbd_smb2_read_cancel);
 		return req;
 	}
-
-	// free initial data blob
-	TALLOC_FREE(state->io_lnk);
-	state->out_data = data_blob_null;
 
 	if (!NT_STATUS_EQUAL(status, NT_STATUS_RETRY)) {
 		/* Real error in setting up aio. Fail. */
@@ -606,9 +766,8 @@ static struct tevent_req *smbd_smb2_read_send(TALLOC_CTX *mem_ctx,
 	}
 
 	/* Ok, read into memory. Allocate the out buffer. */
-	if (!io_pool_alloc_blob(fsp->conn, smb2req, in_length, &state->out_data,
-				&state->io_lnk)) {
-		tevent_req_nomem(NULL, req);
+	state->out_data = data_blob_talloc(state, NULL, in_length);
+	if (in_length > 0 && tevent_req_nomem(state->out_data.data, req)) {
 		return tevent_req_post(req, ev);
 	}
 
@@ -687,12 +846,31 @@ static NTSTATUS smbd_smb2_read_recv(struct tevent_req *req,
 	}
 
 	*out_data = state->out_data;
-
-	// Reparent the io_lnk to the longer-lived memory context for the
-	// SMB response. The io_lnk controls when the read buffer is returned
-	// to memory pool.
-	talloc_steal(mem_ctx, state->io_lnk);
-
+#ifdef HAVE_LIBURING
+	{
+		/*
+		 * Encrypted-READ fast path uses a buffer from the truenas_uring
+		 * registered fixed-pool. Those pointers are NOT talloc chunks;
+		 * talloc_steal on them would dereference random memory before
+		 * the pointer trying to read the TC_HDR. A lifetime-owner
+		 * sentinel is already parented to the SMB2 request (smb2req)
+		 * by schedule_smb2_aio_read, so the slot is released when the
+		 * request is freed; no steal is necessary in that case.
+		 */
+		struct truenas_uring *u = truenas_uring_get(
+			state->fsp->conn->sconn->ev_ctx);
+		if (u != NULL && out_data->data != NULL &&
+		    truenas_uring_buf_index(u, out_data->data) >= 0) {
+			/* pool-backed -- skip steal */
+		} else if (out_data->data != NULL) {
+			talloc_steal(mem_ctx, out_data->data);
+		}
+	}
+#else
+	if (out_data->data != NULL) {
+		talloc_steal(mem_ctx, out_data->data);
+	}
+#endif
 	*out_remaining = state->out_remaining;
 
 	if (state->out_headers.length > 0) {
@@ -702,9 +880,65 @@ static NTSTATUS smbd_smb2_read_recv(struct tevent_req *req,
 		state->smb2req->queue_entry.sendfile_header = &state->out_headers;
 		state->smb2req->queue_entry.sendfile_body_size = state->in_length;
 		talloc_set_destructor(state, smb2_sendfile_send_data);
-	} else {
-		tevent_req_received(req);
+		return NT_STATUS_OK;
 	}
 
+#ifdef HAVE_LIBURING
+	if (state->splice.type != SPLICE_OP_NONE) {
+		struct tevent_req *tracker;
+		struct smb2_splice_tracker_state *tdummy;
+
+		/*
+		 * Stamp the queue entry with the splice descriptor. The async
+		 * flush state machine (smbd_smb2_flush_with_sendmsg_uring)
+		 * picks this up when the entry reaches the queue head: vmsplice
+		 * the header iovs into a pipe, IORING_OP_SPLICE file->pipe,
+		 * IORING_OP_SPLICE pipe->socket, advance queue.
+		 */
+		state->smb2req->queue_entry.splice.type        = state->splice.type;
+		state->smb2req->queue_entry.splice.fsp         = state->fsp;
+		state->smb2req->queue_entry.splice.offset      = state->in_offset;
+		state->smb2req->queue_entry.splice.payload_len = state->in_length;
+		if (state->splice.type == SPLICE_OP_SIGNED_OUT) {
+			state->smb2req->queue_entry.splice.signed_out.signing_key =
+				state->splice.signing_key;
+			/*
+			 * outhdr_ptr is stamped by the caller after the response
+			 * is fully built (not available yet here -- do_signing
+			 * zeroes the signature only in the final assembly step).
+			 */
+		}
+
+		/*
+		 * Create a tracker tevent_req parented to smb2req (which is
+		 * the queue entry's mem_ctx and survives until pipe->socket
+		 * CQE fires). aio_add_req_to_fsp registers a link parented
+		 * to the tracker -- when the tracker is freed (with smb2req
+		 * after splice completes) the link's destructor decrements
+		 * fsp->num_aio_requests.
+		 *
+		 * SMB2 CLOSE iterates fsp->aio_requests, calls
+		 * tevent_req_cancel (no-op here since we set no cancel fn),
+		 * then waits on the existing tevent_queue mechanism until
+		 * the array drains. So CLOSE blocks until our splice
+		 * completes -- fsp stays alive throughout.
+		 */
+		tracker = tevent_req_create(state->smb2req, &tdummy,
+					    struct smb2_splice_tracker_state);
+		if (tracker == NULL) {
+			tevent_req_received(req);
+			return NT_STATUS_NO_MEMORY;
+		}
+		if (aio_add_req_to_fsp(state->fsp, tracker) == NULL) {
+			TALLOC_FREE(tracker);
+			tevent_req_received(req);
+			return NT_STATUS_NO_MEMORY;
+		}
+		tevent_req_received(req);
+		return NT_STATUS_OK;
+	}
+#endif
+
+	tevent_req_received(req);
 	return NT_STATUS_OK;
 }

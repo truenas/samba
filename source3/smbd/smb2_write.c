@@ -25,6 +25,9 @@
 #include "../lib/util/tevent_ntstatus.h"
 #include "rpc_server/srv_pipe_hnd.h"
 #include "libcli/security/security.h"
+#ifdef HAVE_LIBURING
+#include "smbd/smbd_smb2_uring.h"
+#endif
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_SMB2
@@ -380,6 +383,89 @@ static struct tevent_req *smbd_smb2_write_send(TALLOC_CTX *mem_ctx,
 		tevent_req_nterror(req, status);
 		return tevent_req_post(req, ev);
 	}
+
+#ifdef HAVE_LIBURING
+	/*
+	 * Signed splice inbound: signed WRITE PDU whose body bytes are still
+	 * on the socket. The SMB2 dispatcher deferred the signature check
+	 * (it couldn't run -- HMAC over empty body would always fail), so we
+	 * must go through the signed splice path here, which splices the
+	 * body into a kernel pipe + tees a copy through AF_ALG, verifies the
+	 * MAC, and only then splices the pipe to the file. The unsigned
+	 * splice path below is NOT a safe fallback: it would write the
+	 * attacker-controlled body bytes before the signature is checked.
+	 */
+	if (smbreq->smb2req != NULL &&
+	    smbreq->smb2req->splice_in.type == SPLICE_OP_SIGNED_IN) {
+		status = truenas_schedule_smb2_signed_splice_write(conn,
+						   smbreq,
+						   fsp,
+						   in_offset,
+						   in_data,
+						   state->write_through);
+		if (NT_STATUS_IS_OK(status)) {
+			tevent_req_set_cancel_fn(req, smbd_smb2_write_cancel);
+			return req;
+		}
+		if (!NT_STATUS_EQUAL(status, NT_STATUS_RETRY)) {
+			tevent_req_nterror(req, status);
+			return tevent_req_post(req, ev);
+		}
+		/*
+		 * Signed splice path declined (algorithm unsupported by
+		 * algif_hash, pipe pool exhausted, etc.). We CANNOT fall back
+		 * to the legacy sys_recvfile path here -- it would write
+		 * attacker-controlled bytes to disk without verifying the
+		 * signature. Fail safely.
+		 */
+		tevent_req_nterror(req, NT_STATUS_ACCESS_DENIED);
+		return tevent_req_post(req, ev);
+	}
+
+	/*
+	 * Unsigned splice inbound. schedule_aio_smb2_write rejected this
+	 * request (most likely because of unread_bytes from the
+	 * short-recvfile path); try socket -> pipe -> file splice before
+	 * falling back to the synchronous sys_recvfile in write_file.
+	 */
+	status = truenas_schedule_smb2_unsigned_splice_write(conn,
+					    smbreq,
+					    fsp,
+					    in_offset,
+					    in_data,
+					    state->write_through);
+	if (NT_STATUS_IS_OK(status)) {
+		tevent_req_set_cancel_fn(req, smbd_smb2_write_cancel);
+		return req;
+	}
+	if (!NT_STATUS_EQUAL(status, NT_STATUS_RETRY)) {
+		tevent_req_nterror(req, status);
+		return tevent_req_post(req, ev);
+	}
+	/*
+	 * Both unsigned splice and any earlier fast paths declined.
+	 * Count the fallback so end-to-end tests can detect the case
+	 * where they expected a splice but the request actually went
+	 * through the legacy sys_recvfile / write_file path.
+	 */
+	if (smbreq->smb2req != NULL &&
+	    smbreq->smb2req->xconn->smb2.uring != NULL) {
+		struct samba_uring_xconn *u =
+			smbreq->smb2req->xconn->smb2.uring;
+		u->counters.legacy_recv++;
+		if (!u->notified_write_splice_fallback) {
+			u->notified_write_splice_fallback = true;
+			DBGC_NOTICE(truenas_uring_debug_class,
+				    "WRITE splice declined and fell back to "
+				    "legacy sys_recvfile/write_file (likely "
+				    "splice pipe pool exhausted or "
+				    "ineligible per-PDU). Subsequent "
+				    "fallbacks on this xconn won't re-log; "
+				    "cumulative count exposed via FSCTL "
+				    "counters.\n");
+		}
+	}
+#endif
 
 	/* Fallback to synchronous. */
 	init_strict_lock_struct(fsp,

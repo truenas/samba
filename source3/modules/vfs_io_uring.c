@@ -1,13 +1,40 @@
 /*
- * Use the io_uring of Linux (>= 5.1)
+ * Use the io_uring of Linux (>= 5.1) -- TrueNAS fork.
  *
- * Copyright (C) Volker Lendecke 2008
- * Copyright (C) Jeremy Allison 2010
- * Copyright (C) Stefan Metzmacher 2019
+ * This file was rewritten on top of source3/lib/truenas_uring (the per-
+ * tevent_context io_uring abstraction). The module is now a thin VFS
+ * adapter:
+ *
+ *   - connect: call truenas_uring_get(ev) so the per-context ring exists,
+ *              then apply per-share IOSQE_ASYNC thresholds for read and
+ *              write op classes (smb.conf:
+ *              `io_uring:force_async_read_threshold`,
+ *              `io_uring:force_async_write_threshold`).
+ *
+ *   - pread / pwrite / fsync: shim over the corresponding truenas_uring_*
+ *              tevent_req-shaped ops, with the existing short-read /
+ *              short-write retry semantics preserved by chaining a
+ *              continuation tevent_req per partial completion.
+ *
+ *   - openat: unchanged -- still rejects O_APPEND when writev2 isn't
+ *              available, since posix_append rides on prep_writev2.
+ *
+ * Per-share state (struct vfs_io_uring_config) is now empty; the ring,
+ * eventfd, queue, and CQE dispatch all live inside truenas_uring. The
+ * recursion guard and SQ-batching infrastructure are gone -- truenas_uring
+ * submits each op immediately, and short-read continuations are linear
+ * tevent_req chains.
+ *
+ * Original copyrights:
+ *   Copyright (C) Volker Lendecke 2008
+ *   Copyright (C) Jeremy Allison 2010
+ *   Copyright (C) Stefan Metzmacher 2019
+ * Refactor:
+ *   Copyright (C) iXsystems, Inc. 2026
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
+ * the Free Software Foundation; either version 3 of the License, or
  * (at your option) any later version.
  *
  * This program is distributed in the hope that it will be useful,
@@ -21,469 +48,69 @@
  */
 
 #include "replace.h"
-
-/*
- * liburing.h only needs a forward declaration
- * of struct open_how.
- *
- * If struct open_how is defined in liburing/compat.h
- * itself, hide it away in order to avoid conflicts
- * with including linux/openat2.h or defining 'struct open_how'
- * in libreplace.
- */
-struct open_how;
-#ifdef HAVE_STRUCT_OPEN_HOW_LIBURING_COMPAT_H
-#define open_how __ignore_liburing_compat_h_open_how
-#include <liburing/compat.h>
-#undef open_how
-#endif /* HAVE_STRUCT_OPEN_HOW_LIBURING_COMPAT_H */
-
 #include "includes.h"
 #include "system/filesys.h"
 #include "smbd/smbd.h"
 #include "smbd/globals.h"
 #include "lib/util/tevent_unix.h"
 #include "lib/util/sys_rw.h"
-#include "lib/util/iov_buf.h"
 #include "smbprofile.h"
-#include <liburing.h>
-
-#define	IO_URING_ASYNC_READ	0x01
-#define	IO_URING_ASYNC_WRITE	0x02
-#define	IO_URING_ASYNC_FSYNC	0x04
-
-#define	VFS_URING_WRITEQ_DEFAULT	10
-#define	VFS_URING_READQ_DEFAULT		20
+#include "lib/truenas_uring.h"
 
 static int vfs_io_uring_debug_level = DBGC_VFS;
 
-#undef	DBGC_CLASS
-#define	DBGC_CLASS vfs_io_uring_debug_level
+#undef DBGC_CLASS
+#define DBGC_CLASS vfs_io_uring_debug_level
 
-struct vfs_io_uring_request;
+/* --------------------------------------------------------------------- */
+/*  connect / openat                                                     */
+/* --------------------------------------------------------------------- */
 
-struct vfs_io_uring_queue_config {
-	int queue_sz;
-	uint op_cnt;
-	uint sync_cnt;
-	uint async_cnt;
-};
-
-struct vfs_io_uring_config {
-	struct io_uring uring;
-	struct tevent_fd *fde;
-	/* recursion guard. See comment above vfs_io_uring_queue_run() */
-	bool busy;
-	/* recursion guard. See comment above vfs_io_uring_queue_run() */
-	bool need_retry;
-	int async_ops;
-	struct vfs_io_uring_request *queue;
-	struct vfs_io_uring_request *pending;
-	struct vfs_io_uring_queue_config writeq;
-	struct vfs_io_uring_queue_config readq;
-};
-
-struct vfs_io_uring_request {
-	struct vfs_io_uring_request *prev, *next;
-	struct vfs_io_uring_request **list_head;
-	struct vfs_io_uring_config *config;
-	struct tevent_req *req;
-	void (*completion_fn)(struct vfs_io_uring_request *cur,
-			      const char *location);
-	int (*destructor_fn)(void *);
-	struct timespec start_time;
-	struct timespec end_time;
-	unsigned sqe_flags;
-	SMBPROFILE_BYTES_ASYNC_STATE(profile_bytes);
-	struct io_uring_sqe sqe;
-	struct io_uring_cqe cqe;
-};
-
-static void vfs_io_uring_finish_req(struct vfs_io_uring_request *cur,
-				    const struct io_uring_cqe *cqe,
-				    struct timespec end_time,
-				    const char *location)
+static int vfs_io_uring_connect(vfs_handle_struct *handle,
+				const char *service,
+				const char *user)
 {
-	struct tevent_req *req =
-		talloc_get_type_abort(cur->req,
-		struct tevent_req);
-	void *state = _tevent_req_data(req);
-
-	talloc_set_destructor(state, NULL);
-	if (cur->list_head != NULL) {
-		DLIST_REMOVE((*cur->list_head), cur);
-		cur->list_head = NULL;
-	}
-	cur->cqe = *cqe;
-
-	SMBPROFILE_BYTES_ASYNC_SET_IDLE(cur->profile_bytes);
-	cur->end_time = end_time;
-
-	/*
-	 * We rely on being inside the _send() function
-	 * or tevent_req_defer_callback() being called
-	 * already.
-	 */
-	cur->completion_fn(cur, location);
-}
-
-static void vfs_io_uring_config_destroy(struct vfs_io_uring_config *config,
-				        int ret,
-				        const char *location)
-{
-	struct vfs_io_uring_request *cur = NULL, *next = NULL;
-	struct timespec start_time;
-	struct timespec end_time;
-	struct io_uring_cqe err_cqe = {
-		.res = ret,
-	};
-
-	PROFILE_TIMESTAMP(&start_time);
-
-	if (config->uring.ring_fd != -1) {
-		/* TODO: cancel queued and pending requests */
-		TALLOC_FREE(config->fde);
-		io_uring_queue_exit(&config->uring);
-		config->uring.ring_fd = -1;
-	}
-
-	PROFILE_TIMESTAMP(&end_time);
-
-	for (cur = config->pending; cur != NULL; cur = next) {
-		next = cur->next;
-		err_cqe.user_data = (uintptr_t)(void *)cur;
-		vfs_io_uring_finish_req(cur, &err_cqe, end_time, location);
-	}
-
-	for (cur = config->queue; cur != NULL; cur = next) {
-		next = cur->next;
-		err_cqe.user_data = (uintptr_t)(void *)cur;
-		cur->start_time = start_time;
-		vfs_io_uring_finish_req(cur, &err_cqe, end_time, location);
-	}
-}
-
-static int vfs_io_uring_config_destructor(struct vfs_io_uring_config *config)
-{
-	vfs_io_uring_config_destroy(config, -EUCLEAN, __location__);
-	return 0;
-}
-
-static int vfs_io_uring_request_state_deny_destructor(struct vfs_io_uring_request *cur)
-{
-	/* our parent is gone */
-	cur->req = NULL;
-
-	/* remove ourself from any list */
-	DLIST_REMOVE((*cur->list_head), cur);
-	cur->list_head = NULL;
-
-	/*
-	 * Our state is about to go away,
-	 * all we can do is shutting down the whole uring.
-	 * But that's ok as we're most likely called from exit_server()
-	 */
-	vfs_io_uring_config_destroy(cur->config, -ESHUTDOWN, __location__);
-	return 0;
-}
-
-static void vfs_io_uring_fd_handler(struct tevent_context *ev,
-				    struct tevent_fd *fde,
-				    uint16_t flags,
-				    void *private_data);
-
-static int vfs_io_uring_connect(vfs_handle_struct *handle, const char *service,
-			    const char *user)
-{
+	struct truenas_uring *u = NULL;
+	struct tevent_context *ev = handle->conn->sconn->ev_ctx;
+	size_t read_thresh, write_thresh;
 	int ret;
-	struct vfs_io_uring_config *config;
-	unsigned num_entries;
-	bool sqpoll;
-	bool force_aio_fsync, force_aio_read, force_aio_write;
-	unsigned flags = 0;
-
-	config = talloc_zero(handle->conn, struct vfs_io_uring_config);
-	if (config == NULL) {
-		DEBUG(0, ("talloc_zero() failed\n"));
-		return -1;
-	}
-
-	SMB_VFS_HANDLE_SET_DATA(handle, config,
-				NULL, struct vfs_io_uring_config,
-				return -1);
 
 	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
 	if (ret < 0) {
 		return ret;
 	}
 
-	num_entries = lp_parm_ulong(SNUM(handle->conn),
-				    "io_uring",
-				    "num_entries",
-				    128);
-	num_entries = MAX(num_entries, 1);
-
-	sqpoll = lp_parm_bool(SNUM(handle->conn),
-			     "io_uring",
-			     "sqpoll",
-			     false);
-	if (sqpoll) {
-		flags |= IORING_SETUP_SQPOLL;
-	}
-
-	force_aio_fsync = lp_parm_bool(SNUM(handle->conn),
-				       "io_uring",
-				       "iosqe_async_fsync",
-				       false);
-	if (force_aio_fsync) {
-		config->async_ops |= IO_URING_ASYNC_FSYNC;
-	}
-
-	force_aio_read = lp_parm_bool(SNUM(handle->conn),
-				      "io_uring",
-				      "iosqe_async_read",
-				      true);
-	if (force_aio_read) {
-		config->async_ops |= IO_URING_ASYNC_READ;
-	}
-
-	force_aio_write = lp_parm_bool(SNUM(handle->conn),
-				       "io_uring",
-				       "iosqe_async_write",
-				       false);
-	if (force_aio_write) {
-		config->async_ops |= IO_URING_ASYNC_WRITE;
-	}
-
-	config->writeq.queue_sz = lp_parm_int(SNUM(handle->conn),
-						   "io_uring",
-						   "write_queue_sz",
-						   VFS_URING_WRITEQ_DEFAULT);
-	if (config->writeq.queue_sz <= 0) {
-		DBG_ERR("%d: write_queue_sz parameter must be greater than 0. "
-			"setting to default of %d\n",
-			config->writeq.queue_sz,
-			VFS_URING_WRITEQ_DEFAULT);
-		config->writeq.queue_sz = VFS_URING_WRITEQ_DEFAULT;
-	}
-
-	config->readq.queue_sz = lp_parm_int(SNUM(handle->conn),
-						  "io_uring",
-						  "read_queue_sz",
-						  VFS_URING_READQ_DEFAULT);
-	if (config->readq.queue_sz <= 0) {
-		DBG_ERR("%d: read_queue_sz parameter must be greater than 0. "
-			"setting to default of %d\n",
-			config->readq.queue_sz,
-			VFS_URING_READQ_DEFAULT);
-		config->readq.queue_sz = VFS_URING_READQ_DEFAULT;
-	}
-
-	ret = io_uring_queue_init(num_entries, &config->uring, flags);
-	if (ret < 0) {
+	u = truenas_uring_get(ev);
+	if (u == NULL) {
+		int saved = errno;
+		DBG_ERR("truenas_uring_get failed: %s\n", strerror(saved));
 		SMB_VFS_NEXT_DISCONNECT(handle);
-		errno = -ret;
+		errno = saved;
 		return -1;
-	}
-
-	talloc_set_destructor(config, vfs_io_uring_config_destructor);
-
-#ifdef HAVE_IO_URING_RING_DONTFORK
-	ret = io_uring_ring_dontfork(&config->uring);
-	if (ret < 0) {
-		SMB_VFS_NEXT_DISCONNECT(handle);
-		errno = -ret;
-		return -1;
-	}
-#endif /* HAVE_IO_URING_RING_DONTFORK */
-
-	config->fde = tevent_add_fd(handle->conn->sconn->ev_ctx,
-				    config,
-				    config->uring.ring_fd,
-				    TEVENT_FD_READ,
-				    vfs_io_uring_fd_handler,
-				    handle);
-	if (config->fde == NULL) {
-		ret = errno;
-		SMB_VFS_NEXT_DISCONNECT(handle);
-		errno = ret;
-		return -1;
-	}
-
-	return 0;
-}
-
-static void _vfs_io_uring_queue_run(struct vfs_io_uring_config *config)
-{
-	struct vfs_io_uring_request *cur = NULL, *next = NULL;
-	struct io_uring_cqe *cqe = NULL;
-	unsigned cqhead;
-	unsigned nr = 0;
-	struct timespec start_time;
-	struct timespec end_time;
-	int ret;
-
-	PROFILE_TIMESTAMP(&start_time);
-
-	if (config->uring.ring_fd == -1) {
-		vfs_io_uring_config_destroy(config, -ESTALE, __location__);
-		return;
-	}
-
-	for (cur = config->queue; cur != NULL; cur = next) {
-		struct io_uring_sqe *sqe = NULL;
-		void *state = _tevent_req_data(cur->req);
-
-		next = cur->next;
-
-		sqe = io_uring_get_sqe(&config->uring);
-		if (sqe == NULL) {
-			break;
-		}
-
-		talloc_set_destructor(state, cur->destructor_fn);
-		DLIST_REMOVE(config->queue, cur);
-		*sqe = cur->sqe;
-		DLIST_ADD_END(config->pending, cur);
-		cur->list_head = &config->pending;
-		SMBPROFILE_BYTES_ASYNC_SET_BUSY(cur->profile_bytes);
-
-		cur->start_time = start_time;
-	}
-
-	ret = io_uring_submit(&config->uring);
-	if (ret == -EAGAIN || ret == -EBUSY) {
-		/* We just retry later */
-	} else if (ret < 0) {
-		vfs_io_uring_config_destroy(config, ret, __location__);
-		return;
-	}
-
-	PROFILE_TIMESTAMP(&end_time);
-
-	io_uring_for_each_cqe(&config->uring, cqhead, cqe) {
-		cur = (struct vfs_io_uring_request *)io_uring_cqe_get_data(cqe);
-		vfs_io_uring_finish_req(cur, cqe, end_time, __location__);
-		nr++;
-	}
-
-	io_uring_cq_advance(&config->uring, nr);
-}
-
-/*
- * Wrapper function to prevent recursion which could happen
- * if we called _vfs_io_uring_queue_run() directly without
- * recursion checks.
- *
- * Looking at the pread call, we can have:
- *
- * vfs_io_uring_pread_send()
- *        ->vfs_io_uring_pread_submit()  <-----------------------------------
- *                ->vfs_io_uring_request_submit()                           |
- *                        ->vfs_io_uring_queue_run()                        |
- *                                ->_vfs_io_uring_queue_run()               |
- *                                                                          |
- * But inside _vfs_io_uring_queue_run() looks like:                         |
- *                                                                          |
- * _vfs_io_uring_queue_run() {                                              |
- *      if (THIS_IO_COMPLETED) {                                            |
- *              ->vfs_io_uring_finish_req()                                 |
- *                      ->cur->completion_fn()                              |
- *      }                                                                   |
- * }                                                                        |
- *                                                                          |
- * cur->completion_fn() for pread is set to vfs_io_uring_pread_completion() |
- *                                                                          |
- * vfs_io_uring_pread_completion() {                                        |
- *      if (READ_TERMINATED) {                                              |
- *              -> tevent_req_done() - We're done, go back up the stack.    |
- *              return;                                                     |
- *      }                                                                   |
- *                                                                          |
- *      We have a short read - adjust the io vectors                        |
- *                                                                          |
- *      ->vfs_io_uring_pread_submit() ---------------------------------------
- * }
- *
- * So before calling _vfs_io_uring_queue_run() we backet it with setting
- * a flag config->busy, and unset it once _vfs_io_uring_queue_run() finally
- * exits the retry loop.
- *
- * If we end up back into vfs_io_uring_queue_run() we notice we've done so
- * as config->busy is set and don't recurse into _vfs_io_uring_queue_run().
- *
- * We set the second flag config->need_retry that tells us to loop in the
- * vfs_io_uring_queue_run() call above us in the stack and return.
- *
- * When the outer call to _vfs_io_uring_queue_run() returns we are in
- * a loop checking if config->need_retry was set. That happens if
- * the short read case occurs and _vfs_io_uring_queue_run() ended up
- * recursing into vfs_io_uring_queue_run().
- *
- * Once vfs_io_uring_pread_completion() finishes without a short
- * read (the READ_TERMINATED case, tevent_req_done() is called)
- * then config->need_retry is left as false, we exit the loop,
- * set config->busy to false so the next top level call into
- * vfs_io_uring_queue_run() won't think it's a recursed call
- * and return.
- *
- */
-
-static void vfs_io_uring_queue_run(struct vfs_io_uring_config *config)
-{
-	if (config->busy) {
-		/*
-		 * We've recursed due to short read/write.
-		 * Set need_retry to ensure we retry the
-		 * io_uring_submit().
-		 */
-		config->need_retry = true;
-		return;
 	}
 
 	/*
-	 * Bracket the loop calling _vfs_io_uring_queue_run()
-	 * with busy = true / busy = false.
-	 * so we can detect recursion above.
+	 * IOSQE_ASYNC threshold knobs. When set, ops at or above the
+	 * threshold get IOSQE_ASYNC so the kernel processes them in a
+	 * worker thread and our process is not blocked on the (kernel-side)
+	 * memcpy.
+	 *
+	 * Defaults: 0 = disabled. Knobs are last-writer-wins across shares
+	 * because the underlying ring is per-tevent_context, not per-share.
+	 * Operators using the threshold should set it the same on all shares.
 	 */
+	read_thresh = lp_parm_ulong(SNUM(handle->conn),
+				    "io_uring",
+				    "force_async_read_threshold",
+				    0);
+	write_thresh = lp_parm_ulong(SNUM(handle->conn),
+				     "io_uring",
+				     "force_async_write_threshold",
+				     0);
+	truenas_uring_set_async_threshold(u, TURING_OP_READ_CLASS, read_thresh);
+	truenas_uring_set_async_threshold(u, TURING_OP_WRITE_CLASS, write_thresh);
 
-	config->busy = true;
-
-	do {
-		config->need_retry = false;
-		_vfs_io_uring_queue_run(config);
-	} while (config->need_retry);
-
-	config->busy = false;
-}
-
-static void vfs_io_uring_request_submit(struct vfs_io_uring_request *cur)
-{
-	struct vfs_io_uring_config *config = cur->config;
-
-	if (cur->sqe_flags) {
-		io_uring_sqe_set_flags(&cur->sqe, cur->sqe_flags);
-	}
-	io_uring_sqe_set_data(&cur->sqe, cur);
-	DLIST_ADD_END(config->queue, cur);
-	cur->list_head = &config->queue;
-
-	vfs_io_uring_queue_run(config);
-}
-
-static void vfs_io_uring_fd_handler(struct tevent_context *ev,
-				    struct tevent_fd *fde,
-				    uint16_t flags,
-				    void *private_data)
-{
-	vfs_handle_struct *handle = (vfs_handle_struct *)private_data;
-	struct vfs_io_uring_config *config = NULL;
-
-	SMB_VFS_HANDLE_GET_DATA(handle, config,
-				struct vfs_io_uring_config,
-				smb_panic(__location__));
-
-	vfs_io_uring_queue_run(config);
+	return 0;
 }
 
 static int vfs_io_uring_openat(struct vfs_handle_struct *handle,
@@ -502,203 +129,127 @@ static int vfs_io_uring_openat(struct vfs_handle_struct *handle,
 	return SMB_VFS_NEXT_OPENAT(handle, dirfsp, smb_fname, fsp, how);
 }
 
+/* --------------------------------------------------------------------- */
+/*  PREAD                                                                */
+/* --------------------------------------------------------------------- */
+
 struct vfs_io_uring_pread_state {
+	struct tevent_context *ev;
 	struct files_struct *fsp;
+	void *buf;
+	size_t count;
 	off_t offset;
-	struct iovec iov;
 	size_t nread;
-	struct vfs_io_uring_request ur;
-	bool is_sync_read;
+	struct timespec start_time;
+	struct timespec end_time;
+	SMBPROFILE_BYTES_ASYNC_STATE(profile_bytes);
 };
 
-static void vfs_io_uring_pread_submit(struct vfs_io_uring_pread_state *state);
-static void vfs_io_uring_pread_completion(struct vfs_io_uring_request *cur,
-					  const char *location);
+static void vfs_io_uring_pread_done(struct tevent_req *subreq);
+static bool vfs_io_uring_pread_submit(struct tevent_req *req);
 
-static int vfs_io_uring_pread_destructor(void *data)
-{
-	struct vfs_io_uring_pread_state *state = NULL;
-
-	state = talloc_get_type_abort(data, struct vfs_io_uring_pread_state);
-	return vfs_io_uring_request_state_deny_destructor(&state->ur);
-}
-
-static struct tevent_req *vfs_io_uring_pread_send(struct vfs_handle_struct *handle,
-					     TALLOC_CTX *mem_ctx,
-					     struct tevent_context *ev,
-					     struct files_struct *fsp,
-					     void *data,
-					     size_t n, off_t offset)
+static struct tevent_req *vfs_io_uring_pread_send(
+		struct vfs_handle_struct *handle,
+		TALLOC_CTX *mem_ctx,
+		struct tevent_context *ev,
+		struct files_struct *fsp,
+		void *data,
+		size_t n, off_t offset)
 {
 	struct tevent_req *req = NULL;
 	struct vfs_io_uring_pread_state *state = NULL;
-	struct vfs_io_uring_config *config = NULL;
-	bool ok;
-
-	SMB_VFS_HANDLE_GET_DATA(handle, config,
-				struct vfs_io_uring_config,
-				smb_panic(__location__));
 
 	req = tevent_req_create(mem_ctx, &state,
 				struct vfs_io_uring_pread_state);
 	if (req == NULL) {
 		return NULL;
 	}
+	state->ev = ev;
+	state->fsp = fsp;
+	state->buf = data;
+	state->count = n;
+	state->offset = offset;
 
-	/*
-	 * Apply backpressure to client by performing synchronous read
-	 */
-	if (config->readq.op_cnt > config->readq.queue_sz) {
-		ssize_t nread;
-		ok = sys_valid_io_range(offset, n);
-		if (!ok) {
-			tevent_req_error(req, EINVAL);
-			return tevent_req_post(req, ev);
-		}
-
-		config->readq.sync_cnt++;
-		state->is_sync_read = true;
-
-		nread = sys_pread_full(fsp_get_io_fd(fsp), data, n, offset);
-		if (nread == -1) {
-			DBG_ERR("%s: read from file failed with error: %s\n",
-				fsp_str_dbg(fsp), strerror(errno));
-			tevent_req_error(req, errno);
-			return tevent_req_post(req, ev);
-		}
-
-		state->nread = nread;
-		tevent_req_done(req);
-		return tevent_req_post(req, ev);
-	}
-
-	if (config->async_ops & IO_URING_ASYNC_READ) {
-		state->ur.sqe_flags |= IOSQE_ASYNC;
-	}
-	state->ur.config = config;
-	state->ur.req = req;
-	state->ur.completion_fn = vfs_io_uring_pread_completion;
-	state->ur.destructor_fn = vfs_io_uring_pread_destructor;
-
-	// Increment because at this point we'll hit the receive_fn
-	// which decrements the op_cnt
-	config->readq.op_cnt++;
-	config->readq.async_cnt++;
-
-	SMBPROFILE_BYTES_ASYNC_START(syscall_asys_pread, profile_p,
-				     state->ur.profile_bytes, n);
-	SMBPROFILE_BYTES_ASYNC_SET_IDLE(state->ur.profile_bytes);
-
-	ok = sys_valid_io_range(offset, n);
-	if (!ok) {
+	if (!sys_valid_io_range(offset, n)) {
 		tevent_req_error(req, EINVAL);
 		return tevent_req_post(req, ev);
 	}
 
-	state->fsp = fsp;
-	state->offset = offset;
-	state->iov.iov_base = (void *)data;
-	state->iov.iov_len = n;
-	vfs_io_uring_pread_submit(state);
+	SMBPROFILE_BYTES_ASYNC_START(syscall_asys_pread, profile_p,
+				     state->profile_bytes, n);
+	SMBPROFILE_BYTES_ASYNC_SET_IDLE(state->profile_bytes);
+	PROFILE_TIMESTAMP(&state->start_time);
 
-	if (!tevent_req_is_in_progress(req)) {
+	if (!vfs_io_uring_pread_submit(req)) {
 		return tevent_req_post(req, ev);
 	}
-
-	tevent_req_defer_callback(req, ev);
 	return req;
 }
 
-static void vfs_io_uring_pread_submit(struct vfs_io_uring_pread_state *state)
-{
-	io_uring_prep_readv(&state->ur.sqe,
-			    fsp_get_io_fd(state->fsp),
-			    &state->iov, 1,
-			    state->offset);
-	vfs_io_uring_request_submit(&state->ur);
-}
-
-static void vfs_io_uring_pread_completion(struct vfs_io_uring_request *cur,
-					  const char *location)
+static bool vfs_io_uring_pread_submit(struct tevent_req *req)
 {
 	struct vfs_io_uring_pread_state *state = tevent_req_data(
-		cur->req, struct vfs_io_uring_pread_state);
-	struct iovec *iov = &state->iov;
-	int num_iov = 1;
-	bool ok;
+		req, struct vfs_io_uring_pread_state);
+	struct tevent_req *subreq = NULL;
+	uint8_t *here = (uint8_t *)state->buf + state->nread;
+	size_t remaining = state->count - state->nread;
+	off_t here_offset = state->offset + (off_t)state->nread;
 
-	/*
-	 * We rely on being inside the _send() function
-	 * or tevent_req_defer_callback() being called
-	 * already.
-	 */
+	subreq = truenas_uring_pread_send(state, state->ev,
+					  fsp_get_io_fd(state->fsp),
+					  here, remaining, here_offset);
+	if (subreq == NULL) {
+		tevent_req_error(req, errno != 0 ? errno : ENOMEM);
+		return false;
+	}
+	tevent_req_set_callback(subreq, vfs_io_uring_pread_done, req);
+	return true;
+}
 
-	if (cur->cqe.res < 0) {
-		int err = -cur->cqe.res;
-		_tevent_req_error(cur->req, err, location);
+static void vfs_io_uring_pread_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	struct vfs_io_uring_pread_state *state = tevent_req_data(
+		req, struct vfs_io_uring_pread_state);
+	ssize_t n;
+	int err = 0;
+
+	n = truenas_uring_pread_recv(subreq, &err);
+	TALLOC_FREE(subreq);
+
+	if (n < 0) {
+		tevent_req_error(req, err);
+		return;
+	}
+	if (n == 0) {
+		/* EOF -- short read is the final answer. */
+		tevent_req_done(req);
 		return;
 	}
 
-	if (cur->cqe.res == 0) {
-		/*
-		 * We reached EOF, we're done
-		 */
-		tevent_req_done(cur->req);
+	state->nread += (size_t)n;
+	if (state->nread < state->count) {
+		/* Short read of a non-empty range; continue. */
+		if (!vfs_io_uring_pread_submit(req)) {
+			return;
+		}
 		return;
 	}
-
-	ok = iov_advance(&iov, &num_iov, cur->cqe.res);
-	if (!ok) {
-		/* This is not expected! */
-		DBG_ERR("iov_advance() failed cur->cqe.res=%d > iov_len=%d\n",
-			(int)cur->cqe.res,
-			(int)state->iov.iov_len);
-		tevent_req_error(cur->req, EIO);
-		return;
-	}
-
-	/* sys_valid_io_range() already checked the boundaries */
-	state->nread += state->ur.cqe.res;
-	if (num_iov == 0) {
-		/* We're done */
-		tevent_req_done(cur->req);
-		return;
-	}
-
-	/*
-	 * sys_valid_io_range() already checked the boundaries
-	 * now try to get the rest.
-	 */
-	state->offset += state->ur.cqe.res;
-	vfs_io_uring_pread_submit(state);
+	tevent_req_done(req);
 }
 
 static ssize_t vfs_io_uring_pread_recv(struct tevent_req *req,
-				  struct vfs_aio_state *vfs_aio_state)
+				       struct vfs_aio_state *vfs_aio_state)
 {
 	struct vfs_io_uring_pread_state *state = tevent_req_data(
 		req, struct vfs_io_uring_pread_state);
 	ssize_t ret;
 
-	if (state->is_sync_read) {
-		if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
-			tevent_req_received(req);
-			return -1;
-		}
-		vfs_aio_state->error = 0;
-		ret = state->nread;
-
-		tevent_req_received(req);
-		return ret;
-	}
-
-	SMBPROFILE_BYTES_ASYNC_END(state->ur.profile_bytes);
-	vfs_aio_state->duration = nsec_time_diff(&state->ur.end_time,
-						 &state->ur.start_time);
-
-	SMB_ASSERT(state->ur.config != NULL);
-	SMB_ASSERT(state->ur.config->readq.op_cnt > 0);
-	state->ur.config->readq.op_cnt--;
+	SMBPROFILE_BYTES_ASYNC_END(state->profile_bytes);
+	PROFILE_TIMESTAMP(&state->end_time);
+	vfs_aio_state->duration = nsec_time_diff(&state->end_time,
+						 &state->start_time);
 
 	if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
 		tevent_req_received(req);
@@ -706,96 +257,53 @@ static ssize_t vfs_io_uring_pread_recv(struct tevent_req *req,
 	}
 
 	vfs_aio_state->error = 0;
-	ret = state->nread;
+	ret = (ssize_t)state->nread;
 
 	tevent_req_received(req);
 	return ret;
 }
 
+/* --------------------------------------------------------------------- */
+/*  PWRITE                                                               */
+/* --------------------------------------------------------------------- */
+
 struct vfs_io_uring_pwrite_state {
+	struct tevent_context *ev;
 	struct files_struct *fsp;
+	const void *buf;
+	size_t count;
 	off_t offset;
-	struct iovec iov;
 	size_t nwritten;
-	struct vfs_io_uring_request ur;
-	bool is_sync_write;
+	struct timespec start_time;
+	struct timespec end_time;
+	SMBPROFILE_BYTES_ASYNC_STATE(profile_bytes);
 };
 
-static void vfs_io_uring_pwrite_submit(struct vfs_io_uring_pwrite_state *state);
-static void vfs_io_uring_pwrite_completion(struct vfs_io_uring_request *cur,
-					   const char *location);
+static void vfs_io_uring_pwrite_done(struct tevent_req *subreq);
+static bool vfs_io_uring_pwrite_submit(struct tevent_req *req);
 
-static int vfs_io_uring_pwrite_destructor(void *data)
-{
-	struct vfs_io_uring_pwrite_state *state = NULL;
-
-	state = talloc_get_type_abort(data, struct vfs_io_uring_pwrite_state);
-	return vfs_io_uring_request_state_deny_destructor(&state->ur);
-}
-
-static struct tevent_req *vfs_io_uring_pwrite_send(struct vfs_handle_struct *handle,
-					      TALLOC_CTX *mem_ctx,
-					      struct tevent_context *ev,
-					      struct files_struct *fsp,
-					      const void *data,
-					      size_t n, off_t offset)
+static struct tevent_req *vfs_io_uring_pwrite_send(
+		struct vfs_handle_struct *handle,
+		TALLOC_CTX *mem_ctx,
+		struct tevent_context *ev,
+		struct files_struct *fsp,
+		const void *data,
+		size_t n, off_t offset)
 {
 	struct tevent_req *req = NULL;
 	struct vfs_io_uring_pwrite_state *state = NULL;
-	struct vfs_io_uring_config *config = NULL;
 	bool ok;
-
-	SMB_VFS_HANDLE_GET_DATA(handle, config,
-				struct vfs_io_uring_config,
-				smb_panic(__location__));
 
 	req = tevent_req_create(mem_ctx, &state,
 				struct vfs_io_uring_pwrite_state);
 	if (req == NULL) {
 		return NULL;
 	}
-
-	/*
-	 * Apply backpressure to client by performing synchronous write
-	 *
-	 */
-	if (config->writeq.op_cnt > config->writeq.queue_sz) {
-		ok = sys_valid_io_range(offset, n);
-		if (!ok) {
-			tevent_req_error(req, EINVAL);
-			return tevent_req_post(req, ev);
-		}
-
-		config->writeq.sync_cnt++;
-		state->is_sync_write = true;
-		state->nwritten = sys_pwrite_full(fsp_get_io_fd(fsp), data, n, offset);
-		if (state->nwritten == -1) {
-			DBG_ERR("%s: write to file failed with error: %s\n",
-				fsp_str_dbg(fsp), strerror(errno));
-			tevent_req_error(req, errno);
-			return tevent_req_post(req, ev);
-		}
-
-		tevent_req_done(req);
-		return tevent_req_post(req, ev);
-	}
-
-	if (config->async_ops & IO_URING_ASYNC_WRITE) {
-		state->ur.sqe_flags |= IOSQE_ASYNC;
-	}
-	state->ur.config = config;
-	state->ur.req = req;
-	state->ur.completion_fn = vfs_io_uring_pwrite_completion;
-	state->ur.destructor_fn = vfs_io_uring_pwrite_destructor;
-
-	// Increment because at this point we'll hit the receive_fn
-	// which decrements the op_cnt
-	config->writeq.op_cnt++;
-	config->writeq.async_cnt++;
-
-	SMBPROFILE_BYTES_ASYNC_START(syscall_asys_pwrite, profile_p,
-				     state->ur.profile_bytes, n);
-	SMBPROFILE_BYTES_ASYNC_SET_IDLE(state->ur.profile_bytes);
+	state->ev = ev;
+	state->fsp = fsp;
+	state->buf = data;
+	state->count = n;
+	state->offset = offset;
 
 	ok = sys_valid_io_range(offset, n);
 	ok |= offset == VFS_PWRITE_APPEND_OFFSET;
@@ -804,124 +312,102 @@ static struct tevent_req *vfs_io_uring_pwrite_send(struct vfs_handle_struct *han
 		return tevent_req_post(req, ev);
 	}
 
-	state->fsp = fsp;
-	state->offset = offset;
-	state->iov.iov_base = discard_const(data);
-	state->iov.iov_len = n;
-	vfs_io_uring_pwrite_submit(state);
+	SMBPROFILE_BYTES_ASYNC_START(syscall_asys_pwrite, profile_p,
+				     state->profile_bytes, n);
+	SMBPROFILE_BYTES_ASYNC_SET_IDLE(state->profile_bytes);
+	PROFILE_TIMESTAMP(&state->start_time);
 
-	if (!tevent_req_is_in_progress(req)) {
+	if (!vfs_io_uring_pwrite_submit(req)) {
 		return tevent_req_post(req, ev);
 	}
-
-	tevent_req_defer_callback(req, ev);
 	return req;
 }
 
-static void vfs_io_uring_pwrite_submit(struct vfs_io_uring_pwrite_state *state)
-{
-	if (!state->fsp->fsp_flags.posix_append) {
-		io_uring_prep_writev(&state->ur.sqe,
-				     fsp_get_io_fd(state->fsp),
-				     &state->iov, 1,
-				     state->offset);
-	}
-	else {
-#ifdef HAVE_IO_URING_PREP_WRITEV2
-		io_uring_prep_writev2(&state->ur.sqe,
-				      fsp_get_io_fd(state->fsp),
-				      &state->iov, 1,
-				      -1,
-				      RWF_APPEND);
-#else
-		/* This should have been caught by vfs_io_uring_openat() */
-		smb_panic("Unexpected POSIX append-IO");
-#endif
-	}
-	vfs_io_uring_request_submit(&state->ur);
-}
-
-static void vfs_io_uring_pwrite_completion(struct vfs_io_uring_request *cur,
-					   const char *location)
+static bool vfs_io_uring_pwrite_submit(struct tevent_req *req)
 {
 	struct vfs_io_uring_pwrite_state *state = tevent_req_data(
-		cur->req, struct vfs_io_uring_pwrite_state);
-	struct iovec *iov = &state->iov;
-	int num_iov = 1;
-	bool ok;
+		req, struct vfs_io_uring_pwrite_state);
+	struct tevent_req *subreq = NULL;
+	const uint8_t *here = (const uint8_t *)state->buf + state->nwritten;
+	size_t remaining = state->count - state->nwritten;
+	off_t here_offset = state->offset + (off_t)state->nwritten;
 
-	/*
-	 * We rely on being inside the _send() function
-	 * or tevent_req_defer_callback() being called
-	 * already.
-	 */
-
-	if (cur->cqe.res < 0) {
-		int err = -cur->cqe.res;
-		_tevent_req_error(cur->req, err, location);
-		return;
-	}
-
-	if (cur->cqe.res == 0) {
+	if (state->fsp->fsp_flags.posix_append) {
+#ifdef HAVE_IO_URING_PREP_WRITEV2
 		/*
-		 * Ensure we can never spin.
+		 * POSIX append-IO: writev2 with RWF_APPEND on the file's
+		 * current EOF. The offset argument to writev2 is ignored
+		 * when RWF_APPEND is set; pass -1 for clarity.
 		 */
-		tevent_req_error(cur->req, ENOSPC);
+		subreq = truenas_uring_pwrite_v2_send(state, state->ev,
+						      fsp_get_io_fd(state->fsp),
+						      here, remaining,
+						      -1, RWF_APPEND);
+#else
+		/* openat() should have rejected this fsp. */
+		smb_panic("Unexpected POSIX append-IO");
+#endif
+	} else {
+		subreq = truenas_uring_pwrite_send(state, state->ev,
+						   fsp_get_io_fd(state->fsp),
+						   here, remaining,
+						   here_offset);
+	}
+	if (subreq == NULL) {
+		tevent_req_error(req, errno != 0 ? errno : ENOMEM);
+		return false;
+	}
+	tevent_req_set_callback(subreq, vfs_io_uring_pwrite_done, req);
+	return true;
+}
+
+static void vfs_io_uring_pwrite_done(struct tevent_req *subreq)
+{
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	struct vfs_io_uring_pwrite_state *state = tevent_req_data(
+		req, struct vfs_io_uring_pwrite_state);
+	ssize_t n;
+	int err = 0;
+
+	if (state->fsp->fsp_flags.posix_append) {
+		n = truenas_uring_pwrite_v2_recv(subreq, &err);
+	} else {
+		n = truenas_uring_pwrite_recv(subreq, &err);
+	}
+	TALLOC_FREE(subreq);
+
+	if (n < 0) {
+		tevent_req_error(req, err);
+		return;
+	}
+	if (n == 0) {
+		/* Spin-protect: a writer that makes no progress is an error. */
+		tevent_req_error(req, ENOSPC);
 		return;
 	}
 
-	ok = iov_advance(&iov, &num_iov, cur->cqe.res);
-	if (!ok) {
-		/* This is not expected! */
-		DBG_ERR("iov_advance() failed cur->cqe.res=%d > iov_len=%d\n",
-			(int)cur->cqe.res,
-			(int)state->iov.iov_len);
-		tevent_req_error(cur->req, EIO);
+	state->nwritten += (size_t)n;
+	if (state->nwritten < state->count) {
+		if (!vfs_io_uring_pwrite_submit(req)) {
+			return;
+		}
 		return;
 	}
-
-	/* sys_valid_io_range() already checked the boundaries */
-	state->nwritten += state->ur.cqe.res;
-	if (num_iov == 0) {
-		/* We're done */
-		tevent_req_done(cur->req);
-		return;
-	}
-	/*
-	 * sys_valid_io_range() already checked the boundaries
-	 * now try to write the rest.
-	 */
-	state->offset += state->ur.cqe.res;
-	vfs_io_uring_pwrite_submit(state);
+	tevent_req_done(req);
 }
 
 static ssize_t vfs_io_uring_pwrite_recv(struct tevent_req *req,
-				   struct vfs_aio_state *vfs_aio_state)
+					struct vfs_aio_state *vfs_aio_state)
 {
 	struct vfs_io_uring_pwrite_state *state = tevent_req_data(
 		req, struct vfs_io_uring_pwrite_state);
 	ssize_t ret;
 
-	if (state->is_sync_write) {
-		if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
-			tevent_req_received(req);
-			return -1;
-		}
-
-		vfs_aio_state->error = 0;
-		ret = state->nwritten;
-
-		tevent_req_received(req);
-		return ret;
-	}
-
-	SMBPROFILE_BYTES_ASYNC_END(state->ur.profile_bytes);
-	vfs_aio_state->duration = nsec_time_diff(&state->ur.end_time,
-						 &state->ur.start_time);
-
-	SMB_ASSERT(state->ur.config != NULL);
-	SMB_ASSERT(state->ur.config->writeq.op_cnt > 0);
-	state->ur.config->writeq.op_cnt--;
+	SMBPROFILE_BYTES_ASYNC_END(state->profile_bytes);
+	PROFILE_TIMESTAMP(&state->end_time);
+	vfs_aio_state->duration = nsec_time_diff(&state->end_time,
+						 &state->start_time);
 
 	if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
 		tevent_req_received(req);
@@ -929,104 +415,82 @@ static ssize_t vfs_io_uring_pwrite_recv(struct tevent_req *req,
 	}
 
 	vfs_aio_state->error = 0;
-	ret = state->nwritten;
+	ret = (ssize_t)state->nwritten;
 
 	tevent_req_received(req);
 	return ret;
 }
 
+/* --------------------------------------------------------------------- */
+/*  FSYNC                                                                */
+/* --------------------------------------------------------------------- */
+
 struct vfs_io_uring_fsync_state {
-	struct vfs_io_uring_request ur;
+	struct timespec start_time;
+	struct timespec end_time;
+	SMBPROFILE_BYTES_ASYNC_STATE(profile_bytes);
 };
 
-static void vfs_io_uring_fsync_completion(struct vfs_io_uring_request *cur,
-					  const char *location);
+static void vfs_io_uring_fsync_done(struct tevent_req *subreq);
 
-static int vfs_io_uring_fsync_destructor(void *data)
-{
-	struct vfs_io_uring_fsync_state *state = NULL;
-
-	state = talloc_get_type_abort(data, struct vfs_io_uring_fsync_state);
-	return vfs_io_uring_request_state_deny_destructor(&state->ur);
-}
-
-static struct tevent_req *vfs_io_uring_fsync_send(struct vfs_handle_struct *handle,
-					     TALLOC_CTX *mem_ctx,
-					     struct tevent_context *ev,
-					     struct files_struct *fsp)
+static struct tevent_req *vfs_io_uring_fsync_send(
+		struct vfs_handle_struct *handle,
+		TALLOC_CTX *mem_ctx,
+		struct tevent_context *ev,
+		struct files_struct *fsp)
 {
 	struct tevent_req *req = NULL;
 	struct vfs_io_uring_fsync_state *state = NULL;
-	struct vfs_io_uring_config *config = NULL;
-
-	SMB_VFS_HANDLE_GET_DATA(handle, config,
-				struct vfs_io_uring_config,
-				smb_panic(__location__));
+	struct tevent_req *subreq = NULL;
 
 	req = tevent_req_create(mem_ctx, &state,
 				struct vfs_io_uring_fsync_state);
 	if (req == NULL) {
 		return NULL;
 	}
-	if (config->async_ops & IO_URING_ASYNC_FSYNC) {
-		state->ur.sqe_flags |= IOSQE_ASYNC;
-	}
-	state->ur.config = config;
-	state->ur.req = req;
-	state->ur.completion_fn = vfs_io_uring_fsync_completion;
-	state->ur.destructor_fn = vfs_io_uring_fsync_destructor;
 
 	SMBPROFILE_BYTES_ASYNC_START(syscall_asys_fsync, profile_p,
-				     state->ur.profile_bytes, 0);
-	SMBPROFILE_BYTES_ASYNC_SET_IDLE(state->ur.profile_bytes);
+				     state->profile_bytes, 0);
+	SMBPROFILE_BYTES_ASYNC_SET_IDLE(state->profile_bytes);
+	PROFILE_TIMESTAMP(&state->start_time);
 
-	io_uring_prep_fsync(&state->ur.sqe,
-			    fsp_get_io_fd(fsp),
-			    0); /* fsync_flags */
-	vfs_io_uring_request_submit(&state->ur);
-
-	if (!tevent_req_is_in_progress(req)) {
+	subreq = truenas_uring_fsync_send(state, ev,
+					  fsp_get_io_fd(fsp), 0);
+	if (subreq == NULL) {
+		tevent_req_error(req, errno != 0 ? errno : ENOMEM);
 		return tevent_req_post(req, ev);
 	}
-
-	tevent_req_defer_callback(req, ev);
+	tevent_req_set_callback(subreq, vfs_io_uring_fsync_done, req);
 	return req;
 }
 
-static void vfs_io_uring_fsync_completion(struct vfs_io_uring_request *cur,
-					  const char *location)
+static void vfs_io_uring_fsync_done(struct tevent_req *subreq)
 {
-	/*
-	 * We rely on being inside the _send() function
-	 * or tevent_req_defer_callback() being called
-	 * already.
-	 */
+	struct tevent_req *req = tevent_req_callback_data(
+		subreq, struct tevent_req);
+	int err = 0;
+	int ret;
 
-	if (cur->cqe.res < 0) {
-		int err = -cur->cqe.res;
-		_tevent_req_error(cur->req, err, location);
+	ret = truenas_uring_fsync_recv(subreq, &err);
+	TALLOC_FREE(subreq);
+
+	if (ret != 0) {
+		tevent_req_error(req, err);
 		return;
 	}
-
-	if (cur->cqe.res > 0) {
-		/* This is not expected! */
-		DBG_ERR("got cur->cqe.res=%d\n", (int)cur->cqe.res);
-		tevent_req_error(cur->req, EIO);
-		return;
-	}
-
-	tevent_req_done(cur->req);
+	tevent_req_done(req);
 }
 
 static int vfs_io_uring_fsync_recv(struct tevent_req *req,
-			      struct vfs_aio_state *vfs_aio_state)
+				   struct vfs_aio_state *vfs_aio_state)
 {
 	struct vfs_io_uring_fsync_state *state = tevent_req_data(
 		req, struct vfs_io_uring_fsync_state);
 
-	SMBPROFILE_BYTES_ASYNC_END(state->ur.profile_bytes);
-	vfs_aio_state->duration = nsec_time_diff(&state->ur.end_time,
-						 &state->ur.start_time);
+	SMBPROFILE_BYTES_ASYNC_END(state->profile_bytes);
+	PROFILE_TIMESTAMP(&state->end_time);
+	vfs_aio_state->duration = nsec_time_diff(&state->end_time,
+						 &state->start_time);
 
 	if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
 		tevent_req_received(req);
@@ -1034,36 +498,17 @@ static int vfs_io_uring_fsync_recv(struct tevent_req *req,
 	}
 
 	vfs_aio_state->error = 0;
-
 	tevent_req_received(req);
 	return 0;
 }
 
-static void vfs_io_uring_disconnect(vfs_handle_struct *handle)
-{
-	struct vfs_io_uring_config *config = NULL;
-
-	SMB_VFS_NEXT_DISCONNECT(handle);
-
-	SMB_VFS_HANDLE_GET_DATA(handle, config,
-				struct vfs_io_uring_config,
-				smb_panic(__location__));
-
-	// optional logging for performance team to check whether
-	// we hit sync fallback during torture run.
-	if (config->writeq.sync_cnt || config->readq.sync_cnt) {
-		DBG_NOTICE("Performed %u synchronous writes and %u async "
-			   "writes, and %u synchronous reads and %u async "
-			   "reads.\n",
-			   config->writeq.sync_cnt, config->writeq.async_cnt,
-			   config->readq.sync_cnt, config->readq.async_cnt);
-	}
-}
+/* --------------------------------------------------------------------- */
+/*  Module registration                                                  */
+/* --------------------------------------------------------------------- */
 
 static struct vfs_fn_pointers vfs_io_uring_fns = {
 	.connect_fn = vfs_io_uring_connect,
 	.openat_fn = vfs_io_uring_openat,
-	.disconnect_fn = vfs_io_uring_disconnect,
 	.pread_send_fn = vfs_io_uring_pread_send,
 	.pread_recv_fn = vfs_io_uring_pread_recv,
 	.pwrite_send_fn = vfs_io_uring_pwrite_send,
@@ -1075,23 +520,6 @@ static struct vfs_fn_pointers vfs_io_uring_fns = {
 static_decl_vfs;
 NTSTATUS vfs_io_uring_init(TALLOC_CTX *ctx)
 {
-	NTSTATUS status;
-
-	status = smb_register_vfs(SMB_VFS_INTERFACE_VERSION,
-				  "io_uring", &vfs_io_uring_fns);
-	if (!NT_STATUS_IS_OK(status)) {
-		return status;
-	}
-
-	vfs_io_uring_debug_level = debug_add_class("io_uring");
-	if (vfs_io_uring_debug_level == -1) {
-		vfs_io_uring_debug_level = DBGC_VFS;
-		DBG_ERR("%s: Couldn't register custom debugging class!\n",
-			"vfs_io_uring_init");
-	} else {
-		DBG_DEBUG("%s: Debug class number of io_uring: %d\n",
-			  "vfs_io_uring_init", vfs_io_uring_debug_level);
-	}
-
-	return status;
+	return smb_register_vfs(SMB_VFS_INTERFACE_VERSION,
+				"io_uring", &vfs_io_uring_fns);
 }
