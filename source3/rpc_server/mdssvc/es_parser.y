@@ -219,6 +219,13 @@ FUNC_INRANGE OBRACE attribute COMMA WORD COMMA WORD CBRACE {
 	} else {
 		$$ = map_expr($3, '~', $5, $7);
 	}
+}
+| FUNC_INRANGE OBRACE attribute COMMA isodate COMMA isodate CBRACE {
+	if ($3 == NULL) {
+		$$ = NULL;
+	} else {
+		$$ = map_expr($3, '~', $5, $7);
+	}
 };
 
 attribute:
@@ -412,7 +419,7 @@ static char *map_fts(const struct es_attr_map *attr,
 		end = ")";
 		break;
 	default:
-		DBG_ERR("Mapping fts [%s] unexpected op [%c]\n", val, op);
+		DBG_DEBUG("Mapping fts [%s] unexpected op [%c]\n", val, op);
 		return NULL;
 	}
 
@@ -487,15 +494,16 @@ static char *map_str(const struct es_attr_map *attr,
 static char *map_sldate_to_esdate(TALLOC_CTX *mem_ctx,
 				  const char *sldate)
 {
+	char *endp = NULL;
 	struct tm *tm = NULL;
 	char *esdate = NULL;
 	char buf[21];
 	size_t len;
 	time_t t;
-	int error;
 
-	t = (time_t)smb_strtoull(sldate, NULL, 10, &error, SMB_STR_STANDARD);
-	if (error != 0) {
+	errno = 0;
+	t = (time_t)strtoll(sldate, &endp, 10);
+	if (*sldate == '\0' || endp == sldate || *endp != '\0' || errno != 0) {
 		DBG_ERR("smb_strtoull [%s] failed\n", sldate);
 		return NULL;
 	}
@@ -508,7 +516,7 @@ static char *map_sldate_to_esdate(TALLOC_CTX *mem_ctx,
 	}
 
 	len = strftime(buf, sizeof(buf),
-		       "%Y-%m-%dT%H:%M:%SZ", tm);
+		       "%4Y-%m-%dT%H:%M:%SZ", tm);
 	if (len != 20) {
 		DBG_ERR("strftime [%s] failed\n", sldate);
 		return NULL;
