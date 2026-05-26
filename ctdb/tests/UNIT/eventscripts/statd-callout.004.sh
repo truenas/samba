@@ -13,11 +13,15 @@ setup "$mode"
 
 ok_null
 simple_test_event "startup"
+ctdb_get_my_public_addresses |
+	while read -r _ sip _; do
+		simple_test_event "takeip" "$sip"
+	done
 simple_test_event "add-client" "192.168.123.45"
 simple_test_event "update"
 
-check_shared_storage_statd_state "192.168.123.45"
+check_shared_storage_statd_state
 
-check_statd_callout_smnotify "192.168.123.45"
+check_statd_callout_smnotify
 
 check_shared_storage_statd_state
