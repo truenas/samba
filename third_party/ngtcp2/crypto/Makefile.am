@@ -30,6 +30,10 @@ if HAVE_QUICTLS
 SUBDIRS += quictls
 endif
 
+if HAVE_LIBRESSL
+SUBDIRS += quictls
+endif
+
 if HAVE_GNUTLS
 SUBDIRS += gnutls
 endif

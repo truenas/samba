@@ -26,6 +26,8 @@
 
 #include <talloc.h>
 
+#define STRING_SUB_UNSAFE_CHARACTERS "$`\"';%|&<>"
+
 /**
  Substitute a string for a pattern in another string. Make sure there is
  enough room!
@@ -33,7 +35,9 @@
  This routine looks for pattern in s and replaces it with
  insert. It may do multiple replacements.
 
- Any of " ; ' $ or ` in the insert string are replaced with _
+ Any of STRING_SUB_UNSAFE_CHARACTERS (see above) and any character
+ caught by calling iscntrl() in the insert string are replaced with _
+
  if len==0 then the string cannot be extended. This is different from the old
  use of len==0 which was for no length checks to be done.
 **/
@@ -46,6 +50,24 @@ void string_sub(char *s,const char *pattern, const char *insert, size_t len);
  use of len==0 which was for no length checks to be done.
 **/
 void all_string_sub(char *s,const char *pattern,const char *insert, size_t len);
+
+/*
+ * If unsafe_characters is NULL all characters are allowed,
+ * if unsafe_characters is not NULL all characters caught
+ * by iscntrl() are also replaced by safe_character.
+ *
+ * *_string might be reallocated!
+ *
+ * On error *_string may still be reallocated and
+ * may contain partial replacements.
+ */
+bool realloc_string_sub_raw(char **_string,
+			    const char *pattern,
+			    const char *insert,
+			    bool replace_once,
+			    bool allow_trailing_dollar,
+			    const char *unsafe_characters,
+			    char safe_character);
 
 char *talloc_string_sub2(TALLOC_CTX *mem_ctx, const char *src,
 			const char *pattern,
@@ -61,4 +83,21 @@ char *talloc_all_string_sub(TALLOC_CTX *ctx,
 				const char *src,
 				const char *pattern,
 				const char *insert);
+
+#ifndef SAMBA_UTIL_CORE_ONLY
+bool talloc_string_sub_mixed_quoting(const char *full_cmd, char variable_char);
+
+char *talloc_string_sub_unsafe(TALLOC_CTX *mem_ctx,
+			       const char *orig_cmd,
+			       char variable_char,
+			       const char *unsafe_value,
+			       const char *unsafe_characters,
+			       char safe_character,
+			       const char *fallback_value,
+			       bool *_modified,
+			       bool *_masked,
+			       bool *_mixed_fallback);
+
+#endif /* ! SAMBA_UTIL_CORE_ONLY */
+
 #endif /* _SAMBA_SUBSTITUTE_H_ */
