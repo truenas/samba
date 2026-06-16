@@ -125,6 +125,16 @@ void truenas_uring_set_async_threshold(struct truenas_uring *u,
 				       enum truenas_uring_op_class op_class,
 				       size_t threshold_bytes);
 
+/*
+ * Cap the kernel io-wq worker pool for this ring (bounds concurrent blocking
+ * ops, i.e. max io_uring op concurrency for this process). values are
+ * (bounded, unbounded); 0 leaves a class at the kernel default. Returns 0 or
+ * -errno (non-fatal -- caller may ignore).
+ */
+int truenas_uring_set_iowq_max_workers(struct truenas_uring *u,
+				       unsigned int bounded,
+				       unsigned int unbounded);
+
 /* ---------------- File I/O ops ---------------- */
 
 struct tevent_req *_truenas_uring_pread_send(TALLOC_CTX *mem_ctx,
@@ -455,6 +465,15 @@ struct truenas_uring_pipe truenas_uring_pipe_acquire(struct truenas_uring *u);
  * otherwise the next acquirer sees stale bytes. Releasing slot < 0 is a
  * no-op (mirrors the failure-handle pattern). */
 void truenas_uring_pipe_release(struct truenas_uring *u, int slot);
+
+/*
+ * Capacity (in bytes) of each pipe in the pool, as requested via F_SETPIPE_SZ
+ * at truenas_uring_register_pipe_pool() time. The real kernel capacity is >=
+ * this (rounded up to whole pages), so callers may use it as a safe upper
+ * bound on how much to splice into a pipe before it must be drained. Returns 0
+ * if no pool is registered.
+ */
+size_t truenas_uring_pipe_capacity(struct truenas_uring *u);
 
 /* ---------------- AF_ALG HMAC sockets (signed splice) ---------------- */
 /*

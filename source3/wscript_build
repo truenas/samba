@@ -778,6 +778,7 @@ bld.SAMBA3_LIBRARY('smbd_base',
                         cli_spoolss
                         samba3-namearray
                         LIBTLS
+                        TRUENAS_MEMPOOL
                    ''' +
                    (' TRUENAS_URING' if bld.CONFIG_SET('HAVE_LIBURING') else '') +
                    bld.env['dmapi_lib'] +
@@ -1162,6 +1163,14 @@ bld.SAMBA3_BINARY('smbd/smbd',
 bld.SAMBA3_SUBSYSTEM('TDB_VALIDATE',
                      source='lib/tdb_validate.c',
                      deps='samba-util')
+
+bld.SAMBA3_SUBSYSTEM('TRUENAS_MEMPOOL',
+                     source='lib/truenas_mempool.c',
+                     deps='''
+                          samba-util
+                          talloc
+                          tevent
+                          ''')
 
 if bld.CONFIG_SET('HAVE_LIBURING'):
     bld.SAMBA3_SUBSYSTEM('TRUENAS_URING',

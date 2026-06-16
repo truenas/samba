@@ -608,7 +608,7 @@ enum csc_policy {
 /*
  * TrueNAS fork: read / reset the per-xconn samba_uring_counters struct
  * so smbtorture can prove which dispatch path actually ran (vs falling
- * back to legacy). Returns the struct as 15 LE uint64_t fields (120
+ * back to legacy). Returns the struct as 21 LE uint64_t fields (168
  * bytes); see SAMBA_URING_COUNTERS_WIRE_BYTES.
  */
 #define FSCTL_SMBTORTURE_TRUENAS_URING_COUNTERS_READ \

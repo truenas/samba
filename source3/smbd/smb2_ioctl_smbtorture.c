@@ -223,7 +223,7 @@ struct tevent_req *smb2_ioctl_smbtorture(uint32_t ctl_code,
 		SBVAL(out,  16, c->signed_splice_in_denied);
 		SBVAL(out,  24, c->unsigned_splice_out);
 		SBVAL(out,  32, c->signed_splice_out);
-		SBVAL(out,  40, c->encrypted_recv_regbuf);
+		SBVAL(out,  40, c->encrypted_recv);
 		SBVAL(out,  48, c->encrypted_send_zc);
 		SBVAL(out,  56, c->legacy_recv);
 		SBVAL(out,  64, c->legacy_send);
@@ -237,6 +237,8 @@ struct tevent_req *smb2_ioctl_smbtorture(uint32_t ctl_code,
 		SBVAL(out, 128, c->signed_alg_cache_misses);
 		SBVAL(out, 136, c->inflight_throttle_events);
 		SBVAL(out, 144, c->inflight_bytes_peak);
+		SBVAL(out, 152, c->unsigned_recv_mempool);
+		SBVAL(out, 160, c->bytes_unsigned_mempool_out);
 
 		tevent_req_done(req);
 		return tevent_req_post(req, ev);

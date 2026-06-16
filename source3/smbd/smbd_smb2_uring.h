@@ -296,8 +296,8 @@ struct samba_uring_xconn {
 		uint64_t signed_splice_in_denied;  /* MAC mismatch / ACCESS_DENIED */
 		uint64_t unsigned_splice_out;      /* file -> pipe -> socket */
 		uint64_t signed_splice_out;        /* + AF_ALG, patched-MAC hdr */
-		uint64_t encrypted_recv_regbuf;    /* RECV into registered slot */
-		uint64_t encrypted_send_zc;        /* SENDMSG_ZC of regbuf slot */
+		uint64_t encrypted_recv;           /* encrypted READ served (mempool or opt-in regbuf) */
+		uint64_t encrypted_send_zc;        /* SENDMSG_ZC sends (all paths) */
 		uint64_t legacy_recv;              /* fell back to tstream recv */
 		uint64_t legacy_send;              /* fell back to sendmsg+pktbuf */
 		uint64_t bytes_unsigned_splice_in;
@@ -310,6 +310,14 @@ struct samba_uring_xconn {
 		uint64_t signed_alg_cache_misses;  /* per-sk bind_fd opened */
 		uint64_t inflight_throttle_events; /* recv deferred due to cap */
 		uint64_t inflight_bytes_peak;      /* high-water mark */
+		/*
+		 * Appended (WIRE_BYTES 19 -> 21): plain (unsigned, unencrypted)
+		 * READ served from the reclaimable io_memory_pool + SENDMSG_ZC
+		 * (the default, non-pinned read path). Kept distinct from
+		 * encrypted_recv so the read-path mix stays observable.
+		 */
+		uint64_t unsigned_recv_mempool;    /* plain READ via io_memory_pool */
+		uint64_t bytes_unsigned_mempool_out;
 	} counters;
 
 	/* Test-only: set by FSCTL_SMBTORTURE_TRUENAS_URING_
@@ -390,7 +398,7 @@ static inline void samba_uring_refund_inflight(struct samba_uring_xconn *u,
 
 /* Wire size of struct samba_uring_counters, in bytes, when serialized
  * for FSCTL_SMBTORTURE_TRUENAS_URING_COUNTERS_READ. */
-#define SAMBA_URING_COUNTERS_WIRE_BYTES (19 * 8)
+#define SAMBA_URING_COUNTERS_WIRE_BYTES (21 * 8)
 
 /* Set by FSCTL_SMBTORTURE_TRUENAS_URING_FORCE_NEXT_SIGNED_WRITE_FAIL.
  * The next signed splice inbound WRITE will force the post-HMAC verify

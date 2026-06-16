@@ -83,7 +83,7 @@ struct truenas_uring_counters {
 	uint64_t signed_splice_in_denied;
 	uint64_t unsigned_splice_out;
 	uint64_t signed_splice_out;
-	uint64_t encrypted_recv_regbuf;
+	uint64_t encrypted_recv;
 	uint64_t encrypted_send_zc;
 	uint64_t legacy_recv;
 	uint64_t legacy_send;
@@ -97,8 +97,10 @@ struct truenas_uring_counters {
 	uint64_t signed_alg_cache_misses;
 	uint64_t inflight_throttle_events;
 	uint64_t inflight_bytes_peak;
+	uint64_t unsigned_recv_mempool;
+	uint64_t bytes_unsigned_mempool_out;
 };
-#define COUNTERS_WIRE_BYTES (19 * 8)
+#define COUNTERS_WIRE_BYTES (21 * 8)
 
 /* Mirror of smbd's TURING_MAX_INFLIGHT_BYTES_DEFAULT
  * (smbd_smb2_uring.h). Defined locally so the suite doesn't pull in
@@ -201,7 +203,7 @@ static bool fsctl_counters_read(struct torture_context *tctx,
 	out->signed_splice_in_denied   = BVAL(p,  16);
 	out->unsigned_splice_out       = BVAL(p,  24);
 	out->signed_splice_out         = BVAL(p,  32);
-	out->encrypted_recv_regbuf     = BVAL(p,  40);
+	out->encrypted_recv     = BVAL(p,  40);
 	out->encrypted_send_zc         = BVAL(p,  48);
 	out->legacy_recv               = BVAL(p,  56);
 	out->legacy_send               = BVAL(p,  64);
@@ -215,6 +217,8 @@ static bool fsctl_counters_read(struct torture_context *tctx,
 	out->signed_alg_cache_misses   = BVAL(p, 128);
 	out->inflight_throttle_events  = BVAL(p, 136);
 	out->inflight_bytes_peak       = BVAL(p, 144);
+	out->unsigned_recv_mempool      = BVAL(p, 152);
+	out->bytes_unsigned_mempool_out = BVAL(p, 160);
 	talloc_free(tmp);
 	return true;
 }
@@ -326,12 +330,18 @@ static size_t expected_counter_offset(enum dispatch_mode m)
 	case MODE_SIGNED_SPLICE_IN:
 		return offsetof(struct truenas_uring_counters, signed_splice_in);
 	case MODE_UNSIGNED_SPLICE_OUT:
-		return offsetof(struct truenas_uring_counters, unsigned_splice_out);
+		/*
+		 * Plain READs are served from the reclaimable io_memory_pool +
+		 * SENDMSG_ZC (schedule_smb2_aio_read); file -> pipe -> socket
+		 * splice is only a fallback for when SENDMSG_ZC is disabled.
+		 * Assert on the mempool counter to match the default behavior.
+		 */
+		return offsetof(struct truenas_uring_counters, unsigned_recv_mempool);
 	case MODE_SIGNED_SPLICE_OUT:
 		return offsetof(struct truenas_uring_counters, signed_splice_out);
 	case MODE_ENCRYPTED_IN:
 	case MODE_ENCRYPTED_OUT:
-		return offsetof(struct truenas_uring_counters, encrypted_recv_regbuf);
+		return offsetof(struct truenas_uring_counters, encrypted_recv);
 	}
 	return 0;
 }
@@ -463,7 +473,7 @@ static bool do_roundtrip(struct torture_context *tctx,
 		(unsigned long long)after.signed_splice_in_denied,
 		(unsigned long long)after.unsigned_splice_out,
 		(unsigned long long)after.signed_splice_out,
-		(unsigned long long)after.encrypted_recv_regbuf,
+		(unsigned long long)after.encrypted_recv,
 		(unsigned long long)after.encrypted_send_zc,
 		(unsigned long long)after.legacy_recv,
 		(unsigned long long)after.legacy_send);

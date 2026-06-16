@@ -435,6 +435,24 @@ static NTSTATUS schedule_smb2_splice_read(struct smbd_smb2_request *smb2req,
 		return NT_STATUS_RETRY;
 	}
 
+	/*
+	 * Plain (unsigned, unencrypted) READs: prefer the registered-buffer +
+	 * SENDMSG_ZC aio path (schedule_smb2_aio_read) over splice. On ZFS the
+	 * file -> pipe leg is copy_splice_read (no page borrow), so splice gains
+	 * no read-side zero-copy and adds per-op pipe-page alloc/free churn on
+	 * the shared page allocator -- measured ~6% slower than the legacy path.
+	 * The regbuf path reads into a pinned, reused slot (READ_FIXED) and DMAs
+	 * straight from it (SENDMSG_ZC) with no per-op page allocation. Decline
+	 * here so dispatch falls through to it. Only divert when it is actually
+	 * available (SENDMSG_ZC enabled); otherwise splice stays the best
+	 * outbound option (it is the only zero-copy send when ZC is off).
+	 * Signed READs keep the splice + AF_ALG patched-MAC path below.
+	 */
+	if (!smb2req->do_signing && !smb2req->do_encryption &&
+	    xconn->smb2.uring->enabled.sendmsg_zc) {
+		return NT_STATUS_RETRY;
+	}
+
 	/* Splice-incompatible request shapes (mirrors sendfile gates).
 	 *
 	 * Signed-but-unencrypted READs are allowed iff signed splice

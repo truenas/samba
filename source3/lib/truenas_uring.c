@@ -500,6 +500,29 @@ void truenas_uring_set_async_threshold(struct truenas_uring *u,
 	u->async_threshold[op_class] = threshold_bytes;
 }
 
+/*
+ * Cap the kernel io-wq worker pool for this ring. Bounds how many blocking
+ * ops (IOSQE_ASYNC reads/writes/splices punted off the main loop) run
+ * concurrently -- i.e. the real "max io_uring op concurrency" for this
+ * process. Critical at high process counts: the kernel default is large
+ * (~512 bounded workers per ring), so thousands of smbds could otherwise
+ * spawn an unbounded number of worker threads. values[0]=bounded (regular
+ * file/blocking I/O), values[1]=unbounded (poll-driven net I/O); 0 leaves a
+ * class at the kernel default. Returns 0 or -errno (non-fatal).
+ */
+int truenas_uring_set_iowq_max_workers(struct truenas_uring *u,
+				       unsigned int bounded,
+				       unsigned int unbounded)
+{
+	unsigned int values[2] = { bounded, unbounded };
+	int ret = io_uring_register_iowq_max_workers(&u->ring, values);
+	if (ret < 0) {
+		DBG_WARNING("truenas_uring: iowq_max_workers(%u,%u) failed: "
+			    "%s\n", bounded, unbounded, strerror(-ret));
+	}
+	return ret;
+}
+
 /* ---------------- Registered buffer pool ---------------- */
 
 int truenas_uring_register_buffers(struct truenas_uring *u,
@@ -809,6 +832,14 @@ struct truenas_uring_pipe truenas_uring_pipe_acquire(struct truenas_uring *u)
 		};
 	}
 	return none;
+}
+
+size_t truenas_uring_pipe_capacity(struct truenas_uring *u)
+{
+	if (u == NULL) {
+		return 0;
+	}
+	return u->pipe_size_bytes;
 }
 
 /* ---------------- AF_ALG HMAC sockets (signed splice) ---------------- */

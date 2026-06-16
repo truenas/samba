@@ -23,6 +23,7 @@
 #include "smbd/globals.h"
 #include "../lib/util/tevent_ntstatus.h"
 #include "../lib/util/tevent_unix.h"
+#include "lib/truenas_mempool.h"
 #ifdef HAVE_LIBURING
 #include "lib/truenas_uring.h"
 #include "smbd/smbd_smb2_uring.h"
@@ -380,24 +381,22 @@ NTSTATUS schedule_smb2_aio_read(connection_struct *conn,
 	}
 
 	/*
-	 * Create the out buffer.
+	 * Create the out buffer for the READ.
 	 *
-	 * Encrypted-READ fast path: when the response will be SMB3-encrypted
-	 * and the truenas_uring registered fixed-buffer pool has a free slot
-	 * of sufficient size, allocate from there. The buffer is pre-pinned,
-	 * so vfs_io_uring's submission helper auto-detects it via
-	 * truenas_uring_buf_index and submits IORING_OP_READ_FIXED. AES-GCM
-	 * in-place encrypt later in the response assembly runs against the
-	 * same pinned buffer; when SENDMSG_ZC is enabled, the NIC DMAs
-	 * directly from these pages.
+	 * All reads (plain and encrypted) are served from the reclaimable
+	 * io_memory_pool: data is pread into a reused (non-pinned, swappable)
+	 * pool buffer -- one copy -- and the response is sent straight from it
+	 * via IORING_OP_SENDMSG_ZC. No registered/pinned RAM, so this scales to
+	 * thousands of smbds; the pool is freed after an idle interval.
 	 *
-	 * Slot release is driven by a talloc destructor on a tiny owner
-	 * object parented to ctx (smbreq->smb2req), so the slot is returned
-	 * whether the request completes normally or is aborted.
-	 *
-	 * Fallback when the pool isn't registered, slot is exhausted, the
-	 * slot is too small for smb_maxcnt, or the request isn't encrypted:
-	 * the existing data_blob_talloc path.
+	 * On ZFS the registered (pinned) fixed-buffer pool buys nothing
+	 * (READ_FIXED only helps DMA, not buffered ARC copies; and multi-iov
+	 * SENDMSG_ZC can't use FIXED_BUF), so it is opt-in only
+	 * (fixed_buffer_pool_count > 0). When enabled, encrypted reads grab a
+	 * pinned slot below for in-place AEAD; otherwise -- and for the
+	 * encrypted path when the pool is off/exhausted -- the mempool is used.
+	 * Slot release (when used) is driven by a talloc destructor on a tiny
+	 * owner parented to ctx, so it returns on normal completion or abort.
 	 */
 #ifdef HAVE_LIBURING
 	if (smbreq->smb2req != NULL && smbreq->smb2req->do_encryption) {
@@ -426,8 +425,7 @@ NTSTATUS schedule_smb2_aio_read(connection_struct *conn,
 			preadbuf->length = smb_maxcnt;
 
 			if (xconn != NULL && xconn->smb2.uring != NULL) {
-				xconn->smb2.uring->counters
-					.encrypted_recv_regbuf++;
+				xconn->smb2.uring->counters.encrypted_recv++;
 				xconn->smb2.uring->counters
 					.bytes_encrypted_out += smb_maxcnt;
 			}
@@ -440,11 +438,31 @@ NTSTATUS schedule_smb2_aio_read(connection_struct *conn,
 	}
 #endif
 	if (preadbuf->data == NULL) {
-		*preadbuf = data_blob_talloc(ctx, NULL, smb_maxcnt);
-		if (preadbuf->data == NULL) {
+		/*
+		 * Default path: reclaimable io_memory_pool buffer, sent
+		 * zero-copy via SENDMSG_ZC. Used by all plain reads and by
+		 * encrypted reads when the opt-in registered pool is off.
+		 */
+		struct io_pool_link *io_lnk = NULL;
+
+		if (!io_pool_alloc_blob(conn, ctx, smb_maxcnt, preadbuf,
+					&io_lnk)) {
 			return NT_STATUS_NO_MEMORY;
 		}
 #ifdef HAVE_LIBURING
+		if (smbreq->smb2req != NULL &&
+		    smbreq->smb2req->xconn != NULL &&
+		    smbreq->smb2req->xconn->smb2.uring != NULL) {
+			struct samba_uring_counters *cnt =
+				&smbreq->smb2req->xconn->smb2.uring->counters;
+			if (smbreq->smb2req->do_encryption) {
+				cnt->encrypted_recv++;
+				cnt->bytes_encrypted_out += smb_maxcnt;
+			} else {
+				cnt->unsigned_recv_mempool++;
+				cnt->bytes_unsigned_mempool_out += smb_maxcnt;
+			}
+		}
 		{
 			NTSTATUS cs = truenas_uring_charge_recv_bytes(
 				ctx, smbreq->smb2req->xconn, smb_maxcnt);
@@ -571,8 +589,10 @@ struct splice_write_state {
 	size_t sock_consumed;    /* bytes already spliced socket -> pipe */
 	size_t file_done;        /* bytes already spliced pipe   -> file */
 	struct truenas_uring_pipe pipe;
+	size_t pipe_cap;             /* usable capacity of the request's pipe */
 	struct lock_struct lock;
 	bool write_through;
+	bool socket_released;        /* socket-reader claim already dropped? */
 	struct file_modified_state modified_state;
 	unsigned int zero_retries;   /* splice-returned-0 retries before EOF */
 };
@@ -595,6 +615,26 @@ static void splice_write_release_pipe(struct splice_write_state *state)
 		truenas_uring_pipe_release(u, state->pipe.slot);
 	}
 	state->pipe.slot = -1;
+}
+
+/*
+ * Drop the socket-reader claim and re-arm the recv state machine. While
+ * SAMBA_URING_INFLIGHT_SPLICE_RECV is set, smbd_smb2_request_next_incoming
+ * refuses to read the next PDU so it can't race the splice for this WRITE's
+ * body bytes. We call this the instant the body is fully off the socket --
+ * NOT at finish -- so the pipe->file drain (and the ZFS write behind it)
+ * overlaps the next request's socket read. Idempotent: guarded by
+ * state->socket_released so a later finish() can't clear a claim that a
+ * successor request has since taken.
+ */
+static void splice_write_release_socket(struct splice_write_state *state)
+{
+	if (state->socket_released) {
+		return;
+	}
+	state->socket_released = true;
+	state->xconn->smb2.uring->inflight &= ~SAMBA_URING_INFLIGHT_SPLICE_RECV;
+	(void)smbd_smb2_request_next_incoming(state->xconn);
 }
 
 NTSTATUS truenas_schedule_smb2_unsigned_splice_write(connection_struct *conn,
@@ -661,6 +701,17 @@ NTSTATUS truenas_schedule_smb2_unsigned_splice_write(connection_struct *conn,
 		TALLOC_FREE(state);
 		return NT_STATUS_RETRY;
 	}
+	state->pipe_cap = truenas_uring_pipe_capacity(u);
+	if (state->pipe_cap == 0) {
+		/*
+		 * Pool registered (we just acquired a pipe) yet reports no
+		 * capacity -- should never happen. Decline to the legacy aio
+		 * path rather than drive the pump/drain loop with a zero bound.
+		 */
+		splice_write_release_pipe(state);
+		TALLOC_FREE(state);
+		return NT_STATUS_RETRY;
+	}
 
 	init_strict_lock_struct(fsp,
 				fsp->op->global->open_persistent_id,
@@ -705,41 +756,74 @@ NTSTATUS truenas_schedule_smb2_unsigned_splice_write(connection_struct *conn,
 }
 
 /*
- * Streaming state machine for socket -> pipe -> file. The pipe has finite
- * capacity (~ /proc/sys/fs/pipe-max-size, default 1 MiB), so for WRITEs
- * larger than the pipe we alternate: pump as much as possible from socket
- * into pipe, then drain pipe to file at the right offset, then repeat
- * until total_len bytes have moved.
+ * Streaming state machine for socket -> pipe -> file.
  *
- * Invariant: at most one splice op is in flight at a time. Reason: a single
- * pipe (per-request) is the only buffer; we can't have two splices racing
- * on it. (Could be relaxed with two pipes but not worth the complexity.)
+ * The pool sizes each pipe to the negotiated SMB2 max_write + headroom (8 MiB
+ * + 64 KiB by default; see smb2_negprot.c), so the whole WRITE body fits in
+ * one pipe. We therefore pump the entire body socket -> pipe first, release
+ * the socket-reader claim, and only then drain pipe -> file. Filling the pipe
+ * up front lets us hand the socket back to the recv state machine the instant
+ * the last body byte is off it, so this request's pipe->file drain (and the
+ * ZFS write behind it) overlaps the NEXT request's socket read. That
+ * cross-request pipelining is what an SMB2 client's credit window expects;
+ * the original code instead alternated 128 KiB socket->pipe / pipe->file ops
+ * and held the socket-reader claim through the disk write, serializing every
+ * connection to one in-flight WRITE with no network/disk overlap -- which is
+ * what collapsed multi-stream write throughput.
+ *
+ * Only when the body is larger than a pipe (operator lowered
+ * truenas_uring:splice_pipe_size below the negotiated max_write) do we fall
+ * back to alternating pump/drain. Correctness holds; that misconfig's
+ * throughput does not.
+ *
+ * Invariant: at most one splice op PER REQUEST is in flight at a time -- the
+ * request's single pipe is its only buffer, so its socket->pipe and pipe->file
+ * legs can't race on it. Concurrency now comes from OTHER requests, each with
+ * its own pipe from the pool.
  */
 static void splice_write_drain_pipe(struct splice_write_state *state);
 static void splice_write_finish(struct splice_write_state *state,
 				NTSTATUS status, int err);
 
-#define SPLICE_WRITE_CHUNK ((size_t)128 * 1024)
-
 static void splice_write_pump_socket(struct splice_write_state *state)
 {
 	struct tevent_req *subreq = NULL;
+	size_t in_pipe = state->sock_consumed - state->file_done;
 	size_t want;
 
 	if (state->sock_consumed >= state->total_len) {
-		/* All socket bytes consumed; just drain remaining pipe. */
+		/*
+		 * Whole body is off the socket. Release the socket-reader
+		 * claim NOW -- before the pipe->file drain -- so the recv path
+		 * can pull the next PDU header while this request drains to
+		 * disk, then drain what we staged.
+		 */
+		splice_write_release_socket(state);
 		splice_write_drain_pipe(state);
 		return;
 	}
+
+	if (in_pipe >= state->pipe_cap) {
+		/*
+		 * Pipe full but the body isn't fully staged: body > pipe size
+		 * (misconfigured splice_pipe_size). Drain to make room, then
+		 * resume pumping. The socket-reader claim stays held until the
+		 * body is fully off the socket.
+		 */
+		splice_write_drain_pipe(state);
+		return;
+	}
+
 	/*
-	 * Chunk splice calls (legacy sys_recvfile uses 16K; we go slightly
-	 * larger). Large single calls to splice-from-socket can return short
-	 * or 0 unexpectedly under flow control; chunking keeps each call
-	 * within what TCP/pipe can reliably move in one shot.
+	 * Pull as much of the remaining body as the pipe can still hold in one
+	 * op. splice() from the socket returns whatever TCP has buffered (a
+	 * short return is normal -- the next pump picks up the rest), so the
+	 * old 128 KiB cap bought nothing but ~32 serialized round-trips per
+	 * 4 MiB WRITE.
 	 */
 	want = state->total_len - state->sock_consumed;
-	if (want > SPLICE_WRITE_CHUNK) {
-		want = SPLICE_WRITE_CHUNK;
+	if (want > state->pipe_cap - in_pipe) {
+		want = state->pipe_cap - in_pipe;
 	}
 	DBG_DEBUG("PUMP: sock_consumed=%zu file_done=%zu total=%zu want=%zu\n",
 		  state->sock_consumed, state->file_done, state->total_len, want);
@@ -809,11 +893,14 @@ static void splice_write_sock_to_pipe_done(struct tevent_req *subreq)
 	}
 
 	/*
-	 * Drain pipe -> file before pumping more (we may have hit pipe
-	 * capacity). This serializes pipe access through the request's
-	 * single pipe and ensures the file offset advances monotonically.
+	 * Keep pumping the body into the pipe. pump_socket switches to draining
+	 * once the whole body is off the socket (and releases the socket-reader
+	 * claim first), or sooner if the pipe fills (oversized-body fallback).
+	 * Staging the full body before draining is what lets us free the socket
+	 * for the next PDU at line rate instead of alternating a 128 KiB read
+	 * with a disk write.
 	 */
-	splice_write_drain_pipe(state);
+	splice_write_pump_socket(state);
 }
 
 static void splice_write_pipe_to_file_done(struct tevent_req *subreq);
@@ -898,14 +985,14 @@ static void splice_write_finish(struct splice_write_state *state,
 		  state->sock_consumed);
 
 	/*
-	 * Release the socket-reader bit and re-arm the next-PDU read. While
-	 * the splice owned the socket, smbd_smb2_request_next_incoming
-	 * deliberately skipped arming TEVENT_FD_READABLE / submitting a
-	 * RECVMSG so we wouldn't race for the body bytes; kick it now so
-	 * the next PDU header lands in the recv state machine.
+	 * On the normal path the socket-reader claim was already dropped by
+	 * splice_write_release_socket() the instant the body came off the
+	 * socket, so this is a guarded no-op. It only does real work when we
+	 * finish early -- a socket->pipe error before the body was fully read;
+	 * the SMB2 error path then drains any leftover unread_bytes and the
+	 * recv state machine resumes from a clean PDU boundary.
 	 */
-	state->xconn->smb2.uring->inflight &= ~SAMBA_URING_INFLIGHT_SPLICE_RECV;
-	(void)smbd_smb2_request_next_incoming(state->xconn);
+	splice_write_release_socket(state);
 
 	splice_write_release_pipe(state);
 
@@ -973,13 +1060,13 @@ struct signed_splice_in_state {
 	int alg_op_fd;            /* AF_ALG operation socket (per-request) */
 	int alg_bind_fd;          /* AF_ALG bind socket (per-request) */
 	uint8_t client_mac[16];   /* stashed signature from inbound header */
+	size_t pipe_cap;          /* usable capacity of pipeA/pipeB */
 	struct lock_struct lock;
 	bool write_through;
+	bool socket_released;     /* socket-reader claim already dropped? */
 	struct file_modified_state modified_state;
 	unsigned int zero_retries;
 };
-
-#define SIGNED_SPLICE_IN_CHUNK ((size_t)128 * 1024)
 
 static void signed_splice_in_pump_socket(struct signed_splice_in_state *state);
 static void signed_splice_in_drain_to_alg(struct signed_splice_in_state *state);
@@ -1238,6 +1325,7 @@ NTSTATUS truenas_schedule_smb2_signed_splice_write(connection_struct *conn,
 	state->offset_orig = (off_t)in_offset;
 	state->total_len = in_data.length;
 	state->write_through = write_through;
+	state->pipe_cap = truenas_uring_pipe_capacity(u);
 
 	/* Stash the client-supplied signature for later memcmp. */
 	inhdr = SMBD_SMB2_IN_HDR_PTR(smb2req);
@@ -1288,12 +1376,30 @@ fail:
 	return status;
 }
 
+/*
+ * Signed-path analogue of splice_write_release_socket(): drop the socket-reader
+ * claim and re-arm the recv state machine the instant the body is off the
+ * socket (tee'd into pipeB), so the HMAC verify + pipe->file drain overlap the
+ * next request's socket read. Verify-then-write is unaffected -- no file byte
+ * is written until the MAC is checked. Idempotent via state->socket_released.
+ */
+static void signed_splice_in_release_socket(struct signed_splice_in_state *state)
+{
+	if (state->socket_released) {
+		return;
+	}
+	state->socket_released = true;
+	state->xconn->smb2.uring->inflight &= ~SAMBA_URING_INFLIGHT_SPLICE_RECV;
+	(void)smbd_smb2_request_next_incoming(state->xconn);
+}
+
 static void signed_splice_in_pump_socket_done(struct tevent_req *subreq);
 static void signed_splice_in_alg_feed_done(struct tevent_req *subreq);
 
 static void signed_splice_in_pump_socket(struct signed_splice_in_state *state)
 {
 	struct tevent_req *subreq;
+	size_t in_pipeA = state->sock_consumed - state->file_done;
 	size_t want;
 
 	if (state->sock_consumed >= state->total_len) {
@@ -1301,9 +1407,29 @@ static void signed_splice_in_pump_socket(struct signed_splice_in_state *state)
 		signed_splice_in_drain_to_alg(state);
 		return;
 	}
+	/*
+	 * Verify-then-write needs the whole body resident in pipeA before the
+	 * MAC can be checked, and the pool sizes each pipe to max_write +
+	 * headroom, so it fits. Pull as much as the pipe can still hold per op
+	 * instead of the old 128 KiB cap; splice short returns are normal and
+	 * the next pump picks up the rest.
+	 */
+	if (in_pipeA >= state->pipe_cap) {
+		/*
+		 * Body larger than the pipe (misconfigured splice_pipe_size):
+		 * verify-then-write can't stage it, and a socket->pipe splice
+		 * into a full pipe would stall. Fail cleanly.
+		 */
+		DBG_WARNING("signed_splice: body %zu exceeds pipe capacity "
+			    "%zu; raise truenas_uring:splice_pipe_size\n",
+			    state->total_len, state->pipe_cap);
+		signed_splice_in_finish(state,
+					NT_STATUS_INSUFFICIENT_RESOURCES, ENOBUFS);
+		return;
+	}
 	want = state->total_len - state->sock_consumed;
-	if (want > SIGNED_SPLICE_IN_CHUNK) {
-		want = SIGNED_SPLICE_IN_CHUNK;
+	if (want > state->pipe_cap - in_pipeA) {
+		want = state->pipe_cap - in_pipeA;
 	}
 	subreq = truenas_uring_splice_send(state,
 					   state->xconn->client->raw_ev_ctx,
@@ -1379,6 +1505,13 @@ static void signed_splice_in_pump_socket_done(struct tevent_req *subreq)
 			return;
 		}
 	}
+	/*
+	 * Whole body is off the socket now (staged in pipeA, tee'd into pipeB).
+	 * Release the socket-reader claim so the next PDU can be read while we
+	 * run the streaming HMAC + verify + pipe->file drain. No file byte is
+	 * written until the MAC checks out, so verify-then-write still holds.
+	 */
+	signed_splice_in_release_socket(state);
 	signed_splice_in_drain_to_alg(state);
 }
 
@@ -1551,8 +1684,13 @@ static void signed_splice_in_finish(struct signed_splice_in_state *state,
 	files_struct *fsp = state->fsp;
 	size_t written = state->file_done;
 
-	state->xconn->smb2.uring->inflight &= ~SAMBA_URING_INFLIGHT_SPLICE_RECV;
-	(void)smbd_smb2_request_next_incoming(state->xconn);
+	/*
+	 * Normally dropped already in signed_splice_in_release_socket() right
+	 * after the body was tee'd off the socket; idempotent here for the
+	 * early-error paths (alg setup / socket->pipe / verify) that finish
+	 * before that point.
+	 */
+	signed_splice_in_release_socket(state);
 
 	signed_splice_in_close_alg(state);  /* idempotent on the success path */
 	signed_splice_in_release_pipes(state);

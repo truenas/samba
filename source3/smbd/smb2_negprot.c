@@ -900,25 +900,31 @@ NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 	 */
 	{
 		/*
-		 * Default 32 slots when the fork is enabled. Each slot is
-		 * sized to smb2_max_read + 8 KiB pad (so a full 4-8 MiB
-		 * encrypted READ response fits in one). 32 * 8 MiB = 256 MiB
-		 * of *virtual* address space per worker; physical pages are
-		 * committed lazily on first touch, so an idle worker pays
-		 * almost nothing. Operator can set to 0 to disable, or to
-		 * another value for memory/concurrency trade-offs.
+		 * Registered (pinned) fixed-buffer pool -- OPT-IN, default 0.
+		 *
+		 * On ZFS this buys nothing on any path: READ_FIXED only helps
+		 * DMA (ZFS reads are buffered ARC copies), and every response is
+		 * multi-iov SENDMSG_ZC, which can't use FIXED_BUF -- so it never
+		 * accelerates the send either. Meanwhile io_uring pins every
+		 * page at registration (unswappable; 32 * (max_read+pad) ~=
+		 * 256 MiB per worker), which does not scale to thousands of
+		 * smbds. All reads (plain and encrypted) now use the reclaimable
+		 * io_memory_pool + SENDMSG_ZC instead (schedule_smb2_aio_read /
+		 * truenas_mempool). Left as an opt-in for low-process-count
+		 * experimentation: set fixed_buffer_pool_count > 0.
+		 *
+		 * If enabled, slot size must hold a full READ payload (else
+		 * buf_acquire() rejects it and the request falls back); default
+		 * to smb2_max_read + 8 KiB pad.
 		 */
-		const bool fork_enabled = lp_parm_bool(
-			GLOBAL_SECTION_SNUM,
-			"truenas_uring", "enabled", true);
 		int pool_count = lp_parm_int(GLOBAL_SECTION_SNUM,
 					     "truenas_uring",
 					     "fixed_buffer_pool_count",
-					     fork_enabled ? 32 : 0);
+					     0);
 		int pool_bufsize = lp_parm_int(GLOBAL_SECTION_SNUM,
 					       "truenas_uring",
 					       "fixed_buffer_pool_bufsize",
-					       1024 * 1024);
+					       (int)lp_smb2_max_read() + 8192);
 		if (pool_count > 0 && pool_bufsize > 0) {
 			struct truenas_uring *u = truenas_uring_get(
 				req->xconn->client->raw_ev_ctx);
@@ -968,7 +974,7 @@ NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 	 *   ~= 258 MiB. Pipe pages are lazily faulted -- idle pool is ~free.
 	 */
 	{
-		const int default_count = 32;
+		const int default_count = 16;  /* ~ client QD (~10) + headroom */
 		const int min_count = 3;   /* SIGNED_OUT needs 3 */
 		const int max_count = 4096;
 		int operator_count;
@@ -1016,6 +1022,41 @@ NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 			if (u != NULL) {
 				(void)truenas_uring_register_pipe_pool(
 					u, (unsigned int)pipe_count, pipe_size);
+			}
+		}
+	}
+
+	/*
+	 * Ring-level concurrency + main-loop safety (idempotent; the uring is
+	 * per-process). Individual knobs, scale-safe defaults:
+	 *
+	 *  - async_threshold_kb: reads/writes/splices at/above this size get
+	 *    IOSQE_ASYNC, so a multi-MiB copy runs on the kernel io-wq instead
+	 *    of inline in io_uring_enter on the tevent main loop. Smaller ops
+	 *    stay inline (cheap, no worker handoff). 0 = all inline.
+	 *  - iowq_max_workers: caps concurrent blocking ops (and kernel worker
+	 *    threads) per process -- the real max-io_uring-op-concurrency knob,
+	 *    essential at thousands of smbds (kernel default is ~512 bounded).
+	 *    0 leaves the kernel default.
+	 */
+	{
+		struct truenas_uring *u = truenas_uring_get(
+			req->xconn->client->raw_ev_ctx);
+		if (u != NULL) {
+			int async_kb = lp_parm_int(GLOBAL_SECTION_SNUM,
+				"truenas_uring", "async_threshold_kb", 256);
+			int iowq = lp_parm_int(GLOBAL_SECTION_SNUM,
+				"truenas_uring", "iowq_max_workers", 8);
+			size_t thr = (async_kb > 0) ?
+				(size_t)async_kb * 1024 : 0;
+
+			truenas_uring_set_async_threshold(u,
+				TURING_OP_READ_CLASS, thr);
+			truenas_uring_set_async_threshold(u,
+				TURING_OP_WRITE_CLASS, thr);
+			if (iowq > 0) {
+				(void)truenas_uring_set_iowq_max_workers(
+					u, (unsigned int)iowq, 0);
 			}
 		}
 	}
