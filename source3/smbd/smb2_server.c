@@ -51,6 +51,12 @@
 
 #include "lib/crypto/gnutls_helpers.h"
 #include <gnutls/gnutls.h>
+#ifdef HAVE_LIBURING
+#include "lib/truenas_uring.h"
+#include "smbd/smbd_smb2_uring.h"
+#include <fcntl.h>      /* SPLICE_F_* */
+#include <sys/uio.h>    /* writev */
+#endif
 #include <gnutls/crypto.h>
 
 #undef DBGC_CLASS
@@ -61,6 +67,252 @@ static void smbd_smb2_connection_handler(struct tevent_context *ev,
 					 uint16_t flags,
 					 void *private_data);
 static NTSTATUS smbd_smb2_flush_send_queue(struct smbXsrv_connection *xconn);
+
+#ifdef HAVE_LIBURING
+/* Forward decl for the per-PDU splice pipeline; full def below. */
+static void splice_kick_pending(struct smbXsrv_connection *xconn);
+
+/*
+ * Per-(xconn, signing_key) AF_ALG bind-socket cache. See the
+ * truenas_signed_alg_cache_entry comment in smbd_smb2_uring.h for
+ * the lifetime rationale -- in short, MS-SMB2 permits multiple
+ * sessions per TCP connection and the signing key is per-session,
+ * so we keep one cache entry per active session/channel rather than
+ * a single slot that would thrash.
+ *
+ * Entry is talloc-parented to the smb2_signing_key, so when the
+ * session/channel that owns the key is torn down the entry is
+ * freed automatically. The destructor closes the fd and unlinks
+ * the entry from the xconn's list.
+ */
+static int signed_alg_cache_entry_destructor(
+	struct truenas_signed_alg_cache_entry *e)
+{
+	if (e->bind_fd >= 0) {
+		truenas_uring_hmac_close(e->bind_fd);
+		e->bind_fd = -1;
+	}
+	if (e->u != NULL) {
+		DLIST_REMOVE(e->u->signed_alg_cache, e);
+		e->u = NULL;
+	}
+	return 0;
+}
+
+static struct truenas_signed_alg_cache_entry *signed_alg_cache_lookup(
+	struct samba_uring_xconn *u, const struct smb2_signing_key *sk)
+{
+	struct truenas_signed_alg_cache_entry *e = NULL;
+
+	for (e = u->signed_alg_cache; e != NULL; e = e->next) {
+		if (e->sk == sk) {
+			return e;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Encrypt one 16-byte block with AES-128 (raw, no chaining): out = AES_K(in).
+ *
+ * GnuTLS intentionally does not expose GNUTLS_CIPHER_AES_128_ECB because
+ * raw ECB is dangerous in the general case. We achieve identical
+ * behavior with AES-128-CBC and a zero IV: the first CBC block computes
+ * C = AES(IV XOR P) which collapses to AES(P) when IV = 0. The cipher
+ * handle is opened fresh for each call so no chaining state leaks
+ * between invocations.
+ *
+ * Used for two single-block operations in the GMAC path:
+ *   - GHASH subkey derivation:  H       = AES_K(0^128)
+ *   - per-PDU tag mask:         tag_mask= AES_K(J0)
+ *
+ * One AES-NI block in userspace is ~40 cycles on modern x86 -- the
+ * gnutls call wrapping it dominates, but still ~1 microsecond total
+ * and amortised over the whole PDU.
+ */
+static int truenas_smb2_aes128_encrypt_block(const uint8_t *key, size_t keylen,
+					     const uint8_t in[16],
+					     uint8_t out[16])
+{
+	static const uint8_t zero16[16] = {0};
+	gnutls_cipher_hd_t hd = NULL;
+	gnutls_datum_t k = { .data = (uint8_t *)key, .size = keylen };
+	gnutls_datum_t iv = { .data = (uint8_t *)zero16, .size = 16 };
+	int rc;
+
+	if (keylen < 16) {
+		return -EINVAL;
+	}
+	k.size = 16;  /* AES-128 */
+
+	rc = gnutls_cipher_init(&hd, GNUTLS_CIPHER_AES_128_CBC, &k, &iv);
+	if (rc < 0) {
+		return -EIO;
+	}
+	memcpy(out, in, 16);
+	rc = gnutls_cipher_encrypt(hd, out, 16);
+	gnutls_cipher_deinit(hd);
+	if (rc < 0) {
+		return -EIO;
+	}
+	return 0;
+}
+
+/*
+ * Derive the GHASH subkey H = AES_K(0^128). SMB3 GMAC's GHASH operates
+ * with H rather than the raw signing key; we compute H once per sk and
+ * feed it to algif_hash("ghash") as the setkey. Done under the cache-miss
+ * branch so the cost is paid once per session, not per PDU.
+ */
+static int signed_splice_derive_gmac_subkey(const uint8_t *key, size_t keylen,
+					    uint8_t H_out[16])
+{
+	static const uint8_t zero16[16] = {0};
+	return truenas_smb2_aes128_encrypt_block(key, keylen, zero16, H_out);
+}
+
+int truenas_smb2_alg_hmac_acquire(struct smbXsrv_connection *xconn,
+				struct smb2_signing_key *sk)
+{
+	struct samba_uring_xconn *u = xconn->smb2.uring;
+	struct truenas_signed_alg_cache_entry *e = NULL;
+	const char *alg = NULL;
+	const uint8_t *keybuf = NULL;
+	uint8_t H[16];
+	size_t klen;
+	int fd;
+
+	if (sk == NULL || !smb2_signing_key_valid(sk)) {
+		return -EINVAL;
+	}
+
+	e = signed_alg_cache_lookup(u, sk);
+	if (e != NULL) {
+		u->counters.signed_alg_cache_hits++;
+		return e->bind_fd;
+	}
+	u->counters.signed_alg_cache_misses++;
+
+	klen = MIN(sk->blob.length, (size_t)SAMBA_URING_HMAC_KEY_MAX);
+
+	switch (sk->sign_algo_id) {
+	case SMB2_SIGNING_HMAC_SHA256:
+		alg = "hmac(sha256)";
+		keybuf = sk->blob.data;
+		break;
+	case SMB2_SIGNING_AES128_CMAC:
+		alg = "cmac(aes)";
+		keybuf = sk->blob.data;
+		break;
+	case SMB2_SIGNING_AES128_GMAC: {
+		/*
+		 * GMAC via ghash: feed AAD through algif_hash("ghash") keyed
+		 * with the GHASH subkey H, then derive the per-message tag in
+		 * userspace as ghash_out XOR AES_K(J0). Per the kernel comment
+		 * on aesni-intel's gcm_crypt, the GCM path opens one FPU
+		 * section per AEAD request rather than the per-block FPU churn
+		 * of cmac(aes); ghash-clmulni-intel inherits that same bulk
+		 * behavior in its shash update, so we get the same ~10-20x
+		 * speedup without paying the algif_aead AAD-echo memcpy.
+		 */
+		int rc = signed_splice_derive_gmac_subkey(sk->blob.data, klen, H);
+		if (rc < 0) {
+			return rc;
+		}
+		alg = "ghash";
+		keybuf = H;
+		klen = 16;
+		break;
+	}
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	fd = truenas_uring_hmac_open(alg, keybuf, klen);
+	if (fd < 0) {
+		return fd;
+	}
+
+	/*
+	 * Parent the entry to sk: session/channel teardown frees sk,
+	 * which cascades to e, which fires the destructor and closes
+	 * the fd + removes e from the xconn's list.
+	 */
+	e = talloc_zero(sk, struct truenas_signed_alg_cache_entry);
+	if (e == NULL) {
+		truenas_uring_hmac_close(fd);
+		return -ENOMEM;
+	}
+	e->u = u;
+	e->sk = sk;
+	e->bind_fd = fd;
+	talloc_set_destructor(e, signed_alg_cache_entry_destructor);
+	DLIST_ADD(u->signed_alg_cache, e);
+
+	DBG_NOTICE("signed_splice: AF_ALG bind socket opened: alg=%s fd=%d "
+		   "sk=%p (sign_algo_id=%u)\n",
+		   alg, fd, sk, (unsigned)sk->sign_algo_id);
+	return fd;
+}
+
+/*
+ * Recv-side back-pressure accounting. The caller has just allocated
+ * `bytes` of userspace memory for an inbound payload (pktbuf,
+ * encrypted-pool slot, talloc fallback, etc.) parented to charge_ctx.
+ * This routine bumps the xconn's inflight_bytes counter and installs
+ * a talloc destructor on a small holder (also parented to charge_ctx)
+ * that refunds the bytes when charge_ctx is freed and kicks the recv
+ * dispatcher in case it was throttled.
+ *
+ * The holder is invisible to callers; charge_ctx talloc-free is the
+ * only event that needs to happen to refund.
+ *
+ * Returns NT_STATUS_OK on success; NT_STATUS_NO_MEMORY only on
+ * holder-alloc failure (in which case the caller should free the
+ * payload too -- the bytes were never counted).
+ */
+struct samba_uring_inflight_holder {
+	struct smbXsrv_connection *xconn;
+	uint64_t bytes;
+};
+
+static int inflight_refund_destructor(struct samba_uring_inflight_holder *h)
+{
+	struct smbXsrv_connection *xconn = h->xconn;
+
+	if (xconn == NULL || xconn->smb2.uring == NULL) {
+		return 0;
+	}
+	samba_uring_refund_inflight(xconn->smb2.uring, h->bytes);
+	/*
+	 * Refund may have crossed the cap downward; kick recv dispatch
+	 * so any throttled next-PDU request can resume.
+	 */
+	(void)smbd_smb2_request_next_incoming(xconn);
+	return 0;
+}
+
+NTSTATUS truenas_uring_charge_recv_bytes(TALLOC_CTX *charge_ctx,
+					 struct smbXsrv_connection *xconn,
+					 uint64_t bytes)
+{
+	struct samba_uring_inflight_holder *h = NULL;
+
+	if (xconn == NULL || xconn->smb2.uring == NULL || bytes == 0) {
+		return NT_STATUS_OK;
+	}
+	h = talloc(charge_ctx, struct samba_uring_inflight_holder);
+	if (h == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
+	h->xconn = xconn;
+	h->bytes = bytes;
+	talloc_set_destructor(h, inflight_refund_destructor);
+
+	samba_uring_charge_inflight(xconn->smb2.uring, bytes);
+	return NT_STATUS_OK;
+}
+#endif
 
 static const struct smbd_smb2_dispatch_table {
 	uint16_t opcode;
@@ -2070,6 +2322,9 @@ static NTSTATUS smb2_send_async_interim_response(const struct smbd_smb2_request 
 	nreq->queue_entry.mem_ctx = nreq;
 	nreq->queue_entry.vector = nreq->out.vector;
 	nreq->queue_entry.count = nreq->out.vector_count;
+#ifdef HAVE_LIBURING
+	nreq->queue_entry.xconn = xconn;
+#endif
 	DLIST_ADD_END(xconn->smb2.send_queue, &nreq->queue_entry);
 	xconn->smb2.send_queue_len++;
 
@@ -2233,7 +2488,6 @@ NTSTATUS smbd_smb2_request_pending_queue(struct smbd_smb2_request *req,
 	return NT_STATUS_OK;
 }
 
-static
 struct smb2_signing_key *smbd_smb2_signing_key(struct smbXsrv_session *session,
 					       struct smbXsrv_connection *xconn,
 					       bool *_has_channel)
@@ -2473,6 +2727,9 @@ static void smbd_smb2_request_pending_timer(struct tevent_context *ev,
 	state->queue_entry.mem_ctx = state;
 	state->queue_entry.vector = state->vector;
 	state->queue_entry.count = ARRAY_SIZE(state->vector);
+#ifdef HAVE_LIBURING
+	state->queue_entry.xconn = xconn;
+#endif
 	DLIST_ADD_END(xconn->smb2.send_queue, &state->queue_entry);
 	xconn->smb2.send_queue_len++;
 
@@ -3250,6 +3507,26 @@ NTSTATUS smbd_smb2_request_dispatch(struct smbd_smb2_request *req)
 			req->do_signing = true;
 		}
 
+#ifdef HAVE_LIBURING
+		/*
+		 * Signed splice inbound: signed WRITE that came in via
+		 * short-recvfile. Body bytes are still on the socket, so
+		 * smb2_signing_check_pdu here would compute HMAC over an empty
+		 * body and fail. Defer the check to
+		 * truenas_schedule_smb2_signed_splice_write, which feeds
+		 * AF_ALG with the splice-tee'd body. Stash the signing_key so
+		 * the signed splice path doesn't have to re-resolve it.
+		 */
+		if (xconn->smb2.uring->enabled.splice_recv &&
+		    opcode == SMB2_OP_WRITE &&
+		    req->smb1req != NULL && req->smb1req->unread_bytes > 0 &&
+		    smb2_signing_key_valid(signing_key)) {
+			req->splice_in.type        = SPLICE_OP_SIGNED_IN;
+			req->splice_in.signing_key = signing_key;
+			goto skipped_signing;
+		}
+#endif
+
 		status = smb2_signing_check_pdu(signing_key,
 						SMBD_SMB2_IN_HDR_IOV(req),
 						SMBD_SMB2_NUM_IOV_PER_REQ - 1);
@@ -3897,15 +4174,34 @@ static NTSTATUS smbd_smb2_request_reply(struct smbd_smb2_request *req)
 			return status;
 		}
 	} else if (req->do_signing) {
-		struct smbXsrv_session *x = req->session;
-		struct smb2_signing_key *signing_key =
-			smbd_smb2_signing_key(x, xconn, NULL);
+#ifdef HAVE_LIBURING
+		/*
+		 * Signed outbound splice: defer signing to the splice state
+		 * machine which tees the file payload through AF_ALG and
+		 * patches the MAC into the response header. The signature
+		 * field stays zeroed until the splice path computes and
+		 * inserts it. Stamp the response header pointer on the queue
+		 * entry so the splice path can patch in place.
+		 */
+		if (req->queue_entry.splice.type == SPLICE_OP_SIGNED_OUT) {
+			uint8_t *out_hdr_ptr = (uint8_t *)outhdr->iov_base;
+			/* Ensure the signature field is zero; the patcher
+			 * memcpys the 16-byte MAC over it. */
+			memset(out_hdr_ptr + SMB2_HDR_SIGNATURE, 0, 16);
+			req->queue_entry.splice.signed_out.outhdr_ptr = out_hdr_ptr;
+		} else
+#endif
+		{
+			struct smbXsrv_session *x = req->session;
+			struct smb2_signing_key *signing_key =
+				smbd_smb2_signing_key(x, xconn, NULL);
 
-		status = smb2_signing_sign_pdu(signing_key,
-					       outhdr,
-					       SMBD_SMB2_NUM_IOV_PER_REQ - 1);
-		if (!NT_STATUS_IS_OK(status)) {
-			return status;
+			status = smb2_signing_sign_pdu(signing_key,
+						       outhdr,
+						       SMBD_SMB2_NUM_IOV_PER_REQ - 1);
+			if (!NT_STATUS_IS_OK(status)) {
+				return status;
+			}
 		}
 	}
 	TALLOC_FREE(req->first_enc_key);
@@ -3976,8 +4272,23 @@ static NTSTATUS smbd_smb2_request_reply(struct smbd_smb2_request *req)
 	req->queue_entry.mem_ctx = req;
 	req->queue_entry.vector = req->out.vector;
 	req->queue_entry.count = req->out.vector_count;
+#ifdef HAVE_LIBURING
+	req->queue_entry.xconn = xconn;
+#endif
 	DLIST_ADD_END(xconn->smb2.send_queue, &req->queue_entry);
 	xconn->smb2.send_queue_len++;
+#ifdef HAVE_LIBURING
+	/*
+	 * Splice entries get their pre-send work (pipe acquire, file->pipe,
+	 * AF_ALG feed for signed) started up-front so it overlaps with the
+	 * current head's pipe->socket. K-deep parallelism is bounded by
+	 * the pipe pool capacity; INIT-phase entries that can't get pipes
+	 * are retried on the next pipe release.
+	 */
+	if (req->queue_entry.splice.type != SPLICE_OP_NONE) {
+		splice_kick_pending(xconn);
+	}
+#endif
 
 	status = smbd_smb2_flush_send_queue(xconn);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -3987,7 +4298,11 @@ static NTSTATUS smbd_smb2_request_reply(struct smbd_smb2_request *req)
 	return NT_STATUS_OK;
 }
 
-static NTSTATUS smbd_smb2_request_next_incoming(struct smbXsrv_connection *xconn);
+NTSTATUS smbd_smb2_request_next_incoming(struct smbXsrv_connection *xconn);
+#ifdef HAVE_LIBURING
+static NTSTATUS smbd_smb2_async_recvmsg_submit(
+	struct smbXsrv_connection *xconn);
+#endif
 
 void smbd_smb2_request_dispatch_immediate(struct tevent_context *ctx,
 					struct tevent_immediate *im,
@@ -4310,6 +4625,9 @@ static struct tevent_req *smbd_smb2_break_send(TALLOC_CTX *mem_ctx,
 	state->queue_entry.mem_ctx = state;
 	state->queue_entry.vector = state->vector;
 	state->queue_entry.count = ARRAY_SIZE(state->vector);
+#ifdef HAVE_LIBURING
+	state->queue_entry.xconn = xconn;
+#endif
 	DLIST_ADD_END(xconn->smb2.send_queue, &state->queue_entry);
 	xconn->smb2.send_queue_len++;
 
@@ -4637,8 +4955,26 @@ static bool is_smb2_recvfile_write(struct smbd_smb2_request_read_state *state)
 		return false;
 	}
 	if (flags & SMB2_HDR_FLAG_SIGNED) {
+#ifdef HAVE_LIBURING
+		/*
+		 * Signed splice inbound: signed WRITEs go through
+		 * short-recvfile too, with verify-then-write via splice +
+		 * AF_ALG. All three SMB3 signing algorithms route through
+		 * algif_hash now: HMAC-SHA256 and AES-128-CMAC use their
+		 * eponymous bindings directly; AES-128-GMAC uses "ghash"
+		 * keyed with H = AES_K(0^128), with the per-message tag
+		 * derived in userspace via AES_K(J0) (see
+		 * truenas_smb2_compute_gmac_tag). No per-PDU session lookup
+		 * required here -- the algorithm dispatch happens in
+		 * signed_splice_in_drain_to_alg at MAC-finalize time.
+		 */
+		if (!state->req->xconn->smb2.uring->enabled.splice_recv) {
+			return false;
+		}
+#else
 		/* Signed. Cannot recvfile. */
 		return false;
+#endif
 	}
 
 	body = &state->pktbuf[SMB2_HDR_BODY];
@@ -4672,6 +5008,27 @@ static bool is_smb2_recvfile_write(struct smbd_smb2_request_read_state *state)
 	if (fsp_is_alternate_stream(fsp)) {
 		return false;
 	}
+	if (fsp->fsp_flags.posix_append) {
+		/*
+		 * O_APPEND breaks the splice IN flow: the kernel-side
+		 * write path takes the file's tail offset, not the
+		 * SMB2_HDR_OFFSET-derived offset we pass to
+		 * IORING_OP_SPLICE(pipe -> file). Same hazard as the
+		 * legacy sys_recvfile splice path. Disable; the legacy
+		 * aio_smb2_write path handles O_APPEND correctly.
+		 */
+		return false;
+	}
+#ifdef HAVE_LIBURING
+	if (state->req->xconn->smb2.uring != NULL &&
+	    samba_uring_consume_force_next_posix_append(
+		    state->req->xconn->smb2.uring)) {
+		/* Test override: torture suite uses this to exercise the
+		 * posix_append rejection branch without setting up SMB2
+		 * POSIX-context infrastructure on the client side. */
+		return false;
+	}
+#endif
 
 	DEBUG(10,("Doing recvfile write len = %u\n",
 		(unsigned int)(state->pktfull - state->pktlen)));
@@ -4679,7 +5036,36 @@ static bool is_smb2_recvfile_write(struct smbd_smb2_request_read_state *state)
 	return true;
 }
 
-static NTSTATUS smbd_smb2_request_next_incoming(struct smbXsrv_connection *xconn)
+/*
+ * Choose the per-xconn `min_recv_size` for the receivefile gate.
+ *
+ * The operator-facing knob `min receive file size = N` only enables
+ * short-recvfile when N is non-zero. The truenas_uring splice WRITE
+ * path REQUIRES short-recvfile to engage -- otherwise
+ * schedule_aio_smb2_write claims every WRITE and the splice scheduler
+ * never sees a request.
+ *
+ * Rather than make every operator also remember `min receive file size`,
+ * auto-engage it (at 1 byte) whenever the fork's splice path is on and
+ * the operator left it at the default 0. An explicit non-zero operator
+ * value is always respected as-is.
+ */
+static size_t smbd_smb2_effective_min_recv_size(
+	const struct smbXsrv_connection *xconn)
+{
+	size_t mrs = lp_min_receive_file_size();
+#ifdef HAVE_LIBURING
+	if (mrs == 0 && xconn->smb2.uring != NULL &&
+	    xconn->smb2.uring->enabled.splice_recv) {
+		mrs = 1;
+	}
+#else
+	(void)xconn;
+#endif
+	return mrs;
+}
+
+NTSTATUS smbd_smb2_request_next_incoming(struct smbXsrv_connection *xconn)
 {
 	struct smbd_smb2_request_read_state *state = &xconn->smb2.request_read_state;
 	struct smbd_smb2_request *req = NULL;
@@ -4701,6 +5087,21 @@ static NTSTATUS smbd_smb2_request_next_incoming(struct smbXsrv_connection *xconn
 		return NT_STATUS_OK;
 	}
 
+#ifdef HAVE_LIBURING
+	if (samba_uring_splice_reads_socket(xconn->smb2.uring)) {
+		/*
+		 * An inbound splice (signed or unsigned) is consuming raw body
+		 * bytes from the socket. Arming the fd watcher (or submitting
+		 * a recv_uring RECVMSG) here would race the splice for those
+		 * bytes and the resulting garbage parse would drop the
+		 * connection. The splice completion handler
+		 * (splice_write_finish) re-invokes
+		 * us so the next PDU header read starts cleanly.
+		 */
+		return NT_STATUS_OK;
+	}
+#endif
+
 	max_send_queue_len = MAX(1, xconn->smb2.credits.max/16);
 	cur_send_queue_len = xconn->smb2.send_queue_len;
 
@@ -4713,6 +5114,35 @@ static NTSTATUS smbd_smb2_request_next_incoming(struct smbXsrv_connection *xconn
 		return NT_STATUS_OK;
 	}
 
+#ifdef HAVE_LIBURING
+	/*
+	 * Per-xconn recv-side back-pressure. Caps the userspace-buffer
+	 * bytes (pktbuf, encrypted-pool slot, encrypted talloc fallback)
+	 * that a single xconn can have in flight. Refund hooks
+	 * (truenas_uring_charge_recv_bytes destructor) re-call this
+	 * function when bytes drop below the cap so deferred recvs
+	 * resume.
+	 */
+	if (xconn->smb2.uring != NULL &&
+	    xconn->smb2.uring->max_inflight_bytes > 0 &&
+	    xconn->smb2.uring->inflight_bytes >=
+		xconn->smb2.uring->max_inflight_bytes) {
+		xconn->smb2.uring->counters.inflight_throttle_events++;
+		if (!xconn->smb2.uring->notified_inflight_throttle) {
+			xconn->smb2.uring->notified_inflight_throttle = true;
+			DBGC_NOTICE(truenas_uring_debug_class,
+				    "recv inflight cap reached "
+				    "(%" PRIu64 " / %" PRIu64
+				    " bytes); pacing next-PDU recv. Set "
+				    "truenas_uring:max_inflight_bytes higher "
+				    "if this is sustained.\n",
+				    xconn->smb2.uring->inflight_bytes,
+				    xconn->smb2.uring->max_inflight_bytes);
+		}
+		return NT_STATUS_OK;
+	}
+#endif
+
 	/* ask for the next request */
 	req = smbd_smb2_request_allocate(xconn);
 	if (req == NULL) {
@@ -4720,7 +5150,7 @@ static NTSTATUS smbd_smb2_request_next_incoming(struct smbXsrv_connection *xconn
 	}
 	*state = (struct smbd_smb2_request_read_state) {
 		.req = req,
-		.min_recv_size = lp_min_receive_file_size(),
+		.min_recv_size = smbd_smb2_effective_min_recv_size(xconn),
 		._vector = {
 			[0] = (struct iovec) {
 				.iov_base = (void *)state->hdr.nbt,
@@ -4730,6 +5160,31 @@ static NTSTATUS smbd_smb2_request_next_incoming(struct smbXsrv_connection *xconn
 		.vector = state->_vector,
 		.count = 1,
 	};
+
+#ifdef HAVE_LIBURING
+	/*
+	 * xconn->smb2.uring is NULL on the very first recv (the negprot
+	 * request), since it is allocated inside smb2_negprot.c after the
+	 * negprot PDU lands. Fall through to the legacy fd watcher in that
+	 * case; the io_uring path takes over from the second recv onward.
+	 */
+	if (xconn->smb2.uring != NULL && xconn->smb2.uring->enabled.recvmsg) {
+		/*
+		 * Drive recv via IORING_OP_RECVMSG instead of arming the
+		 * tevent_fd READable watcher. The CQE callback continues
+		 * the read state machine. We MUST explicitly disable the
+		 * fd watcher's read tracking -- if it was armed from an
+		 * earlier call (before the recv_uring knob was latched at
+		 * negprot, or by another code path) it would race the
+		 * io_uring path on the same socket and steal bytes via
+		 * legacy recvmsg.
+		 */
+		if (xconn->transport.fde != NULL) {
+			TEVENT_FD_NOT_READABLE(xconn->transport.fde);
+		}
+		return smbd_smb2_async_recvmsg_submit(xconn);
+	}
+#endif
 
 	TEVENT_FD_READABLE(xconn->transport.fde);
 
@@ -5024,11 +5479,1327 @@ static NTSTATUS smbd_smb2_flush_with_sendmsg(struct smbXsrv_connection *xconn)
 	return NT_STATUS_MORE_PROCESSING_REQUIRED;
 }
 
+#ifdef HAVE_LIBURING
+/*
+ * Async io_uring SENDMSG state machine for SMB2 response sends.
+ *
+ * Replaces the synchronous while(queue) sendmsg() loop above with a
+ * tevent_req-driven model: at most one IORING_OP_SENDMSG SQE is in flight
+ * per xconn at any time (preserves SMB2 wire order). The CQE callback
+ * advances the queue and, if more work remains, submits the next entry.
+ *
+ * Sendfile-header entries fall back to the synchronous path (it's already
+ * a kernel-level zero-copy syscall and not what send_uring optimizes; on
+ * TrueNAS sendfile is forcibly off so this branch never fires anyway).
+ *
+ * Combined with `io_uring:force_async_write_threshold` (which sets
+ * IOSQE_ASYNC on submissions above the threshold), the kernel offloads
+ * the socket-buffer memcpy to a kernel worker so the main process is
+ * free to drive other tevent activity. Without IOSQE_ASYNC + an async
+ * caller contract, this path has no advantage over direct sendmsg().
+ */
+
+static NTSTATUS smbd_smb2_flush_with_sendmsg_uring(
+	struct smbXsrv_connection *xconn);
+static void smbd_smb2_async_sendmsg_done(struct tevent_req *subreq);
+
+static size_t iov_total_len(const struct iovec *iov, int count)
+{
+	size_t total = 0;
+	int i;
+	for (i = 0; i < count; i++) {
+		total += iov[i].iov_len;
+	}
+	return total;
+}
+
+static NTSTATUS smbd_smb2_async_submit_head(struct smbXsrv_connection *xconn)
+{
+	struct smbd_smb2_send_queue *e = xconn->smb2.send_queue;
+	struct tevent_req *subreq = NULL;
+	unsigned int sendmsg_flags = 0;
+	bool use_zc;
+
+	SMB_ASSERT(e != NULL);
+	SMB_ASSERT(e->sendfile_header == NULL);
+	SMB_ASSERT(!(xconn->smb2.uring->inflight & SAMBA_URING_INFLIGHT_ANY_SEND));
+
+	e->msg = (struct msghdr) {
+		.msg_iov = e->vector,
+		.msg_iovlen = e->count,
+	};
+#ifdef MSG_NOSIGNAL
+	sendmsg_flags |= MSG_NOSIGNAL;
+#endif
+	/*
+	 * No MSG_DONTWAIT -- with io_uring the kernel handles the wait
+	 * internally (or, with IOSQE_ASYNC, on a kernel worker thread)
+	 * and the CQE fires when the send has been accepted by the socket
+	 * buffer. We don't want EAGAIN here.
+	 */
+
+	/*
+	 * Pick SEND_ZC when (a) the master knob enabled the SENDMSG_ZC
+	 * fast path and (b) the response payload is large enough that the
+	 * dual-CQE notification overhead is amortized by the saved
+	 * socket-buffer copy. The threshold is io_uring:send_zc_min_size
+	 * (default 65536). Below it, regular SENDMSG wins.
+	 *
+	 * SEND_ZC pins the iov pages until the notif CQE -- the per-entry
+	 * talloc context (e->mem_ctx) lives until truenas_uring_sendmsg_zc_recv
+	 * returns, which only happens after both CQEs, so iov memory stays
+	 * stable for the kernel-side DMA window.
+	 */
+	use_zc = xconn->smb2.uring->enabled.sendmsg_zc &&
+		iov_total_len(e->vector, e->count) >=
+			xconn->smb2.uring->enabled.zc_min_bytes;
+
+	if (use_zc) {
+		subreq = truenas_uring_sendmsg_zc_send(xconn,
+						       xconn->client->raw_ev_ctx,
+						       xconn->transport.sock,
+						       &e->msg, sendmsg_flags);
+		xconn->smb2.uring->counters.encrypted_send_zc++;
+	} else {
+		subreq = truenas_uring_sendmsg_send(xconn,
+						    xconn->client->raw_ev_ctx,
+						    xconn->transport.sock,
+						    &e->msg, sendmsg_flags);
+		xconn->smb2.uring->counters.legacy_send++;
+	}
+	if (subreq == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
+	tevent_req_set_callback(subreq,
+				smbd_smb2_async_sendmsg_done, xconn);
+
+	xconn->smb2.uring->inflight |= use_zc
+		? SAMBA_URING_INFLIGHT_SEND_ZC
+		: SAMBA_URING_INFLIGHT_SEND;
+	return NT_STATUS_OK;
+}
+
+static void smbd_smb2_async_sendmsg_done(struct tevent_req *subreq)
+{
+	struct smbXsrv_connection *xconn = tevent_req_callback_data(
+		subreq, struct smbXsrv_connection);
+	struct smbd_smb2_send_queue *e = xconn->smb2.send_queue;
+	NTSTATUS status;
+	ssize_t n;
+	int err = 0;
+
+	if (xconn->smb2.uring->inflight & SAMBA_URING_INFLIGHT_SEND_ZC) {
+		n = truenas_uring_sendmsg_zc_recv(subreq, &err);
+	} else {
+		n = truenas_uring_sendmsg_recv(subreq, &err);
+	}
+	TALLOC_FREE(subreq);
+	xconn->smb2.uring->inflight &= ~SAMBA_URING_INFLIGHT_ANY_SEND;
+
+	if (n < 0) {
+		status = map_nt_error_from_unix_common(err);
+		smbXsrv_connection_disconnect_transport(xconn, status);
+		return;
+	}
+	if (n == 0) {
+		/* EOF on a connected socket is fatal mid-PDU. */
+		status = NT_STATUS_INTERNAL_ERROR;
+		smbXsrv_connection_disconnect_transport(xconn, status);
+		return;
+	}
+	if (e == NULL) {
+		/*
+		 * Queue was drained while our SQE was in flight (only
+		 * possible via shutdown). Nothing more to do.
+		 */
+		return;
+	}
+
+	status = smbd_smb2_advance_send_queue(xconn, &e, (size_t)n);
+	if (!NT_STATUS_IS_OK(status) &&
+	    !NT_STATUS_EQUAL(status, NT_STATUS_RETRY)) {
+		smbXsrv_connection_disconnect_transport(xconn, status);
+		return;
+	}
+	/*
+	 * NT_STATUS_RETRY just means "current entry has bytes left" --
+	 * the next pass picks up the partial entry and re-submits.
+	 */
+
+	status = smbd_smb2_flush_with_sendmsg_uring(xconn);
+	if (!NT_STATUS_IS_OK(status) &&
+	    !NT_STATUS_EQUAL(status, NT_STATUS_MORE_PROCESSING_REQUIRED)) {
+		smbXsrv_connection_disconnect_transport(xconn, status);
+		return;
+	}
+}
+
+/*
+ * Acquire the three pipes needed by the signed outbound splice (body,
+ * tee-to-AF_ALG, patched-header). On partial failure releases what was
+ * acquired so the caller never sees half-state. All three out-params
+ * must start with .slot == -1.
+ */
+static NTSTATUS signed_splice_out_acquire_pipes(
+	struct truenas_uring *u,
+	struct truenas_uring_pipe *body,
+	struct truenas_uring_pipe *tee,
+	struct truenas_uring_pipe *hdr)
+{
+	*body = truenas_uring_pipe_acquire(u);
+	*tee  = truenas_uring_pipe_acquire(u);
+	*hdr  = truenas_uring_pipe_acquire(u);
+	if (body->slot < 0 || tee->slot < 0 || hdr->slot < 0) {
+		if (body->slot >= 0) {
+			truenas_uring_pipe_release(u, body->slot);
+			body->slot = -1;
+		}
+		if (tee->slot >= 0) {
+			truenas_uring_pipe_release(u, tee->slot);
+			tee->slot = -1;
+		}
+		if (hdr->slot >= 0) {
+			truenas_uring_pipe_release(u, hdr->slot);
+			hdr->slot = -1;
+		}
+		return NT_STATUS_INSUFFICIENT_RESOURCES;
+	}
+	return NT_STATUS_OK;
+}
+
+/*
+ * Acquire the cached AF_ALG bind socket for this signing key and
+ * accept4() a fresh per-request op fd off it. The bind fd is owned
+ * by the per-signing_key cache entry (talloc-parented to sk); the
+ * entry's destructor closes it at session/channel teardown. The
+ * splice state destructor must not close it.
+ */
+static NTSTATUS signed_splice_out_open_alg_fd(
+	struct smbXsrv_connection *xconn,
+	struct smb2_signing_key *sk,
+	int *alg_op_fd_out)
+{
+	int cached_bind;
+	int op_fd;
+
+	cached_bind = truenas_smb2_alg_hmac_acquire(xconn, sk);
+	if (cached_bind < 0) {
+		return map_nt_error_from_unix_common(-cached_bind);
+	}
+	op_fd = accept4(cached_bind, NULL, NULL, SOCK_CLOEXEC);
+	if (op_fd < 0) {
+		return map_nt_error_from_unix_common(errno);
+	}
+	*alg_op_fd_out = op_fd;
+	return NT_STATUS_OK;
+}
+
+/*
+ * Feed AF_ALG the HMAC inputs known BEFORE the file is read:
+ *   outhdr[0:SMB2_HDR_SIGNATURE]  -- pre-signature response header
+ *   16 zero bytes                 -- signature field placeholder
+ *   body iov bytes                -- SMB2 READ response body (typ. 16 B)
+ *
+ * MSG_MORE keeps the hash state open for the subsequent body splice
+ * (tee_pipe -> AF_ALG).
+ *
+ * e->vector layout for the response: [NBT, TF, HDR, BODY, DYN]
+ *   NBT  = vector[0] (4 B)
+ *   TF   = vector[1] (0 B unencrypted)
+ *   HDR  = vector[2] (= outhdr, 64 B)
+ *   BODY = vector[3] (READ response body, 16 B)
+ *   DYN  = vector[4] (fake-len from splice setup, no real data)
+ */
+static NTSTATUS signed_splice_out_feed_hmac_header(
+	int alg_op_fd,
+	const uint8_t *outhdr,
+	const struct iovec *body_iov)
+{
+	static const uint8_t zero16[16] = {0};
+	uint8_t hdrbuf[SMB2_HDR_SIGNATURE + sizeof(zero16) + 256];
+	size_t hdrlen = 0;
+	ssize_t sent;
+
+	if (SMB2_HDR_SIGNATURE + sizeof(zero16) + body_iov->iov_len
+	    > sizeof(hdrbuf)) {
+		return NT_STATUS_INVALID_PARAMETER;
+	}
+	memcpy(hdrbuf + hdrlen, outhdr, SMB2_HDR_SIGNATURE);
+	hdrlen += SMB2_HDR_SIGNATURE;
+	memcpy(hdrbuf + hdrlen, zero16, sizeof(zero16));
+	hdrlen += sizeof(zero16);
+	memcpy(hdrbuf + hdrlen, body_iov->iov_base, body_iov->iov_len);
+	hdrlen += body_iov->iov_len;
+
+	sent = send(alg_op_fd, hdrbuf, hdrlen, MSG_MORE);
+	if (sent < 0 || (size_t)sent != hdrlen) {
+		int saved_errno = (sent < 0) ? errno : EIO;
+		DBG_WARNING("signed_splice_out: AF_ALG hdr send failed: %s\n",
+			    strerror(saved_errno));
+		return map_nt_error_from_unix_common(saved_errno);
+	}
+	return NT_STATUS_OK;
+}
+
+/* ---- Outbound splice state machine (pipelined per-PDU) ----
+ *
+ * Per-PDU in-flight state lives on e->splice.state (samba_uring_splice_state,
+ * allocated lazily by splice_state_start). Multiple entries can be in
+ * different phases concurrently; the pre-send work (acquire pipes,
+ * file -> body_pipe, AF_ALG feed + MAC patch for SIGNED_OUT) overlaps
+ * across entries. Only the head entry's pipe -> socket runs at any
+ * moment, preserving SMB2 wire order.
+ *
+ * Phases (samba_uring_splice_state.phase):
+ *   INIT       initial; setup not started.
+ *   FETCHING   pipes held; file -> pipe + (SIGNED_OUT) AF_ALG feed in
+ *              flight or queued. Transitions to SEND_READY synchronously
+ *              when the last fetch CQE arrives and, for SIGNED_OUT,
+ *              after the MAC has been computed and patched.
+ *   SEND_READY all pre-send work done; awaits idle socket + head of
+ *              send queue.
+ *   SENDING    pipe -> socket SQE in flight; entry is dequeued and
+ *              state freed by splice_entry_complete when last CQE
+ *              arrives.
+ *
+ * Throttling: splice_state_start may fail with NT_STATUS_INSUFFICIENT_RESOURCES
+ * if the pipe pool is empty. Entry stays in INIT phase. Each pipe
+ * release calls splice_kick_pending which retries setup on INIT entries.
+ *
+ * Pipe sizing assumption: splice_pipe_size = lp_smb2_max_write() so each
+ * body_pipe holds a full PDU payload. The FETCHING phase loads the entire
+ * payload before transitioning to SEND_READY. SIGNED_OUT requires this
+ * already (verify-then-send); UNSIGNED_OUT applies the same model for
+ * simplicity and to enable pipelining.
+ */
+
+static int splice_state_destructor(struct samba_uring_splice_state *s);
+static void splice_kick_pending(struct smbXsrv_connection *xconn);
+static NTSTATUS splice_state_start(struct smbd_smb2_send_queue *e);
+static NTSTATUS splice_state_start_unsigned(struct smbd_smb2_send_queue *e,
+					    struct truenas_uring *u);
+static NTSTATUS splice_state_start_signed(struct smbd_smb2_send_queue *e,
+					  struct truenas_uring *u);
+static void splice_fetching_pump_file(struct smbd_smb2_send_queue *e);
+static void splice_fetching_pump_file_done(struct tevent_req *subreq);
+static void splice_fetching_drain_to_alg(struct smbd_smb2_send_queue *e);
+static void splice_fetching_alg_feed_done(struct tevent_req *subreq);
+static NTSTATUS splice_signed_finalize_mac(struct smbd_smb2_send_queue *e);
+static NTSTATUS splice_dispatch_head(struct smbXsrv_connection *xconn);
+static void splice_send_begin(struct smbd_smb2_send_queue *e);
+static void splice_send_hdr_signed(struct smbd_smb2_send_queue *e);
+static void splice_send_hdr_done(struct tevent_req *subreq);
+static void splice_send_body(struct smbd_smb2_send_queue *e);
+static void splice_send_body_done(struct tevent_req *subreq);
+static void splice_entry_complete(struct smbd_smb2_send_queue *e);
+static void splice_entry_fail(struct smbd_smb2_send_queue *e, NTSTATUS status);
+
+/*
+ * State destructor. Releases held pipes and AF_ALG op fd. Idempotent.
+ * Auto-called on talloc_free(state) -- either normal completion or
+ * xconn-disconnect cleanup via the entry's mem_ctx free.
+ */
+static int splice_state_destructor(struct samba_uring_splice_state *s)
+{
+	if (s->u == NULL) {
+		return 0;  /* never wired up; nothing to release */
+	}
+	if (s->body_pipe.slot >= 0) {
+		truenas_uring_pipe_release(s->u, s->body_pipe.slot);
+		s->body_pipe.slot = -1;
+	}
+	if (s->type == SPLICE_OP_SIGNED_OUT) {
+		if (s->signed_out.tee_pipe.slot >= 0) {
+			truenas_uring_pipe_release(s->u, s->signed_out.tee_pipe.slot);
+			s->signed_out.tee_pipe.slot = -1;
+		}
+		if (s->signed_out.hdr_pipe.slot >= 0) {
+			truenas_uring_pipe_release(s->u, s->signed_out.hdr_pipe.slot);
+			s->signed_out.hdr_pipe.slot = -1;
+		}
+		if (s->signed_out.alg_op_fd >= 0) {
+			close(s->signed_out.alg_op_fd);
+			s->signed_out.alg_op_fd = -1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Walk the send queue and start setup on any INIT-phase splice entries
+ * we find, stopping at the first failure (pool exhausted) or the end
+ * of the queue. Idempotent. Called when pipes are released or when a
+ * new splice entry is enqueued.
+ */
+static void splice_kick_pending(struct smbXsrv_connection *xconn)
+{
+	struct smbd_smb2_send_queue *e;
+
+	if (xconn->smb2.uring == NULL) {
+		return;
+	}
+	for (e = xconn->smb2.send_queue; e != NULL; e = e->next) {
+		NTSTATUS status;
+		if (e->splice.type == SPLICE_OP_NONE) {
+			continue;  /* regular sendmsg or sendfile entry */
+		}
+		if (e->splice.state != NULL) {
+			continue;  /* already started */
+		}
+		status = splice_state_start(e);
+		if (!NT_STATUS_IS_OK(status)) {
+			/* INSUFFICIENT_RESOURCES = pool empty; will retry on
+			 * next pipe release. Other errors are unrecoverable
+			 * for that entry -- fail it. */
+			if (NT_STATUS_EQUAL(status, NT_STATUS_INSUFFICIENT_RESOURCES)) {
+				break;
+			}
+			splice_entry_fail(e, status);
+			/* Don't break -- subsequent entries might still succeed. */
+		}
+	}
+}
+
+/*
+ * Allocate state on entry e, then dispatch to the per-variant setup.
+ * On success the state is talloc'd as a child of e->mem_ctx and either
+ * (a) the entry has reached SEND_READY synchronously (small/empty
+ * payload), in which case splice_dispatch_head will fire its send on
+ * the next dispatcher pass, or (b) FETCHING with at least one CQE
+ * pending.
+ */
+static NTSTATUS splice_state_start(struct smbd_smb2_send_queue *e)
+{
+	struct smbXsrv_connection *xconn = e->xconn;
+	struct samba_uring_splice_state *s;
+	struct truenas_uring *u;
+	NTSTATUS status;
+
+	SMB_ASSERT(e->splice.state == NULL);
+
+	u = truenas_uring_get(xconn->client->raw_ev_ctx);
+	if (u == NULL) {
+		return NT_STATUS_INTERNAL_ERROR;
+	}
+
+	s = talloc_zero(e->mem_ctx, struct samba_uring_splice_state);
+	if (s == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
+	talloc_set_destructor(s, splice_state_destructor);
+	s->u = u;
+	s->type = e->splice.type;
+	s->phase = SPLICE_STATE_INIT;
+	s->body_pipe.slot = -1;
+	s->signed_out.tee_pipe.slot = -1;
+	s->signed_out.hdr_pipe.slot = -1;
+	s->signed_out.alg_op_fd = -1;
+
+	e->splice.state = s;
+
+	switch (e->splice.type) {
+	case SPLICE_OP_UNSIGNED_OUT:
+		status = splice_state_start_unsigned(e, u);
+		break;
+	case SPLICE_OP_SIGNED_OUT:
+		status = splice_state_start_signed(e, u);
+		break;
+	default:
+		status = NT_STATUS_INTERNAL_ERROR;
+		break;
+	}
+
+	if (!NT_STATUS_IS_OK(status)) {
+		/* Destructor releases anything we partially acquired. */
+		TALLOC_FREE(s);
+		e->splice.state = NULL;
+		return status;
+	}
+
+	s->phase = SPLICE_STATE_FETCHING;
+	return NT_STATUS_OK;
+}
+
+/*
+ * Setup for unsigned outbound splice. Acquire body_pipe, write the
+ * response header iovs into it, then kick the file->pipe pump.
+ */
+static NTSTATUS splice_state_start_unsigned(struct smbd_smb2_send_queue *e,
+					    struct truenas_uring *u)
+{
+	struct samba_uring_splice_state *s = e->splice.state;
+	struct truenas_uring_pipe pipe;
+	ssize_t w;
+	size_t header_len;
+
+	pipe = truenas_uring_pipe_acquire(u);
+	if (pipe.slot < 0) {
+		return NT_STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	/*
+	 * Write the response header iovs into the pipe via writev(), NOT
+	 * vmsplice(). vmsplice (with or without SPLICE_F_GIFT) attaches the
+	 * userspace pages to pipe buffers by reference; those pages then
+	 * become skb fragments at socket-splice time and the kernel keeps
+	 * referencing them until TCP ACK. We free e->mem_ctx as soon as the
+	 * socket splice completes, and talloc reuses that memory for the
+	 * next response's header -- so any in-flight skb sees the *next*
+	 * response's header bytes, corrupting the wire (wrong MID, wrong
+	 * length, etc.).
+	 *
+	 * Concrete observed symptom: 8 parallel SMB2 READ responses, two
+	 * MIDs sent twice (duplicate skbs) and two MIDs never sent (their
+	 * pages overwritten before the kernel queued them); client hangs.
+	 *
+	 * write/writev into a pipe copies into kernel-owned pipe pages and
+	 * decouples userspace lifetime from the in-flight skbs cleanly.
+	 *
+	 * Header is always < PIPE_BUF (4 KiB on Linux), so writev is atomic
+	 * and the full header lands in one go.
+	 */
+	header_len = iov_total_len(e->vector, e->count);
+	w = writev(pipe.wfd, e->vector, e->count);
+	if (w < 0 || (size_t)w != header_len) {
+		int saved_errno = errno;
+		DBG_ERR("writev header (%zu bytes): %s (got %zd)\n",
+			header_len, strerror(saved_errno), w);
+		truenas_uring_pipe_release(u, pipe.slot);
+		return map_nt_error_from_unix_common(w < 0 ? saved_errno : EIO);
+	}
+
+	s->body_pipe = pipe;
+	s->unsigned_out.header_len  = header_len;
+	s->unsigned_out.file_done   = 0;
+	s->unsigned_out.socket_done = 0;
+	s->unsigned_out.total_bytes = header_len + e->splice.payload_len;
+
+	e->xconn->smb2.uring->counters.unsigned_splice_out++;
+	e->xconn->smb2.uring->counters.bytes_unsigned_splice_out +=
+		e->splice.payload_len;
+
+	splice_fetching_pump_file(e);
+	return NT_STATUS_OK;
+}
+
+/*
+ * Setup for signed outbound splice. Acquire 3 pipes, open AF_ALG op fd,
+ * feed AF_ALG the pre-payload bytes (response header + 16 zero bytes
+ * for the signature field + body iov), then kick the file->pipe pump.
+ */
+static NTSTATUS splice_state_start_signed(struct smbd_smb2_send_queue *e,
+					  struct truenas_uring *u)
+{
+	struct samba_uring_splice_state *s = e->splice.state;
+	struct smb2_signing_key *sk = e->splice.signed_out.signing_key;
+	uint8_t *outhdr;
+	const struct iovec *body_iov;
+	NTSTATUS status;
+	int alg_op_fd = -1;
+
+	SMB_ASSERT(e->splice.signed_out.outhdr_ptr != NULL);
+
+	switch (sk->sign_algo_id) {
+	case SMB2_SIGNING_HMAC_SHA256:
+	case SMB2_SIGNING_AES128_CMAC:
+	case SMB2_SIGNING_AES128_GMAC:
+		break;
+	default:
+		return NT_STATUS_HMAC_NOT_SUPPORTED;
+	}
+	if (e->count < 4) {
+		DBG_ERR("signed_splice_out: short e->vector (count=%d)\n",
+			e->count);
+		return NT_STATUS_INTERNAL_ERROR;
+	}
+	outhdr   = e->splice.signed_out.outhdr_ptr;
+	body_iov = &e->vector[3];
+
+	status = signed_splice_out_acquire_pipes(u,
+						 &s->body_pipe,
+						 &s->signed_out.tee_pipe,
+						 &s->signed_out.hdr_pipe);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;  /* INSUFFICIENT_RESOURCES if pool empty */
+	}
+	status = signed_splice_out_open_alg_fd(e->xconn, sk, &alg_op_fd);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+	s->signed_out.alg_op_fd = alg_op_fd;
+
+	status = signed_splice_out_feed_hmac_header(alg_op_fd, outhdr, body_iov);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+
+	s->signed_out.payload_len  = e->splice.payload_len;
+	s->signed_out.file_done    = 0;
+	s->signed_out.alg_fed      = 0;
+	s->signed_out.hdr_sent     = 0;
+	s->signed_out.body_sent    = 0;
+	s->signed_out.hdr_pipe_len = 0;
+	s->signed_out.outhdr_ptr   = outhdr;
+
+	e->xconn->smb2.uring->counters.signed_splice_out++;
+	e->xconn->smb2.uring->counters.bytes_signed_splice_out +=
+		e->splice.payload_len;
+
+	splice_fetching_pump_file(e);
+	return NT_STATUS_OK;
+}
+
+/*
+ * FETCHING phase: pump bytes from the file into body_pipe. For both
+ * variants we load the full payload before advancing -- pipes are
+ * sized to lp_smb2_max_write() + 64 KiB headroom so the payload AND
+ * the previously-written SMB2 response header fit. The headroom is
+ * load-bearing: pipe slots are page-granular, so the ~100-byte header
+ * still occupies one full 4 KiB slot, and a pipe sized exactly to
+ * max_write would deadlock the trailing splice of the final ~4 KiB.
+ * When file_done == payload_len we either tee+feed AF_ALG (SIGNED_OUT)
+ * or mark SEND_READY (UNSIGNED_OUT).
+ */
+static void splice_fetching_pump_file(struct smbd_smb2_send_queue *e)
+{
+	struct samba_uring_splice_state *s = e->splice.state;
+	struct smbXsrv_connection *xconn = e->xconn;
+	struct tevent_req *subreq;
+	int64_t in_off;
+	size_t want;
+	size_t file_done;
+
+	if (s->type == SPLICE_OP_SIGNED_OUT) {
+		file_done = s->signed_out.file_done;
+	} else {
+		file_done = s->unsigned_out.file_done;
+	}
+
+	if (file_done >= e->splice.payload_len) {
+		/* All payload in body_pipe. Branch on variant. */
+		if (s->type == SPLICE_OP_SIGNED_OUT) {
+			/* tee body_pipe -> tee_pipe (single syscall; pages
+			 * are ref-bumped, not copied). Then drain tee_pipe
+			 * into AF_ALG. */
+			ssize_t te = tee(s->body_pipe.rfd,
+					 s->signed_out.tee_pipe.wfd,
+					 e->splice.payload_len, 0);
+			if (te < 0 || (size_t)te != e->splice.payload_len) {
+				int saved = (te < 0) ? errno : EIO;
+				DBG_WARNING("signed_splice_out: tee short "
+					    "%zd != %zu: %s\n",
+					    te, e->splice.payload_len,
+					    strerror(saved));
+				splice_entry_fail(e,
+					map_nt_error_from_unix_common(saved));
+				return;
+			}
+			splice_fetching_drain_to_alg(e);
+			return;
+		}
+		/* UNSIGNED_OUT: nothing more to do; ready to send. */
+		s->phase = SPLICE_STATE_SEND_READY;
+		(void)smbd_smb2_flush_with_sendmsg_uring(xconn);
+		return;
+	}
+
+	want = e->splice.payload_len - file_done;
+	in_off = (int64_t)e->splice.offset + (int64_t)file_done;
+	subreq = truenas_uring_splice_send(e->mem_ctx,
+					   xconn->client->raw_ev_ctx,
+					   fsp_get_io_fd(e->splice.fsp),
+					   &in_off,
+					   s->body_pipe.wfd, NULL,
+					   want, 0);
+	if (subreq == NULL) {
+		splice_entry_fail(e, NT_STATUS_NO_MEMORY);
+		return;
+	}
+	tevent_req_set_callback(subreq, splice_fetching_pump_file_done, e);
+}
+
+static void splice_fetching_pump_file_done(struct tevent_req *subreq)
+{
+	struct smbd_smb2_send_queue *e = _tevent_req_callback_data(subreq);
+	struct samba_uring_splice_state *s = e->splice.state;
+	ssize_t n;
+	int err = 0;
+
+	n = truenas_uring_splice_recv(subreq, &err);
+	TALLOC_FREE(subreq);
+	if (n < 0) {
+		splice_entry_fail(e, map_nt_error_from_unix_common(err));
+		return;
+	}
+	if (n == 0) {
+		/* file EOF mid-read: gate should have caught this. */
+		splice_entry_fail(e, NT_STATUS_END_OF_FILE);
+		return;
+	}
+	if (s->type == SPLICE_OP_SIGNED_OUT) {
+		s->signed_out.file_done += (size_t)n;
+	} else {
+		s->unsigned_out.file_done += (size_t)n;
+	}
+	splice_fetching_pump_file(e);
+}
+
+/*
+ * SIGNED_OUT only. Drain bytes from tee_pipe into AF_ALG to compute
+ * the HMAC. When alg_fed == payload_len, read the MAC out, patch it
+ * into the response header, write the patched header iovs into
+ * hdr_pipe, mark SEND_READY.
+ */
+static void splice_fetching_drain_to_alg(struct smbd_smb2_send_queue *e)
+{
+	struct samba_uring_splice_state *s = e->splice.state;
+	struct smbXsrv_connection *xconn = e->xconn;
+	struct tevent_req *subreq;
+	size_t want;
+
+	if (s->signed_out.alg_fed >= e->splice.payload_len) {
+		NTSTATUS status;
+		status = splice_signed_finalize_mac(e);
+		if (!NT_STATUS_IS_OK(status)) {
+			splice_entry_fail(e, status);
+			return;
+		}
+		s->phase = SPLICE_STATE_SEND_READY;
+		(void)smbd_smb2_flush_with_sendmsg_uring(xconn);
+		return;
+	}
+
+	want = e->splice.payload_len - s->signed_out.alg_fed;
+	subreq = truenas_uring_splice_send(e->mem_ctx,
+					   xconn->client->raw_ev_ctx,
+					   s->signed_out.tee_pipe.rfd, NULL,
+					   s->signed_out.alg_op_fd, NULL,
+					   want, SPLICE_F_MOVE | SPLICE_F_MORE);
+	if (subreq == NULL) {
+		splice_entry_fail(e, NT_STATUS_NO_MEMORY);
+		return;
+	}
+	tevent_req_set_callback(subreq, splice_fetching_alg_feed_done, e);
+}
+
+static void splice_fetching_alg_feed_done(struct tevent_req *subreq)
+{
+	struct smbd_smb2_send_queue *e = _tevent_req_callback_data(subreq);
+	struct samba_uring_splice_state *s = e->splice.state;
+	ssize_t n;
+	int err = 0;
+
+	n = truenas_uring_splice_recv(subreq, &err);
+	TALLOC_FREE(subreq);
+	if (n < 0) {
+		splice_entry_fail(e, map_nt_error_from_unix_common(err));
+		return;
+	}
+	if (n == 0) {
+		splice_entry_fail(e, NT_STATUS_INTERNAL_ERROR);
+		return;
+	}
+	s->signed_out.alg_fed += (size_t)n;
+	splice_fetching_drain_to_alg(e);
+}
+
+/*
+ * Send the GMAC length block (NIST SP 800-38D §6.5: 64-bit AAD bitlen BE
+ * concatenated with 64-bit ciphertext bitlen BE = 0 for GMAC) to close
+ * the ghash input stream, read the 16-byte GHASH accumulator, derive J0
+ * from the SMB2 message-id + flags in `hdr_for_iv`, encrypt J0 with the
+ * signing key (one AES-NI block in userspace via gnutls), and XOR to
+ * produce the SMB3 GMAC tag.
+ *
+ * Shared by both signed splice OUT (response signing) and signed splice
+ * IN (request verification). `alg_op_fd` is an algif_hash("ghash") op
+ * socket keyed with H = AES_K(0^128). `hdr_for_iv` points at a 64-byte
+ * SMB2 header from which msg_id + flags are read.
+ *
+ * IV layout matches Samba's smb2_signing_calc_signature in
+ * libcli/smb/smb2_signing.c so wire bytes are interoperable with
+ * gnutls-based clients/servers:
+ *   IV[0..7]  = msg_id LE (u64)
+ *   IV[8..11] = low 4 bytes of (flags & SMB2_HDR_FLAG_REDIRECT) LE
+ *   J0[12..15] = 0x00000001 BE (initial GCM counter)
+ *
+ * Cancel-handling (high_bits |= SMB2_HDR_FLAG_ASYNC for SMB2_OP_CANCEL)
+ * is intentionally omitted -- SMB2_OP_CANCEL responses are not signed and
+ * cancel requests are too small to engage the splice path either way.
+ */
+NTSTATUS truenas_smb2_compute_gmac_tag(int alg_op_fd,
+				       const uint8_t *key, size_t keylen,
+				       const uint8_t *hdr_for_iv,
+				       size_t aad_len,
+				       uint8_t tag_out[16])
+{
+	uint8_t lenblock[16];
+	uint8_t ghash_out[16];
+	uint8_t tag_mask[16];
+	uint8_t j0[16];
+	uint64_t msg_id;
+	uint32_t flags;
+	uint32_t high_bits;
+	uint64_t aad_bits;
+	ssize_t n;
+	int rc;
+	int i;
+
+	aad_bits = (uint64_t)aad_len * 8;
+	RSBVAL(lenblock, 0, aad_bits);
+	memset(lenblock + 8, 0, 8);
+	n = send(alg_op_fd, lenblock, 16, 0);
+	if (n != 16) {
+		int saved = (n < 0) ? errno : EIO;
+		DBG_WARNING("signed_splice gmac: length block send failed: "
+			    "%s\n", strerror(saved));
+		return map_nt_error_from_unix_common(saved);
+	}
+
+	n = read(alg_op_fd, ghash_out, 16);
+	if (n != 16) {
+		int saved = (n < 0) ? errno : EIO;
+		DBG_WARNING("signed_splice gmac: ghash read failed: %s\n",
+			    strerror(saved));
+		return map_nt_error_from_unix_common(saved);
+	}
+
+	msg_id = BVAL(hdr_for_iv, SMB2_HDR_MESSAGE_ID);
+	flags = IVAL(hdr_for_iv, SMB2_HDR_FLAGS);
+	high_bits = flags & SMB2_HDR_FLAG_REDIRECT;
+	SBVAL(j0, 0, msg_id);
+	SIVAL(j0, 8, high_bits);
+	j0[12] = 0;
+	j0[13] = 0;
+	j0[14] = 0;
+	j0[15] = 1;
+
+	rc = truenas_smb2_aes128_encrypt_block(key, keylen, j0, tag_mask);
+	if (rc < 0) {
+		return NT_STATUS_INTERNAL_ERROR;
+	}
+
+	for (i = 0; i < 16; i++) {
+		tag_out[i] = ghash_out[i] ^ tag_mask[i];
+	}
+	return NT_STATUS_OK;
+}
+
+/*
+ * Read the computed MAC from AF_ALG, patch it into the response header,
+ * then write the header iovs into hdr_pipe. After this returns OK the
+ * entry is fully ready to send.
+ *
+ * Dispatch on sign_algo_id: HMAC/CMAC just read the result from
+ * algif_hash. GMAC needs an extra length-block send + userspace tag
+ * derivation -- see splice_signed_compute_gmac_tag above.
+ */
+static NTSTATUS splice_signed_finalize_mac(struct smbd_smb2_send_queue *e)
+{
+	struct samba_uring_splice_state *s = e->splice.state;
+	struct smb2_signing_key *sk = e->splice.signed_out.signing_key;
+	uint8_t mac[16];
+	ssize_t r;
+	uint8_t hdrbuf[256];
+	size_t hdr_len = 0;
+	int i;
+	ssize_t w;
+	NTSTATUS status;
+
+	if (sk->sign_algo_id == SMB2_SIGNING_AES128_GMAC) {
+		/*
+		 * AAD layout (matches signed_splice_out_feed_hmac_header
+		 * + splice_fetching_drain_to_alg):
+		 *   outhdr[0..SMB2_HDR_SIGNATURE]  = 48 bytes
+		 *   zero16 (replaces signature field) = 16 bytes
+		 *   e->vector[3] (SMB2 body fixed) = body_iov->iov_len
+		 *   file payload  = e->splice.payload_len
+		 */
+		size_t aad_len = SMB2_HDR_SIGNATURE + 16
+			       + e->vector[3].iov_len
+			       + e->splice.payload_len;
+		status = truenas_smb2_compute_gmac_tag(s->signed_out.alg_op_fd,
+						       sk->blob.data,
+						       sk->blob.length,
+						       s->signed_out.outhdr_ptr,
+						       aad_len, mac);
+		close(s->signed_out.alg_op_fd);
+		s->signed_out.alg_op_fd = -1;
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
+	} else {
+		r = read(s->signed_out.alg_op_fd, mac, 16);
+		close(s->signed_out.alg_op_fd);
+		s->signed_out.alg_op_fd = -1;
+		if (r != 16) {
+			int saved = (r < 0) ? errno : EIO;
+			DBG_WARNING("signed_splice_out: read MAC failed: %s\n",
+				    strerror(saved));
+			return map_nt_error_from_unix_common(saved);
+		}
+	}
+	memcpy(s->signed_out.outhdr_ptr + SMB2_HDR_SIGNATURE, mac, 16);
+
+	/*
+	 * Materialise the response header iovs in hdr_pipe via write(),
+	 * not vmsplice(). vmsplice without SPLICE_F_GIFT pins userspace
+	 * pages and the pipe references them; the pages are then attached
+	 * as skb fragments at socket-splice time. When e->mem_ctx is
+	 * freed (at entry completion) and the memory is reused for the
+	 * next request, in-flight skbs would see the next request's
+	 * bytes, corrupting MAC verification client-side. write() copies
+	 * into pipe-private kernel pages, decoupling lifetimes cleanly.
+	 *
+	 * Vector layout: [NBT, TF, HDR, BODY] = vector[0..3]. DYN bytes
+	 * (file payload) are in body_pipe.
+	 */
+	for (i = 0; i < 4; i++) {
+		size_t l = e->vector[i].iov_len;
+		if (hdr_len + l > sizeof(hdrbuf)) {
+			DBG_ERR("signed_splice_out: response header too big "
+				"(%zu > %zu)\n", hdr_len + l, sizeof(hdrbuf));
+			return NT_STATUS_INTERNAL_ERROR;
+		}
+		if (l > 0) {
+			memcpy(hdrbuf + hdr_len, e->vector[i].iov_base, l);
+			hdr_len += l;
+		}
+	}
+	w = write(s->signed_out.hdr_pipe.wfd, hdrbuf, hdr_len);
+	if (w < 0 || (size_t)w != hdr_len) {
+		int saved = (w < 0) ? errno : EIO;
+		DBG_WARNING("signed_splice_out: hdr_pipe write %zd != %zu: %s\n",
+			    w, hdr_len, strerror(saved));
+		return map_nt_error_from_unix_common(saved);
+	}
+	s->signed_out.hdr_pipe_len = hdr_len;
+	return NT_STATUS_OK;
+}
+
+/*
+ * Dispatcher hook. Called from smbd_smb2_flush_with_sendmsg_uring's
+ * main loop when the head queue entry is a splice entry. Decides
+ * what to do based on the head's phase:
+ *
+ *   SEND_READY  -> fire pipe->socket; SAMBA_URING_INFLIGHT_SEND set
+ *   FETCHING    -> NOP (state machine callback will re-flush)
+ *   INIT        -> try to start setup (rare; kick_pending should
+ *                  already have done this on enqueue)
+ *   SENDING     -> NOP (current send-in-flight; ANY_SEND gate
+ *                  in flush_with_sendmsg_uring should have caught
+ *                  this earlier, but defensive)
+ */
+static NTSTATUS splice_dispatch_head(struct smbXsrv_connection *xconn)
+{
+	struct smbd_smb2_send_queue *e = xconn->smb2.send_queue;
+
+	SMB_ASSERT(e != NULL);
+	SMB_ASSERT(e->splice.type != SPLICE_OP_NONE);
+
+	if (e->splice.state == NULL) {
+		NTSTATUS status = splice_state_start(e);
+		if (!NT_STATUS_IS_OK(status)) {
+			if (NT_STATUS_EQUAL(status,
+					    NT_STATUS_INSUFFICIENT_RESOURCES)) {
+				/* Pool empty -- will retry when pipes free.
+				 * Return OK so dispatcher just waits. */
+				return NT_STATUS_OK;
+			}
+			splice_entry_fail(e, status);
+			return status;
+		}
+	}
+
+	switch (e->splice.state->phase) {
+	case SPLICE_STATE_SEND_READY:
+		splice_send_begin(e);
+		return NT_STATUS_OK;
+	case SPLICE_STATE_INIT:
+	case SPLICE_STATE_FETCHING:
+	case SPLICE_STATE_SENDING:
+		/* Wait for state machine to advance. */
+		return NT_STATUS_OK;
+	}
+	return NT_STATUS_INTERNAL_ERROR;
+}
+
+/*
+ * Start the SENDING phase for the head entry. SIGNED_OUT sends the
+ * hdr_pipe first then the body_pipe; UNSIGNED_OUT sends body_pipe
+ * directly (it already contains the header + payload bytes).
+ */
+static void splice_send_begin(struct smbd_smb2_send_queue *e)
+{
+	struct samba_uring_splice_state *s = e->splice.state;
+	struct smbXsrv_connection *xconn = e->xconn;
+
+	SMB_ASSERT(!(xconn->smb2.uring->inflight & SAMBA_URING_INFLIGHT_ANY_SEND));
+	xconn->smb2.uring->inflight |= SAMBA_URING_INFLIGHT_SEND;
+	s->phase = SPLICE_STATE_SENDING;
+
+	if (s->type == SPLICE_OP_SIGNED_OUT) {
+		splice_send_hdr_signed(e);
+	} else {
+		splice_send_body(e);
+	}
+}
+
+static void splice_send_hdr_signed(struct smbd_smb2_send_queue *e)
+{
+	struct samba_uring_splice_state *s = e->splice.state;
+	struct smbXsrv_connection *xconn = e->xconn;
+	struct tevent_req *subreq;
+	size_t remain;
+
+	if (s->signed_out.hdr_sent >= s->signed_out.hdr_pipe_len) {
+		splice_send_body(e);
+		return;
+	}
+	remain = s->signed_out.hdr_pipe_len - s->signed_out.hdr_sent;
+	subreq = truenas_uring_splice_send(e->mem_ctx,
+					   xconn->client->raw_ev_ctx,
+					   s->signed_out.hdr_pipe.rfd, NULL,
+					   xconn->transport.sock, NULL,
+					   remain, 0);
+	if (subreq == NULL) {
+		splice_entry_fail(e, NT_STATUS_NO_MEMORY);
+		return;
+	}
+	tevent_req_set_callback(subreq, splice_send_hdr_done, e);
+}
+
+static void splice_send_hdr_done(struct tevent_req *subreq)
+{
+	struct smbd_smb2_send_queue *e = _tevent_req_callback_data(subreq);
+	struct samba_uring_splice_state *s = e->splice.state;
+	ssize_t n;
+	int err = 0;
+
+	n = truenas_uring_splice_recv(subreq, &err);
+	TALLOC_FREE(subreq);
+	if (n < 0) {
+		splice_entry_fail(e, map_nt_error_from_unix_common(err));
+		return;
+	}
+	if (n == 0) {
+		splice_entry_fail(e, NT_STATUS_CONNECTION_RESET);
+		return;
+	}
+	s->signed_out.hdr_sent += (size_t)n;
+	splice_send_hdr_signed(e);
+}
+
+/*
+ * Send the body bytes. For UNSIGNED_OUT body_pipe contains
+ * [header + payload]; for SIGNED_OUT it contains [payload] only
+ * (the header was sent from hdr_pipe). Loops over multiple SQEs to
+ * handle short socket writes.
+ */
+static void splice_send_body(struct smbd_smb2_send_queue *e)
+{
+	struct samba_uring_splice_state *s = e->splice.state;
+	struct smbXsrv_connection *xconn = e->xconn;
+	struct tevent_req *subreq;
+	size_t remain;
+
+	if (s->type == SPLICE_OP_SIGNED_OUT) {
+		if (s->signed_out.body_sent >= e->splice.payload_len) {
+			splice_entry_complete(e);
+			return;
+		}
+		remain = e->splice.payload_len - s->signed_out.body_sent;
+	} else {
+		if (s->unsigned_out.socket_done >= s->unsigned_out.total_bytes) {
+			splice_entry_complete(e);
+			return;
+		}
+		remain = s->unsigned_out.total_bytes - s->unsigned_out.socket_done;
+	}
+
+	subreq = truenas_uring_splice_send(e->mem_ctx,
+					   xconn->client->raw_ev_ctx,
+					   s->body_pipe.rfd, NULL,
+					   xconn->transport.sock, NULL,
+					   remain, 0);
+	if (subreq == NULL) {
+		splice_entry_fail(e, NT_STATUS_NO_MEMORY);
+		return;
+	}
+	tevent_req_set_callback(subreq, splice_send_body_done, e);
+}
+
+static void splice_send_body_done(struct tevent_req *subreq)
+{
+	struct smbd_smb2_send_queue *e = _tevent_req_callback_data(subreq);
+	struct samba_uring_splice_state *s = e->splice.state;
+	ssize_t n;
+	int err = 0;
+
+	n = truenas_uring_splice_recv(subreq, &err);
+	TALLOC_FREE(subreq);
+	if (n < 0) {
+		splice_entry_fail(e, map_nt_error_from_unix_common(err));
+		return;
+	}
+	if (n == 0) {
+		splice_entry_fail(e, NT_STATUS_CONNECTION_RESET);
+		return;
+	}
+	if (s->type == SPLICE_OP_SIGNED_OUT) {
+		s->signed_out.body_sent += (size_t)n;
+	} else {
+		s->unsigned_out.socket_done += (size_t)n;
+	}
+	splice_send_body(e);
+}
+
+/*
+ * Normal-completion path. Updates unacked_bytes, removes the entry
+ * from the queue, frees state (destructor releases pipes), kicks
+ * the dispatcher to start the next entry's send and start setup
+ * on any newly-eligible pending entries.
+ */
+static void splice_entry_complete(struct smbd_smb2_send_queue *e)
+{
+	struct smbXsrv_connection *xconn = e->xconn;
+	struct samba_uring_splice_state *s = e->splice.state;
+	size_t total;
+	NTSTATUS status;
+
+	if (s->type == SPLICE_OP_SIGNED_OUT) {
+		total = s->signed_out.hdr_pipe_len + s->signed_out.body_sent;
+	} else {
+		total = s->unsigned_out.total_bytes;
+	}
+
+	xconn->smb2.uring->inflight &= ~SAMBA_URING_INFLIGHT_ANY_SEND;
+
+	xconn->ack.unacked_bytes += total;
+	xconn->smb2.send_queue_len--;
+	DLIST_REMOVE(xconn->smb2.send_queue, e);
+	if (e->ack.req == NULL) {
+		talloc_free(e->mem_ctx);  /* destroys state, releases pipes */
+	} else {
+		e->ack.required_acked_bytes = xconn->ack.unacked_bytes;
+		DLIST_ADD_END(xconn->ack.queue, e);
+		/* state lives until ack arrives; pipes stay held. The
+		 * ack-complete path frees e->mem_ctx which frees state. */
+	}
+
+	/* Released pipes might unblock pending setups. */
+	splice_kick_pending(xconn);
+
+	status = smbd_smb2_flush_with_sendmsg_uring(xconn);
+	if (!NT_STATUS_IS_OK(status) &&
+	    !NT_STATUS_EQUAL(status, NT_STATUS_MORE_PROCESSING_REQUIRED)) {
+		smbXsrv_connection_disconnect_transport(xconn, status);
+	}
+}
+
+/*
+ * Error path for a single entry. Disconnects the xconn since a splice
+ * failure mid-stream means we've written partial PDU bytes to the
+ * socket (or worse, our state with the kernel pipe is inconsistent).
+ */
+static void splice_entry_fail(struct smbd_smb2_send_queue *e, NTSTATUS status)
+{
+	struct smbXsrv_connection *xconn = e->xconn;
+	xconn->smb2.uring->inflight &= ~SAMBA_URING_INFLIGHT_ANY_SEND;
+	smbXsrv_connection_disconnect_transport(xconn, status);
+}
+
+/* ---- Async recv side: IORING_OP_RECVMSG-driven inbound ---- */
+static NTSTATUS smbd_smb2_advance_incoming(struct smbXsrv_connection *xconn,
+					   size_t n);
+static void smbd_smb2_async_recvmsg_done(struct tevent_req *subreq);
+
+static NTSTATUS smbd_smb2_async_recvmsg_submit(struct smbXsrv_connection *xconn)
+{
+	struct smbd_smb2_request_read_state *state =
+		&xconn->smb2.request_read_state;
+	struct tevent_req *subreq = NULL;
+	int recvmsg_flags = 0;
+
+	if (xconn->smb2.uring->inflight & SAMBA_URING_INFLIGHT_RECV) {
+		return NT_STATUS_OK;  /* CQE callback will continue */
+	}
+	if (samba_uring_splice_reads_socket(xconn->smb2.uring)) {
+		/*
+		 * An inbound splice (signed or unsigned) is consuming raw
+		 * bytes from the same socket; submitting a RECVMSG here would
+		 * race for those bytes. The splice completion handler kicks
+		 * us again.
+		 */
+		return NT_STATUS_OK;
+	}
+	if (state->req == NULL || state->count == 0) {
+		return NT_STATUS_OK;  /* nothing to recv */
+	}
+
+	state->msg = (struct msghdr) {
+		.msg_iov = state->vector,
+		.msg_iovlen = state->count,
+	};
+#ifdef MSG_NOSIGNAL
+	recvmsg_flags |= MSG_NOSIGNAL;
+#endif
+	/* No MSG_DONTWAIT -- io_uring blocks internally until data arrives. */
+
+	subreq = truenas_uring_recvmsg_send(xconn,
+					    xconn->client->raw_ev_ctx,
+					    xconn->transport.sock,
+					    &state->msg, recvmsg_flags);
+	if (subreq == NULL) {
+		return NT_STATUS_NO_MEMORY;
+	}
+	tevent_req_set_callback(subreq, smbd_smb2_async_recvmsg_done, xconn);
+	xconn->smb2.uring->inflight |= SAMBA_URING_INFLIGHT_RECV;
+	return NT_STATUS_OK;
+}
+
+static void smbd_smb2_async_recvmsg_done(struct tevent_req *subreq)
+{
+	struct smbXsrv_connection *xconn = tevent_req_callback_data(
+		subreq, struct smbXsrv_connection);
+	NTSTATUS status;
+	ssize_t n;
+	int err = 0;
+
+	n = truenas_uring_recvmsg_recv(subreq, &err);
+	TALLOC_FREE(subreq);
+	xconn->smb2.uring->inflight &= ~SAMBA_URING_INFLIGHT_RECV;
+
+	if (n < 0) {
+		status = map_nt_error_from_unix_common(err);
+		smbXsrv_connection_disconnect_transport(xconn, status);
+		return;
+	}
+	if (n == 0) {
+		status = NT_STATUS_END_OF_FILE;
+		smbXsrv_connection_disconnect_transport(xconn, status);
+		return;
+	}
+
+	/*
+	 * Tell valgrind the first n bytes of the recv iov are defined.
+	 * io_uring fills via CQE rather than syscall return, which
+	 * memcheck doesn't instrument; without this annotation any
+	 * subsequent read of those bytes (e.g. is_smb2_recvfile_write)
+	 * trips a false-positive uninitialized-value warning.
+	 */
+	iov_valgrind_mem_defined(xconn->smb2.request_read_state.vector,
+				 xconn->smb2.request_read_state.count,
+				 (size_t)n);
+
+	status = smbd_smb2_advance_incoming(xconn, (size_t)n);
+	if (NT_STATUS_EQUAL(status, NT_STATUS_PENDING) ||
+	    NT_STATUS_EQUAL(status, NT_STATUS_RETRY)) {
+		/*
+		 * Either we want more bytes for the current vector, or
+		 * advance_incoming set up a new vector to recv into.
+		 * Either way, submit another RECVMSG SQE.
+		 */
+		status = smbd_smb2_async_recvmsg_submit(xconn);
+		if (!NT_STATUS_IS_OK(status)) {
+			smbXsrv_connection_disconnect_transport(xconn, status);
+		}
+		return;
+	}
+	if (!NT_STATUS_IS_OK(status)) {
+		smbXsrv_connection_disconnect_transport(xconn, status);
+		return;
+	}
+	/*
+	 * PDU complete and dispatched. advance_incoming may have set up the
+	 * read_state for the next PDU; check and continue.
+	 */
+	(void)smbd_smb2_async_recvmsg_submit(xconn);
+}
+
+static NTSTATUS smbd_smb2_flush_with_sendmsg_uring(
+	struct smbXsrv_connection *xconn)
+{
+	if (xconn->smb2.uring->inflight & SAMBA_URING_INFLIGHT_ANY_SEND) {
+		/* CQE callback will continue the drain. */
+		return NT_STATUS_OK;
+	}
+
+	while (xconn->smb2.send_queue != NULL) {
+		struct smbd_smb2_send_queue *e = xconn->smb2.send_queue;
+
+		if (!NT_STATUS_IS_OK(xconn->transport.status)) {
+			/*
+			 * Transport is dead; drain queue without sending
+			 * (mirrors the legacy sync path's behavior).
+			 */
+			xconn->smb2.send_queue_len--;
+			DLIST_REMOVE(xconn->smb2.send_queue, e);
+			talloc_free(e->mem_ctx);
+			continue;
+		}
+
+		if (e->splice.type != SPLICE_OP_NONE) {
+			/*
+			 * Splice entry. The per-PDU state machine handles
+			 * all phases independently per entry. The dispatcher
+			 * here only kicks the SEND phase for the head entry
+			 * when it's reached SEND_READY; pre-send work (pipes,
+			 * file->pipe, AF_ALG feed) for this and following
+			 * entries runs concurrently in their own callbacks.
+			 */
+			return splice_dispatch_head(xconn);
+		}
+
+		if (e->sendfile_header != NULL) {
+			/*
+			 * Sendfile-header entries go through the synchronous
+			 * legacy path. That path's destructor triggers
+			 * SMB_VFS_SENDFILE and removes the entry; it may
+			 * also process subsequent regular entries before
+			 * returning. After it's done we loop again to handle
+			 * whatever is left.
+			 */
+			NTSTATUS s = smbd_smb2_flush_with_sendmsg(xconn);
+			if (!NT_STATUS_IS_OK(s) &&
+			    !NT_STATUS_EQUAL(s, NT_STATUS_MORE_PROCESSING_REQUIRED)) {
+				return s;
+			}
+			continue;
+		}
+
+		/* Regular sendmsg entry -- go async. */
+		return smbd_smb2_async_submit_head(xconn);
+	}
+
+	/* Queue empty. */
+	if (xconn->transport.fde != NULL) {
+		TEVENT_FD_NOT_WRITEABLE(xconn->transport.fde);
+	}
+	return NT_STATUS_MORE_PROCESSING_REQUIRED;
+}
+#endif /* HAVE_LIBURING */
+
 static NTSTATUS smbd_smb2_flush_send_queue(struct smbXsrv_connection *xconn)
 {
 	NTSTATUS status;
 
+#ifdef HAVE_LIBURING
+	/*
+	 * xconn->smb2.uring is allocated late in negprot processing. The
+	 * dialect-0x2FF transient response (multi-protocol upgrade from
+	 * SMB1 NEGOTIATE) is sent BEFORE that allocation, so the uring
+	 * pointer can legitimately be NULL on this path -- take the
+	 * legacy sendmsg route in that case.
+	 */
+	if (xconn->smb2.uring != NULL && xconn->smb2.uring->enabled.sendmsg) {
+		status = smbd_smb2_flush_with_sendmsg_uring(xconn);
+	} else {
+		status = smbd_smb2_flush_with_sendmsg(xconn);
+	}
+#else
 	status = smbd_smb2_flush_with_sendmsg(xconn);
+#endif
 	if (!NT_STATUS_EQUAL(status, NT_STATUS_MORE_PROCESSING_REQUIRED)) {
 		return status;
 	}
@@ -5089,6 +6860,20 @@ static NTSTATUS smbd_smb2_advance_incoming(struct smbXsrv_connection *xconn, siz
 			if (state->pktbuf == NULL) {
 				return NT_STATUS_NO_MEMORY;
 			}
+#ifdef HAVE_LIBURING
+			/* The realloc grew pktbuf from pktlen to pktfull;
+			 * charge the delta to the recv inflight cap. The
+			 * earlier pktlen charge is held by state->req via
+			 * its existing holder and will refund together. */
+			{
+				NTSTATUS cs = truenas_uring_charge_recv_bytes(
+					state->req, xconn,
+					state->pktfull - ofs);
+				if (!NT_STATUS_IS_OK(cs)) {
+					return cs;
+				}
+			}
+#endif
 
 			state->_vector[0]  = (struct iovec) {
 				.iov_base = (void *)(state->pktbuf + ofs),
@@ -5143,6 +6928,16 @@ static NTSTATUS smbd_smb2_advance_incoming(struct smbXsrv_connection *xconn, siz
 	if (state->pktbuf == NULL) {
 		return NT_STATUS_NO_MEMORY;
 	}
+#ifdef HAVE_LIBURING
+	{
+		NTSTATUS cs = truenas_uring_charge_recv_bytes(state->req,
+							      xconn,
+							      state->pktlen);
+		if (!NT_STATUS_IS_OK(cs)) {
+			return cs;
+		}
+	}
+#endif
 
 	state->_vector[0] = (struct iovec) {
 		.iov_base = (void *)state->pktbuf,
@@ -5162,7 +6957,7 @@ got_full:
 		req = state->req;
 		*state = (struct smbd_smb2_request_read_state) {
 			.req = req,
-			.min_recv_size = lp_min_receive_file_size(),
+			.min_recv_size = smbd_smb2_effective_min_recv_size(xconn),
 			._vector = {
 				[0] = (struct iovec) {
 					.iov_base = (void *)state->hdr.nbt,

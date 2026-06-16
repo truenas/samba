@@ -2,6 +2,8 @@
  * Unix SMB/CIFS implementation.
  * Samba system utilities
  * Copyright (C) Volker Lendecke 2014
+ * Copyright (C) Stefan Metzmacher 2020,2026 (iov_valgrind_mem_defined,
+ *                                            adapted from upstream !4453)
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -98,5 +100,48 @@ bool iov_advance(struct iovec **iov, int *iovcnt, size_t n)
 }
 
 uint8_t *iov_concat(TALLOC_CTX *mem_ctx, const struct iovec *iov, int count);
+
+#ifdef HAVE_VALGRIND_MEMCHECK_H
+#include <valgrind/memcheck.h>
+#elif defined(HAVE_VALGRIND_H)
+#include <valgrind.h>
+#endif
+
+/*
+ * Mark the first n bytes spanned by iov[0..iovcnt) as defined for
+ * valgrind. No-op in non-valgrind builds.
+ *
+ * Used after kernel-side fills (e.g. io_uring RECVMSG / READ /
+ * RDMA-offloaded SMB2 read) that valgrind's syscall instrumentation
+ * cannot see: the bytes ARE valid, but the talloc-allocated buffer
+ * appears as uninit to memcheck. Calling this with (iov, iovcnt, n)
+ * matching the kernel-reported byte count silences the false positive
+ * without paying memset cost in production.
+ */
+static inline
+void iov_valgrind_mem_defined(struct iovec *iov, int iovcnt, size_t n)
+{
+#ifdef VALGRIND_MAKE_MEM_DEFINED
+	int i;
+
+	for (i = 0; i < iovcnt && n > 0; i++) {
+		if (iov[i].iov_len == 0) {
+			continue;
+		}
+
+		if (n < iov[i].iov_len) {
+			VALGRIND_MAKE_MEM_DEFINED(iov[i].iov_base, n);
+			return;
+		}
+
+		VALGRIND_MAKE_MEM_DEFINED(iov[i].iov_base, iov[i].iov_len);
+		n -= iov[i].iov_len;
+	}
+#else
+	(void)iov;
+	(void)iovcnt;
+	(void)n;
+#endif
+}
 
 #endif

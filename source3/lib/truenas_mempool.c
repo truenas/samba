@@ -21,9 +21,16 @@
 #include "smbd/globals.h"
 #include "../lib/util/tevent_ntstatus.h"
 #include "../lib/util/tevent_unix.h"
+#include "lib/truenas_mempool.h"
 
-#define MEM_POOL_SZ (16 * 1024 * 1024)
-#define IO_POOL_IDLE_TIMEOUT 300
+/*
+ * Defaults chosen scale-safe (thousands of smbds): a modest reusable arena
+ * and a short idle reclaim, so an idle or read-light worker pays ~nothing.
+ * A low-client-count "max speed" box can raise io_pool_size_kb and set
+ * io_pool_idle_secs=0 to keep buffers permanently warm.
+ */
+#define MEM_POOL_DEFAULT_KB     (16 * 1024)   /* 16 MiB arena hint */
+#define IO_POOL_DEFAULT_IDLE    60            /* seconds; 0 = never reclaim */
 
 /* Count of allocations out of memory pool */
 static uint alloc_cnt;
@@ -32,6 +39,23 @@ static struct tevent_timer *io_buffer_timer;
 static struct timespec last_alloc;
 
 struct io_pool_link { DATA_BLOB to_free; };
+
+static size_t io_pool_size_bytes(void)
+{
+	int kb = lp_parm_int(GLOBAL_SECTION_SNUM, "truenas_uring",
+			     "io_pool_size_kb", MEM_POOL_DEFAULT_KB);
+	if (kb <= 0) {
+		kb = MEM_POOL_DEFAULT_KB;
+	}
+	return (size_t)kb * 1024;
+}
+
+static int io_pool_idle_secs(void)
+{
+	int s = lp_parm_int(GLOBAL_SECTION_SNUM, "truenas_uring",
+			    "io_pool_idle_secs", IO_POOL_DEFAULT_IDLE);
+	return (s < 0) ? IO_POOL_DEFAULT_IDLE : s;
+}
 
 static int io_buffer_destroy(struct io_pool_link *lnk)
 {
@@ -65,21 +89,6 @@ static struct io_pool_link *link_io_buffer_blob(TALLOC_CTX *mem_ctx, DATA_BLOB *
 	return lnk;
 }
 
-static bool link_io_buffer(TALLOC_CTX *mem_ctx)
-{
-	// This linkage is used to keep count of memory allocations
-	// from the pool
-	struct io_pool_link *lnk = NULL;
-
-	lnk = talloc_zero(mem_ctx, struct io_pool_link);
-	if (lnk == NULL) {
-		return false;
-	}
-
-	talloc_set_destructor(lnk, io_buffer_destroy);
-	return true;
-}
-
 static void io_pool_time_handler(struct tevent_context *ctx,
 				 struct tevent_timer *te,
 				 struct timeval now,
@@ -87,10 +96,10 @@ static void io_pool_time_handler(struct tevent_context *ctx,
 {
 	// This is an idle timer. We want to free the io memory
 	// pool if the smbd process is not using it for more than
-	// five minutes.
+	// the configured idle interval.
 	struct smbd_server_connection *sconn = NULL;
 	struct timespec mono_now;
-	int err;
+	int idle = io_pool_idle_secs();
 
 	sconn = (struct smbd_server_connection *)private_data;
 	SMB_ASSERT(sconn != NULL);
@@ -98,14 +107,14 @@ static void io_pool_time_handler(struct tevent_context *ctx,
 	clock_gettime(CLOCK_MONOTONIC_COARSE, &mono_now);
 
 	if ((alloc_cnt == 0) &&
-	    (timespec_elapsed2(&last_alloc, &mono_now) > IO_POOL_IDLE_TIMEOUT)){
+	    (timespec_elapsed2(&last_alloc, &mono_now) > idle)){
 		TALLOC_FREE(sconn->io_memory_pool);
 		io_buffer_timer = NULL;
 		return;
 	}
 
 	// now is timeval based on realtime clock (not monotonic time)
-	now.tv_sec += IO_POOL_IDLE_TIMEOUT;
+	now.tv_sec += idle;
 	io_buffer_timer = tevent_add_timer(sconn->ev_ctx, NULL,
 					   now, io_pool_time_handler,
 					   sconn);
@@ -113,21 +122,24 @@ static void io_pool_time_handler(struct tevent_context *ctx,
 
 static bool init_io_pool(struct smbd_server_connection *sconn)
 {
+	int idle = io_pool_idle_secs();
+
 	// Allocate the memory pool if needed and then set the idle
 	// timer.
 	clock_gettime(CLOCK_MONOTONIC_COARSE, &last_alloc);
 	if (sconn->io_memory_pool == NULL) {
-		sconn->io_memory_pool = talloc_pool(sconn, MEM_POOL_SZ);
+		sconn->io_memory_pool = talloc_pool(sconn, io_pool_size_bytes());
 		if (sconn->io_memory_pool == NULL) {
 			return false;
 		}
 		talloc_set_name(sconn->io_memory_pool, "TrueNAS Memory Pool");
 	}
 
-	if (io_buffer_timer == NULL) {
+	// idle reclaim disabled (io_pool_idle_secs=0): keep the pool warm.
+	if ((idle > 0) && (io_buffer_timer == NULL)) {
 		// tevent timers are based on CLOCK_REALTIME
 		struct timeval interval;
-		interval = timeval_current_ofs(IO_POOL_IDLE_TIMEOUT, 0);
+		interval = timeval_current_ofs(idle, 0);
 
 		io_buffer_timer = tevent_add_timer(sconn->ev_ctx, NULL,
 						   interval,

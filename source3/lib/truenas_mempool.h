@@ -25,6 +25,16 @@ struct io_pool_link;
  *	  when lnk_out is freed. lnk_out is allocated under the specified
  *	  mem_ctx.
  *
+ * The pool is an ordinary (swappable, non-pinned) talloc arena reused
+ * across requests to avoid per-I/O malloc churn, and is freed after an
+ * idle interval. It is the buffer source for the zero-copy SMB2 READ
+ * path: data is pread into a pool buffer (one copy) and sent straight
+ * from it via IORING_OP_SENDMSG_ZC -- no registered/pinned RAM, so it
+ * scales to thousands of smbd processes. Sizing and idle reclaim are
+ * tunable for the two deployment profiles:
+ *   truenas_uring:io_pool_size_kb   arena hint     (default 16384 = 16 MiB)
+ *   truenas_uring:io_pool_idle_secs idle reclaim   (default 60; 0 = never)
+ *
  * @param[in]	conn		The current tree connection
  * @param[in]   mem_ctx		Memory context under which to free buffer.
  * @param[in]	buflen		size of buffer to allocate

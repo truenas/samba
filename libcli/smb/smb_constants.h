@@ -605,6 +605,43 @@ enum csc_policy {
 	(FSCTL_SMBTORTURE | FSCTL_ACCESS_WRITE | 0x0020 | FSCTL_METHOD_NEITHER)
 #define FSCTL_SMBTORTURE_FSP_ASYNC_SLEEP \
 	(FSCTL_SMBTORTURE | FSCTL_ACCESS_WRITE | 0x0040 | FSCTL_METHOD_NEITHER)
+/*
+ * TrueNAS fork: read / reset the per-xconn samba_uring_counters struct
+ * so smbtorture can prove which dispatch path actually ran (vs falling
+ * back to legacy). Returns the struct as 21 LE uint64_t fields (168
+ * bytes); see SAMBA_URING_COUNTERS_WIRE_BYTES.
+ */
+#define FSCTL_SMBTORTURE_TRUENAS_URING_COUNTERS_READ \
+	(FSCTL_SMBTORTURE | FSCTL_ACCESS_READ  | 0x0050 | FSCTL_METHOD_NEITHER)
+#define FSCTL_SMBTORTURE_TRUENAS_URING_COUNTERS_RESET \
+	(FSCTL_SMBTORTURE | FSCTL_ACCESS_WRITE | 0x0060 | FSCTL_METHOD_NEITHER)
+/*
+ * One-shot flag: the next signed splice inbound WRITE will force the
+ * post-HMAC verify to fail (without tampering with the bytes), so the
+ * file-write SQE is NEVER submitted. Used by the smbtorture tamper-
+ * rejection test to assert that the verify-before-write invariant
+ * actually rolls back to ACCESS_DENIED and leaves the file untouched.
+ * Auto-clears after the next signed-splice WRITE is processed.
+ */
+#define FSCTL_SMBTORTURE_TRUENAS_URING_FORCE_NEXT_SIGNED_WRITE_FAIL \
+	(FSCTL_SMBTORTURE | FSCTL_ACCESS_WRITE | 0x0070 | FSCTL_METHOD_NEITHER)
+/*
+ * One-shot flag: the next is_smb2_recvfile_write() call rejects the
+ * recvfile / splice IN path as if the target fsp had posix_append set.
+ * Lets the torture suite verify the O_APPEND gate without setting up
+ * SMB2 POSIX-context infrastructure on the client side. Auto-clears
+ * after the next WRITE is processed.
+ */
+#define FSCTL_SMBTORTURE_TRUENAS_URING_FORCE_NEXT_POSIX_APPEND \
+	(FSCTL_SMBTORTURE | FSCTL_ACCESS_WRITE | 0x0080 | FSCTL_METHOD_NEITHER)
+/*
+ * Override the per-xconn recv-side inflight-bytes cap at runtime.
+ * Input: 8-byte LE uint64 with the new cap (0 = disable throttle).
+ * Lets the torture suite dial the cap small to force the throttle
+ * gate to engage on modest test workloads.
+ */
+#define FSCTL_SMBTORTURE_TRUENAS_URING_SET_MAX_INFLIGHT_BYTES \
+	(FSCTL_SMBTORTURE | FSCTL_ACCESS_WRITE | 0x0090 | FSCTL_METHOD_NEITHER)
 
 /*
  * A few values from [MS-FSCC] 2.1.2.1 Reparse Tags

@@ -27,6 +27,9 @@
 #include "include/ntioctl.h"
 #include "smb2_ioctl_private.h"
 #include "librpc/gen_ndr/ioctl.h"
+#ifdef HAVE_LIBURING
+#include "smbd/smbd_smb2_uring.h"
+#endif
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_SMB2
@@ -185,6 +188,134 @@ struct tevent_req *smb2_ioctl_smbtorture(uint32_t ctl_code,
 		state->smb2req->xconn->smb2.smbtorture.read_body_padding = 8;
 		tevent_req_done(req);
 		return tevent_req_post(req, ev);
+
+#ifdef HAVE_LIBURING
+	case FSCTL_SMBTORTURE_TRUENAS_URING_COUNTERS_READ: {
+		struct samba_uring_xconn *u =
+			state->smb2req->xconn->smb2.uring;
+		uint8_t *out;
+		const struct samba_uring_counters *c;
+		size_t want = SAMBA_URING_COUNTERS_WIRE_BYTES;
+
+		if (state->in_input.length != 0) {
+			tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
+			return tevent_req_post(req, ev);
+		}
+		if (u == NULL) {
+			/* xconn->smb2.uring is allocated at negprot; we
+			 * shouldn't get here before that. Defensive return. */
+			tevent_req_nterror(req, NT_STATUS_DEVICE_NOT_READY);
+			return tevent_req_post(req, ev);
+		}
+		if (state->in_max_output < want) {
+			tevent_req_nterror(req, NT_STATUS_BUFFER_TOO_SMALL);
+			return tevent_req_post(req, ev);
+		}
+
+		state->out_output = data_blob_talloc(state, NULL, want);
+		if (tevent_req_nomem(state->out_output.data, req)) {
+			return tevent_req_post(req, ev);
+		}
+		out = state->out_output.data;
+		c   = &u->counters;
+		SBVAL(out,   0, c->unsigned_splice_in);
+		SBVAL(out,   8, c->signed_splice_in);
+		SBVAL(out,  16, c->signed_splice_in_denied);
+		SBVAL(out,  24, c->unsigned_splice_out);
+		SBVAL(out,  32, c->signed_splice_out);
+		SBVAL(out,  40, c->encrypted_recv);
+		SBVAL(out,  48, c->encrypted_send_zc);
+		SBVAL(out,  56, c->legacy_recv);
+		SBVAL(out,  64, c->legacy_send);
+		SBVAL(out,  72, c->bytes_unsigned_splice_in);
+		SBVAL(out,  80, c->bytes_signed_splice_in);
+		SBVAL(out,  88, c->bytes_unsigned_splice_out);
+		SBVAL(out,  96, c->bytes_signed_splice_out);
+		SBVAL(out, 104, c->bytes_encrypted_in);
+		SBVAL(out, 112, c->bytes_encrypted_out);
+		SBVAL(out, 120, c->signed_alg_cache_hits);
+		SBVAL(out, 128, c->signed_alg_cache_misses);
+		SBVAL(out, 136, c->inflight_throttle_events);
+		SBVAL(out, 144, c->inflight_bytes_peak);
+		SBVAL(out, 152, c->unsigned_recv_mempool);
+		SBVAL(out, 160, c->bytes_unsigned_mempool_out);
+
+		tevent_req_done(req);
+		return tevent_req_post(req, ev);
+	}
+
+	case FSCTL_SMBTORTURE_TRUENAS_URING_COUNTERS_RESET: {
+		struct samba_uring_xconn *u =
+			state->smb2req->xconn->smb2.uring;
+
+		if (state->in_input.length != 0) {
+			tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
+			return tevent_req_post(req, ev);
+		}
+		if (u == NULL) {
+			tevent_req_nterror(req, NT_STATUS_DEVICE_NOT_READY);
+			return tevent_req_post(req, ev);
+		}
+		ZERO_STRUCT(u->counters);
+
+		tevent_req_done(req);
+		return tevent_req_post(req, ev);
+	}
+
+	case FSCTL_SMBTORTURE_TRUENAS_URING_FORCE_NEXT_SIGNED_WRITE_FAIL: {
+		struct samba_uring_xconn *u =
+			state->smb2req->xconn->smb2.uring;
+
+		if (state->in_input.length != 0) {
+			tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
+			return tevent_req_post(req, ev);
+		}
+		if (u == NULL) {
+			tevent_req_nterror(req, NT_STATUS_DEVICE_NOT_READY);
+			return tevent_req_post(req, ev);
+		}
+		u->force_signed_in_fail = true;
+
+		tevent_req_done(req);
+		return tevent_req_post(req, ev);
+	}
+
+	case FSCTL_SMBTORTURE_TRUENAS_URING_FORCE_NEXT_POSIX_APPEND: {
+		struct samba_uring_xconn *u =
+			state->smb2req->xconn->smb2.uring;
+
+		if (state->in_input.length != 0) {
+			tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
+			return tevent_req_post(req, ev);
+		}
+		if (u == NULL) {
+			tevent_req_nterror(req, NT_STATUS_DEVICE_NOT_READY);
+			return tevent_req_post(req, ev);
+		}
+		u->force_next_posix_append = true;
+
+		tevent_req_done(req);
+		return tevent_req_post(req, ev);
+	}
+
+	case FSCTL_SMBTORTURE_TRUENAS_URING_SET_MAX_INFLIGHT_BYTES: {
+		struct samba_uring_xconn *u =
+			state->smb2req->xconn->smb2.uring;
+
+		if (state->in_input.length != 8) {
+			tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
+			return tevent_req_post(req, ev);
+		}
+		if (u == NULL) {
+			tevent_req_nterror(req, NT_STATUS_DEVICE_NOT_READY);
+			return tevent_req_post(req, ev);
+		}
+		u->max_inflight_bytes = BVAL(state->in_input.data, 0);
+
+		tevent_req_done(req);
+		return tevent_req_post(req, ev);
+	}
+#endif /* HAVE_LIBURING */
 
 	case FSCTL_SMBTORTURE_FSP_ASYNC_SLEEP: {
 		struct tevent_req *subreq = NULL;

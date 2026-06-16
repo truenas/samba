@@ -30,9 +30,13 @@ TORTURE_LOCAL_SOURCE = '''../../../lib/util/charset/tests/iconv.c
 	nss_tests.c
         mdspkt.c
 	fsrvp_state.c
+	truenas_uring.c
 	smbtorture_fullname.c'''
 
 TORTURE_LOCAL_DEPS = 'RPC_NDR_ECHO TDR LIBCLI_SMB MESSAGING iconv TORTURE_AUTH TORTURE_UTIL TORTURE_NDR TORTURE_LIBCRYPTO share torture_registry %s ldb samdb replace-test RPC_FSS_STATE util_str_escape' % provision
+
+if bld.CONFIG_SET('HAVE_LIBURING'):
+    TORTURE_LOCAL_DEPS += ' TRUENAS_URING'
 
 bld.SAMBA_MODULE('TORTURE_LOCAL',
 	source=TORTURE_LOCAL_SOURCE,

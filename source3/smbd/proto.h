@@ -57,14 +57,12 @@ bool srv_init_signing(struct smbXsrv_connection *conn);
 /* The following definitions come from smbd/aio.c  */
 
 struct aio_extra;
-struct io_pool_link;
 bool aio_write_through_requested(struct aio_extra *aio_ex);
 NTSTATUS schedule_smb2_aio_read(connection_struct *conn,
 				struct smb_request *smbreq,
 				files_struct *fsp,
 				TALLOC_CTX *ctx,
 				DATA_BLOB *preadbuf,
-				struct io_pool_link *lnk,
 				off_t startpos,
 				size_t smb_maxcnt);
 NTSTATUS schedule_aio_smb2_write(connection_struct *conn,
@@ -73,6 +71,34 @@ NTSTATUS schedule_aio_smb2_write(connection_struct *conn,
 				uint64_t in_offset,
 				DATA_BLOB in_data,
 				bool write_through);
+#ifdef HAVE_LIBURING
+NTSTATUS truenas_schedule_smb2_unsigned_splice_write(connection_struct *conn,
+				    struct smb_request *smbreq,
+				    files_struct *fsp,
+				    uint64_t in_offset,
+				    DATA_BLOB in_data,
+				    bool write_through);
+NTSTATUS truenas_schedule_smb2_signed_splice_write(connection_struct *conn,
+				   struct smb_request *smbreq,
+				   files_struct *fsp,
+				   uint64_t in_offset,
+				   DATA_BLOB in_data,
+				   bool write_through);
+NTSTATUS smbd_smb2_request_next_incoming(struct smbXsrv_connection *xconn);
+struct smb2_signing_key *smbd_smb2_signing_key(struct smbXsrv_session *session,
+					       struct smbXsrv_connection *xconn,
+					       bool *_has_channel);
+int truenas_smb2_alg_hmac_acquire(struct smbXsrv_connection *xconn,
+				struct smb2_signing_key *sk);
+NTSTATUS truenas_smb2_compute_gmac_tag(int alg_op_fd,
+				const uint8_t *key, size_t keylen,
+				const uint8_t *hdr_for_iv,
+				size_t aad_len,
+				uint8_t tag_out[16]);
+NTSTATUS truenas_uring_charge_recv_bytes(TALLOC_CTX *charge_ctx,
+				struct smbXsrv_connection *xconn,
+				uint64_t bytes);
+#endif
 bool cancel_smb2_aio(struct smb_request *smbreq);
 struct aio_req_fsp_link;
 struct aio_req_fsp_link *aio_add_req_to_fsp(files_struct *fsp, struct tevent_req *req);
