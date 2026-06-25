@@ -1,4 +1,4 @@
-name: QEMU Build & Test (ZFS + Samba)
+name: Build & Test
 
 # Builds TrueNAS OpenZFS (kmod + userland) inside a Debian Trixie VM, then
 # builds this TrueNAS Samba tree against that libzfs and smoke-tests the
@@ -31,7 +31,7 @@ env:
 
 jobs:
   build-test:
-    name: Debian Trixie · build ZFS + Samba · smoke test
+    name: Debian Trixie
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v4
@@ -63,6 +63,16 @@ jobs:
         path: /tmp/qemu-work/debian-trixie.qcow2
         key: debian-trixie-cloudimage-${{ env.IMAGE_VERSION }}
 
+    # ccache speeds up the (full, per-PR) Samba rebuild. Rolling key: restore
+    # the most recent cache, save an updated one keyed on this commit.
+    - name: Cache ccache (Samba build)
+      uses: actions/cache@v4
+      with:
+        path: /tmp/ccache
+        key: ccache-samba-debian-trixie-${{ env.IMAGE_VERSION }}-${{ github.sha }}
+        restore-keys: |
+          ccache-samba-debian-trixie-${{ env.IMAGE_VERSION }}-
+
     - name: Start Debian Trixie VM
       timeout-minutes: 10
       run: bash .github/workflows/scripts/qemu-2-start.sh
@@ -81,7 +91,9 @@ jobs:
       run: bash .github/workflows/scripts/qemu-3.5-restart.sh
 
     - name: Smoke-test the TrueNAS VFS stack on ZFS
-      timeout-minutes: 25
+      # Bumped from 25: now also runs the truenas streams/shadow_copy/acl torture
+      # suites and a curated set of upstream smb2.* regression suites.
+      timeout-minutes: 45
       run: bash .github/workflows/scripts/qemu-4-test.sh
 
     - name: Collect logs

@@ -1470,7 +1470,6 @@ static NTSTATUS shadow_copy_zfs_get_real_filename_at(
         TALLOC_CTX *mem_ctx,
         char **found_name)
 {
-	ssize_t ret;
 	char *conv = NULL;
 	NTSTATUS status;
 	struct smb_filename *conv_fname = NULL;
@@ -1504,8 +1503,8 @@ static NTSTATUS shadow_copy_zfs_get_real_filename_at(
 		return status;
 	}
 
-	status = get_real_filename_full_scan_at(
-		conv_fname->fsp, path, false, mem_ctx, found_name);
+	status = get_real_filename_at(
+		conv_fname->fsp, path, mem_ctx, found_name);
 
 	TALLOC_FREE(conv_fname);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -1520,42 +1519,6 @@ static NTSTATUS shadow_copy_zfs_get_real_filename_at(
 
 	TALLOC_FREE(conv);
 	return NT_STATUS_OK;
-}
-
-
-static const char *shadow_copy_zfs_connectpath(struct vfs_handle_struct *handle,
-					    const struct files_struct *dirfsp,
-					    const struct smb_filename *smb_fname)
-{
-	const char *ret;
-	char *conv = NULL;
-	struct shadow_copy_zfs_config *config = NULL;
-
-	SMB_VFS_HANDLE_GET_DATA(handle, config, struct shadow_copy_zfs_config,
-				return NULL);
-
-	if (config->shadow_connectpath != NULL) {
-		DBG_INFO("cached connect path is [%s]\n",
-			 config->shadow_connectpath->shadow_cp);
-		return config->shadow_connectpath->shadow_cp;
-	}
-
-	if (shadow_copy_zfs_match_name(handle, smb_fname)) {
-		char *out = NULL;
-		struct snapshot_data data = { 0 };
-		conv = do_convert_shadow_zfs_name(handle, smb_fname, &data);
-		if (conv == NULL) {
-			return handle->conn->connectpath;
-		}
-		TALLOC_FREE(conv);
-		if (data.shadow_cp[0] == '\0') {
-			return SMB_VFS_NEXT_CONNECTPATH(handle, dirfsp, smb_fname);
-		}
-		out = talloc_strdup(talloc_tos(), data.shadow_cp);
-
-		return out;
-	}
-	return SMB_VFS_NEXT_CONNECTPATH(handle, dirfsp, smb_fname);
 }
 
 static uint64_t shadow_copy_zfs_disk_free(vfs_handle_struct *handle,
@@ -1786,7 +1749,6 @@ static struct vfs_fn_pointers vfs_shadow_copy_zfs_fns = {
 	.fsetxattr_fn = shadow_copy_zfs_fsetxattr,
 	.fchflags_fn = shadow_copy_zfs_fchflags,
 	.get_real_filename_at_fn = shadow_copy_zfs_get_real_filename_at,
-	.connectpath_fn = shadow_copy_zfs_connectpath,
 	.parent_pathname_fn = zfs_parent_pathname,
 };
 

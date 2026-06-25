@@ -19,7 +19,7 @@ cp /tmp/test-exitcode.txt "$LOG_DIR/" 2>/dev/null || true
 # Samba logs + system logs (best-effort; VM may be down).
 ssh debian@$VM_IP "sudo cat /var/log/samba4/smbd.log"     > "$LOG_DIR/smbd.log"      2>/dev/null || true
 ssh debian@$VM_IP "sudo ls -lR /var/log/samba4"           > "$LOG_DIR/samba-logdir.txt" 2>/dev/null || true
-ssh debian@$VM_IP "sudo testparm -s /etc/samba/smb.conf"  > "$LOG_DIR/testparm.txt"  2>/dev/null || true
+ssh debian@$VM_IP "sudo testparm -s /etc/smb4.conf"       > "$LOG_DIR/testparm.txt"  2>/dev/null || true
 ssh debian@$VM_IP "sudo journalctl -n 2000 --no-pager"    > "$LOG_DIR/journalctl.log" 2>/dev/null || true
 ssh debian@$VM_IP "sudo dmesg"                            > "$LOG_DIR/dmesg.log"     2>/dev/null || true
 ssh debian@$VM_IP "zpool status; zfs list"               > "$LOG_DIR/zfs-status.txt" 2>/dev/null || true

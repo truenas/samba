@@ -34,9 +34,16 @@ echo "Copying Samba source to VM..."
 ssh debian@$VM_IP "mkdir -p ~/samba"
 rsync -az --delete \
   --exclude='.git' \
-  --exclude='bin/' \
+  --exclude='/bin/' \
   --exclude='*.o' --exclude='*.lo' \
   "$GITHUB_WORKSPACE/" debian@$VM_IP:~/samba/
+
+# Restore ccache (Samba build accelerator) into the VM if a cache was restored.
+if [ -d /tmp/ccache ] && [ -n "$(ls -A /tmp/ccache 2>/dev/null || true)" ]; then
+  echo "Restoring ccache into VM..."
+  ssh debian@$VM_IP "mkdir -p ~/.ccache"
+  rsync -az /tmp/ccache/ debian@$VM_IP:~/.ccache/
+fi
 
 echo "Building in VM..."
 ssh debian@$VM_IP bash -s "$CACHED_ZFS" "$ZFS_BRANCH" <<'REMOTE_SCRIPT'
@@ -61,8 +68,10 @@ else
     build-essential autoconf automake libtool gawk alien fakeroot dkms \
     libblkid-dev uuid-dev libudev-dev libssl-dev zlib1g-dev libaio-dev \
     libattr1-dev libelf-dev "linux-headers-$(uname -r)" python3 \
-    python3-dev python3-setuptools python3-cffi libffi-dev git \
-    libtirpc-dev
+    python3-dev python3-setuptools python3-cffi python3-packaging \
+    python3-distlib libffi-dev git \
+    libtirpc-dev \
+    dh-python libpam0g-dev python3-all-dev python3-sphinx
   cd /tmp
   git clone --depth 1 --branch "$ZFS_BRANCH" https://github.com/truenas/zfs.git
   cd zfs
@@ -102,8 +111,10 @@ dpkg -l | grep -Ei 'libzfs|libnvpair|libuutil|libzpool' || true
 ##################################################################
 echo "Installing Samba build dependencies..."
 cd ~/samba
-sudo apt-get install -y build-essential devscripts equivs
-# build-dep reads debian/control; already-installed libzfs* satisfy those.
+sudo apt-get install -y build-essential devscripts equivs ccache
+# build-dep reads debian/control; the openzfs-* packages installed above
+# satisfy libzfs7 / libzfs7-devel / libnvpair3 / libuutil3 via their
+# Debian "Provides:" (the package names differ; the virtual names match).
 sudo apt-get build-dep -y . || {
   echo "apt-get build-dep failed; retrying via mk-build-deps..."
   sudo mk-build-deps --install --remove \
@@ -111,12 +122,29 @@ sudo apt-get build-dep -y . || {
     debian/control
 }
 
+# Fail fast (before the long build) with a clear message if any Build-Depends
+# is still unmet -- e.g. if the openzfs dev package that Provides
+# libzfs7-devel was not produced/installed.
+echo "Confirming all Samba Build-Depends are satisfied..."
+if ! dpkg-checkbuilddeps; then
+  echo "FATAL: unmet Samba build dependencies (see above)."
+  echo "Installed openzfs packages and what they Provide:"
+  dpkg-query -W -f='${Package}\tProvides: ${Provides}\n' 'openzfs-*' 2>/dev/null || true
+  exit 1
+fi
+
 ##################################################################
 # 3. Build Samba (waf via dpkg-buildpackage, configured --with-libzfs).
 ##################################################################
 echo "Building Samba (this is the long pole)..."
 cd ~/samba
+# Route the compiler through ccache to speed up subsequent rebuilds.
+export PATH="/usr/lib/ccache:$PATH"
+export CCACHE_DIR="$HOME/.ccache"
+export CCACHE_MAXSIZE="2G"
+ccache -z >/dev/null 2>&1 || true
 DEB_BUILD_OPTIONS="parallel=$(nproc)" dpkg-buildpackage -us -uc -b
+echo "ccache stats after build:"; ccache -s || true
 
 echo "Installing truenas-samba..."
 sudo apt-get install -y $(ls ../truenas-samba_*.deb) || {
@@ -153,6 +181,11 @@ if [ "$CACHED_ZFS" = "false" ]; then
   mkdir -p /tmp/zfs-debs
   rsync -az debian@$VM_IP:/tmp/zfs-debs/ /tmp/zfs-debs/ || echo "Note: nothing to cache"
 fi
+
+# Pull the updated ccache back to the host so actions/cache can save it.
+echo "Saving ccache from VM for caching..."
+mkdir -p /tmp/ccache
+rsync -az debian@$VM_IP:~/.ccache/ /tmp/ccache/ || echo "Note: no ccache to save"
 
 # Reboot is required so the ZFS kmod loads cleanly for the test stage.
 echo "Cleaning cloud-init and powering off VM..."

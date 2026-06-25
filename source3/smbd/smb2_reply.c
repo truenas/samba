@@ -1493,11 +1493,21 @@ NTSTATUS rename_internals_fsp(connection_struct *conn,
 		/*
 		 * Same directory
 		 */
-		if (strcsequal(smb_fname_src_rel->base_name,
+		if (!(conn->internal_tcon_flags &
+		      TCON_FLAG_CASE_INSENSTIVE_FS) &&
+		    strcsequal(smb_fname_src_rel->base_name,
 			       smb_fname_dst_rel->base_name))
 		{
 			/*
-			 * No file name change
+			 * No file name change.
+			 *
+			 * TrueNAS: on a case-insensitive dataset the
+			 * client-visible name may differ in case from the
+			 * on-disk name (the case-insensitive name-lookup
+			 * optimization keeps the requested case), so identical
+			 * request strings can still be a real on-disk case
+			 * change. Don't short-circuit -- let the request reach
+			 * zfs_core_renameat(), which performs the case change.
 			 */
 			status = NT_STATUS_OK;
 			goto out;
