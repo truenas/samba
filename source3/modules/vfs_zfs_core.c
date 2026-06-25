@@ -542,7 +542,6 @@ static int zfs_core_chdir(vfs_handle_struct *handle,
 	return SMB_VFS_NEXT_CHDIR(handle, smb_fname);
 }
 
-#if 0 /*pending rework of case insensitve renames */
 /*
  * Windows clients return NT_STATUS_OBJECT_NAME_COLLISION in case of
  * rename in case of rename in case insensitive dataset. MacOS does
@@ -577,6 +576,11 @@ static int zfs_core_renameat(vfs_handle_struct *handle,
 					     dstfsp,
 					     smb_fname_dst,
 					     rhow);
+	}
+
+	if (is_named_stream(smb_fname_src) || is_named_stream(smb_fname_dst)) {
+		errno = ENOENT;
+		return -1;
 	}
 
 	srcid = SMB_VFS_FS_FILE_ID(handle->conn, &srcfsp->fsp_name->st);
@@ -619,7 +623,6 @@ static int zfs_core_renameat(vfs_handle_struct *handle,
 	TALLOC_FREE(tmp_base_name);
 	return result;
 }
-#endif
 
 /**
  * When a client authenticates with UPN format (e.g. bob@domain.com),
@@ -772,6 +775,10 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 			handle->conn->connectpath, strerror(errno));
 
 	} else {
+		if (config->ds->properties->casesens == SMBZFS_INSENSITIVE) {
+			handle->conn->internal_tcon_flags |= TCON_FLAG_CASE_INSENSTIVE_FS;
+		}
+
 		base_quota_str = lp_parm_const_string(SNUM(handle->conn),
 			"zfs_core", "base_user_quota", NULL);
 
@@ -806,6 +813,7 @@ static struct vfs_fn_pointers zfs_core_fns = {
 	.fs_capabilities_fn = zfs_core_fs_capabilities,
 	.chdir_fn = zfs_core_chdir,
 	.connect_fn = zfs_core_connect,
+	.renameat_fn = zfs_core_renameat,
 	.fsctl_fn = zfs_core_fsctl,
 	.offload_read_send_fn = zfs_core_offload_read_send,
 	.offload_read_recv_fn = zfs_core_offload_read_recv,

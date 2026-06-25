@@ -1520,8 +1520,20 @@ NTSTATUS rename_internals_fsp(connection_struct *conn,
 			.dst_fsp = smb_fname_dst->fsp,
 		};
 		struct files_struct *found_open = NULL;
+		/*
+		 * TrueNAS: on a case-insensitive filesystem a pure case-change
+		 * rename resolves src and dst to the same underlying file. Detect
+		 * that by file id so it is not treated as a collision or as the
+		 * target being open; the actual case change is performed by
+		 * zfs_core_renameat().
+		 */
+		struct file_id fileid_src = vfs_file_id_from_sbuf(
+			conn, &smb_fname_src->st);
+		struct file_id fileid_dst = vfs_file_id_from_sbuf(
+			conn, &smb_fname_dst->st);
+		bool is_same_fileid = file_id_equal(&fileid_src, &fileid_dst);
 
-		if (!replace_if_exists) {
+		if (!is_same_fileid && !replace_if_exists) {
 			DBG_NOTICE("dest exists doing rename "
 				   "%s -> %s\n",
 				   smb_fname_str_dbg(smb_fname_src),
@@ -1530,16 +1542,18 @@ NTSTATUS rename_internals_fsp(connection_struct *conn,
 			goto out;
 		}
 
-		check_state.fileid = vfs_file_id_from_sbuf(conn,
-							   &smb_fname_dst->st);
+		if (!is_same_fileid) {
+			check_state.fileid = vfs_file_id_from_sbuf(conn,
+								   &smb_fname_dst->st);
 
-		found_open = files_forall(conn->sconn,
-					  rename_check_open_fn,
-					  &check_state);
-		if (found_open != NULL) {
-			DBG_NOTICE("Target file open\n");
-			status = NT_STATUS_ACCESS_DENIED;
-			goto out;
+			found_open = files_forall(conn->sconn,
+						  rename_check_open_fn,
+						  &check_state);
+			if (found_open != NULL) {
+				DBG_NOTICE("Target file open\n");
+				status = NT_STATUS_ACCESS_DENIED;
+				goto out;
+			}
 		}
 	}
 
