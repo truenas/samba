@@ -1,0 +1,101 @@
+name: QEMU Build & Test (ZFS + Samba)
+
+# Builds TrueNAS OpenZFS (kmod + userland) inside a Debian Trixie VM, then
+# builds this TrueNAS Samba tree against that libzfs and smoke-tests the
+# TrueNAS VFS stack (zfs_core, truenas_streams_xattr) on a real ZFS dataset.
+#
+# A VM is required (not a plain container) because:
+#   * the ZFS kernel module must be built against, and loaded into, a real
+#     running kernel, and
+#   * smbd/the VFS modules need real root + a real ZFS pool to exercise.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - 'truenas/**'
+      - 'SCALE-**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+# Bump IMAGE_VERSION to bust both the cloud-image cache and the OpenZFS deb
+# cache together (e.g. after a kernel bump that needs a fresh kmod build).
+env:
+  IMAGE_VERSION: v1
+  # TrueNAS OpenZFS branch to build libzfs/kmod from. Keep in sync with the
+  # ZFS that TrueNAS SCALE ships and that debian/control's libzfs7 expects.
+  ZFS_BRANCH: truenas/zfs-2.4-release
+
+jobs:
+  build-test:
+    name: Debian Trixie · build ZFS + Samba · smoke test
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+
+    - name: Setup QEMU
+      timeout-minutes: 10
+      run: bash .github/workflows/scripts/qemu-1-setup.sh
+
+    - name: Get OpenZFS commit hash
+      id: zfs-hash
+      run: |
+        ZFS_COMMIT=$(git ls-remote https://github.com/truenas/zfs.git "refs/heads/${ZFS_BRANCH}" | cut -f1)
+        echo "hash=$ZFS_COMMIT" >> $GITHUB_OUTPUT
+        echo "OpenZFS ($ZFS_BRANCH) commit: $ZFS_COMMIT"
+
+    - name: Cache OpenZFS packages
+      id: cache-zfs
+      uses: actions/cache@v4
+      with:
+        path: /tmp/zfs-debs
+        key: zfs-debs-debian-trixie-${{ env.IMAGE_VERSION }}-${{ steps.zfs-hash.outputs.hash }}
+
+    - name: Cache Debian Trixie cloud image
+      id: cache-image
+      uses: actions/cache@v4
+      with:
+        path: /tmp/qemu-work/debian-trixie.qcow2
+        key: debian-trixie-cloudimage-${{ env.IMAGE_VERSION }}
+
+    - name: Start Debian Trixie VM
+      timeout-minutes: 10
+      run: bash .github/workflows/scripts/qemu-2-start.sh
+
+    # Builds ZFS (or restores cached debs), then builds + installs this Samba
+    # tree against it. This is the long pole — full Samba build from source.
+    - name: Build ZFS + Samba in the VM
+      timeout-minutes: 150
+      env:
+        ZFS_CACHE_HIT: ${{ steps.cache-zfs.outputs.cache-hit }}
+        ZFS_BRANCH: ${{ env.ZFS_BRANCH }}
+      run: bash .github/workflows/scripts/qemu-3-build.sh
+
+    - name: Restart VM to load kernel modules
+      timeout-minutes: 10
+      run: bash .github/workflows/scripts/qemu-3.5-restart.sh
+
+    - name: Smoke-test the TrueNAS VFS stack on ZFS
+      timeout-minutes: 25
+      run: bash .github/workflows/scripts/qemu-4-test.sh
+
+    - name: Collect logs
+      if: always()
+      timeout-minutes: 5
+      run: bash .github/workflows/scripts/qemu-5-collect-logs.sh
+
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: samba-build-test-logs-debian-trixie
+        path: /tmp/qemu-logs.tar.gz
+        if-no-files-found: ignore
+
+    - name: Test Summary
+      if: always()
+      run: bash .github/workflows/scripts/qemu-6-summary.sh
