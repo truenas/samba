@@ -435,6 +435,14 @@ bld.SAMBA3_MODULE('vfs_streams_xattr',
                  internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_streams_xattr'),
                  enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_streams_xattr'))
 
+bld.SAMBA3_MODULE('vfs_truenas_streams_xattr',
+                 subsystem='vfs',
+                 source='truenas_streams_xattr.c',
+                 deps='samba-util HASH_INODE',
+                 init_function='',
+                 internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_truenas_streams_xattr'),
+                 enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_truenas_streams_xattr'))
+
 bld.SAMBA3_MODULE('vfs_streams_depot',
                  subsystem='vfs',
                  source='vfs_streams_depot.c',
