@@ -384,6 +384,7 @@ static int do_global_checks(void)
 	const char **lp_ptr = NULL;
 	const struct loadparm_substitution *lp_sub =
 		loadparm_s3_global_substitution();
+	const char *check_pw_script = NULL;
 	int ival;
 
 	fprintf(stderr, "\n");
@@ -856,6 +857,17 @@ static int do_global_checks(void)
 #endif
 	}
 
+	check_pw_script = lp_check_password_script(talloc_tos(), lp_sub);
+	if (talloc_string_sub_mixed_quoting(check_pw_script, 'u')) {
+		fprintf(stderr,
+			"WARNING: You are using 'check password script' "
+			"with mixed quoting and %%u.\n"
+			"CVE-2026-4408 changed the way %%u substitution works. \n"
+			"You should use the SAMBA_CPS_ACCOUNT_NAME "
+			"environment variable exported to the script, or\n"
+			"at least use single quotes (directly) around '%%u'.\n\n");
+	}
+
 	return ret;
 }
 
@@ -951,6 +963,14 @@ static void do_per_share_checks(int s)
 		fprintf(stderr,
 			"Warning: Service %s defines a print command, but "
 			"parameter is ignored when using CUPS libraries.\n\n",
+			lp_servicename(talloc_tos(), lp_sub, s));
+	}
+	if (talloc_string_sub_mixed_quoting(lp_print_command(s), 'J')) {
+		fprintf(stderr,
+			"WARNING: Service %s defines a 'print command' "
+			"with mixed quoting and %%J.\n"
+			"CVE-2026-4480 changed the way %%J substitution works.\n"
+			"You should use single quotes (directly) around '%%J'.\n\n",
 			lp_servicename(talloc_tos(), lp_sub, s));
 	}
 
