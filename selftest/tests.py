@@ -558,6 +558,8 @@ plantestsuite("samba.unittests.sys_rw", "none",
               [os.path.join(bindir(), "default/lib/util/test_sys_rw")])
 plantestsuite("samba.unittests.stable_sort", "none",
               [os.path.join(bindir(), "default/lib/util/test_stable_sort")])
+plantestsuite("samba.unittests.test_string_sub", "none",
+              [os.path.join(bindir(), "test_string_sub")])
 plantestsuite("samba.unittests.ntlm_check", "none",
               [os.path.join(bindir(), "default/libcli/auth/test_ntlm_check")])
 plantestsuite("samba.unittests.gnutls", "none",
@@ -572,6 +574,8 @@ plantestsuite("samba.unittests.test_oLschema2ldif", "none",
               [os.path.join(bindir(), "default/source4/utils/oLschema2ldif/test_oLschema2ldif")])
 plantestsuite("samba.unittests.auth.sam", "none",
               [os.path.join(bindir(), "test_auth_sam")])
+plantestsuite("samba.unittests.test_rpc_samr", "none",
+              [os.path.join(bindir(), "test_rpc_samr")])
 if have_heimdal_support and not using_system_gssapi:
     plantestsuite("samba.unittests.auth.heimdal_gensec_unwrap_des", "none",
                   [valgrindify(os.path.join(bindir(), "test_heimdal_gensec_unwrap_des"))])
