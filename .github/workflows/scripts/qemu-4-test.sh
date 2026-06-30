@@ -340,7 +340,12 @@ if python3 -c "import os; os.getxattr('/tank/acl', 'system.nfs4_acl_xdr')" 2>/de
   # Best-effort: truenas_pyos builds a C extension (needs gcc + libbsd-dev), so
   # skip without failing the run if it cannot be installed.
   echo "--- ixnas demote: on-disk ACL untouched (truenas_pyos) ---"
-  apt-get install -y --no-install-recommends libbsd-dev >/dev/null 2>&1 || true
+  # truenas_pyos builds a C extension and is pip-installed from git, so it needs
+  # pip + Python headers + libbsd-dev (gcc/git are already present from the
+  # ZFS/Samba build). Trixie ships no pip by default -- without python3-pip the
+  # install fails "No module named pip" and fixture_scope silently self-skips.
+  apt-get install -y --no-install-recommends \
+    python3-pip python3-dev libbsd-dev >/dev/null 2>&1 || true
   if python3 -m pip install --break-system-packages --quiet \
        "git+https://github.com/truenas/truenas_pyos" >/tmp/pyos-install.log 2>&1 \
      && command -v truenas_setfacl >/dev/null 2>&1; then
