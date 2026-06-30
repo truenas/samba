@@ -330,6 +330,53 @@ if python3 -c "import os; os.getxattr('/tank/acl', 'system.nfs4_acl_xdr')" 2>/de
   else
     echo "ERROR: truenas.acl mapping suite FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
   fi
+
+  # ---- Advertisement-only proof: SMB demotes special identities, on-disk
+  # (NFS view) ACL is left untouched. ixnas strips WRITE_ACL/WRITE_OWNER from
+  # owner@/group@/everyone@ in the SD it reports because ZFS will not honor them
+  # there, while named entries keep them. truenas_setfacl lays down a fixture
+  # carrying both on disk; truenas.acl.fixture_scope checks the SMB view; and
+  # truenas_getfacl before/after proves the GET never rewrote the stored ACL.
+  # Best-effort: truenas_pyos builds a C extension (needs gcc + libbsd-dev), so
+  # skip without failing the run if it cannot be installed.
+  echo "--- ixnas demote: on-disk ACL untouched (truenas_pyos) ---"
+  apt-get install -y --no-install-recommends libbsd-dev >/dev/null 2>&1 || true
+  if python3 -m pip install --break-system-packages --quiet \
+       "git+https://github.com/truenas/truenas_pyos" >/tmp/pyos-install.log 2>&1 \
+     && command -v truenas_setfacl >/dev/null 2>&1; then
+    assert_ondisk_owner_full() {
+      truenas_getfacl -j -n "$1" | python3 -c '
+import sys, json
+acl = json.loads(sys.stdin.read())
+o = next((set(e["perms"]) for e in acl["aces"] if e["who"] == "owner@"), None)
+assert o is not None, "no owner@ entry on disk"
+assert "WRITE_ACL" in o and "WRITE_OWNER" in o, \
+    "owner@ lacks WRITE_ACL/WRITE_OWNER on disk"
+'
+    }
+    FIX=/tank/acl/pyfix
+    : > "$FIX"; chown smbtest:smbtest "$FIX"
+    # owner@/group@/everyone@ + a named user (root) all Full Control, so the
+    # stored ACL carries WRITE_ACL(C)+WRITE_OWNER(o) on every entry.
+    truenas_setfacl -m 'owner@:full_set::allow,group@:full_set::allow,everyone@:full_set::allow,user:0:full_set::allow' "$FIX"
+    echo "on-disk ACL (before SMB GET):"; truenas_getfacl -n "$FIX" || true
+    assert_ondisk_owner_full "$FIX" \
+      || { echo "ERROR: fixture setup -- owner@ lacks WRITE_ACL/WRITE_OWNER on disk"; exit 1; }
+    if "$SMBTORTURE" //127.0.0.1/zacl -U 'smbtest%testpass123' \
+         --option='torture:acl_nfs4=yes' --option='torture:acl_fixture=pyfix' \
+         truenas.acl.fixture_scope; then
+      echo "truenas.acl.fixture_scope PASSED (SMB demotes special, keeps named)"
+    else
+      echo "ERROR: truenas.acl.fixture_scope FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
+    fi
+    assert_ondisk_owner_full "$FIX" \
+      || { echo "ERROR: SMB GET mutated the on-disk ACL (owner@ lost WRITE_ACL/WRITE_OWNER)"; exit 1; }
+    echo "on-disk ACL unchanged by SMB GET -- advertisement-only confirmed"
+    rm -f "$FIX"
+  else
+    echo "WARN: truenas_pyos unavailable; skipping on-disk advertisement-only check"
+    tail -3 /tmp/pyos-install.log 2>/dev/null || true
+  fi
 else
   echo "WARN: ZFS does not expose system.nfs4_acl_xdr on /tank/acl; skipping ACL suite"
 fi
