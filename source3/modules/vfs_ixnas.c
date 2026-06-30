@@ -32,6 +32,7 @@ static int vfs_ixnas_debug_level = DBGC_VFS;
 struct ixnas_config_data {
 	struct smbacl4_vfs_params nfs4_params;
 	bool dosattrib_xattr;
+	bool advertise_enforced_acl;
 };
 
 enum ixnas_dacl_type {
@@ -442,7 +443,8 @@ static int path_get_aclbrand(const char *path)
 }
 
 /* Convert the native ZFS ACE format to the generic Samba NFSv4 format */
-static bool zfsentry2smbace(zfsacl_entry_t ae, SMB_ACE4PROP_T *aceprop)
+static bool zfsentry2smbace(zfsacl_entry_t ae, SMB_ACE4PROP_T *aceprop,
+			    bool advertise_enforced)
 {
 	int i;
 	zfsace_permset_t perms = 0;
@@ -515,6 +517,21 @@ static bool zfsentry2smbace(zfsacl_entry_t ae, SMB_ACE4PROP_T *aceprop)
 	if ((aceprop->aceType == SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE) &&
 	    (aceprop->aceMask != 0)) {
 		aceprop->aceMask |= SMB_ACE4_SYNCHRONIZE;
+	}
+
+	/*
+	 * Advertisement-only: ZFS will not honor WRITE_ACL/WRITE_OWNER granted
+	 * through owner@/group@/everyone@, so do not report those bits on the
+	 * special identities. This drops them from the SD we present, never from
+	 * what we store (the set path is untouched), so SMB and NFS clients on the
+	 * same dataset keep getting identical, ZFS-enforced access. Named
+	 * user/group entries (flags == 0) still convey these rights and so are
+	 * left intact. Gated by ixnas:zfs_acl_advertise_enforced.
+	 */
+	if (advertise_enforced &&
+	    (aceprop->flags & SMB_ACE4_ID_SPECIAL) &&
+	    (aceprop->aceType == SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE)) {
+		aceprop->aceMask &= ~(SMB_ACE4_WRITE_ACL | SMB_ACE4_WRITE_OWNER);
 	}
 
 	return true;
@@ -713,7 +730,7 @@ static NTSTATUS ixnas_get_nt_acl_nfs4_common(struct connection_struct *conn,
 			return map_nt_error_from_unix(errno);
 		}
 
-		ok = zfsentry2smbace(ae, &aceprop);
+		ok = zfsentry2smbace(ae, &aceprop, config->advertise_enforced_acl);
 		if (!ok) {
 			TALLOC_FREE(pacl);
 			return map_nt_error_from_unix(errno);
@@ -1475,6 +1492,14 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 	if (!config->dosattrib_xattr) {
 		lp_do_parameter(SNUM(handle->conn), "kernel dosmodes", "yes");
 	}
+
+	/*
+	 * Present only the WRITE_ACL/WRITE_OWNER that ZFS will actually honor:
+	 * strip those bits from owner@/group@/everyone@ in the SD we report (not
+	 * from what we store). Default on; set to no to advertise the raw ACL.
+	 */
+	config->advertise_enforced_acl = lp_parm_bool(SNUM(handle->conn),
+			"ixnas", "zfs_acl_advertise_enforced", true);
 
 	ok = set_acl_parameters(handle, config);
 	if (!ok) {
