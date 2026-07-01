@@ -324,19 +324,23 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 			return false;
 		}
 
-		error = SMB_VFS_STAT(handle->conn, c_fsp->fsp_name);
-		if (error) {
-			DBG_ERR("%s: stat() failed: %s\n", fsp_str_dbg(c_fsp), strerror(errno));
+		/*
+		 * Populate a valid stat on our synthetic FSP using its
+		 * own open fd. This runs during the connection's first
+		 * chdir, before conn->cwd_fsp has a usable fd, so a
+		 * path-based SMB_VFS_STAT() that resolves relative to
+		 * cwd_fsp (as vfs_fruit does) would fail with EBADF.
+		 */
+		status = vfs_stat_fsp(c_fsp);
+		if (!NT_STATUS_IS_OK(status)) {
+			DBG_ERR("%s: stat() failed: %s\n",
+				fsp_str_dbg(c_fsp), nt_errstr(status));
 			fd_close(c_fsp);
 			file_free(NULL, c_fsp);
 			fd_close(pathref);
 			file_free(NULL, pathref);
 			return false;
 		}
-
-		/*
-		 * ensure we have valid stat on our synthetic FSP
-		 */
 
 		status = inherit_new_acl(pathref, c_fsp);
 		if (!NT_STATUS_IS_OK(status)) {

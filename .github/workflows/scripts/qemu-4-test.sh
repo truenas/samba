@@ -11,6 +11,10 @@
 #     shadow_copy browse/readonly/listdir) against the share
 #   * verify per-user ZFS dataset auto-creation (zfs_core:zfs_auto_create),
 #     including on-disk ownership
+#   * verify per-user auto-creation with vfs_fruit + ixnas in the stack
+#     inherits the parent dataset's NFSv4 ACL into the new dataset -- the
+#     regression where zfs_inherit_acls' connect-time stat routed through
+#     fruit's cwd_fsp-relative stat and failed EBADF -> ACCESS_DENIED
 #   * snapshot browsing via shadow_copy_zfs and Time Machine auto-snapshot
 #     via tmprotect
 #   * ACL<->Security-Descriptor mapping via ixnas on an NFSv4-ACL dataset
@@ -64,6 +68,12 @@ chmod 0777 /tank/tm
 zfs create -o acltype=nfsv4 -o aclmode=passthrough \
            -o casesensitivity=insensitive -o atime=off tank/acl
 chmod 0777 /tank/acl
+# NFSv4-ACL dataset for the per-user auto-creation + ACL-inheritance test
+# ([zhome]). Same NFSv4/passthrough setup as tank/acl so an inheritable ACL
+# seeded here propagates into the dataset zfs_core auto-creates on connect.
+zfs create -o acltype=nfsv4 -o aclmode=passthrough \
+           -o casesensitivity=insensitive -o atime=off tank/home
+chmod 0777 /tank/home
 # Case-SENSITIVE plain dataset for upstream smb2.* protocol regression, so the
 # generic suites aren't tripped by ZFS case-insensitivity.
 zfs create -o casesensitivity=sensitive -o atime=off tank/vanilla
@@ -133,6 +143,22 @@ cat > /etc/smb4.conf <<CONF
     path = /tank/acl
     read only = no
     vfs objects = ixnas zfs_core
+    nfs4:mode = simple
+    nfs4:acedup = merge
+
+[zhome]
+    # Per-user dataset auto-creation with the *full* production-shaped stack:
+    # vfs_fruit (whose cwd_fsp-relative stat triggered the regression) + the
+    # ixnas ACL mapping, so zfs_core's connect-time ACL inheritance runs and is
+    # observable on disk. Object order follows middleware util_smbconf.py
+    # (fruit, streams, ixnas, then zfs_core). fruit:nfs_aces=no keeps fruit out
+    # of the ACL it would otherwise synthesise, leaving the ixnas/ZFS view clean.
+    path = /tank/home/%U
+    read only = no
+    vfs objects = fruit truenas_streams_xattr ixnas zfs_core
+    zfs_core:zfs_auto_create = yes
+    zfs_core:dataset_auto_quota = 1G
+    fruit:nfs_aces = no
     nfs4:mode = simple
     nfs4:acedup = merge
 
@@ -384,6 +410,78 @@ assert "WRITE_ACL" in o and "WRITE_OWNER" in o, \
   fi
 else
   echo "WARN: ZFS does not expose system.nfs4_acl_xdr on /tank/acl; skipping ACL suite"
+fi
+
+echo "=========================================="
+echo "Per-user dataset auto-creation + ACL inheritance (fruit + ixnas stack)"
+echo "=========================================="
+# Regression guard for zfs_core's connect-time ACL inheritance with vfs_fruit in
+# the stack. Connecting to [zhome] makes zfs_core create tank/home/smbtest via
+# libzfs and run zfs_inherit_acls(parent=tank/home, child=smbtest). That helper
+# stats the just-created child; with fruit's cwd_fsp-relative stat and the
+# connection's not-yet-valid cwd_fsp that failed EBADF -> ACCESS_DENIED, so a
+# successful connect + dataset creation here already gates the fix.
+zfs destroy -r tank/home/smbtest 2>/dev/null || true
+
+# Seed the parent dataset with a DISTINCTIVE inheritable ACE (named user root,
+# file+dir inherit) so the inheritance check proves the child got *this* entry,
+# not merely that it has some non-trivial ACL. owner@/group@/everyone@ are made
+# inheritable too so the auto-created child stays traversable by its owner.
+# truenas_setfacl/getfacl come from truenas_pyos, installed best-effort by the
+# ixnas section above; if absent, the connect+create assertions still run.
+MARKER_SET=0
+if command -v truenas_setfacl >/dev/null 2>&1; then
+  if truenas_setfacl -m 'owner@:full_set:fd:allow,group@:modify_set:fd:allow,everyone@:modify_set:fd:allow,user:0:modify_set:fd:allow' /tank/home; then
+    MARKER_SET=1
+    echo "seeded inheritable ACL on /tank/home:"; truenas_getfacl -n /tank/home || true
+  else
+    echo "WARN: could not seed inheritable ACL on /tank/home"
+  fi
+fi
+
+smbclient //127.0.0.1/zhome -U 'smbtest%testpass123' -c 'ls' \
+  || { echo "ERROR: connect to [zhome] failed -- zfs_inherit_acls EBADF regression under fruit?"; tail -80 /var/log/samba4/smbd.log; exit 1; }
+
+if zfs list -H -o name tank/home/smbtest >/dev/null 2>&1; then
+  echo "zfs_core auto-created tank/home/smbtest (fruit + ixnas in stack)"
+else
+  echo "ERROR: zfs_core did not create tank/home/smbtest"; zfs list -r tank/home; exit 1
+fi
+home_owner="$(stat -c %U /tank/home/smbtest 2>/dev/null || echo '?')"
+if [ "$home_owner" = "smbtest" ]; then
+  echo "auto-created dataset owned by connecting user: smbtest"
+else
+  echo "ERROR: tank/home/smbtest owner is [$home_owner], expected smbtest"; exit 1
+fi
+
+# Explicit ACL inheritance check: the auto-created child dataset must carry the
+# parent's distinctive inheritable named ACE (user:0). truenas_getfacl -j emits
+# per-ACE {who, perms[], flags[], type} using truenas_os NFS4Flag names, so we
+# look for who=user:0 still flagged inheritable (FILE_INHERIT/DIRECTORY_INHERIT).
+# A freshly created ZFS dataset has only a trivial owner@/group@/everyone@ ACL,
+# so a named user:0 entry can only be there because it was inherited from the
+# parent -- that presence is the proof of inheritance. We deliberately do NOT
+# require the per-ACE INHERITED flag: the ixnas backend maps the parent ACL into
+# a security descriptor without SEC_DESC_DACL_AUTO_INHERITED, so Samba's
+# se_create_child_secdesc() never stamps SEC_ACE_FLAG_INHERITED_ACE onto the
+# propagated ACEs (that round-trip lives only in the nfs4acl_xattr backend).
+if [ "$MARKER_SET" = 1 ]; then
+  echo "on-disk ACL of auto-created dataset:"; truenas_getfacl -n /tank/home/smbtest || true
+  if truenas_getfacl -j -n /tank/home/smbtest | python3 -c '
+import sys, json
+acl = json.loads(sys.stdin.read())
+inh = [a for a in acl["aces"] if a["who"] == "user:0"
+       and ({"FILE_INHERIT", "DIRECTORY_INHERIT"} & set(a["flags"]))]
+assert not acl["trivial"], "child dataset ACL is trivial; nothing was inherited"
+assert inh, "parent inheritable ACE absent on child: " + json.dumps(acl["aces"])
+print("inherited ACE present on child:", inh[0])
+'; then
+    echo "explicit ACL inheritance verified on auto-created dataset"
+  else
+    echo "ERROR: auto-created dataset did not inherit parent ACL"; tail -80 /var/log/samba4/smbd.log; exit 1
+  fi
+else
+  echo "WARN: truenas_pyos/truenas_setfacl unavailable; skipped explicit ACL-inheritance assertion (connect+create still gated above)"
 fi
 
 echo "=========================================="
