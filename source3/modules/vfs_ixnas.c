@@ -19,6 +19,7 @@
 #include "libcli/security/security.h"
 #include "librpc/gen_ndr/ndr_security.h"
 #include "smbd/smbd.h"
+#include "auth.h"
 #include "system/filesys.h"
 #include "passdb/lookup_sid.h"
 #include "nfs4_acls.h"
@@ -375,6 +376,206 @@ static bool fsp_set_zfsacl(files_struct *fsp, zfsacl_t zfsacl)
 }
 
 /*
+ * True if the ZFS ACL is a "fully open" everyone@ ACL: every entry is an
+ * everyone@ ALLOW entry (no DENY, no owner@/group@/named trustee) and at least
+ * one of them grants the full set of rights on the object itself (not
+ * inherit-only). Such an ACL imposes no real access control -- semantically a
+ * NULL DACL that ixnas materialised as everyone@ -- so it is the one state in
+ * which overriding ZFS's refusal to honor everyone@ WRITE_ACL/WRITE_OWNER is
+ * safe. Tolerates the hidden everyone@:empty entry ixnas adds for inheritance.
+ *
+ * Distinct from ixnas_zfsacl_get_dacl_type()'s strict IXNAS_NULL_DACL (single
+ * entry, no inheritance flags): this also matches the multi-entry, inheritable
+ * everyone@:FULL form. Observed with Avid MediaComposer, which applies an
+ * Everyone:Full DACL (dropping the inherited named-user ACE) to its content
+ * directories and to files created inside them via an SMB2 create-context
+ * security descriptor -- the create-time apply is what fails without the retry.
+ */
+static bool is_open_everyone(zfsacl_t zfsacl)
+{
+	bool ok;
+	uint cnt, i;
+	bool saw_full = false;
+
+	ok = zfsacl_get_acecnt(zfsacl, &cnt);
+	if (!ok || (cnt == 0)) {
+		return false;
+	}
+
+	for (i = 0; i < cnt; i++) {
+		zfsacl_entry_t ae = NULL;
+		zfsace_permset_t perms = 0;
+		zfsace_flagset_t flags = 0;
+		zfsace_who_t who_type = ZFSACL_UNDEFINED_TAG;
+		zfsace_id_t who_id = ZFSACL_UNDEFINED_ID;
+		zfsace_entry_type_t entry_type = 0;
+
+		ok = zfsacl_get_aclentry(zfsacl, i, &ae);
+		if (!ok) {
+			return false;
+		}
+
+		ok = zfsace_get_who(ae, &who_type, &who_id);
+		if (!ok) {
+			return false;
+		}
+		if ((who_type != ZFSACL_EVERYONE) ||
+		    (who_id != ZFSACL_UNDEFINED_ID)) {
+			return false;
+		}
+
+		ok = zfsace_get_entry_type(ae, &entry_type);
+		if (!ok || (entry_type != ZFSACL_ENTRY_TYPE_ALLOW)) {
+			return false;
+		}
+
+		ok = zfsace_get_permset(ae, &perms);
+		if (!ok) {
+			return false;
+		}
+
+		ok = zfsace_get_flagset(ae, &flags);
+		if (!ok) {
+			return false;
+		}
+
+		if ((perms == ZFSACE_FULL_SET) &&
+		    ((flags & ZFSACE_INHERIT_ONLY) == 0)) {
+			saw_full = true;
+		}
+	}
+
+	return saw_full;
+}
+
+/*
+ * True if the ACL grants owner@ full control on the object itself: some owner@
+ * (ZFSACL_USER_OBJ) ALLOW entry with the full permset, not inherit-only. ZFS
+ * strips WRITE_ACL from owner@ and, on a non-trivial ACL, lets only CAP_FOWNER
+ * write it, so the file owner cannot rewrite such an ACL without the privileged
+ * retry below. Coexisting group@/everyone@/named entries are fine.
+ */
+static bool acl_has_owner_full(zfsacl_t zfsacl)
+{
+	bool ok;
+	uint cnt, i;
+
+	ok = zfsacl_get_acecnt(zfsacl, &cnt);
+	if (!ok) {
+		return false;
+	}
+
+	for (i = 0; i < cnt; i++) {
+		zfsacl_entry_t ae = NULL;
+		zfsace_permset_t perms = 0;
+		zfsace_flagset_t flags = 0;
+		zfsace_who_t who_type = ZFSACL_UNDEFINED_TAG;
+		zfsace_id_t who_id = ZFSACL_UNDEFINED_ID;
+		zfsace_entry_type_t entry_type = 0;
+
+		ok = zfsacl_get_aclentry(zfsacl, i, &ae);
+		if (!ok) {
+			return false;
+		}
+		ok = zfsace_get_who(ae, &who_type, &who_id);
+		if (!ok) {
+			return false;
+		}
+		if (who_type != ZFSACL_USER_OBJ) {
+			continue;
+		}
+		ok = zfsace_get_entry_type(ae, &entry_type);
+		if (!ok || (entry_type != ZFSACL_ENTRY_TYPE_ALLOW)) {
+			continue;
+		}
+		ok = zfsace_get_permset(ae, &perms);
+		if (!ok) {
+			return false;
+		}
+		ok = zfsace_get_flagset(ae, &flags);
+		if (!ok) {
+			return false;
+		}
+		if ((perms == ZFSACE_FULL_SET) &&
+		    ((flags & ZFSACE_INHERIT_ONLY) == 0)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/* True if the connecting SMB user owns this file. */
+static bool fsp_caller_is_owner(files_struct *fsp)
+{
+	if (!VALID_STAT(fsp->fsp_name->st)) {
+		if (!NT_STATUS_IS_OK(vfs_stat_fsp(fsp))) {
+			return false;
+		}
+	}
+	return fsp->conn->session_info->unix_token->uid ==
+	       fsp->fsp_name->st.st_ex_uid;
+}
+
+/*
+ * Set the ZFS ACL, falling back to a privileged retry when SMB says the caller
+ * may manage the ACL but ZFS refuses. ZFS strips WRITE_ACL/WRITE_OWNER from
+ * owner@/group@/everyone@ ALLOW ACEs and, on a non-trivial ACL, grants WRITE_ACL
+ * only to CAP_FOWNER (zfs_acl.c uses secpolicy_vnode_chown there, not the
+ * owner-allowed secpolicy_vnode_setdac) -- so neither a fully-open everyone@
+ * object nor the owner of a normal file can rewrite the ACL, and fsp_set_zfsacl
+ * gets EACCES/EPERM. When @escalate is set (ixnas:zfs_acl_advertise_enforced, on
+ * by default) complete the set under become_root() (CAP_FOWNER) iff the on-disk
+ * ACL is a fully-open everyone@ ACL (no protection to bypass) or grants owner@
+ * full control and the connecting user owns the file. Only the set is
+ * privileged; the on-disk read is not. Any owner change is done separately by
+ * smb_set_nt_acl_nfs4() and stays ZFS-enforced.
+ */
+static bool fsp_set_zfsacl_escalate(files_struct *fsp, zfsacl_t zfsacl,
+				    bool escalate)
+{
+	int saved_errno, retry_errno;
+	zfsacl_t current = NULL;
+	bool may_escalate = false;
+	bool ok;
+
+	if (fsp_set_zfsacl(fsp, zfsacl)) {
+		return true;
+	}
+	if (!escalate || ((errno != EACCES) && (errno != EPERM))) {
+		return false;
+	}
+	saved_errno = errno;
+
+	/*
+	 * Reading the ACL needs no privilege (owner and everyone@ both hold
+	 * READ_ACL); read it as the user and fail closed unless the caller may
+	 * manage it: a fully-open everyone@ ACL, or an owner@ full-control ACL on
+	 * a file the connecting user owns.
+	 */
+	current = fsp_get_zfsacl(fsp);
+	if (current != NULL) {
+		may_escalate = is_open_everyone(current) ||
+			(acl_has_owner_full(current) &&
+			 fsp_caller_is_owner(fsp));
+		zfsacl_free(&current);
+	}
+	if (!may_escalate) {
+		errno = saved_errno;
+		return false;
+	}
+
+	/* Only the set needs root (CAP_FOWNER); the read above did not. */
+	become_root();
+	ok = fsp_set_zfsacl(fsp, zfsacl);
+	retry_errno = ok ? 0 : errno;
+	unbecome_root();
+
+	errno = retry_errno;
+	return ok;
+}
+
+/*
  * fsp_get_aclbrand() and path_get_aclbrand() both get the ACL brand on the
  * underlying filesystem. In almost all cases we rely on the ACL brand we
  * detected on the initial SMB tree connect, which is preferable to detecting
@@ -521,15 +722,17 @@ static bool zfsentry2smbace(zfsacl_entry_t ae, SMB_ACE4PROP_T *aceprop,
 
 	/*
 	 * Advertisement-only: ZFS will not honor WRITE_ACL/WRITE_OWNER granted
-	 * through owner@/group@/everyone@, so do not report those bits on the
-	 * special identities. This drops them from the SD we present, never from
-	 * what we store (the set path is untouched), so SMB and NFS clients on the
-	 * same dataset keep getting identical, ZFS-enforced access. Named
-	 * user/group entries (flags == 0) still convey these rights and so are
-	 * left intact. Gated by ixnas:zfs_acl_advertise_enforced.
+	 * through group@ (a group member cannot rewrite the ACL via group@), so do
+	 * not report those bits on group@. owner@ and everyone@ keep them: the file
+	 * owner may manage its ACL and a fully-open everyone@ ACL has no protection,
+	 * and fsp_set_zfsacl_escalate() completes those sets under privilege. This
+	 * drops bits only from the SD we present, never from what we store (the set
+	 * path is untouched). Named user/group entries (flags == 0) are untouched.
+	 * Gated by ixnas:zfs_acl_advertise_enforced.
 	 */
 	if (advertise_enforced &&
 	    (aceprop->flags & SMB_ACE4_ID_SPECIAL) &&
+	    (aceprop->who.special_id == SMB_ACE4_WHO_GROUP) &&
 	    (aceprop->aceType == SMB_ACE4_ACCESS_ALLOWED_ACE_TYPE)) {
 		aceprop->aceMask &= ~(SMB_ACE4_WRITE_ACL | SMB_ACE4_WRITE_OWNER);
 	}
@@ -1074,7 +1277,8 @@ static bool ixnas_process_smbacl(vfs_handle_struct *handle,
 	}
 
 	dump_acl_info(zfsacl);
-	if (!fsp_set_zfsacl(fsp, zfsacl)) {
+	if (!fsp_set_zfsacl_escalate(fsp, zfsacl,
+					 config->advertise_enforced_acl)) {
 		DBG_ERR("%s: failed to set acl: %s\n",
 			fsp_str_dbg(fsp), strerror(errno));
 		zfsacl_free(&zfsacl);
@@ -1121,6 +1325,11 @@ static NTSTATUS ixnas_fset_special_dacl(vfs_handle_struct *handle,
 	zfsacl_entry_t placeholder_entry = NULL;
 	bool ok;
 	zfsace_permset_t perms;
+	struct ixnas_config_data *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct ixnas_config_data,
+				return NT_STATUS_INTERNAL_ERROR);
 
 	switch (dtype) {
 	case IXNAS_NULL_DACL:
@@ -1162,7 +1371,8 @@ static NTSTATUS ixnas_fset_special_dacl(vfs_handle_struct *handle,
 	}
 
 	dump_acl_info(zfsacl);
-	if (!fsp_set_zfsacl(fsp, zfsacl)) {
+	if (!fsp_set_zfsacl_escalate(fsp, zfsacl,
+					 config->advertise_enforced_acl)) {
 		DBG_ERR("%s: failed to set acl: %s\n",
 			fsp_str_dbg(fsp), strerror(errno));
 		zfsacl_free(&zfsacl);
@@ -1494,9 +1704,13 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 	}
 
 	/*
-	 * Present only the WRITE_ACL/WRITE_OWNER that ZFS will actually honor:
-	 * strip those bits from owner@/group@/everyone@ in the SD we report (not
-	 * from what we store). Default on; set to no to advertise the raw ACL.
+	 * Reconcile the SMB ACL view and set operations with what the ZFS backend
+	 * actually enforces. On (default): strip the WRITE_ACL/WRITE_OWNER that ZFS
+	 * won't honor from owner@/group@/everyone@ in the SD we report (not from
+	 * what we store) -- except for a fully-open everyone@ ACL, which we
+	 * advertise in full and whose DACL writes we complete under privilege (see
+	 * is_open_everyone() / fsp_set_zfsacl_escalate()). Off: raw passthrough
+	 * of the stored ACL, no demotion and no privileged retry.
 	 */
 	config->advertise_enforced_acl = lp_parm_bool(SNUM(handle->conn),
 			"ixnas", "zfs_acl_advertise_enforced", true);

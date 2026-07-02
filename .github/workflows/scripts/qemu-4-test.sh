@@ -63,15 +63,18 @@ zfs create -o atime=off tank/tm
 chmod 0777 /tank/tm
 # NFSv4-ACL dataset for the ixnas ACL<->Security-Descriptor mapping tests. The
 # system.nfs4_acl_xdr xattr ixnas reads/writes is provided by the TrueNAS ZFS
-# module (built here), so the mapping is testable; aclmode=passthrough lets the
-# client install arbitrary ACLs.
-zfs create -o acltype=nfsv4 -o aclmode=passthrough \
+# module (built here), so the mapping is testable. aclmode=passthrough lets the
+# client install arbitrary ACLs; aclinherit=passthrough matches the TrueNAS SMB
+# default so inherited ACEs keep WRITE_ACL/WRITE_OWNER and no mode-derived
+# owner@/group@ is synthesised -- a child of an everyone@:full dir inherits the
+# full set (as production does), not the restricted-default stripped form.
+zfs create -o acltype=nfsv4 -o aclmode=passthrough -o aclinherit=passthrough \
            -o casesensitivity=insensitive -o atime=off tank/acl
 chmod 0777 /tank/acl
 # NFSv4-ACL dataset for the per-user auto-creation + ACL-inheritance test
 # ([zhome]). Same NFSv4/passthrough setup as tank/acl so an inheritable ACL
 # seeded here propagates into the dataset zfs_core auto-creates on connect.
-zfs create -o acltype=nfsv4 -o aclmode=passthrough \
+zfs create -o acltype=nfsv4 -o aclmode=passthrough -o aclinherit=passthrough \
            -o casesensitivity=insensitive -o atime=off tank/home
 chmod 0777 /tank/home
 # Case-SENSITIVE plain dataset for upstream smb2.* protocol regression, so the
@@ -357,11 +360,11 @@ if python3 -c "import os; os.getxattr('/tank/acl', 'system.nfs4_acl_xdr')" 2>/de
     echo "ERROR: truenas.acl mapping suite FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
   fi
 
-  # ---- Advertisement-only proof: SMB demotes special identities, on-disk
-  # (NFS view) ACL is left untouched. ixnas strips WRITE_ACL/WRITE_OWNER from
-  # owner@/group@/everyone@ in the SD it reports because ZFS will not honor them
-  # there, while named entries keep them. truenas_setfacl lays down a fixture
-  # carrying both on disk; truenas.acl.fixture_scope checks the SMB view; and
+  # ---- Advertisement-only proof: SMB demotes group@, on-disk (NFS view) ACL is
+  # left untouched. ixnas strips WRITE_ACL/WRITE_OWNER from group@ in the SD it
+  # reports (a group member cannot convey them there), while owner@, everyone@
+  # and named entries keep them. truenas_setfacl lays down a fixture carrying
+  # them on disk; truenas.acl.fixture_scope checks the SMB view; and
   # truenas_getfacl before/after proves the GET never rewrote the stored ACL.
   # Best-effort: truenas_pyos builds a C extension (needs gcc + libbsd-dev), so
   # skip without failing the run if it cannot be installed.
@@ -396,7 +399,7 @@ assert "WRITE_ACL" in o and "WRITE_OWNER" in o, \
     if "$SMBTORTURE" //127.0.0.1/zacl -U 'smbtest%testpass123' \
          --option='torture:acl_nfs4=yes' --option='torture:acl_fixture=pyfix' \
          truenas.acl.fixture_scope; then
-      echo "truenas.acl.fixture_scope PASSED (SMB demotes special, keeps named)"
+      echo "truenas.acl.fixture_scope PASSED (SMB demotes group@, keeps owner@/everyone@/named)"
     else
       echo "ERROR: truenas.acl.fixture_scope FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
     fi
