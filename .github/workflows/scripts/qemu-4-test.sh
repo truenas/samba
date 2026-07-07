@@ -43,7 +43,7 @@ echo "Verify TrueNAS VFS modules are installed"
 echo "=========================================="
 VFS_DIR="$(dirname "$(find /usr/lib -path '*/samba/vfs/zfs_core.so' -print -quit)")"
 echo "VFS dir: $VFS_DIR"
-for m in zfs_core truenas_streams_xattr; do
+for m in zfs_core truenas_streams_xattr truenas_recycle; do
   test -e "$VFS_DIR/$m.so" && echo "  ok $m.so" || { echo "  MISSING $m.so"; exit 1; }
 done
 SMBD="$(command -v smbd || echo /usr/sbin/smbd)"
@@ -81,6 +81,24 @@ chmod 0777 /tank/home
 # generic suites aren't tripped by ZFS case-insensitivity.
 zfs create -o casesensitivity=sensitive -o atime=off tank/vanilla
 chmod 0777 /tank/vanilla
+# Per-user recycle bin (vfs_truenas_recycle) validation datasets, one per ACL
+# flavour. The NFSv4 one is aclmode=restricted on purpose: that is the case
+# where a chmod of an inherited ACL fails EPERM, so recycle must set the bin
+# descriptor via an ACL set. aclinherit=passthrough matches the SMB default.
+zfs create -o acltype=posix -o casesensitivity=insensitive -o atime=off tank/recp
+chmod 0777 /tank/recp
+zfs create -o acltype=nfsv4 -o aclmode=restricted -o aclinherit=passthrough \
+           -o casesensitivity=insensitive -o atime=off tank/recn
+chmod 0777 /tank/recn
+# Nested child dataset mounted inside the [zrecn] share: proves a delete on a
+# child dataset recycles into that dataset's own bin (same mount, no EXDEV purge).
+zfs create -o acltype=nfsv4 -o aclmode=restricted -o aclinherit=passthrough \
+           -o casesensitivity=insensitive -o atime=off tank/recn/child
+chmod 0777 /tank/recn/child
+# POSIX dataset for the AD-layout recycle test (recycle:repository=.recycle/%D/%U),
+# exercising the two-level shared parent chain (.recycle and .recycle/<domain>).
+zfs create -o acltype=posix -o casesensitivity=insensitive -o atime=off tank/recad
+chmod 0777 /tank/recad
 echo "Dataset:"; zfs get casesensitivity tank/share
 
 echo "=========================================="
@@ -170,6 +188,37 @@ cat > /etc/smb4.conf <<CONF
     # protocol regression -- isolates protocol semantics from module quirks.
     path = /tank/vanilla
     read only = no
+
+[zrecp]
+    # Per-user recycle bin on a POSIX-ACL dataset.
+    path = /tank/recp
+    read only = no
+    vfs objects = truenas_recycle zfs_core
+    recycle:repository = .recycle/%U
+    recycle:keeptree = yes
+    recycle:subdir_mode = 0700
+
+[zrecn]
+    # Per-user recycle bin on an NFSv4-ACL dataset (aclmode=restricted). Object
+    # order follows middleware util_smbconf.py: ixnas, recycle, zfs_core.
+    path = /tank/recn
+    read only = no
+    vfs objects = ixnas truenas_recycle zfs_core
+    nfs4:mode = simple
+    nfs4:acedup = merge
+    recycle:repository = .recycle/%U
+    recycle:keeptree = yes
+    recycle:subdir_mode = 0700
+
+[zrecad]
+    # AD repository layout: two shared parents (.recycle and .recycle/%D) above
+    # the per-user leaf. %D resolves to the workgroup for the standalone user.
+    path = /tank/recad
+    read only = no
+    vfs objects = truenas_recycle zfs_core
+    recycle:repository = .recycle/%D/%U
+    recycle:keeptree = yes
+    recycle:subdir_mode = 0700
 CONF
 
 testparm -s /etc/smb4.conf >/dev/null && echo "testparm: OK"
@@ -486,6 +535,183 @@ print("inherited ACE present on child:", inh[0])
 else
   echo "WARN: truenas_pyos/truenas_setfacl unavailable; skipped explicit ACL-inheritance assertion (connect+create still gated above)"
 fi
+
+echo "=========================================="
+echo "Per-user recycle bin (truenas_recycle): POSIX + NFSv4"
+echo "=========================================="
+# Delete a file over SMB and prove truenas_recycle moved it into the per-user
+# bin <share>/.recycle/<user>/; that the bin was created (under become_root)
+# owned by the connecting user while the shared .recycle parent stays root-owned;
+# and that recycle:keeptree preserved the sub-path. Run on both ACL flavours.
+# The NFSv4 dataset is aclmode=restricted, where a chmod of the inherited ACL
+# would EPERM -- a correctly ACL'd bin there proves recycle set the descriptor
+# via an ACL set, not a chmod.
+recycle_smoke() {
+  local share="$1" root="$2" flavour="$3"
+  local bin="$root/.recycle/smbtest"
+  echo "--- [$share] $flavour ($root) ---"
+  rm -rf "$root/.recycle" "$root/sub" 2>/dev/null || true
+
+  echo "recycle-me" > /tmp/rec.txt
+  smbclient "//127.0.0.1/$share" -U 'smbtest%testpass123' \
+    -c 'put /tmp/rec.txt top.txt; rm top.txt' \
+    || { echo "ERROR: [$share] top-level put/rm failed"; tail -60 /var/log/samba4/smbd.log; exit 1; }
+  test -f "$bin/top.txt" \
+    || { echo "ERROR: [$share] top.txt not recycled to $bin/"; ls -laR "$root/.recycle" 2>/dev/null; tail -40 /var/log/samba4/smbd.log; exit 1; }
+
+  smbclient "//127.0.0.1/$share" -U 'smbtest%testpass123' \
+    -c 'mkdir sub; put /tmp/rec.txt sub\deep.txt; rm sub\deep.txt' \
+    || { echo "ERROR: [$share] keeptree put/rm failed"; exit 1; }
+  test -f "$bin/sub/deep.txt" \
+    || { echo "ERROR: [$share] keeptree file not recycled to $bin/sub/"; ls -laR "$root/.recycle"; exit 1; }
+
+  local bin_owner parent_owner
+  bin_owner="$(stat -c %U "$bin")"
+  parent_owner="$(stat -c %U "$root/.recycle")"
+  [ "$bin_owner" = "smbtest" ] \
+    || { echo "ERROR: [$share] bin owner [$bin_owner] != smbtest"; exit 1; }
+  [ "$parent_owner" = "root" ] \
+    || { echo "ERROR: [$share] .recycle parent owner [$parent_owner] != root"; exit 1; }
+  echo "  [$share] recycled top-level + keeptree; bin owned by smbtest, parent by root"
+}
+
+recycle_smoke zrecp /tank/recp POSIX
+
+# Seed the NFSv4 share root with a distinctive inheritable ACL so the shared
+# .recycle parent inherits it (recycle no longer hardcodes a grant). everyone@
+# is made inheritable so the connecting user can traverse to its bin; user:0 is
+# the distinctive marker asserted on .recycle afterwards. Best-effort:
+# truenas_setfacl comes from truenas_pyos (installed by the ixnas section).
+REC_INHERIT=0
+if command -v truenas_setfacl >/dev/null 2>&1; then
+  if truenas_setfacl -m 'owner@:full_set:fd:allow,group@:modify_set:fd:allow,everyone@:modify_set:fd:allow,user:0:modify_set:fd:allow' /tank/recn; then
+    REC_INHERIT=1
+    echo "seeded inheritable ACL on /tank/recn:"; truenas_getfacl -n /tank/recn || true
+  fi
+fi
+
+recycle_smoke zrecn /tank/recn NFSv4-restricted
+
+# The shared .recycle parent must carry the share root's inherited ACL (proof
+# recycle inherits rather than granting world): look for the distinctive user:0
+# marker still flagged inheritable on .recycle itself.
+if [ "$REC_INHERIT" = 1 ]; then
+  echo "--- [zrecn] .recycle inherited from share root ---"
+  truenas_getfacl -n /tank/recn/.recycle || true
+  if truenas_getfacl -j -n /tank/recn/.recycle | python3 -c '
+import sys, json
+acl = json.loads(sys.stdin.read())
+inh = [a for a in acl["aces"] if a["who"] == "user:0"
+       and ({"FILE_INHERIT", "DIRECTORY_INHERIT"} & set(a["flags"]))]
+assert inh, "shared .recycle did not inherit share-root ACE: " + json.dumps(acl["aces"])
+# A: the seed put everyone@/group@/user:0 :modify (write) here; the parent
+# lockdown must have stripped every non-owner ALLOW ACE to read+traverse.
+WRITE = {"WRITE_DATA", "APPEND_DATA", "WRITE_NAMED_ATTRS", "WRITE_ATTRIBUTES",
+         "DELETE_CHILD", "WRITE_ACL", "WRITE_OWNER"}
+writable = [a for a in acl["aces"]
+            if a["type"] == "allow" and a["who"] != "owner@"
+            and (WRITE & set(a["perms"]))]
+assert not writable, "shared .recycle grants write to a non-owner: " + json.dumps(writable)
+print("inherited ACE on .recycle:", inh[0]["who"], "| non-owner write stripped: ok")
+'; then
+    echo "  [zrecn] .recycle inherited the share-root ACL"
+  else
+    echo "ERROR: [zrecn] .recycle did not inherit the share-root ACL"; exit 1
+  fi
+fi
+
+# NFSv4: the per-user bin must carry an inheritable ALLOW entry for the user
+# (best-effort; truenas_getfacl comes from truenas_pyos, installed by the ixnas
+# section). A non-trivial ACL with an inheritable user ACE proves the descriptor
+# was set through the stack under aclmode=restricted.
+if command -v truenas_getfacl >/dev/null 2>&1; then
+  echo "--- [zrecn] per-user bin ACL (NFSv4) ---"
+  truenas_getfacl -n /tank/recn/.recycle/smbtest || true
+  if truenas_getfacl -j -n /tank/recn/.recycle/smbtest | python3 -c '
+import sys, json
+acl = json.loads(sys.stdin.read())
+assert not acl["trivial"], "bin ACL is trivial; ACL set did not take"
+uinh = [a for a in acl["aces"]
+        if (a["who"] == "owner@" or a["who"].startswith("user:"))
+        and a["type"] == "allow"
+        and {"FILE_INHERIT", "DIRECTORY_INHERIT"} <= set(a["flags"])]
+assert uinh, "no inheritable user ALLOW ACE on bin: " + json.dumps(acl["aces"])
+ginh = [a for a in acl["aces"] if a["who"].startswith("group:")
+        and a["type"] == "allow"
+        and {"FILE_INHERIT", "DIRECTORY_INHERIT"} <= set(a["flags"])]
+print("inheritable user ACE:", uinh[0]["who"],
+      "| inheritable group (admins) ACE:", ginh[0]["who"] if ginh else "(none)")
+'; then
+    echo "  [zrecn] bin ACL verified under aclmode=restricted"
+  else
+    echo "ERROR: [zrecn] bin ACL missing inheritable user entry"; exit 1
+  fi
+else
+  echo "WARN: truenas_getfacl unavailable; skipped NFSv4 bin-ACL assertion (recycle behaviour still gated above)"
+fi
+
+# Nested child dataset: a delete on tank/recn/child is on a *different mount*
+# than the share root, so a single share-root bin would EXDEV-purge it. It must
+# instead recycle into the child dataset's own bin, and must not touch the
+# child dataset root (the mountpoint) itself.
+echo "--- [zrecn] nested child dataset (cross-dataset recycle) ---"
+rm -rf /tank/recn/child/.recycle 2>/dev/null || true
+echo recycle-me > /tmp/rec.txt
+smbclient //127.0.0.1/zrecn -U 'smbtest%testpass123' \
+  -c 'put /tmp/rec.txt child\nested.txt; rm child\nested.txt' \
+  || { echo "ERROR: [zrecn] child-dataset put/rm failed"; tail -40 /var/log/samba4/smbd.log; exit 1; }
+test -f /tank/recn/child/.recycle/smbtest/nested.txt \
+  || { echo "ERROR: [zrecn] child-dataset file not recycled to its own bin (EXDEV purge?)"; ls -laR /tank/recn/child/.recycle 2>/dev/null; ls -la /tank/recn/child; exit 1; }
+test ! -e /tank/recn/.recycle/smbtest/nested.txt \
+  || { echo "ERROR: [zrecn] child-dataset file wrongly targeted the share-root bin"; exit 1; }
+# the child dataset root (mountpoint) must be left untouched, not relocked read-only
+cm="$(stat -c %A /tank/recn/child)"
+[ "${cm:8:1}" = "w" ] \
+  || { echo "ERROR: [zrecn] child dataset root relocked read-only ($cm) -- recycle touched the mountpoint!"; exit 1; }
+echo "  [zrecn] child-dataset file recycled to /tank/recn/child/.recycle/smbtest/ (own mount); mountpoint untouched"
+
+# POSIX: the bin should carry a default (inheritable) ACL, so keeptree subdirs
+# and the files moved in inherit the owner's access.
+echo "--- [zrecp] per-user bin ACL (POSIX) ---"
+getfacl -p /tank/recp/.recycle/smbtest 2>/dev/null || true
+if getfacl -p /tank/recp/.recycle/smbtest 2>/dev/null | grep -qE '^default:'; then
+  echo "  [zrecp] bin has an inheritable (default) POSIX ACL"
+else
+  echo "ERROR: [zrecp] bin lacks a default (inheritable) POSIX ACL"; exit 1
+fi
+
+# AD layout (.recycle/%D/%U): two shared parents above the per-user leaf. On a
+# POSIX share root with nothing to inherit, both shared parents must land at the
+# read-only floor (no group/other write) and stay root-owned, while the leaf is
+# owned by the connecting user. %D resolves to the workgroup, so discover the
+# recycled path by search rather than hardcoding it.
+echo "--- [zrecad] AD layout (.recycle/%D/%U), POSIX ---"
+rm -rf /tank/recad/.recycle 2>/dev/null || true
+echo recycle-me > /tmp/rec.txt
+smbclient //127.0.0.1/zrecad -U 'smbtest%testpass123' \
+  -c 'put /tmp/rec.txt top.txt; rm top.txt' \
+  || { echo "ERROR: [zrecad] put/rm failed"; tail -60 /var/log/samba4/smbd.log; exit 1; }
+found="$(find /tank/recad/.recycle -type f -name top.txt 2>/dev/null | head -1)"
+[ -n "$found" ] \
+  || { echo "ERROR: [zrecad] file not recycled under .recycle/<domain>/<user>/"; ls -laR /tank/recad/.recycle 2>/dev/null; exit 1; }
+leaf_dir="$(dirname "$found")"           # .recycle/<dom>/smbtest
+dom_dir="$(dirname "$leaf_dir")"         # .recycle/<dom>
+rec_dir="$(dirname "$dom_dir")"          # .recycle
+[ "$rec_dir" = /tank/recad/.recycle ] \
+  || { echo "ERROR: [zrecad] unexpected recycle depth for $found"; exit 1; }
+for d in "$rec_dir" "$dom_dir"; do
+  m="$(stat -c %A "$d")"; o="$(stat -c %U "$d")"
+  # "other" (index 8 of e.g. "drwxrwxr-x") is the class regular users fall into
+  # for a root:root dir, so no other-write == no regular user can write the
+  # shared parent. The group bits (index 5) are the POSIX ACL *mask*, not the
+  # real group perm, so they are not a reliable signal here -- the NFSv4 test
+  # checks the full ACL for non-owner writes.
+  [ "${m:8:1}" = "-" ] || { echo "ERROR: [zrecad] shared parent $d is other-writable ($m)"; exit 1; }
+  [ "$o" = root ] || { echo "ERROR: [zrecad] shared parent $d not root-owned ($o)"; exit 1; }
+done
+[ "$(stat -c %U "$leaf_dir")" = smbtest ] \
+  || { echo "ERROR: [zrecad] leaf $leaf_dir not owned by smbtest"; exit 1; }
+echo "  [zrecad] recycled to $found; both shared parents read-only+root, leaf owned by smbtest"
 
 echo "=========================================="
 echo "Upstream SMB2 protocol regression (vanilla share)"
