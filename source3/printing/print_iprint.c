@@ -121,10 +121,10 @@ static int iprint_get_server_version(http_t *http, char* serviceUri)
 			*response = NULL;	/* IPP Response */
 	ipp_attribute_t	*attr;			/* Current attribute */
 	cups_lang_t	*language = NULL;	/* Default language */
-	char		*ver;			/* server version pointer */
+	const char	*ver;			/* server version pointer */
 	char		*vertmp;		/* server version tmp pointer */
 	int		serverVersion = 0;	/* server version */
-	char		*os;			/* server os */
+	const char	*os;			/* server os */
 	int		osFlag = 0;		/* 0 for NetWare, 1 for anything else */
 	char		*temp;			/* pointer for string manipulation */
 
@@ -186,7 +186,8 @@ static int iprint_get_server_version(http_t *http, char* serviceUri)
 		if ((os = strstr(ippGetString(attr, 0, NULL),
                                   NOVELL_SERVER_SYSNAME)) != NULL) {
 			os += strlen(NOVELL_SERVER_SYSNAME);
-			if ((temp = strchr(os,'<')) != NULL)
+			temp = discard_const_p(char, os);
+			if ((temp = strchr(temp,'<')) != NULL)
 				*temp = '\0';
 			if (strcmp(os,NOVELL_SERVER_SYSNAME_NETWARE))
 				osFlag = 1; /* 1 for non-NetWare systems */
