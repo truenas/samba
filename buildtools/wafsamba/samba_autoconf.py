@@ -812,7 +812,8 @@ def SAMBA_CONFIG_H(conf, path=None):
                         testflags=True)
         conf.ADD_CFLAGS('-Werror=old-style-definition -Wold-style-definition',
                         testflags=True)
-
+        conf.ADD_CFLAGS('-Werror=tautological-compare',
+                        testflags=True)
         conf.ADD_CFLAGS('-Wformat=2 -Wno-format-y2k', testflags=True)
         conf.ADD_CFLAGS('-Wno-format-zero-length', testflags=True)
         conf.ADD_CFLAGS('-Werror=format-security -Wformat-security',
@@ -846,7 +847,6 @@ int main(void) {
 
         if not Options.options.disable_warnings_as_errors:
             conf.ADD_NAMED_CFLAGS('PICKY_CFLAGS', '-Werror -Wno-error=deprecated-declarations', testflags=True)
-            conf.ADD_NAMED_CFLAGS('PICKY_CFLAGS', '-Wno-error=tautological-compare', testflags=True)
             conf.ADD_NAMED_CFLAGS('PICKY_CFLAGS', '-Wno-error=cast-align', testflags=True)
 
     if Options.options.fatal_errors:
