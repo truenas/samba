@@ -1,0 +1,22 @@
+name: Nightly tests
+
+# Run the full QEMU build + smoke test once a day (and on demand) against
+# the current published TrueNAS kernel + OpenZFS <train>-nightly debs.
+# Those releases roll independently of this repo -- and of each other -- so
+# this is what notices kernel/ZFS-side breakage between PRs, including the
+# two nightlies drifting apart (qemu-3-build.sh refuses to proceed when the
+# OpenZFS debs were built against a kernel the linux nightly has moved past).
+# Scheduled workflows only fire from the default branch, so this inherently
+# exercises truenas/v4-24-stable.  The pipeline itself is the reusable
+# qemu-build-test.yml workflow, invoked via workflow_call.
+on:
+  schedule:
+    - cron: '41 5 * * *'  # 05:41 UTC daily, offset off :00 to dodge scheduler backlog
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/qemu-build-test.yml
