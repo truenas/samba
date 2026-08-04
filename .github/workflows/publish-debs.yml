@@ -1,0 +1,258 @@
+name: Publish debs
+
+# On every push to a mapped (publishable) branch, build the truenas-samba
+# deb against the published TrueNAS kernel headers and OpenZFS userland, and
+# republish it as a rolling <train>-nightly GitHub release on this repo.
+#
+# The build takes its two TrueNAS-specific inputs from the same rolling
+# <train>-nightly releases the QEMU test VM installs:
+#   * truenas/linux -- the linux-*libc-dev UAPI headers debian/control
+#     requires in place of the stock linux-libc-dev, and
+#   * truenas/zfs   -- the libzfs7 / libzfs7-devel / libnvpair3 / libuutil3
+#     that --with-libzfs builds against.  Only the openzfs-lib* subset is
+#     installed: the kmod is irrelevant to a userland build in a container.
+# The third non-Debian input, upstream liburing 2.15, is cloned and staged
+# by debian/build-liburing.sh during the build itself.
+#
+# This runs on merges only, deliberately decoupled from the QEMU functional
+# tests (qemu-build-test.yml): a pull request's QEMU run builds, installs
+# and smoke-tests this same tree inside the test VM and gates the merge, so
+# a push to a mapped branch publishes an already-validated tree directly. A
+# flaky QEMU runner must never be able to block shipping debs that already
+# passed on the branch.
+#
+# There is intentionally no cancelling workflow-level concurrency: the
+# publish job (below) serialises release writes with a non-cancelling group
+# so a rapid second push can never tear a half-written release.
+on:
+  push:
+    branches: [truenas/v4-24-stable, stable/26]
+
+jobs:
+  build-deb:
+    name: Build deb
+    runs-on: ubuntu-24.04
+    # The Debian release TrueNAS is based on.
+    container:
+      image: debian:trixie
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # Install deps (including git) before checkout: the base debian:trixie
+      # image has no git, which actions/checkout prefers.
+      - name: Install dependencies
+        run: |
+          apt-get update > /dev/null
+          # ca-certificates/curl/jq: fetch and verify the release assets.
+          # git: for actions/checkout, and for the pinned liburing clone in
+          # debian/build-liburing.sh.  The rest is the deb toolchain; this
+          # package's own Build-Depends come from apt-get build-dep below.
+          apt-get install -y \
+            ca-certificates curl jq git \
+            build-essential devscripts equivs fakeroot > /dev/null
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Map branch to TrueNAS train
+        run: |
+          # train-for-ref.sh is the single source of truth for the
+          # branch -> train mapping.
+          train="$(.github/workflows/scripts/train-for-ref.sh "$GITHUB_REF_NAME")"
+          echo "TRAIN=$train" >> "$GITHUB_ENV"
+          echo "Building against the $train train"
+
+      - name: Fetch and install TrueNAS kernel UAPI headers
+        run: |
+          # Only the linux-*libc-dev package is needed to compile Samba --
+          # not the bootable image.  It Provides/Conflicts the stock
+          # linux-libc-dev, so installing it both replaces the trixie headers
+          # and satisfies debian/control's
+          # linux-truenas-production-libc-dev Build-Depends.
+          manifest="$(.github/workflows/scripts/tn-fetch-debs.sh \
+            truenas/linux "$TRAIN" /tmp/tn-kernel 'linux-*libc-dev_*')"
+          apt-get install -y /tmp/tn-kernel/linux-*libc-dev_*.deb
+          echo "KERNEL_RELEASE=$(jq -r '.release' "$manifest")" >> "$GITHUB_ENV"
+
+      - name: Fetch and install TrueNAS OpenZFS userland
+        run: |
+          # The closed set Samba links against: openzfs-libzfs-dev plus its
+          # openzfs-* dependencies.  Each glob ends in '_' so the matching
+          # -dbgsym packages are left behind.  Everything outside the set
+          # (libssl-dev, libblkid1, ...) comes from trixie.
+          manifest="$(.github/workflows/scripts/tn-fetch-debs.sh \
+            truenas/zfs "$TRAIN" /tmp/zfs-debs \
+            'openzfs-libzfs-dev_*' 'openzfs-libzfs7_*' 'openzfs-libnvpair3_*' \
+            'openzfs-libuutil3_*' 'openzfs-libzfsbootenv1_*' 'openzfs-libzpool7_*')"
+          apt-get install -y /tmp/zfs-debs/openzfs-*.deb
+          echo "ZFS_VERSION=$(jq -r '.zfs_version' "$manifest")" >> "$GITHUB_ENV"
+
+      - name: Install Samba build dependencies
+        run: |
+          apt-get build-dep -y . || {
+            echo "apt-get build-dep failed; retrying via mk-build-deps..."
+            mk-build-deps --install --remove \
+              --tool='apt-get -o Debug::pkgProblemResolver=yes --no-install-recommends -y' \
+              debian/control
+          }
+          # Resolving the build-deps could have swapped the TrueNAS UAPI
+          # headers back out for the stock linux-libc-dev (they Conflict).
+          # Building against the TrueNAS ones is the point of this job.
+          if ! dpkg-query -W -f='${Status}' linux-truenas-production-libc-dev \
+               | grep -q '^install ok installed$'; then
+            echo "FATAL: linux-truenas-production-libc-dev is not installed;"
+            echo "Samba would compile against the stock linux-libc-dev instead."
+            exit 1
+          fi
+          dpkg-checkbuilddeps
+
+      - name: Build deb package
+        env:
+          DEBEMAIL: dev@truenas.com
+          DEBFULLNAME: TrueNAS Engineering
+        run: |
+          # Version the rolling deb above the changelog release it is based
+          # on so consecutive builds stay upgradeable, mirroring how
+          # truenas/zfs versions its own rolling debs.
+          dch -b -M \
+            -v "$(dpkg-parsechangelog -S Version)+truenas.$(date -u +%Y%m%d).$GITHUB_RUN_NUMBER" \
+            --force-distribution --distribution "${TRAIN}-nightly" \
+            "Rolling build of $GITHUB_REF_NAME at ${GITHUB_SHA::12}"
+          # Ships the auto-generated truenas-samba-dbgsym alongside the deb.
+          # Add noautodbgsym here if the symbols ever outgrow the release.
+          DEB_BUILD_OPTIONS="parallel=$(nproc)" dpkg-buildpackage -us -uc -b
+
+      - name: Assemble artifacts
+        if: success()
+        run: |
+          mkdir artifacts
+          mv ../truenas-samba*.deb artifacts
+          # liburing is statically linked into vfs_io_uring, so the version
+          # is a property of this build, not of anything installed -- read it
+          # back from the pin that produced it.
+          jq -n \
+            --arg train "$TRAIN" \
+            --arg samba_version "$(dpkg-parsechangelog -S Version)" \
+            --arg kernel_release "$KERNEL_RELEASE" \
+            --arg zfs_version "$ZFS_VERSION" \
+            --arg liburing_version \
+              "$(sed -n 's/^LIBURING_TAG="liburing-\(.*\)"$/\1/p' debian/build-liburing.sh)" \
+            '{train: $train, samba_version: $samba_version,
+              kernel_release: $kernel_release, zfs_version: $zfs_version,
+              liburing_version: $liburing_version}' \
+            > artifacts/buildinfo.json
+          cat artifacts/buildinfo.json
+          ls -l artifacts
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: truenas-samba-debs
+          path: artifacts
+
+  # On every push to a mapped branch, republish the debs built above as the
+  # single asset set of a per-train rolling prerelease (master-nightly /
+  # 26-nightly).  Release assets never expire and are downloadable
+  # anonymously at stable URLs:
+  #   https://github.com/truenas/samba/releases/download/master-nightly/<file>
+  # Consumers fetch manifest.json first, then verify against SHA256SUMS --
+  # which is exactly what .github/workflows/scripts/tn-fetch-debs.sh does for
+  # the truenas/linux and truenas/zfs releases this repo consumes.
+  publish:
+    needs: build-deb
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/truenas/v4-24-stable' || github.ref == 'refs/heads/stable/26') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-debs-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Download debs
+        uses: actions/download-artifact@v4
+        with:
+          name: truenas-samba-debs
+          path: truenas-samba-debs
+
+      - name: Assemble release assets
+        run: |
+          mkdir release-assets
+          cp truenas-samba-debs/*.deb release-assets/
+          for k in train samba_version kernel_release zfs_version liburing_version; do
+            echo "${k^^}=$(jq -r ".$k" truenas-samba-debs/buildinfo.json)" >> "$GITHUB_ENV"
+          done
+
+      - name: Generate checksums and manifest
+        run: |
+          cd release-assets
+          sha256sum *.deb > SHA256SUMS
+          ls *.deb | jq -R . | jq -s \
+            --arg branch "$GITHUB_REF_NAME" \
+            --arg commit "$GITHUB_SHA" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg samba_version "$SAMBA_VERSION" \
+            --arg kernel_release "$KERNEL_RELEASE" \
+            --arg zfs_version "$ZFS_VERSION" \
+            --arg liburing_version "$LIBURING_VERSION" \
+            '{
+              branch: $branch,
+              commit: $commit,
+              date: $date,
+              run_url: $run_url,
+              samba_version: $samba_version,
+              kernel_release: $kernel_release,
+              zfs_version: $zfs_version,
+              liburing_version: $liburing_version,
+              debs: .
+            }' > manifest.json
+          cat manifest.json
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # If the branch has already moved past this commit, let the run
+          # building the new tip publish instead - the release must never
+          # go back to an older deb.
+          tip=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$GITHUB_REF_NAME" --jq .object.sha)
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "$GITHUB_REF_NAME is now at $tip, not publishing $GITHUB_SHA"
+            exit 0
+          fi
+
+          tag="${TRAIN}-nightly"
+
+          {
+            echo "Rolling build of \`$GITHUB_REF_NAME\` at $GITHUB_SHA."
+            echo
+            echo "- truenas-samba version: \`$SAMBA_VERSION\`"
+            echo "- Built against TrueNAS kernel UAPI headers: \`$KERNEL_RELEASE\`"
+            echo "  from https://github.com/truenas/linux/releases/tag/$tag"
+            echo "- Built against TrueNAS OpenZFS: \`$ZFS_VERSION\`"
+            echo "  from https://github.com/truenas/zfs/releases/tag/$tag"
+            echo "- Statically linked upstream liburing: \`$LIBURING_VERSION\`"
+            echo "- Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "The tag and all assets are replaced on every push to"
+            echo "\`$GITHUB_REF_NAME\`. Fetch \`manifest.json\` to see what is"
+            echo "currently published and verify downloads against \`SHA256SUMS\`."
+            echo
+            echo "Match \`truenas-samba_*\` for the package alone;"
+            echo "\`truenas-samba-dbgsym_*\` is the detached debug symbols."
+          } > release-notes.md
+
+          gh release delete "$tag" --cleanup-tag --yes || true
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag" 2>/dev/null || true
+          gh release create "$tag" \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "TrueNAS $TRAIN Samba debs (nightly)" \
+            --notes-file release-notes.md \
+            release-assets/*.deb \
+            release-assets/SHA256SUMS \
+            release-assets/manifest.json

@@ -18,6 +18,13 @@ export PYSHORT=python3
 export PYTHON=$(shell which $(PYSHORT))
 export PYTHON_CONFIG="$(PYTHON)-config"
 
+# vfs_io_uring is built against the pinned upstream liburing that
+# debian/build-liburing.sh fetches and stages, not Debian's liburing-dev --
+# see that script for why, and for how it is linked. Putting the staged
+# pkgconfig directory first is what makes source3/wscript's
+# CHECK_CFG(package='liburing') resolve to it.
+LIBURING_PKG_CONFIG_PATH = $(CURDIR)/debian/liburing/stage/usr/lib/pkgconfig
+
 #WAF := $(PYTHON) ./buildtools/bin/waf -v
 WAF = make
 WAF_NO_PARALLEL := $(WAF) -j 1
@@ -88,7 +95,18 @@ endif
 	dh $* --with python3
 
 override_dh_auto_configure:
-	./configure $(conf_args)
+	debian/build-liburing.sh
+	PKG_CONFIG_PATH="$(LIBURING_PKG_CONFIG_PATH):$(PKG_CONFIG_PATH)" ./configure $(conf_args)
+	# source3/wscript only adds vfs_io_uring to the default module set when
+	# configure found liburing, and a miss there is not fatal to configure --
+	# so without this check a staging/pkg-config slip would quietly ship a
+	# package with no io_uring module at all.
+	grep -q '^#define HAVE_LIBURING 1' bin/default/include/config.h || \
+	  { echo "FATAL: configure did not pick up the staged liburing"; exit 1; }
+
+override_dh_auto_clean:
+	rm -rf debian/liburing
+	dh_auto_clean
 
 override_dh_auto_build:
 	DESTDIR="$(DESTDIR)" $(WAF)
