@@ -1,12 +1,19 @@
 name: Build & Test
 
-# Builds TrueNAS OpenZFS (kmod + userland) inside a Debian Trixie VM, then
-# builds this TrueNAS Samba tree against that libzfs and smoke-tests the
-# TrueNAS VFS stack (zfs_core, truenas_streams_xattr) on a real ZFS dataset.
+# Builds this TrueNAS Samba tree inside a Debian Trixie VM running the TrueNAS
+# kernel, against the prebuilt TrueNAS OpenZFS (kmod + userland), then
+# smoke-tests the TrueNAS VFS stack (zfs_core, truenas_streams_xattr, ...) on a
+# real ZFS dataset.
+#
+# The kernel image + UAPI headers (truenas/linux) and the OpenZFS debs
+# (truenas/zfs) are consumed from the rolling <train>-nightly GitHub releases
+# rather than built here, so CI compiles and runs against the same kernel/ZFS
+# pair TrueNAS ships -- which is also what debian/control's
+# linux-truenas-production-libc-dev Build-Depends demands.
 #
 # A VM is required (not a plain container) because:
-#   * the ZFS kernel module must be built against, and loaded into, a real
-#     running kernel, and
+#   * the prebuilt OpenZFS kmod only loads under the matching running kernel,
+#     so the VM has to boot the TrueNAS kernel, and
 #   * smbd/the VFS modules need real root + a real ZFS pool to exercise.
 
 on:
@@ -15,19 +22,36 @@ on:
     branches:
       - 'truenas/**'
       - 'SCALE-**'
+      - 'stable/**'
+  workflow_call:
+    inputs:
+      train:
+        # TrueNAS train (master or 26) whose rolling <train>-nightly kernel
+        # and OpenZFS releases to build and test against.  Empty (the
+        # default, used by nightly.yml and PR runs) means derive it from the
+        # branch via train-for-ref.sh.  Callers may pass a specific train to
+        # pin one.
+        description: "(optional) TrueNAS train to build against ('master' or '26'; default: derived from branch)"
+        type: string
+        required: false
+        default: ""
   workflow_dispatch:
+    inputs:
+      train:
+        type: string
+        required: false
+        default: ""
+        description: "(optional) TrueNAS train to build against ('master' or '26'; default: derived from branch)"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
-# Bump IMAGE_VERSION to bust both the cloud-image cache and the OpenZFS deb
-# cache together (e.g. after a kernel bump that needs a fresh kmod build).
+# Bump IMAGE_VERSION to bust the cloud-image and ccache caches together (e.g.
+# after a change that invalidates every cached object, such as moving to a
+# different kernel's UAPI headers).
 env:
-  IMAGE_VERSION: v1
-  # TrueNAS OpenZFS branch to build libzfs/kmod from. Keep in sync with the
-  # ZFS that TrueNAS SCALE ships and that debian/control's libzfs7 expects.
-  ZFS_BRANCH: truenas/zfs-2.4-release
+  IMAGE_VERSION: v2
 
 jobs:
   build-test:
@@ -36,25 +60,31 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        ref: ${{ github.event.pull_request.head.sha }}
+        # PR runs check out the PR head; push / workflow_dispatch /
+        # workflow_call runs (nightly) have no PR event, so fall back to the
+        # triggering commit.
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    - name: Determine TrueNAS train
+      id: train
+      run: |
+        # One train selects both the kernel and the OpenZFS built against it:
+        # an explicit input (workflow_dispatch or workflow_call) wins,
+        # otherwise the branch (the PR base on PRs, else the triggering ref)
+        # maps to its train.
+        if [ -n "${{ inputs.train }}" ]; then
+          TRAIN="${{ inputs.train }}"
+        elif [ "${{ github.event_name }}" = "pull_request" ]; then
+          TRAIN="$(.github/workflows/scripts/train-for-ref.sh "${{ github.base_ref }}")"
+        else
+          TRAIN="$(.github/workflows/scripts/train-for-ref.sh "${{ github.ref_name }}")"
+        fi
+        echo "train=$TRAIN" >> "$GITHUB_OUTPUT"
+        echo "Using TrueNAS train: $TRAIN"
 
     - name: Setup QEMU
       timeout-minutes: 10
       run: bash .github/workflows/scripts/qemu-1-setup.sh
-
-    - name: Get OpenZFS commit hash
-      id: zfs-hash
-      run: |
-        ZFS_COMMIT=$(git ls-remote https://github.com/truenas/zfs.git "refs/heads/${ZFS_BRANCH}" | cut -f1)
-        echo "hash=$ZFS_COMMIT" >> $GITHUB_OUTPUT
-        echo "OpenZFS ($ZFS_BRANCH) commit: $ZFS_COMMIT"
-
-    - name: Cache OpenZFS packages
-      id: cache-zfs
-      uses: actions/cache@v4
-      with:
-        path: /tmp/zfs-debs
-        key: zfs-debs-debian-trixie-${{ env.IMAGE_VERSION }}-${{ steps.zfs-hash.outputs.hash }}
 
     - name: Cache Debian Trixie cloud image
       id: cache-image
@@ -77,16 +107,15 @@ jobs:
       timeout-minutes: 10
       run: bash .github/workflows/scripts/qemu-2-start.sh
 
-    # Builds ZFS (or restores cached debs), then builds + installs this Samba
-    # tree against it. This is the long pole — full Samba build from source.
-    - name: Build ZFS + Samba in the VM
+    # Installs the prebuilt kernel + OpenZFS, then builds + installs this Samba
+    # tree against them. This is the long pole — full Samba build from source.
+    - name: Build Samba against the TrueNAS kernel + OpenZFS
       timeout-minutes: 150
       env:
-        ZFS_CACHE_HIT: ${{ steps.cache-zfs.outputs.cache-hit }}
-        ZFS_BRANCH: ${{ env.ZFS_BRANCH }}
+        TRAIN: ${{ steps.train.outputs.train }}
       run: bash .github/workflows/scripts/qemu-3-build.sh
 
-    - name: Restart VM to load kernel modules
+    - name: Restart VM into the TrueNAS kernel
       timeout-minutes: 10
       run: bash .github/workflows/scripts/qemu-3.5-restart.sh
 
