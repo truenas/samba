@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 
 ######################################################################
-# Smoke-test the freshly-built TrueNAS Samba against a real ZFS dataset:
+# Smoke-test the freshly-built TrueNAS Samba against a real ZFS dataset,
+# running on the TrueNAS kernel the VM was rebooted into:
+#   * confirm the TrueNAS kernel is what booted
 #   * load the ZFS kmod
 #   * create a (case-insensitive) ZFS dataset
 #   * serve it with `vfs objects = truenas_streams_xattr zfs_core`
@@ -20,6 +22,8 @@
 #   * ACL<->Security-Descriptor mapping via ixnas on an NFSv4-ACL dataset
 #   * a curated set of upstream smb2.* protocol regression suites against a
 #     case-sensitive vanilla share
+#   * the vfs_io_uring read/write path, which is linked against the pinned
+#     upstream liburing (debian/build-liburing.sh) rather than Debian's
 ######################################################################
 
 set -eu
@@ -30,6 +34,20 @@ source /tmp/vm-info.sh
 
 ssh debian@$VM_IP 'sudo bash -s' <<'REMOTE_SCRIPT'
 set -eu
+
+echo "=========================================="
+echo "Confirm the VM booted the TrueNAS kernel"
+echo "=========================================="
+# The prebuilt OpenZFS kmod only loads under the kernel it was built against,
+# and Samba was compiled against that kernel's UAPI headers. If the reboot in
+# qemu-3.5-restart.sh landed on anything else, say so here rather than let it
+# surface as a confusing modprobe failure.
+KREL="$(uname -r)"
+echo "Running kernel: $KREL"
+case "$KREL" in
+  *truenas*) echo "TrueNAS kernel confirmed" ;;
+  *) echo "ERROR: expected a TrueNAS kernel, booted $KREL"; exit 1 ;;
+esac
 
 echo "=========================================="
 echo "Load ZFS kernel module"
@@ -43,9 +61,17 @@ echo "Verify TrueNAS VFS modules are installed"
 echo "=========================================="
 VFS_DIR="$(dirname "$(find /usr/lib -path '*/samba/vfs/zfs_core.so' -print -quit)")"
 echo "VFS dir: $VFS_DIR"
-for m in zfs_core truenas_streams_xattr truenas_recycle; do
+for m in zfs_core truenas_streams_xattr truenas_recycle io_uring; do
   test -e "$VFS_DIR/$m.so" && echo "  ok $m.so" || { echo "  MISSING $m.so"; exit 1; }
 done
+# io_uring.so is linked against the pinned upstream liburing, statically
+# (debian/build-liburing.sh), so it must not have picked up a DT_NEEDED on
+# Debian's older liburing.so.2 -- that would mean the module is running
+# against 2.9 regardless of what it was compiled against.
+if ldd "$VFS_DIR/io_uring.so" | grep -i liburing; then
+  echo "ERROR: io_uring.so links a shared liburing (expected static)"; exit 1
+fi
+echo "  ok io_uring.so has no external liburing dependency"
 SMBD="$(command -v smbd || echo /usr/sbin/smbd)"
 echo "smbd: $SMBD"; "$SMBD" -b | grep -i 'WITH_LIBZFS\|HAVE_LIBZFS' || echo "(libzfs build flag not shown)"
 
@@ -81,6 +107,11 @@ chmod 0777 /tank/home
 # generic suites aren't tripped by ZFS case-insensitivity.
 zfs create -o casesensitivity=sensitive -o atime=off tank/vanilla
 chmod 0777 /tank/vanilla
+# Dedicated dataset for the vfs_io_uring read/write path, kept apart from
+# tank/vanilla so the smb2.* suites and the io_uring round-trip cannot see
+# each other's files.
+zfs create -o atime=off tank/uring
+chmod 0777 /tank/uring
 # Per-user recycle bin (vfs_truenas_recycle) validation datasets, one per ACL
 # flavour. The NFSv4 one is aclmode=restricted on purpose: that is the case
 # where a chmod of an inherited ACL fails EPERM, so recycle must set the bin
@@ -189,6 +220,15 @@ cat > /etc/smb4.conf <<CONF
     path = /tank/vanilla
     read only = no
 
+[zuring]
+    # Read/write routed through io_uring by vfs_io_uring, which is linked
+    # against the pinned upstream liburing (debian/build-liburing.sh). Placed
+    # last in the object list, as upstream's own selftest io_uring share does.
+    path = /tank/uring
+    read only = no
+    guest ok = yes
+    vfs objects = io_uring
+
 [zrecp]
     # Per-user recycle bin on a POSIX-ACL dataset.
     path = /tank/recp
@@ -278,6 +318,32 @@ else
 fi
 
 echo "=========================================="
+echo "io_uring read/write path (vfs_io_uring + upstream liburing)"
+echo "=========================================="
+# vfs_io_uring routes pread/pwrite/fsync through io_uring, so this is the
+# runtime proof that the statically-linked liburing 2.15 actually drives the
+# TrueNAS kernel's io_uring. A non-zero kernel.io_uring_disabled restricts or
+# forbids io_uring_setup (1 = unprivileged processes denied, 2 = everyone),
+# which would fail the tree connect for reasons that have nothing to do with
+# this build -- report that rather than call it a pass. Both Debian and the
+# TrueNAS kernel default to 0, so this is a safety valve, not the usual path.
+uring_disabled="$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0)"
+if [ "$uring_disabled" != "0" ]; then
+  echo "SKIP: kernel.io_uring_disabled=$uring_disabled (io_uring restricted)"
+else
+  # 4 MiB so the transfer spans many SMB2 reads/writes, i.e. a stream of
+  # submitted io_uring ops rather than a single one.
+  head -c 4194304 /dev/urandom > /tmp/uring.bin
+  smbclient //127.0.0.1/zuring -N -c "put /tmp/uring.bin big.bin" \
+    || { echo "ERROR: io_uring put failed"; tail -60 /var/log/samba4/smbd.log; exit 1; }
+  smbclient //127.0.0.1/zuring -N -c "get big.bin /tmp/uring.out" \
+    || { echo "ERROR: io_uring get failed"; tail -60 /var/log/samba4/smbd.log; exit 1; }
+  cmp /tmp/uring.bin /tmp/uring.out \
+    || { echo "ERROR: io_uring round-trip data mismatch"; exit 1; }
+  echo "4 MiB round-trip through vfs_io_uring OK"
+fi
+
+echo "=========================================="
 echo "Run the truenas smbtorture suite"
 echo "=========================================="
 # smbtorture needs an authenticated user (the smbclient checks above used guest).
@@ -297,8 +363,8 @@ echo "smbtorture: $SMBTORTURE"
 # truenas.rename.case_insensitive and truenas.streams.cap_and_offset run here.
 # truenas.shadow_copy.* and truenas.acl.* self-skip on this share (no
 # shadow_copy_zfs; not an ixnas NFSv4 share) -- they run against zsc/zacl below.
-# The streams cap matches the global "smbd max xattr size"; a TrueNAS-kernel CI
-# can raise both to exercise multi-MiB streams.
+# The streams cap matches the global "smbd max xattr size"; now that CI runs on
+# the TrueNAS kernel, both could be raised to exercise multi-MiB streams.
 if "$SMBTORTURE" //127.0.0.1/ztest -U 'smbtest%testpass123' \
      --option='torture:streams_cap=32768' truenas; then
   echo "truenas smbtorture suite PASSED"
