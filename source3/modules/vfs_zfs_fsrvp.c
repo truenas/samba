@@ -29,7 +29,7 @@
 #define ZFS_FSRVP_SNAPLEN 17
 
 struct zfs_fsrvp_config_data {
-	struct zfs_dataset *ds;
+	const struct zfs_dataset *ds;
 	char *dataset_name;
 };
 
@@ -113,7 +113,7 @@ static NTSTATUS zfs_fsrvp_snap_create(struct vfs_handle_struct *handle,
 	snprintf(snap_name, sizeof(snap_name), "%s-%ld%ld",
 		 ZFS_FSRVP_PREFIX, ts.tv_sec, ts.tv_nsec);
 	become_root();
-	ret = smb_zfs_snapshot(config->ds->zhandle, snap_name, false);
+	ret = smb_zfs_snapshot(config->ds->mnt_id, snap_name, false);
 	unbecome_root();
 	if (ret != 0) {
 		return map_nt_error_from_unix(errno);
@@ -187,14 +187,12 @@ static int zfs_fsrvp_connect(struct vfs_handle_struct *handle,
 {
 	int ret;
 	struct zfs_fsrvp_config_data *config = NULL;
-	struct zfs_dataset *ds = NULL;
+	const struct zfs_dataset *ds = NULL;
 	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
 	if (ret != 0) {
 		return ret;
 	}
-	ret = conn_zfs_init(handle->conn->sconn,
-			    handle->conn->connectpath,
-			    &ds, handle->conn->tcon != NULL);
+	ret = conn_zfs_init(handle->conn->connectpath, &ds);
 
 	if (ds == NULL) {
 		DBG_ERR("Failed to obtain dataset list for connect path. "

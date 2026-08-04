@@ -46,7 +46,7 @@ static struct vfs_offload_ctx *zfs_core_offload_ctx;
  * FSCTL).
  */
 static bool zfs_core_block_cloning_enabled(struct vfs_handle_struct *handle,
-                                           struct zfs_dataset *ds)
+                                           const struct zfs_dataset *ds)
 {
 	bool config_enabled;
 	bool feat_enabled;
@@ -63,7 +63,7 @@ static bool zfs_core_block_cloning_enabled(struct vfs_handle_struct *handle,
 		return false;
 	}
 
-	if (!smb_zfs_pool_feature_enabled(ds,
+	if (!smb_zfs_pool_feature_enabled(ds->mnt_id,
 					  SMBZFS_BLOCK_CLONING,
 					  &feat_enabled)) {
 		// libzfs call failed, which is unexpected, but we've
@@ -647,7 +647,7 @@ const zc_offload_ops_t zc_clone_opmap = (zc_offload_ops_t) {
 
 void zfs_core_set_offload_ops(struct vfs_handle_struct *handle,
 			      struct zfs_core_config_data *config,
-			      struct zfs_dataset *ds)
+			      const struct zfs_dataset *ds)
 {
 	SMB_ASSERT(config != NULL);
 	bool block_cloning_enabled;
