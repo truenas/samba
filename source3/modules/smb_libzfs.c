@@ -84,10 +84,15 @@ char *hasmntopt (const struct mntent *__mnt,
 #define ZFS_ALIAS_CACHE_BYTES (64 * 1024)
 
 /*
- * Cache keys are a prefix plus a 16 digit mount ID; the buffer is the key,
- * NUL padding included, so it has to hold the longest of them.
+ * Cache keys are a one byte tag and the mount ID's raw bytes. memcache
+ * orders keys with memcmp() over their length and copies them into the
+ * element, so a key needs no text encoding and no terminator: building one
+ * is a store and an eight byte copy rather than an snprintf() on every
+ * lookup, and these sit on the per-file path through smbfname_to_ds().
  */
-#define ZFS_CACHE_KEYLEN 32
+#define ZFS_CACHE_KEYLEN (1 + sizeof(uint64_t))
+#define ZFS_CACHE_TAG_MNT 'M'
+#define ZFS_CACHE_TAG_ALIAS 'A'
 
 typedef struct dataset_entry_internal {
 	struct zfs_dataset *ds;		/* published, as a const pointer */
@@ -170,29 +175,41 @@ static void global_handle_incref()
  * long as its connection lasts. The cache is bounded by the number of ZFS
  * mounts a given smbd actually serves.
  */
+
+/*
+ * The blob points into buf, so it lives exactly as long as the caller's
+ * buffer -- which is all memcache needs, since it copies the key.
+ */
+static DATA_BLOB zfs_cache_key(uint8_t buf[ZFS_CACHE_KEYLEN],
+			       uint8_t tag,
+			       uint64_t mnt_id)
+{
+	buf[0] = tag;
+	memcpy(&buf[1], &mnt_id, sizeof(mnt_id));
+
+	return data_blob_const(buf, ZFS_CACHE_KEYLEN);
+}
+
 static dataset_t *zcache_lookup_dataset(uint64_t mnt_id)
 {
-	char key[ZFS_CACHE_KEYLEN] = {0};
+	uint8_t key[ZFS_CACHE_KEYLEN];
 	dataset_t *out = NULL;
+	DATA_BLOB blob;
 
-	snprintf(key, sizeof(key), "MNT_0x%016" PRIx64, mnt_id);
+	blob = zfs_cache_key(key, ZFS_CACHE_TAG_MNT, mnt_id);
 
-	out = memcache_lookup_talloc(global_zcache,
-				     ZFS_CACHE,
-				     data_blob_const(&key, sizeof(key)));
+	out = memcache_lookup_talloc(global_zcache, ZFS_CACHE, blob);
 	return out;
 }
 
 static void zcache_add_dataset(dataset_t *ds)
 {
-	char key[ZFS_CACHE_KEYLEN] = {0};
+	uint8_t key[ZFS_CACHE_KEYLEN];
+	DATA_BLOB blob;
 
-	snprintf(key, sizeof(key), "MNT_0x%016" PRIx64, ds->ds->mnt_id);
+	blob = zfs_cache_key(key, ZFS_CACHE_TAG_MNT, ds->ds->mnt_id);
 
-	memcache_add_talloc(global_zcache,
-			    ZFS_CACHE,
-			    data_blob_const(&key, sizeof(key)),
-			    &ds);
+	memcache_add_talloc(global_zcache, ZFS_CACHE, blob, &ds);
 }
 
 /*
@@ -204,8 +221,9 @@ static void zcache_add_dataset(dataset_t *ds)
  */
 static void alias_cache_add(uint64_t queried_id, uint64_t dataset_id)
 {
-	char key[ZFS_CACHE_KEYLEN] = {0};
+	uint8_t key[ZFS_CACHE_KEYLEN];
 	uint64_t *value = NULL;
+	DATA_BLOB blob;
 
 	/*
 	 * ZFS_CACHE is a talloc-typed memcache kind, so the value has to be
@@ -218,24 +236,20 @@ static void alias_cache_add(uint64_t queried_id, uint64_t dataset_id)
 	}
 	*value = dataset_id;
 
-	snprintf(key, sizeof(key), "ALIAS_0x%016" PRIx64, queried_id);
+	blob = zfs_cache_key(key, ZFS_CACHE_TAG_ALIAS, queried_id);
 
-	memcache_add_talloc(global_alias_cache,
-			    ZFS_CACHE,
-			    data_blob_const(&key, sizeof(key)),
-			    &value);
+	memcache_add_talloc(global_alias_cache, ZFS_CACHE, blob, &value);
 }
 
 static bool alias_cache_lookup(uint64_t queried_id, uint64_t *dataset_id)
 {
-	char key[ZFS_CACHE_KEYLEN] = {0};
+	uint8_t key[ZFS_CACHE_KEYLEN];
 	uint64_t *value = NULL;
+	DATA_BLOB blob;
 
-	snprintf(key, sizeof(key), "ALIAS_0x%016" PRIx64, queried_id);
+	blob = zfs_cache_key(key, ZFS_CACHE_TAG_ALIAS, queried_id);
 
-	value = memcache_lookup_talloc(global_alias_cache,
-				       ZFS_CACHE,
-				       data_blob_const(&key, sizeof(key)));
+	value = memcache_lookup_talloc(global_alias_cache, ZFS_CACHE, blob);
 	if (value == NULL) {
 		return false;
 	}
