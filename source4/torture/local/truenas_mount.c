@@ -1053,8 +1053,18 @@ static bool test_libzfs_create_dataset(struct torture_context *tctx)
 	torture_assert_str_equal(tctx, created[2]->mountpoint, mp,
 				 "anchor mountpoint");
 	tn_zfs_destroy(name);
+
+	/*
+	 * The directory is usually gone already: destroying a dataset whose
+	 * mountpoint property is inherited makes libzfs rmdir() that
+	 * mountpoint (remove_mountpoint(), lib/libzfs/libzfs_mount.c), and
+	 * that is the plain directory the dataset was mounted over. Either
+	 * way it must not still be there -- an EBUSY here would mean the
+	 * dataset was never unmounted.
+	 */
 	ret = rmdir(subdir);
-	torture_assert_int_equal(tctx, ret, 0, "rmdir subdir");
+	torture_assert(tctx, (ret == 0) || (errno == ENOENT),
+		       "subdir gone after the dataset was destroyed");
 
 	/* intermediate datasets, deepest first */
 	snprintf(path, sizeof(path), "%s/tn_ac_deep/a/b", mp);
