@@ -38,7 +38,7 @@ static bool zfs_core_get_integrity_info(struct vfs_handle_struct *handle,
 					struct files_struct *fsp,
 					struct zfs_integrity_info *info)
 {
-	struct zfs_dataset *ds = NULL;
+	const struct zfs_dataset *ds = NULL;
 	struct zfs_core_config_data *config = NULL;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,

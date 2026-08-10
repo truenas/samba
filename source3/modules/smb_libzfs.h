@@ -30,9 +30,6 @@
 #include <pwd.h>
 #include <talloc.h>
 
-struct smbzhandle;
-typedef struct smbzhandle *smbzhandle_t;
-
 #define SMBGMT_NAMELEN 25
 #define ZFSDS_NAMELEN 256
 /*
@@ -99,60 +96,61 @@ struct zfs_dataset_prop
 	uint64_t record_size;
 };
 
+/*
+ * Facts about a mounted ZFS dataset. Instances are owned by the library
+ * and live for the life of the process: callers hold const pointers to
+ * them and never free or modify one. The ZFS dataset handle behind an
+ * instance is internal -- every operation below takes the mount ID and
+ * looks the handle up, so a handle is never shared with a caller.
+ */
 struct zfs_dataset
 {
 	char dataset_name[ZFSDS_NAMELEN];
 	char mountpoint[PATH_MAX];
-	smbzhandle_t zhandle;
-	dev_t devid;
+	uint64_t mnt_id;	/* unique mount ID of the dataset mount */
 	struct zfs_dataset_prop *properties;
 };
 
-#ifdef DOXYGEN
-int get_smbzhandle(TALLOC_CTX *mem_ctx, const char *path,
-		   struct smbzhandle **smbzhandle,
-		   bool resolve);
-#else
-#define	get_smbzhandle(mem_ctx, path, smbzhandle, resolve) \
-	_get_smbzhandle(mem_ctx, path, smbzhandle, resolve, __location__)
-#endif
-
-#ifdef DOXYGEN
-int fget_smbzhandle(TALLOC_CTX *mem_ctx, int fd,
-                    smbzhandle_t *smbzhandle);
-#else
-#define	fget_smbzhandle(mem_ctx, fd, smbzhandle) \
-	_fget_smbzhandle(mem_ctx, path, smbzhandle, __location__)
-#endif
+/*
+ * Look up the dataset backing a unique mount ID (st_ex_mnt_id in any
+ * SMB_STRUCT_STAT). Mount IDs of snapshot automounts resolve to the
+ * dataset the snapshot belongs to.
+ *
+ * @param[in]	mnt_id		unique mount ID
+ *
+ * @return	dataset, or NULL with errno set: ENOTSUP when the mount is
+ *		not ZFS, otherwise the failure of the lookup itself
+ */
+const struct zfs_dataset *smb_zfs_lookup_dataset(uint64_t mnt_id);
 
 /*
- * Get userspace quotas for a given path, ID, and quota type.
- * @param[in]	hdl			ZFS dataset handle from which to get quota
+ * Get userspace quotas for a given mount, ID, and quota type.
+ * @param[in]	mnt_id			mount ID of the dataset
  * @param[in]	xid		 	user id or group id.
  * @param[in]	quota_type	 	quota type
  * @param[out]	qt			zfs_quota struct with quota info
  *
  * @return	0 on success -1 on failure
  */
-int smb_zfs_get_quota(struct smbzhandle *hdl,
+int smb_zfs_get_quota(uint64_t mnt_id,
 		      uint64_t xid,
 		      enum zfs_quotatype quota_type,
 		      struct zfs_quota *qt);
 
 /*
- * Set userspace quotas for a given path, ID, and quota type. May require
+ * Set userspace quotas for a given mount, ID, and quota type. May
  * fail with EPERM if user lacks permissions to set quota.
- * @param[in]	hdl			ZFS dataset handle on which to get quota
+ * @param[in]	mnt_id			mount ID of the dataset
  * @param[in]	xid		 	user id or group id.
  * @param[in]	qt		 	struct containing quota info
  *
  * @return	0 on success -1 on failure
  */
-int smb_zfs_set_quota(struct smbzhandle *hdl,
+int smb_zfs_set_quota(uint64_t mnt_id,
 		      uint64_t xid,
 		      struct zfs_quota qt);
 
-uint64_t smb_zfs_disk_free(struct smbzhandle *hdl,
+uint64_t smb_zfs_disk_free(uint64_t mnt_id,
 			   uint64_t *bsize,
 			   uint64_t *dfree,
 			   uint64_t *dsize);
@@ -166,12 +164,23 @@ uint64_t smb_zfs_disk_free(struct smbzhandle *hdl,
  * and mounted. In this situation, the specified `quota` will only be
  * applied to "zroot/share/foo/bar", and not to the intermediate datasets.
  *
- * @param[in]	mem_ctx			memory context under which to
- *					allocate the output dataset_list
- * @param[in]	smblibzfsp		smblibzfs handle struct
+ * The datasets that have to exist are counted below the dataset the path
+ * already lies in, so the nearest existing ancestor of the path being a
+ * plain directory rather than a mountpoint means a dataset is created for
+ * it too -- and without `create_ancestors` that is refused rather than
+ * done silently.
+ *
+ * @param[in]	mem_ctx			memory context for the returned
+ *					array itself
  * @para[in]	path			path to be created.
  * @para[in]	quota			quota to set on final dataset.
- * @para[out]	_array_out		pointer to array of datasets.
+ * @para[out]	_array_out		array of the datasets created,
+ *					deepest first, followed by the
+ *					pre-existing dataset they nest under.
+ *					The array is allocated under mem_ctx;
+ *					its elements are owned by the library
+ *					and must not be freed (see
+ *					smb_zfs_lookup_dataset()).
  * @para[out]	_nentries		number of datasets.
  * @para[in]	create_ancestors	create intermediate datasets.
  *
@@ -179,89 +188,16 @@ uint64_t smb_zfs_disk_free(struct smbzhandle *hdl,
  */
 int smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 			   const char *path, const char *quota,
-			   struct zfs_dataset ***_array_out,
+			   const struct zfs_dataset ***_array_out,
 			   size_t *_nentries,
 			   bool create_ancestors);
-
-
-/*
- * Retrieve the value of a user-defined ZFS dataset property
- * "org.samba:" prefix will be automatically applied.
- *
- * @param[in]	hdl			ZFS dataset from which to retrieve property
- * @param[in]	mem_ctx			talloc memory context
- * @param[in]	prop			property name
- * @param[out]	value			talloc'ed string containing
- *					value of propert.
- *
- * @return	0 on success -1 on failure
- */
-int smb_zfs_get_user_prop(smbzhandle_t hdl,
-			  TALLOC_CTX *mem_ctx,
-			  const char *prop,
-			  char **value);
-
-/*
- * Set the value of a user-defined ZFS dataset property.
- * "org.samba:" prefix will be automatically applied.
- *
- * @param[in]	hdl			ZFS dataset on which to apply custom
- *					proprety
- * @param[in]	prop			property name
- * @param[out]	value			value to set
- *
- * @return	0 on success -1 on failure
- */
-int smb_zfs_set_user_prop(smbzhandle_t hdl,
-			  const char *prop,
-			  const char *value);
-
-/*
- * Returns ZFS dataset information for a given path or dataset name.
- * If get_props is set to True, then ZFS dataset properties are included
- * in the returned zfs_dataset struct.
- */
-#ifdef DOXYGEN
-struct zfs_dataset *smb_zfs_path_get_dataset(TALLOC_CTX *mem_ctx,
-					     const char *path,
-					     bool get_props,
-					     bool open_zhandle,
-					     bool resolve_path);
-#else
-#define	smb_zfs_path_get_dataset(mem_ctx, path, get_props, open, resolve)\
-	(struct zfs_dataset *)_smb_zfs_path_get_dataset(\
-		mem_ctx, path, get_props, open, resolve, __location__)
-
-struct zfs_dataset *_smb_zfs_path_get_dataset(TALLOC_CTX *mem_ctx,
-					      const char *path,
-					      bool get_props,
-					      bool open_zhandle,
-					      bool resolve_path,
-					      const char *location);
-#endif
-
-#ifdef DOXYGEN
-struct zfs_dataset *smb_zfs_fd_get_dataset(TALLOC_CTX *mem_ctx,
-					   int fd,
-					   bool get_props,
-					   bool open_zhandle);
-#else
-#define	smb_zfs_fd_get_dataset(mem_ctx, fd, get_props, open_zhandle)\
-	(struct zfs_dataset *)_smb_zfs_fd_get_dataset(\
-		mem_ctx, fd, get_props, open_zhandle, __location__)
-
-struct zfs_dataset *_smb_zfs_fd_get_dataset(TALLOC_CTX *mem_ctx,
-					    int fd,
-					    bool get_props,
-					    bool open_zhandle,
-					    const char *location);
-#endif
 
 /*
  * This function returns a list of ZFS snapshots matching the specified
  * filters, allocated under a user-provided talloc memory context. Returns
- * NULL on error. It is a wrapper around zhandle_list_snapshots.
+ * NULL on error.
  *
+ * @param[in]	mnt_id			mount ID of the dataset.
  * @param[in]	mem_ctx			talloc memory context
  * @param[in]	ignore_empty_snaps	ignore snapshots with zero space used
  * @param[in]	inclusions		list of filters to determine whether to
@@ -276,33 +212,10 @@ struct zfs_dataset *_smb_zfs_fd_get_dataset(TALLOC_CTX *mem_ctx,
  * @return	struct snapshot_list
  */
 struct snapshot_list *smb_zfs_list_snapshots(TALLOC_CTX *mem_ctx,
-					     const char *fs,
+					     uint64_t mnt_id,
 					     struct snap_filter *filter);
 
-/*
- * This function returns a list of ZFS snapshots matching the specified
- * filters, allocated under a user-provided talloc memory context. Returns
- * NULL on error.
- *
- * @param[in]	smbzhandle		smbzhandle struct (typically from dataset).
- * @param[in]	mem_ctx			talloc memory context
- * @param[in]	ignore_empty_snaps	ignore snapshots with zero space used
- * @param[in]	inclusions		list of filters to determine whether to
- *					include a snapshot
- * @param[in]	exclusions		list of filters to determine whether to
- *					exclude a snapshot
- * @param[in]	start			snapshots with create time greater than
- *					this will be included
- * @param[in]	end			snapshots with create time less than
- *					this will be included
- *
- * @return	struct snapshot_list
- */
-struct snapshot_list *zhandle_list_snapshots(smbzhandle_t hdl,
-					     TALLOC_CTX *mem_ctx,
-					     struct snap_filter *filter);
-
-bool update_snapshot_list(smbzhandle_t hdl,
+bool update_snapshot_list(uint64_t mnt_id,
 			  struct snapshot_list *snaps,
 			  struct snap_filter *filter);
 
@@ -318,44 +231,42 @@ bool update_snapshot_list(smbzhandle_t hdl,
 int smb_zfs_delete_snapshots(struct snapshot_list *snaps);
 
 /*
- * Take a named snapshot of a given path.
- * @param[in]	hdl			ZFS dataset handle to snapshot
+ * Take a named snapshot of a given dataset.
+ * @param[in]	mnt_id			mount ID of the dataset to snapshot
  * @param[in]	snapshot_name		name to give snapshot
  * @param[in]	recursive		snapshot child datasets
  *
  * @return	0 on success -1 on failure
  */
-int smb_zfs_snapshot(smbzhandle_t hdl,
+int smb_zfs_snapshot(uint64_t mnt_id,
 		     const char *snapshot_name,
 		     bool recursive);
 
 /*
  * Check whether the specified zpool feature is enabled
  *
- * @param[in] ds - pointer to fully initialized struct zfs_dataset
+ * @param[in] mnt_id - mount ID of a dataset in the pool
  * @param[in] feature - feature to check
  * @param[out] enabled - whether feature is enabled
  *
  * @return - bool true on success else false
  */
-bool smb_zfs_pool_feature_enabled(struct zfs_dataset *ds,
+bool smb_zfs_pool_feature_enabled(uint64_t mnt_id,
 				  enum zfs_feature feature,
 				  bool *enabled_out);
 
 /*
- * Initialize global libzfs handle if necessary and populate
- * dataset list for connectpath
+ * Initialize global libzfs handle if necessary and look up the
+ * dataset for the connectpath. *ppds is set to NULL (with a return
+ * value of 0) if the connectpath is not on ZFS.
  *
- * @param[in]	mem_ctx			talloc memory context on which to hang results.
  * @param[in]	connectpath		connectpath to share.
- * @param[out]	ppdsl			dataset for connectpath.
- * @param[in]	has_tcon		indicates whether talloc ctx is short-lived
+ * @param[out]	ppds			dataset for connectpath, owned by
+ *					the library.
  * @return	0 on success -1 on failure
  */
-int conn_zfs_init(TALLOC_CTX *mem_ctx,
-		  const char *connectpath,
-		  struct zfs_dataset **ppds,
-		  bool has_tcon);
+int conn_zfs_init(const char *connectpath,
+		  const struct zfs_dataset **ppds);
 
 bool inode_is_ctldir(ino_t ino);
 #endif	/* !__SMB_LIBZFS_H */

@@ -26,18 +26,14 @@
 
 static int vfs_zfs_core_debug_level = DBGC_VFS;
 
-struct zfs_dataset *smbfname_to_ds(const struct connection_struct *conn,
+const struct zfs_dataset *smbfname_to_ds(const struct connection_struct *conn,
 				   struct zfs_core_config_data *config,
 				   const struct smb_filename *smb_fname)
 {
 	int ret;
 	SMB_STRUCT_STAT sbuf;
 	const SMB_STRUCT_STAT *psbuf = NULL;
-	struct zfs_dataset *resolved = NULL;
-	char *full_path = NULL;
-	char *to_free = NULL;
-	char path[PATH_MAX + 1];
-	int len;
+	const struct zfs_dataset *resolved = NULL;
 
 	SMB_ASSERT(config->ds != NULL);
 	if (VALID_STAT(smb_fname->st)) {
@@ -54,45 +50,34 @@ struct zfs_dataset *smbfname_to_ds(const struct connection_struct *conn,
 		psbuf = &sbuf;
 	}
 
-	if (psbuf->st_ex_dev == config->ds->devid) {
-		return config->ds;
-	}
-
-	if (config->singleton &&
-	    (config->singleton->devid == psbuf->st_ex_dev)) {
-		return config->singleton;
-	}
-
-	len = full_path_tos(discard_const(conn->cwd_fsp->fsp_name->base_name),
-			    smb_fname->base_name,
-			    path, sizeof(path),
-			    &full_path, &to_free);
-	if (len == -1) {
-		DBG_ERR("Could not allocate memory in full_path_tos.\n");
+	if (psbuf->st_ex_mnt_id == 0) {
+		/*
+		 * Every stat taken through our VFS carries the unique mount
+		 * ID. A zero here means the SMB_STRUCT_STAT was synthesized
+		 * elsewhere and there is nothing to resolve.
+		 */
+		DBG_ERR("%s: stat has no unique mount ID\n",
+			smb_fname_str_dbg(smb_fname));
+		errno = ENOTSUP;
 		return NULL;
 	}
 
-	/*
-	 * Our current cache of datasets does not contain the path in
-	 * question. Use libzfs to try to get it. Allocate under
-	 * memory context of our dataset list.
-	 */
-	resolved = smb_zfs_path_get_dataset(config, path, true, true, true);
+	if (psbuf->st_ex_mnt_id == config->ds->mnt_id) {
+		return config->ds;
+	}
+
+	resolved = smb_zfs_lookup_dataset(psbuf->st_ex_mnt_id);
 	if (resolved != NULL) {
-		TALLOC_FREE(config->singleton);
-		TALLOC_FREE(to_free);
-		config->singleton = resolved;
 		return resolved;
 	}
 
-	DBG_ERR("No dataset found for %s with device id: %lu\n",
-		path, psbuf->st_ex_dev);
-	TALLOC_FREE(to_free);
+	DBG_ERR("%s: no dataset found for mount id: %" PRIu64 "\n",
+		smb_fname_str_dbg(smb_fname), psbuf->st_ex_mnt_id);
 	errno = ENOENT;
 	return NULL;
 }
 
-struct zfs_dataset *zfs_core_fsp_get_ds(struct vfs_handle_struct *handle,
+const struct zfs_dataset *zfs_core_fsp_get_ds(struct vfs_handle_struct *handle,
 					struct files_struct *fsp)
 {
 	struct zfs_core_config_data *config = NULL;

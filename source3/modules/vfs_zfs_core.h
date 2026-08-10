@@ -45,9 +45,8 @@ typedef struct zfs_core_offload_ops {
 } zc_offload_ops_t;
 
 struct zfs_core_config_data {
-	struct zfs_dataset *ds;
-	struct zfs_dataset *singleton;
-	struct zfs_dataset **created;
+	const struct zfs_dataset *ds;
+	const struct zfs_dataset **created;
 	size_t ncreated;
 	bool zfs_space_enabled;
 	bool zfs_quota_enabled;
@@ -99,11 +98,11 @@ NTSTATUS zfs_core_offload_write_recv(struct vfs_handle_struct *handle,
 
 void zfs_core_set_offload_ops(struct vfs_handle_struct *handle,
 			      struct zfs_core_config_data *config,
-			      struct zfs_dataset *ds);
+			      const struct zfs_dataset *ds);
 
-struct zfs_dataset *smbfname_to_ds(const struct connection_struct *conn,
+const struct zfs_dataset *smbfname_to_ds(const struct connection_struct *conn,
 				   struct zfs_core_config_data *config,
 				   const struct smb_filename *smb_fname);
 
-struct zfs_dataset *zfs_core_fsp_get_ds(struct vfs_handle_struct *handle,
+const struct zfs_dataset *zfs_core_fsp_get_ds(struct vfs_handle_struct *handle,
 					struct files_struct *fsp);
