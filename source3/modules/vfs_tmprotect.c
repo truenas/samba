@@ -37,7 +37,7 @@ static int vfs_tmprotect_debug_level = DBGC_VFS;
 #define DBGC_CLASS vfs_tmprotect_debug_level
 
 struct tmprotect_config_data {
-	struct smbzhandle *hdl;
+	uint64_t mnt_id;
 	struct snap_filter *filter;
 	int retention;
 	int min_snaps;
@@ -56,12 +56,9 @@ static bool init_zfs(vfs_handle_struct *handle,
 {
 	int ret;
 	struct smblibzfshandle *libzp = NULL;
-	struct zfs_dataset *ds = NULL;
+	const struct zfs_dataset *ds = NULL;
 
-	ret = conn_zfs_init(handle->conn->sconn,
-			    handle->conn->connectpath,
-			    &ds,
-			    handle->conn->tcon != NULL);
+	ret = conn_zfs_init(handle->conn->connectpath, &ds);
 	if (ret != 0) {
 		DBG_ERR("Failed to initialize libzfs: %s\n", strerror(errno));
 		return false;
@@ -72,7 +69,7 @@ static bool init_zfs(vfs_handle_struct *handle,
 		errno = EINVAL;
 		return false;
 	}
-	config->hdl = ds->zhandle;
+	config->mnt_id = ds->mnt_id;
 	return true;
 }
 
@@ -95,8 +92,7 @@ static bool prune_snapshots(vfs_handle_struct *handle,
 	if (!config->enabled) {
 		return false;
 	}
-	snapshots = zhandle_list_snapshots(config->hdl,
-					   talloc_tos(),
+	snapshots = smb_zfs_list_snapshots(talloc_tos(), config->mnt_id,
 					   config->filter);
 	if (snapshots == NULL) {
 		return false;
@@ -166,8 +162,7 @@ static bool last_snap_ts(vfs_handle_struct *handle,
 	struct snapshot_list *snapshots = NULL;
 	struct snapshot_entry *entry = NULL;
 
-	snapshots = zhandle_list_snapshots(config->hdl,
-					   talloc_tos(),
+	snapshots = smb_zfs_list_snapshots(talloc_tos(), config->mnt_id,
 					   config->filter);
 	if (snapshots == NULL) {
 		DBG_ERR("Failed to list snapshots: %s\n", strerror(errno));
@@ -420,7 +415,7 @@ static void tmprotect_take_snapshot(vfs_handle_struct *handle,
 		return;
 	}
 
-	ret = smb_zfs_snapshot(config->hdl, snapshot_name, false);
+	ret = smb_zfs_snapshot(config->mnt_id, snapshot_name, false);
 	if (ret != 0) {
 		DBG_ERR("Failed to generate snapshot on path: %s\n",
 			handle->conn->connectpath);

@@ -1167,6 +1167,15 @@ bld.SAMBA3_SUBSYSTEM('TRUENAS_MEMPOOL',
                           ''')
 
 
+bld.SAMBA3_LIBRARY('truenas_mount',
+                   source='lib/truenas_mount.c',
+                   deps='''
+                        samba-util
+                        talloc
+                        ''',
+                   private_library=True)
+
+
 bld.SAMBA3_SUBSYSTEM('util_sd',
                      deps='smbclient',
                      source='lib/util_sd.c')

@@ -69,7 +69,7 @@ static uint64_t zfs_core_disk_free(vfs_handle_struct *handle,
 {
 	uint64_t res;
 	struct zfs_core_config_data *config = NULL;
-	struct zfs_dataset *ds = NULL;
+	const struct zfs_dataset *ds = NULL;
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct zfs_core_config_data,
 				return -1);
@@ -85,7 +85,7 @@ static uint64_t zfs_core_disk_free(vfs_handle_struct *handle,
 		return -1;
 	}
 
-	res = smb_zfs_disk_free(ds->zhandle, bsize, dfree, dsize);
+	res = smb_zfs_disk_free(ds->mnt_id, bsize, dfree, dsize);
 	if (res == -1) {
 		res = SMB_VFS_NEXT_DISK_FREE(handle, smb_fname, bsize, dfree, dsize);
 	}
@@ -101,7 +101,7 @@ static int zfs_core_get_quota(struct vfs_handle_struct *handle,
 {
 	int ret;
 	struct zfs_core_config_data *config = NULL;
-	struct zfs_dataset *ds = NULL;
+	const struct zfs_dataset *ds = NULL;
 	struct zfs_quota zfs_qt;
 	uint64_t hardlimit = 0, xid;
 
@@ -127,7 +127,7 @@ static int zfs_core_get_quota(struct vfs_handle_struct *handle,
 	case SMB_USER_FS_QUOTA_TYPE:
 		xid = id.uid == -1?(uint64_t)geteuid():(uint64_t)id.uid;
 		become_root();
-		ret = smb_zfs_get_quota(ds->zhandle,
+		ret = smb_zfs_get_quota(ds->mnt_id,
 					xid,
 					SMBZFS_USER_QUOTA,
 					&zfs_qt);
@@ -137,7 +137,7 @@ static int zfs_core_get_quota(struct vfs_handle_struct *handle,
 	case SMB_GROUP_FS_QUOTA_TYPE:
 		xid = id.gid == -1?(uint64_t)getegid():(uint64_t)id.gid;
 		become_root();
-		ret = smb_zfs_get_quota(ds->zhandle,
+		ret = smb_zfs_get_quota(ds->mnt_id,
 					xid,
 					SMBZFS_GROUP_QUOTA,
 					&zfs_qt);
@@ -205,7 +205,7 @@ static int zfs_core_set_quota(struct vfs_handle_struct *handle,
 		xid = id.uid == -1?(uint64_t)geteuid():(uint64_t)id.uid;
 		zq.quota_type = SMBZFS_USER_QUOTA;
 		become_root();
-		ret = smb_zfs_set_quota(config->ds->zhandle, xid, zq);
+		ret = smb_zfs_set_quota(config->ds->mnt_id, xid, zq);
 		unbecome_root();
 		break;
 	case SMB_GROUP_QUOTA_TYPE:
@@ -216,7 +216,7 @@ static int zfs_core_set_quota(struct vfs_handle_struct *handle,
 		xid = id.gid == -1?(uint64_t)getegid():(uint64_t)id.gid;
 		zq.quota_type = SMBZFS_GROUP_QUOTA;
 		become_root();
-		ret = smb_zfs_set_quota(config->ds->zhandle, xid, zq);
+		ret = smb_zfs_set_quota(config->ds->mnt_id, xid, zq);
 		unbecome_root();
 		break;
 	default:
@@ -310,7 +310,7 @@ static bool zfs_inherit_acls(vfs_handle_struct *handle,
 	}
 
 	while (idx > 0) {
-		struct zfs_dataset *ds = NULL;
+		const struct zfs_dataset *ds = NULL;
 		struct files_struct *c_fsp = NULL;
 		NTSTATUS status;
 
@@ -446,7 +446,7 @@ static int set_base_user_quota(vfs_handle_struct *handle,
 		return -1;
 	}
 
-	ret = smb_zfs_get_quota(config->ds->zhandle,
+	ret = smb_zfs_get_quota(config->ds->mnt_id,
 					  current_user,
 					  SMBZFS_USER_QUOTA,
 					  &zq);
@@ -461,7 +461,7 @@ static int set_base_user_quota(vfs_handle_struct *handle,
 
 	if (zq.bytes == 0) {
 		zq.bytes = config->base_user_quota;
-		ret = smb_zfs_set_quota(config->ds->zhandle,
+		ret = smb_zfs_set_quota(config->ds->mnt_id,
 				        current_user, zq);
 		if (ret != 0) {
 			DBG_ERR("Failed to set base quota uid: (%u), "
@@ -760,10 +760,7 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 		}
 	}
 
-	ret = conn_zfs_init(handle->conn->sconn,
-			    handle->conn->connectpath,
-			    &config->ds,
-			    handle->conn->tcon != NULL);
+	ret = conn_zfs_init(handle->conn->connectpath, &config->ds);
 	if (ret != 0) {
 		DBG_ERR("Failed to initialize ZFS data: %s\n",
 			strerror(errno));

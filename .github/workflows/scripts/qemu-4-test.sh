@@ -5,6 +5,10 @@
 # running on the TrueNAS kernel the VM was rebooted into:
 #   * confirm the TrueNAS kernel is what booted
 #   * load the ZFS kmod
+#   * run the local.truenas_mount / local.smb_libzfs torture suites against
+#     dedicated datasets (statmount wrapping, listmount batch boundary,
+#     casesensitivity via mnt_opts, mountpoint=legacy, spaces in dataset
+#     names, snapshot-automount resolution) entirely outside smbd
 #   * create a (case-insensitive) ZFS dataset
 #   * serve it with `vfs objects = truenas_streams_xattr zfs_core`
 #   * exercise basic I/O, a case-only rename (zfs_core_renameat) and an
@@ -131,6 +135,33 @@ chmod 0777 /tank/recn/child
 zfs create -o acltype=posix -o casesensitivity=insensitive -o atime=off tank/recad
 chmod 0777 /tank/recad
 echo "Dataset:"; zfs get casesensitivity tank/share
+
+echo "=========================================="
+echo "Provision datasets for the library test suites"
+echo "=========================================="
+# Datasets for the local.truenas_mount / local.smb_libzfs torture suites
+# (run further down, once smbtorture is available with a config in place).
+# Dedicated so the SMB shares below never see them:
+#   tank/libtest         case-sensitive, snapshotted (automount resolution)
+#   tank/libtest/ci      case-insensitive (mnt_opts casesensitivity token)
+#   tank/libtest/legacy  mountpoint=legacy (mount table is the only source
+#                        of the mountpoint -- the old mountinfo-parser case)
+#   tank/libtest/with space
+#                        ZFS permits spaces in dataset names and escapes
+#                        them as \040 for /proc/self/mounts; statmount
+#                        unescapes, so sb_source must arrive intact and be
+#                        usable by zfs_open()
+# The auto-creation test additionally creates and destroys tn_ac_* datasets
+# below tank/libtest as it runs.
+zfs create -o casesensitivity=sensitive -o atime=off tank/libtest
+zfs create -o casesensitivity=insensitive -o atime=off tank/libtest/ci
+zfs create -o mountpoint=legacy tank/libtest/legacy
+zfs create -o casesensitivity=sensitive -o atime=off 'tank/libtest/with space'
+mkdir -p /mnt/libtest-legacy
+mount -t zfs tank/libtest/legacy /mnt/libtest-legacy
+zfs snapshot tank/libtest@libtest-snap
+# a path walk into the snapdir triggers the snapshot automount
+ls /tank/libtest/.zfs/snapshot/libtest-snap >/dev/null
 
 echo "=========================================="
 echo "Write smb.conf and start smbd"
@@ -359,6 +390,34 @@ net sam rights grant smbtest SeDiskOperatorPrivilege \
 SMBTORTURE="$(command -v smbtorture || echo /usr/bin/smbtorture)"
 test -x "$SMBTORTURE" || { echo "ERROR: smbtorture not found (expected in truenas-samba)"; exit 1; }
 echo "smbtorture: $SMBTORTURE"
+
+echo "=========================================="
+echo "Run the local library test suites"
+echo "=========================================="
+# Library-level coverage of statmount wrapping and path->dataset resolution
+# against the tank/libtest datasets provisioned earlier -- local
+# (non-protocol) torture suites, no smbd involvement. smb_libzfs runs
+# first: the truenas_mount batch-boundary test unshares the process's
+# mount namespace as its final act. tn_mount_require_all turns every
+# environmental skip into a failure: on this kernel, as root, with the
+# datasets above, an all-skip green run would mean the tests never
+# touched ZFS -- so require that they did.
+if "$SMBTORTURE" ncalrpc:localhost -U% \
+     --option='torture:tn_mount_require_all=yes' \
+     --option='torture:tn_mount_ds=tank/libtest' \
+     --option='torture:tn_mount_mp=/tank/libtest' \
+     --option='torture:tn_mount_ci_mp=/tank/libtest/ci' \
+     --option='torture:tn_mount_legacy_ds=tank/libtest/legacy' \
+     --option='torture:tn_mount_legacy_mp=/mnt/libtest-legacy' \
+     --option='torture:tn_mount_space_ds=tank/libtest/with space' \
+     --option='torture:tn_mount_space_mp=/tank/libtest/with space' \
+     --option='torture:tn_mount_snap_name=libtest-snap' \
+     --option='torture:tn_mount_snap_path=/tank/libtest/.zfs/snapshot/libtest-snap' \
+     local.smb_libzfs local.truenas_mount; then
+  echo "local library test suites PASSED"
+else
+  echo "ERROR: local library test suites FAILED"; exit 1
+fi
 # ztest is casesensitivity=insensitive with zfs_core + truenas_streams_xattr, so
 # truenas.rename.case_insensitive and truenas.streams.cap_and_offset run here.
 # truenas.shadow_copy.* and truenas.acl.* self-skip on this share (no
