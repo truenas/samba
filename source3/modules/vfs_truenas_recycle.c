@@ -28,6 +28,7 @@
 #include "system/filesys.h"
 #include "auth.h"
 #include "source3/lib/substitute.h"
+#include "source3/lib/truenas_mount.h"
 
 #define ALLOC_CHECK(ptr, label) do { if ((ptr) == NULL) { DBG_ERR("recycle.bin: out of memory!\n"); errno = ENOMEM; goto label; } } while(0)
 
@@ -39,8 +40,9 @@ static int vfs_truenas_recycle_debug_level = DBGC_VFS;
 /*
  * A file on a nested child dataset is on a different mount than the share root,
  * so a single bin there would EXDEV on rename. We put the per-user bin on the
- * file's own mount and cache the mountpoint (relative to the share root) keyed
- * by the file's unique mount id.
+ * file's own mount, resolved via statmount() on the file's unique mount id and
+ * cached per connection. Unique mount ids are never reused within a boot, so
+ * cached entries cannot go stale.
  */
 struct recycle_mount {
 	uint64_t mnt_id;
@@ -713,40 +715,44 @@ out:
 }
 
 /*
- * Mount id of a directory named relative to the share root, or 0 if it cannot
- * be stat'd. Every stat fills st_ex_mnt_id (statx STATX_MNT_ID_UNIQUE).
+ * Test whether a share-relative path starts with the given prefix.
+ *
+ * Mountpoints come from the kernel with their on-disk case while the path
+ * carries the case the client sent, and on a case-insensitive dataset smbd
+ * deliberately skips the scan for the real filename, so the two may differ
+ * in case alone.
  */
-static uint64_t recycle_path_mnt_id(vfs_handle_struct *handle,
-				    const char *relpath)
+static bool recycle_prefix_match(vfs_handle_struct *handle,
+				 const char *path,
+				 const char *prefix)
 {
-	struct smb_filename smb_fname = {
-		.base_name = discard_const_p(char, relpath),
-	};
+	size_t prefix_len = strlen(prefix);
 
-	if (SMB_VFS_STAT(handle->conn, &smb_fname) != 0) {
-		return 0;
+	if (handle->conn->internal_tcon_flags & TCON_FLAG_CASE_INSENSTIVE_FS) {
+		return strnequal(path, prefix, prefix_len);
 	}
-	return smb_fname.st.st_ex_mnt_id;
+	return strncmp(path, prefix, prefix_len) == 0;
 }
 
 /*
  * Resolve, relative to the share root, the mountpoint of the dataset a file
  * lives on -- "" for the share's own mount, or e.g. "child" for a nested child
- * dataset. The file is on mount mnt_id, in directory path_name. We compare
- * mount ids up the path rather than mapping the id to a path (the unique mount
- * id is not in /proc/self/mountinfo). Cached per connection, keyed by mnt_id.
+ * dataset. The mountpoint comes from statmount() on the file's unique mount
+ * id. Cached per connection, keyed by mnt_id.
  */
 static const char *recycle_mount_root(vfs_handle_struct *handle,
 				      struct recycle_config_data *config,
-				      const char *path_name,
 				      uint64_t mnt_id)
 {
 	TALLOC_CTX *frame = NULL;
-	const char *found = NULL;
+	struct tn_mount_entry *entry = NULL;
+	const char *connectpath = handle->conn->connectpath;
+	size_t cp_len = strlen(connectpath);
 	const char *result = NULL;
-	char *accum = NULL, *copy = NULL, *tok = NULL, *saveptr = NULL;
 	struct recycle_mount *tmp = NULL;
+	bool below_share;
 	size_t i;
+	int ret;
 
 	for (i = 0; i < config->num_mounts; i++) {
 		if (config->mounts[i].mnt_id == mnt_id) {
@@ -756,46 +762,40 @@ static const char *recycle_mount_root(vfs_handle_struct *handle,
 
 	frame = talloc_stackframe();
 
-	if (recycle_path_mnt_id(handle, ".") == mnt_id) {
-		found = "";
-	} else {
-		/*
-		 * Walk the file's directory components from the share root
-		 * down; the shallowest prefix on the file's mount is its
-		 * dataset mountpoint.
-		 */
-		copy = talloc_strdup(frame, path_name);
-		if (copy == NULL) {
-			TALLOC_FREE(frame);
-			return NULL;
-		}
-		for (tok = strtok_r(copy, "/", &saveptr);
-		     tok != NULL;
-		     tok = strtok_r(NULL, "/", &saveptr)) {
-			accum = (accum == NULL) ?
-				talloc_strdup(frame, tok) :
-				talloc_asprintf(frame, "%s/%s", accum, tok);
-			if (accum == NULL) {
-				TALLOC_FREE(frame);
-				return NULL;
-			}
-			if (recycle_path_mnt_id(handle, accum) == mnt_id) {
-				found = accum;
-				break;
-			}
-		}
-	}
-
-	if (found == NULL) {
-		/* The file's own directory is on its mount, so this is a bug. */
-		DBG_WARNING("recycle: no mountpoint for mnt_id %"PRIu64
-			    " under '%s'\n", mnt_id, path_name);
+	ret = tn_mount_entry_get(frame, mnt_id, &entry);
+	if ((ret != 0) || (entry->mnt_point == NULL)) {
+		DBG_WARNING("recycle: no mount entry for mnt_id %"PRIu64
+			    ": %s\n", mnt_id, strerror(errno));
 		TALLOC_FREE(frame);
 		return NULL;
 	}
 
-	/* Copy onto config so it survives the frame, then cache it. */
-	result = (found[0] == '\0') ? "" : talloc_strdup(config, found);
+	/*
+	 * The kernel reports the mountpoint with its on-disk case while the
+	 * connectpath carries the case the administrator configured, so the
+	 * comparison follows the dataset's own case sensitivity.
+	 */
+	below_share = recycle_prefix_match(handle, entry->mnt_point,
+					   connectpath);
+
+	/*
+	 * A share rooted at "/" has no path component of its own, so the
+	 * mountpoint is share-relative once the leading slash is dropped.
+	 */
+	if (cp_len == 1) {
+		SMB_ASSERT(connectpath[0] == '/');
+		cp_len = 0;
+	}
+
+	/*
+	 * A mount rooted at or above the share root means the bin belongs at
+	 * the share root; below it, the bin goes at the mountpoint.
+	 */
+	if (below_share && (entry->mnt_point[cp_len] == '/')) {
+		result = talloc_strdup(config, entry->mnt_point + cp_len + 1);
+	} else {
+		result = "";
+	}
 	TALLOC_FREE(frame);
 	if (result == NULL) {
 		return NULL;
@@ -831,6 +831,8 @@ static int recycle_unlink_internal(vfs_handle_struct *handle,
 	struct smb_filename *smb_fname_final = NULL;
 	const char *base = NULL;
 	uint64_t mnt_id;
+	size_t mroot_len;
+	bool matched;
 	int i;
 	bool exist;
 	int rc = -1;
@@ -903,7 +905,7 @@ static int recycle_unlink_internal(vfs_handle_struct *handle,
 	}
 	SMB_ASSERT(mnt_id != 0);
 
-	mroot = recycle_mount_root(handle, config, path_name, mnt_id);
+	mroot = recycle_mount_root(handle, config, mnt_id);
 	if (mroot == NULL) {
 		/* Resolution failed; fall back to the share root. */
 		mroot = "";
@@ -917,10 +919,19 @@ static int recycle_unlink_internal(vfs_handle_struct *handle,
 			goto done;
 		}
 		/* keeptree mirrors the path within the mount root */
-		if (strcmp(path_name, mroot) == 0) {
+		mroot_len = strlen(mroot);
+		matched = recycle_prefix_match(handle, path_name, mroot);
+		if (matched && (path_name[mroot_len] == '\0')) {
 			keep_path = ".";
+		} else if (matched && (path_name[mroot_len] == '/')) {
+			keep_path = path_name + mroot_len + 1;
 		} else {
-			keep_path = path_name + strlen(mroot) + 1;
+			/*
+			 * The file was reached through a path (e.g. a
+			 * symlink) that does not correspond to the
+			 * mountpoint; mirror the full share-relative path.
+			 */
+			keep_path = path_name;
 		}
 	} else {
 		repository = config->repository;
@@ -928,8 +939,7 @@ static int recycle_unlink_internal(vfs_handle_struct *handle,
 	}
 
 	/* we don't recycle the recycle bin... */
-	if (strncmp(full_fname->base_name, repository,
-		    strlen(repository)) == 0) {
+	if (recycle_prefix_match(handle, full_fname->base_name, repository)) {
 		DBG_INFO("recycle: File is within recycling bin, unlinking ...\n");
 		rc = SMB_VFS_NEXT_UNLINKAT(handle,
 					dirfsp,

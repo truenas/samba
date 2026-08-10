@@ -78,6 +78,11 @@
 	torture_local_tfork,
 	torture_local_mdspkt,
 	torture_local_smbtorture,
+#ifdef HAVE_LIBZFS
+	torture_local_smb_libzfs,
+	/* keep last: batch-boundary test unshares the mount namespace */
+	torture_local_truenas_mount,
+#endif
 	NULL
 };
 

@@ -29,12 +29,17 @@
 #include <talloc.h>
 #include <sys/stat.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <string.h>
+/*
+ * The ZFS include paths put libzfs/sys ahead of the system include
+ * directory, so <mntent.h> resolves to ZFS's sys/mntent.h (mount option
+ * name constants) rather than the libc header. libspl's sys/mnttab.h
+ * compat shim (pulled in via libzfs.h) needs struct mntent and
+ * hasmntopt() from the shadowed libc header, so declare them here.
+ */
 #include <mntent.h>
 #ifndef hasmntopt
-/* Search MNT->mnt_opts for an option matching OPT.
-   Returns the address of the substring, or null if none found.  */
-/* Structure describing a mount table entry.  */
 struct mntent
   {
     char *mnt_fsname;           /* Device or server for filesystem.  */
@@ -52,7 +57,6 @@ char *hasmntopt (const struct mntent *__mnt,
 #include <libzfs/libzfs.h>
 #include "lib/util/time.h"
 #include "lib/util/debug.h"
-#include "lib/util/discard.h"
 #include "lib/util/dlinklist.h"
 #include "lib/util/fault.h"
 #include "lib/util/memcache.h"
@@ -60,9 +64,9 @@ char *hasmntopt (const struct mntent *__mnt,
 #include "lib/util/unix_match.h"
 #include "smb_macros.h"
 #include "modules/smb_libzfs.h"
+#include "lib/truenas_mount.h"
 
 #define SHADOW_COPY_ZFS_GMT_FORMAT "@GMT-%Y.%m.%d-%H.%M.%S"
-#define ZFS_PROP_SAMBA_PREFIX "org.samba"
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof(a[0]))
@@ -72,25 +76,40 @@ char *hasmntopt (const struct mntent *__mnt,
 #define ZFSCTL_INO_ROOT     0x0000FFFFFFFFFFFFULL
 #endif /* ZFSCTL_INO_ROOT */
 
+/*
+ * Bound for the mount ID alias cache. Entries are a pair of mount IDs, so
+ * this holds several hundred snapshot automounts; evicting one costs a
+ * re-resolve and nothing more.
+ */
+#define ZFS_ALIAS_CACHE_BYTES (64 * 1024)
+
+/*
+ * Cache keys are a one byte tag and the mount ID's raw bytes. memcache
+ * orders keys with memcmp() over their length and copies them into the
+ * element, so a key needs no text encoding and no terminator: building one
+ * is a store and an eight byte copy rather than an snprintf() on every
+ * lookup, and these sit on the per-file path through smbfname_to_ds().
+ */
+#define ZFS_CACHE_KEYLEN (1 + sizeof(uint64_t))
+#define ZFS_CACHE_TAG_MNT 'M'
+#define ZFS_CACHE_TAG_ALIAS 'A'
+
 typedef struct dataset_entry_internal {
-	struct zfs_dataset *ds;
+	struct zfs_dataset *ds;		/* published, as a const pointer */
+	zfs_handle_t *zhandle;		/* never leaves this library */
 } dataset_t;
 
-struct share_dataset_list {
-	char *connectpath;
-	dev_t dev_id;
-	struct share_dataset_list *prev, *next;
-};
-
-static struct share_dataset_list *shareds = NULL;
-
+/*
+ * Case sensitivity as reported by ZFS via its superblock mount options
+ * (statmount() mnt_opts / show_options).
+ */
 static const struct {
 	enum casesensitivity sens;
-	const char *sens_str;
-} sens_enum_list[] = {
-	{SMBZFS_SENSITIVE, "sensitive"},
-	{SMBZFS_INSENSITIVE, "insensitive"},
-	{SMBZFS_MIXED, "mixed"},
+	const char *opt;
+} sens_opt_list[] = {
+	{SMBZFS_SENSITIVE, "casesensitive"},
+	{SMBZFS_INSENSITIVE, "caseinsensitive"},
+	{SMBZFS_MIXED, "casemixed"},
 };
 
 static const struct {
@@ -113,28 +132,12 @@ static const char *group_quota_strings[] =  {
 static libzfs_handle_t *g_libzfs_handle;
 static uint32_t g_refcount;
 static struct memcache *global_zcache;
-
-enum zhandle_zone {ZHANDLE_LOCAL, ZHANDLE_ROOT};
-
-struct smbzhandle {
-        libzfs_handle_t *lz;
-	dev_t dev_id;
-	zfs_handle_t *zhandle;
-	int zhandle_ref;
-	enum zhandle_zone zone;
-	const char *location;
-};
+static struct memcache *global_alias_cache;
 
 struct snap_cb
 {
 	struct snapshot_list *snapshots;
 	struct snap_filter *iter_info;
-};
-
-struct child_cb
-{
-	struct dataset_list *dslist;
-	bool open_zhandle;
 };
 
 static void global_handle_decref()
@@ -158,58 +161,112 @@ static void global_handle_incref()
 	g_refcount++;
 }
 
-static dataset_t *zcache_lookup_dataset(dev_t dev_id)
+/*
+ * The dataset cache is keyed by the unique mount ID of the dataset mount.
+ * Unique mount IDs are never reused within a boot, so unlike the previous
+ * dev_t based scheme a cache hit can never refer to a different (since
+ * remounted) filesystem.
+ *
+ * An entry owns the ZFS dataset handle every operation in this library
+ * runs against. Handles are never handed out, so nothing outside can be
+ * holding one, and the facts we publish (struct zfs_dataset) are handed
+ * out as const pointers into the entry rather than copied. That is what
+ * makes entries process-lifetime: a caller may hold the pointer for as
+ * long as its connection lasts. The cache is bounded by the number of ZFS
+ * mounts a given smbd actually serves.
+ */
+
+/*
+ * The blob points into buf, so it lives exactly as long as the caller's
+ * buffer -- which is all memcache needs, since it copies the key.
+ */
+static DATA_BLOB zfs_cache_key(uint8_t buf[ZFS_CACHE_KEYLEN],
+			       uint8_t tag,
+			       uint64_t mnt_id)
 {
-	char key[22] = {0};
+	buf[0] = tag;
+	memcpy(&buf[1], &mnt_id, sizeof(mnt_id));
+
+	return data_blob_const(buf, ZFS_CACHE_KEYLEN);
+}
+
+static dataset_t *zcache_lookup_dataset(uint64_t mnt_id)
+{
+	uint8_t key[ZFS_CACHE_KEYLEN];
 	dataset_t *out = NULL;
+	DATA_BLOB blob;
 
-	snprintf(key, sizeof(key), "DS_0x%16lx", dev_id);
+	blob = zfs_cache_key(key, ZFS_CACHE_TAG_MNT, mnt_id);
 
-	out = memcache_lookup_talloc(global_zcache,
-				     ZFS_CACHE,
-				     data_blob_const(&key, sizeof(key)));
+	out = memcache_lookup_talloc(global_zcache, ZFS_CACHE, blob);
 	return out;
 }
 
 static void zcache_add_dataset(dataset_t *ds)
 {
-	char key[22] = {0};
+	uint8_t key[ZFS_CACHE_KEYLEN];
+	DATA_BLOB blob;
 
-	snprintf(key, sizeof(key), "DS_0x%16lx", ds->ds->devid);
+	blob = zfs_cache_key(key, ZFS_CACHE_TAG_MNT, ds->ds->mnt_id);
 
-	ds->ds->zhandle->zone = ZHANDLE_ROOT;
-	memcache_add_talloc(global_zcache,
-			    ZFS_CACHE,
-			    data_blob_const(&key, sizeof(key)),
-			    &ds);
+	memcache_add_talloc(global_zcache, ZFS_CACHE, blob, &ds);
 }
 
-static void zcache_remove_dataset(dev_t dev_id)
+/*
+ * Mount IDs that are not themselves dataset mounts -- those of snapshot
+ * automounts, which resolve to the dataset the snapshot belongs to -- get
+ * an entry here so that repeated operations on a path inside a snapshot
+ * do not repeat the resolution (two statmount() calls and a libzfs open).
+ * Values are mount IDs, so eviction costs nothing but a re-resolve.
+ */
+static void alias_cache_add(uint64_t queried_id, uint64_t dataset_id)
 {
-	char key[22] = {0};
+	uint8_t key[ZFS_CACHE_KEYLEN];
+	uint64_t *value = NULL;
+	DATA_BLOB blob;
 
-	snprintf(key, sizeof(key), "DS_0x%16lx", dev_id);
+	/*
+	 * ZFS_CACHE is a talloc-typed memcache kind, so the value has to be
+	 * a talloc pointer the cache takes over and frees on eviction.
+	 */
+	value = talloc(NULL, uint64_t);
+	if (value == NULL) {
+		/* the alias only saves work; losing it is not an error */
+		return;
+	}
+	*value = dataset_id;
 
-	memcache_delete(global_zcache,
-			ZFS_CACHE,
-			data_blob_const(&key, sizeof(key)));
+	blob = zfs_cache_key(key, ZFS_CACHE_TAG_ALIAS, queried_id);
+
+	memcache_add_talloc(global_alias_cache, ZFS_CACHE, blob, &value);
 }
 
-static void add_to_global_datasets(dataset_t *ds)
+static bool alias_cache_lookup(uint64_t queried_id, uint64_t *dataset_id)
 {
-	zcache_add_dataset(ds);
+	uint8_t key[ZFS_CACHE_KEYLEN];
+	uint64_t *value = NULL;
+	DATA_BLOB blob;
+
+	blob = zfs_cache_key(key, ZFS_CACHE_TAG_ALIAS, queried_id);
+
+	value = memcache_lookup_talloc(global_alias_cache, ZFS_CACHE, blob);
+	if (value == NULL) {
+		return false;
+	}
+	*dataset_id = *value;
+	return true;
 }
 
-static int smbzhandle_destructor(smbzhandle_t zhp)
+/*
+ * A cache entry owns its dataset handle outright.
+ */
+static int dataset_entry_destructor(dataset_t *entry)
 {
-	if (zhp->zhandle != NULL) {
-		if (zhp->zone == ZHANDLE_LOCAL) {
-			zfs_close(zhp->zhandle);
-		}
-		zhp->zhandle = NULL;
+	if (entry->zhandle != NULL) {
+		zfs_close(entry->zhandle);
+		entry->zhandle = NULL;
 	}
 	global_handle_decref();
-	zhp->lz = NULL;
 	return 0;
 }
 
@@ -218,144 +275,171 @@ static libzfs_handle_t *get_global_smblibzfs_handle() {
 	return g_libzfs_handle;
 }
 
-static int existing_parent_name(const char *path, char *buf, size_t buflen, int *nslashes);
-
-static zfs_handle_t *get_zhandle(libzfs_handle_t *lz, const char *path,
-				 dev_t *dev_id, bool resolve)
+/*
+ * ZFS reports the dataset name as the mount source: pool/ds for a
+ * dataset, pool/ds@snap for a snapshot automount below
+ * <mp>/.zfs/snapshot/<snap>.
+ */
+static bool entry_is_zfs(const struct tn_mount_entry *entry)
 {
-	/* "path" here can be either mountpoint or dataset name */
-	int rv;
-	struct stat st;
-	zfs_handle_t *zfsp = NULL;
+	if (entry->sb_magic != 0) {
+		return entry->sb_magic == ZFS_SUPER_MAGIC;
+	}
+	return (entry->fs_type != NULL) &&
+	       (strcmp(entry->fs_type, "zfs") == 0);
+}
 
-	if (path == NULL) {
-		DBG_ERR("No pathname provided\n");
+static bool entry_is_zfs_snapshot(const struct tn_mount_entry *entry)
+{
+	if (!entry_is_zfs(entry) || (entry->sb_source == NULL)) {
+		return false;
+	}
+	return strchr(entry->sb_source, '@') != NULL;
+}
+
+/* The dataset name for a mount, without any @snapshot suffix. */
+static char *entry_base_dataset_name(TALLOC_CTX *mem_ctx,
+				     const struct tn_mount_entry *entry)
+{
+	const char *at = NULL;
+
+	if (!entry_is_zfs(entry) || (entry->sb_source == NULL)) {
 		errno = EINVAL;
-		return zfsp;
+		return NULL;
 	}
 
-	zfsp = zfs_path_to_zhandle(lz, discard_const(path),
-				   ZFS_TYPE_FILESYSTEM);
-
-	if (zfsp == NULL) {
-		if (resolve && errno == ENOENT) {
-			int to_create;
-			char parent[ZFS_MAXPROPLEN] = {0};
-
-			rv = existing_parent_name(path, parent, sizeof(parent), &to_create);
-			if (rv != 0) {
-				DBG_ERR("Unable to access parent of %s\n", path);
-				errno = ENOENT;
-				return NULL;
-			}
-			DBG_INFO("Path [%s] does not exist, optaining zfs dataset handle from "
-				 "path [%s]\n", path, parent);
-
-			rv = stat(parent, &st);
-			if (rv != 0) {
-				DBG_ERR("%s: stat() failed: %s\n", parent, strerror(errno));
-				*dev_id = 0;
-			} else {
-				*dev_id = st.st_dev;
-			}
-			zfsp = zfs_path_to_zhandle(lz, parent,
-						   ZFS_TYPE_FILESYSTEM);
-			if (zfsp == NULL) {
-				DBG_ERR("%s: failed to obtain zhandle on path: %s\n",
-					parent, libzfs_error_description(lz));
-			}
-			DBG_DEBUG("Successfully obtained ZFS dataset handle\n");
-			return zfsp;
-		}
-		DBG_ERR("Failed to obtain zhandle on path: (%s)\n", path);
+	at = strchr(entry->sb_source, '@');
+	if (at == NULL) {
+		return talloc_strdup(mem_ctx, entry->sb_source);
 	}
-
-	rv = stat(path, &st);
-	if (rv != 0) {
-		DBG_ERR("%s: stat() failed: %s\n", path, strerror(errno));
-		*dev_id = 0;
-	} else {
-		*dev_id = st.st_dev;
-	}
-	return zfsp;
+	return talloc_strndup(mem_ctx, entry->sb_source,
+			      PTR_DIFF(at, entry->sb_source));
 }
 
-static bool mp_to_dataset_name(const char *mp, char *name_out, size_t bufsz)
+struct find_dataset_state {
+	const char *dataset;
+	TALLOC_CTX *mem_ctx;
+	struct tn_mount_entry *found;
+};
+
+static bool find_dataset_cb(const struct tn_mount_entry *entry,
+			    void *private_data)
 {
-	/*
-	 * Depending on what Samba's VFS is doing we may receive a request
-	 * for snapshot enumeration on a VSS path (within snapdir). In this case
-	 * we should determine whether the path is legitimately a snapdir or
-	 * something a person has just named ".zfs/snapshot" and if it is
-	 * one, strip off the path components within the ZFS ctldir so that
-	 * we can retrieve a regular ZFS dataset handle for it.
-	 */
-	char buf[PATH_MAX + 1];
-	char *ptr = NULL;
-	size_t cnt;
-	struct stat st;
+	struct find_dataset_state *state = private_data;
 
-	cnt = readlink(mp, buf, sizeof(buf) - 1);
-	if (cnt == -1) {
-		DBG_ERR("%s: readlink() failed: %s\n", mp, strerror(errno));
-		return false;
-	}
-
-	// readlink() does not NULL-terminate
-	buf[cnt] = '\0';
-	strlcpy(name_out, buf, bufsz);
-
-	ptr = strstr(name_out, ".zfs/snapshot");
-	if (ptr == NULL) {
+	if (!entry_is_zfs(entry) ||
+	    (entry->sb_source == NULL) ||
+	    (strcmp(entry->sb_source, state->dataset) != 0)) {
 		return true;
 	}
 
-	/*
-	 * Trim off everything after .zfs in our temporary
-	 * buffer so that we can check its inode number to be
-	 * extra sure this is the ZFS ctldir
-	 */
-	buf[PTR_DIFF(ptr + 4, name_out)] = '\0';
-	if (stat(buf, &st) != 0) {
-		return false;
-	}
-
-	if (!inode_is_ctldir(st.st_ino)) {
-		return true;
-	}
-
-	// trim off the ctldir
-	*ptr = '\0';
-	return true;
+	state->found = tn_mount_entry_copy(state->mem_ctx, entry);
+	SMB_ASSERT(state->found != NULL);
+	return false;
 }
 
-static zfs_handle_t *fget_zhandle(libzfs_handle_t *lz, dev_t *dev_id, int fd)
+/*
+ * Find the mount of a dataset by exact name. Works uniformly for datasets
+ * with mountpoint=legacy.
+ *
+ * A dataset can be mounted more than once -- a bind mount or a second
+ * legacy mount each get their own mount ID while reporting the same
+ * dataset as the mount source -- so the search is scoped to the mounts
+ * below parent_mnt_id whenever the caller knows which one it wants.
+ * TN_MOUNT_NS_ROOT searches the whole mount namespace.
+ */
+static int find_zfs_dataset_mount(TALLOC_CTX *mem_ctx,
+				  uint64_t parent_mnt_id,
+				  const char *dataset,
+				  struct tn_mount_entry **entry_out)
+{
+	struct find_dataset_state state = {
+		.dataset = dataset,
+		.mem_ctx = mem_ctx,
+	};
+	int ret;
+
+	ret = tn_mount_traverse(parent_mnt_id, false, find_dataset_cb,
+				&state);
+	if (ret != 0) {
+		return -1;
+	}
+	if (state.found == NULL) {
+		DBG_INFO("%s: dataset is not mounted\n", dataset);
+		errno = ENOENT;
+		return -1;
+	}
+
+	*entry_out = state.found;
+	return 0;
+}
+
+/*
+ * Resolve the mount entry backing a location to the entry of the regular
+ * dataset mount. For a location inside a ZFS snapshot automount this is
+ * the mount of the dataset itself. This may legitimately be encountered
+ * when Samba's VFS hands us a location within the ZFS ctldir, for
+ * example for VSS or an FSRVP snapshot share.
+ */
+static int entry_resolve_base(TALLOC_CTX *mem_ctx,
+			      struct tn_mount_entry **pentry)
+{
+	struct tn_mount_entry *entry = *pentry;
+	struct tn_mount_entry *parent = NULL;
+	char *base_name = NULL;
+	int ret;
+
+	if (!entry_is_zfs_snapshot(entry)) {
+		return 0;
+	}
+
+	base_name = entry_base_dataset_name(mem_ctx, entry);
+	if (base_name == NULL) {
+		return -1;
+	}
+
+	/*
+	 * Snapshot automounts appear on <mp>/.zfs/snapshot/<snap>, so the
+	 * parent mount is normally the dataset mount itself. Fall back to
+	 * scanning the mount namespace if it is not.
+	 */
+	ret = tn_mount_entry_get(mem_ctx, entry->mnt_parent_id, &parent);
+	if ((ret != 0) ||
+	    !entry_is_zfs(parent) ||
+	    (parent->sb_source == NULL) ||
+	    (strcmp(parent->sb_source, base_name) != 0)) {
+		/*
+		 * The dataset mount is an ancestor of the snapshot mount
+		 * rather than a descendant, so there is no subtree to scope
+		 * the search to.
+		 */
+		TALLOC_FREE(parent);
+		ret = find_zfs_dataset_mount(mem_ctx, TN_MOUNT_NS_ROOT,
+					     base_name, &parent);
+		if (ret != 0) {
+			DBG_ERR("%s: failed to locate dataset mount for "
+				"snapshot mount [%s]: %s\n",
+				base_name, entry->sb_source, strerror(errno));
+			TALLOC_FREE(base_name);
+			return -1;
+		}
+	}
+
+	TALLOC_FREE(base_name);
+	TALLOC_FREE(*pentry);
+	*pentry = parent;
+	return 0;
+}
+
+static zfs_handle_t *zhandle_from_entry(libzfs_handle_t *lz,
+					const struct tn_mount_entry *entry)
 {
 	zfs_handle_t *zfsp = NULL;
-	int err;
-	struct stat st;
-	char procfd_path[PATH_MAX] = {0};
-	char ds_name[ZFS_MAX_DATASET_NAME_LEN];
 
-	err = fstat(fd, &st);
-	if (err) {
-		DBG_ERR("fstat() failed: %s\n", strerror(errno));
-		*dev_id = 0;
-	} else {
-		*dev_id = st.st_dev;
-	}
-
-	snprintf(procfd_path, sizeof(procfd_path), "/proc/self/fd/%d", fd);
-
-	if (!mp_to_dataset_name(procfd_path, ds_name, ZFS_MAX_DATASET_NAME_LEN)) {
-		DBG_ERR("%s: failed to convert to dataset name\n", procfd_path);
-		strlcpy(ds_name, procfd_path, ZFS_MAX_DATASET_NAME_LEN);
-	}
-
-	zfsp = zfs_path_to_zhandle(lz, ds_name, ZFS_TYPE_FILESYSTEM);
+	zfsp = zfs_open(lz, entry->sb_source, ZFS_TYPE_FILESYSTEM);
 	if (zfsp == NULL) {
-		DBG_ERR("%s zfs_open() failed: %s\n",
-			ds_name, libzfs_error_description(lz));
+		DBG_ERR("%s: zfs_open() failed: %s\n",
+			entry->sb_source, libzfs_error_description(lz));
 	}
 	return zfsp;
 }
@@ -365,168 +449,33 @@ bool inode_is_ctldir(ino_t ino)
 	return ino == ZFSCTL_INO_ROOT ? true : false;
 }
 
-static zfs_handle_t *get_zhandle_from_smbzhandle(struct smbzhandle *smbzhandle)
-{
-	SMB_ASSERT(smbzhandle->zhandle != NULL);
-	return smbzhandle->zhandle;
-}
-
-static bool zfs_get_smbzhandle(TALLOC_CTX *mem_ctx,
-			       libzfs_handle_t *lz,
-			       zfs_handle_t *zfsp,
-			       dev_t dev_id,
-			       smbzhandle_t *zh_out)
-{
-	smbzhandle_t zh = NULL;
-
-	zh = talloc_zero(mem_ctx, struct smbzhandle);
-	if (zh == NULL) {
-		/* caller does refcounting on lz */
-		errno = ENOMEM;
-		return false;
-	}
-
-	zh->zhandle = zfsp;
-	zh->lz = lz;
-	zh->dev_id = dev_id;
-	zh->zone = ZHANDLE_LOCAL;
-	talloc_set_destructor(zh, smbzhandle_destructor);
-	*zh_out = zh;
-	return true;
-}
-
-int _get_smbzhandle(TALLOC_CTX *mem_ctx, const char *path,
-		   smbzhandle_t *smbzhandle,
-		   bool resolve, const char *location)
-{
-	zfs_handle_t *zfsp = NULL;
-	smbzhandle_t zh = NULL;
-	libzfs_handle_t *lz = NULL;
-	dev_t devid;
-	bool ok;
-
-	lz = get_global_smblibzfs_handle();
-
-	zfsp = get_zhandle(lz, path, &devid, resolve);
-	if (zfsp == NULL) {
-		DBG_ERR("Failed to obtain zhandle on path: [%s]: %s\n",
-			path, strerror(errno));
-		global_handle_decref();
-		return -1;
-	}
-
-	ok = zfs_get_smbzhandle(mem_ctx, lz, zfsp, devid, &zh);
-	if (!ok) {
-		global_handle_decref();
-		return -1;
-	}
-
-	zh->location = location;
-	*smbzhandle = zh;
-	return 0;
-}
-
-int _fget_smbzhandle(TALLOC_CTX *mem_ctx, int fd,
-		    smbzhandle_t *smbzhandle, const char *location)
-{
-	zfs_handle_t *zfsp = NULL;
-	smbzhandle_t zh = NULL;
-	libzfs_handle_t *lz = NULL;
-	dev_t devid;
-	bool ok;
-
-	lz = get_global_smblibzfs_handle();
-
-	zfsp = fget_zhandle(lz, &devid, fd);
-	if (zfsp == NULL) {
-		global_handle_decref();
-		return -1;
-	}
-
-	ok = zfs_get_smbzhandle(mem_ctx, lz, zfsp, devid, &zh);
-	if (!ok) {
-		global_handle_decref();
-		return -1;
-	}
-
-	zh->location = location;
-	*smbzhandle = zh;
-	return 0;
-}
+/*
+ * Resolve a mount ID to its cache entry, opening the dataset and filling
+ * the entry in on a miss. The entry, and so the ZFS dataset handle it
+ * owns, belongs to the cache: callers borrow it for the duration of an
+ * operation and never free it.
+ */
+static dataset_t *mntid_get_entry(uint64_t mnt_id);
 
 /*
- * duplicate a smbzfs handle under different
- * TALLOC context. This also duplicates
- * underlying ZFS dataset handle so that
- * destructor doesn't close our cached one
+ * The ZFS dataset handle for a mount ID. Every operation this library
+ * exposes goes through here rather than taking a handle from its caller.
  */
-smbzhandle_t smbzhandle_dup(TALLOC_CTX *mem_ctx,
-			    smbzhandle_t in_zh)
+static zfs_handle_t *mntid_get_zhandle_cached(uint64_t mnt_id)
 {
-	libzfs_handle_t *lz = NULL;
-	zfs_handle_t *new_zh = NULL;
-	smbzhandle_t out = NULL;
-	bool ok;
+	dataset_t *entry = NULL;
 
-	new_zh = get_zhandle_from_smbzhandle(in_zh);
-	SMB_ASSERT(new_zh);
-	lz = get_global_smblibzfs_handle();
-	ok = zfs_get_smbzhandle(mem_ctx, lz, new_zh,
-				in_zh->dev_id,
-				&out);
-	SMB_ASSERT(ok);
-	return out;
-}
-
-/*
- * Make a copy of the stored dataset handle from our internal
- * cache under the provided talloc context. ZFS dataset handle
- * is duped and global handle refcount increased.
- */
-static struct zfs_dataset *copy_to_external(TALLOC_CTX *mem_ctx,
-					    dataset_t *ds_in,
-					    bool include_props,
-				            bool open_zhandle)
-{
-	struct zfs_dataset *out = NULL;
-
-	out = talloc_zero(mem_ctx, struct zfs_dataset);
-	if (out == NULL) {
-		errno = ENOMEM;
+	entry = mntid_get_entry(mnt_id);
+	if (entry == NULL) {
 		return NULL;
 	}
-
-	strlcpy(out->dataset_name, ds_in->ds->dataset_name,
-		sizeof(out->dataset_name));
-	strlcpy(out->mountpoint, ds_in->ds->mountpoint,
-		sizeof(out->mountpoint));
-	out->devid = ds_in->ds->devid;
-	if (include_props) {
-		struct zfs_dataset_prop *prop_in = ds_in->ds->properties;
-		out->properties = talloc_zero(mem_ctx, struct zfs_dataset_prop);
-		if (out->properties == NULL) {
-			TALLOC_FREE(out);
-			errno = ENOMEM;
-			return NULL;
-		}
-		out->properties->casesens = prop_in->casesens;
-		out->properties->readonly = prop_in->readonly;
-		out->properties->record_size = prop_in->record_size;
-		out->properties->checksum_enabled = prop_in->checksum_enabled;
-		out->properties->snapdir = prop_in->snapdir;
-	}
-	if (open_zhandle) {
-		out->zhandle = smbzhandle_dup(out, ds_in->ds->zhandle);
-		out->zhandle->zone = ZHANDLE_ROOT;
-		out->zhandle->location = ds_in->ds->zhandle->location;
-	}
-	return out;
+	return entry->zhandle;
 }
 
 struct zfs_quota_singleton_cache
 {
 	struct zfs_quota qt;
-	dev_t dev_id;
+	uint64_t mnt_id;
 	uint64_t xid;
 	time_t ts;
 	bool valid;
@@ -536,7 +485,7 @@ struct zfs_quota_singleton_cache cached_quota[SMBZFS_GROUP_QUOTA + 1];
 #define ZFS_QUOTA_TIMEOUT 10
 
 static bool
-smb_zfs_get_cached_quota(dev_t dev_id,
+smb_zfs_get_cached_quota(uint64_t mnt_id,
 			 uint64_t xid,
 			 enum zfs_quotatype quota_type,
 			 struct zfs_quota *qt)
@@ -548,7 +497,7 @@ smb_zfs_get_cached_quota(dev_t dev_id,
 	SMB_ASSERT((quota_type == SMBZFS_USER_QUOTA) ||
 		   (quota_type == SMBZFS_GROUP_QUOTA));
 	cache = &cached_quota[quota_type];
-	if (!cache->valid || (cache->dev_id != dev_id) ||
+	if (!cache->valid || (cache->mnt_id != mnt_id) ||
 	    (cache->xid != xid)) {
 		return false;
 	}
@@ -565,7 +514,7 @@ smb_zfs_get_cached_quota(dev_t dev_id,
 }
 
 static void
-smb_zfs_set_cached_quota(dev_t dev_id,
+smb_zfs_set_cached_quota(uint64_t mnt_id,
 			 uint64_t xid,
 			 enum zfs_quotatype quota_type,
 			 struct zfs_quota *qt,
@@ -577,7 +526,7 @@ smb_zfs_set_cached_quota(dev_t dev_id,
 
 	cache = &cached_quota[quota_type];
 	*cache = (struct zfs_quota_singleton_cache) {
-		.dev_id = dev_id,
+		.mnt_id = mnt_id,
 		.xid = xid,
 		.valid = valid
 	};
@@ -586,7 +535,7 @@ smb_zfs_set_cached_quota(dev_t dev_id,
 }
 
 int
-smb_zfs_get_quota(smbzhandle_t hdl,
+smb_zfs_get_quota(uint64_t mnt_id,
 		  uint64_t xid,
 		  enum zfs_quotatype quota_type,
 		  struct zfs_quota *qt)
@@ -598,10 +547,14 @@ smb_zfs_get_quota(smbzhandle_t hdl,
 	char req[ZFS_MAXPROPLEN] = { 0 };
 	uint64_t rv[2] = { 0 };
 
-	zfsp = get_zhandle_from_smbzhandle(hdl);
-	cached = smb_zfs_get_cached_quota(hdl->dev_id, xid, quota_type, qt);
+	cached = smb_zfs_get_cached_quota(mnt_id, xid, quota_type, qt);
 	if (cached) {
 		return 0;
+	}
+
+	zfsp = mntid_get_zhandle_cached(mnt_id);
+	if (zfsp == NULL) {
+		return -1;
 	}
 
 	switch (quota_type) {
@@ -627,12 +580,12 @@ smb_zfs_get_quota(smbzhandle_t hdl,
 	qt->bytes = rv[0] / blocksize;
 	qt->bytes_used = rv[1] / blocksize;
 	qt->quota_type = quota_type;
-	smb_zfs_set_cached_quota(hdl->dev_id, xid, quota_type, qt, true);
+	smb_zfs_set_cached_quota(mnt_id, xid, quota_type, qt, true);
 	return 0;
 }
 
 int
-smb_zfs_set_quota(smbzhandle_t hdl, uint64_t xid, struct zfs_quota qt)
+smb_zfs_set_quota(uint64_t mnt_id, uint64_t xid, struct zfs_quota qt)
 {
 	int rv;
 	zfs_handle_t *zfsp = NULL;
@@ -645,7 +598,10 @@ smb_zfs_set_quota(smbzhandle_t hdl, uint64_t xid, struct zfs_quota qt)
 		return -1;
 	}
 
-	zfsp = get_zhandle_from_smbzhandle(hdl);
+	zfsp = mntid_get_zhandle_cached(mnt_id);
+	if (zfsp == NULL) {
+		return -1;
+	}
 
 	switch (qt.quota_type) {
 	case SMBZFS_USER_QUOTA:
@@ -660,7 +616,7 @@ smb_zfs_set_quota(smbzhandle_t hdl, uint64_t xid, struct zfs_quota qt)
 	}
 
 	snprintf(quota, sizeof(quota), "%lu", qt.bytes);
-	smb_zfs_set_cached_quota(hdl->dev_id, xid, qt.quota_type, &qt, false);
+	smb_zfs_set_cached_quota(mnt_id, xid, qt.quota_type, &qt, false);
 	rv = zfs_prop_set(zfsp, qr, quota);
 	if (rv != 0) {
 		DBG_ERR("Failed to set (%s = %s)\n", qr, quota);
@@ -671,7 +627,7 @@ smb_zfs_set_quota(smbzhandle_t hdl, uint64_t xid, struct zfs_quota qt)
 }
 
 uint64_t
-smb_zfs_disk_free(smbzhandle_t hdl,
+smb_zfs_disk_free(uint64_t mnt_id,
 		  uint64_t *bsize, uint64_t *dfree,
 		  uint64_t *dsize)
 {
@@ -680,7 +636,11 @@ smb_zfs_disk_free(smbzhandle_t hdl,
 	uint64_t available, usedbysnapshots, usedbydataset,
 		usedbychildren, real_used, total;
 
-	zfsp = get_zhandle_from_smbzhandle(hdl);
+	zfsp = mntid_get_zhandle_cached(mnt_id);
+	if (zfsp == NULL) {
+		/* the caller falls back to the next VFS module */
+		return (uint64_t)-1;
+	}
 
 	available = zfs_prop_get_int(zfsp, ZFS_PROP_AVAILABLE);
 	usedbysnapshots = zfs_prop_get_int(zfsp, ZFS_PROP_USEDSNAP);
@@ -699,70 +659,26 @@ smb_zfs_disk_free(smbzhandle_t hdl,
 	return (*dfree);
 }
 
+/* the nearest ancestor of a path that exists, which need not be a mount */
 static int
 existing_parent_name(const char *path,
 		     char *buf,
-		     size_t buflen,
-		     int *nslashes)
+		     size_t buflen)
 {
 	char *slashp = NULL;
-	*nslashes = 0;
+
 	strlcpy(buf, path, buflen);
 	for (;;) {
 		slashp = strrchr(buf, '/');
 		if (slashp == NULL) {
 			return -1;
 		}
-		*nslashes += 1;
 		*slashp = '\0';
 		if (access(buf, F_OK) == 0) {
 			break;
 		}
 	}
 	return 0;
-}
-
-static int
-get_mp_offset(zfs_handle_t *zfsp, size_t *offset)
-{
-	int rv;
-	char parent_mp[ZFS_MAXPROPLEN] = {0};
-	const char *parent_dsname = NULL;
-
-	parent_dsname = zfs_get_name(zfsp);
-	rv = zfs_prop_get(zfsp, ZFS_PROP_MOUNTPOINT, parent_mp,
-			  sizeof(parent_mp), NULL, NULL,
-			  0, 0);
-	if (rv != 0) {
-		DBG_ERR("Failed to get mountpoint for %s: %s\n",
-			parent_dsname, strerror(errno));
-		return -1;
-	}
-	*offset = strlen(parent_mp) - strlen(parent_dsname);
-	return rv;
-}
-
-static char *
-get_target_name(TALLOC_CTX *mem_ctx, zfs_handle_t *zfsp, const char *path)
-{
-	int rv;
-	size_t len_mp;
-	char *out = NULL;
-	rv = get_mp_offset(zfsp, &len_mp);
-	out = talloc_strdup(mem_ctx, path);
-	if (out == NULL) {
-		DBG_ERR("strdup failed for %s: %s\n",
-			path, strerror(errno));
-		errno = ENOMEM;
-		return out;
-	}
-	if (strlen(path) < len_mp) {
-		errno = EINVAL;
-		TALLOC_FREE(out);
-		return NULL;
-	}
-	out += len_mp;
-	return out;
 }
 
 static int
@@ -804,87 +720,66 @@ failure:
 	return rv;
 }
 
-#define DATASET_ARRAY_SZ 50	/* zfs_max_dataset_nesting */
-
-static bool path_to_dataset_list(TALLOC_CTX *mem_ctx,
-				 const char *path,
-				 struct zfs_dataset ***_array_out,
-				 size_t *_nentries,
-				 int depth)
+/*
+ * Resolve a dataset by name via its mount entry below parent_mnt_id. This
+ * is the name-based counterpart of smb_zfs_lookup_dataset() and
+ * requires the dataset to be mounted.
+ */
+static const struct zfs_dataset *name_get_dataset(uint64_t parent_mnt_id,
+						  const char *dsname)
 {
-	char *slashp = NULL;
-	struct zfs_dataset **ds_array = NULL;
-	struct zfs_dataset *ds = NULL;
-	char tmp_path[ZFS_MAXPROPLEN] = {0};
-	size_t nentries;
-	int rv;
+	TALLOC_CTX *tmp_ctx = NULL;
+	struct tn_mount_entry *entry = NULL;
+	const struct zfs_dataset *out = NULL;
+	int ret;
 
-	strlcpy(tmp_path, path, sizeof(tmp_path));
-
-	/* allocate array of pointers to datasets */
-	ds_array = talloc_zero_array(mem_ctx, struct zfs_dataset *, DATASET_ARRAY_SZ);
-	if (ds_array == NULL) {
+	tmp_ctx = talloc_new(NULL);
+	if (tmp_ctx == NULL) {
 		errno = ENOMEM;
-		return false;
+		return NULL;
 	}
 
-	ds = smb_zfs_path_get_dataset(ds_array, path, true, true, false);
-	if (ds == NULL) {
-		TALLOC_FREE(ds_array);
-		return false;
-	}
-	ds_array[0] = ds;
-	nentries = 1;
-
-	if (tmp_path[strlen(tmp_path) -1] == '/') {
-		tmp_path[strlen(tmp_path) -1] = '\0';
+	ret = find_zfs_dataset_mount(tmp_ctx, parent_mnt_id, dsname, &entry);
+	if (ret != 0) {
+		DBG_ERR("%s: failed to find dataset mount: %s\n",
+			dsname, strerror(errno));
+		TALLOC_FREE(tmp_ctx);
+		return NULL;
 	}
 
-	for (; nentries <= depth; nentries++) {
-		slashp = strrchr(tmp_path, '/');
-		if (slashp == NULL) {
-			DBG_ERR("Exiting at depth %zu\n",
-				 nentries);
-			break;
-		}
-		*slashp = '\0';
-		ds = smb_zfs_path_get_dataset(ds_array, tmp_path,
-					      true, true, false);
-		if (ds == NULL) {
-			TALLOC_FREE(ds_array);
-			return false;
-		}
-		ds_array[nentries] = ds;
-	}
-	*_nentries = nentries;
-	*_array_out = ds_array;
-	return true;
+	out = smb_zfs_lookup_dataset(entry->mnt_id);
+	TALLOC_FREE(tmp_ctx);
+	return out;
 }
 
 int
 smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 		       const char *path, const char *quota,
-		       struct zfs_dataset ***_array_out,
+		       const struct zfs_dataset ***_array_out,
 		       size_t *_nentries,
 		       bool create_ancestors)
 {
-	int rv = -1, error, to_create;
-	zfs_handle_t *zfsp = NULL;
-	char parent[ZFS_MAXPROPLEN] = {0};
+	int rv = -1;
+	int error;
+	int to_create;
+	int i;
+	size_t mp_len;
+	char parent[PATH_MAX] = {0};
+	const char *relative = NULL;
+	const char *p = NULL;
 	char *target_ds = NULL;
-	struct zfs_dataset **ds_array = NULL;
-	struct dataset_list *ds_list = NULL;
+	char *name = NULL;
+	struct tn_mount_entry *parent_entry = NULL;
+	const struct zfs_dataset **ds_array = NULL;
 	TALLOC_CTX *tmp_ctx = NULL;
 	libzfs_handle_t *lz = NULL;
-	size_t nentries;
-	bool ok;
 
 	lz = get_global_smblibzfs_handle();
 
 	tmp_ctx = talloc_new(mem_ctx);
 	if (tmp_ctx == NULL) {
 		errno = ENOMEM;
-		return -1;
+		goto fail;
 	}
 
 	if (access(path, F_OK) == 0) {
@@ -893,7 +788,7 @@ smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 		goto fail;
 	}
 
-	error = existing_parent_name(path, parent, sizeof(parent), &to_create);
+	error = existing_parent_name(path, parent, sizeof(parent));
 	if (error) {
 		DBG_ERR("Unable to access parent of %s\n", path);
 		errno = ENOENT;
@@ -901,25 +796,60 @@ smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 	}
 
 	/*
-	 * This zfs dataset handle allows us to figure out the
-	 * name that our new dataset should have by looking at
-	 * dataset properties of parent dataset.
+	 * The nearest existing ancestor gives us the dataset the new
+	 * datasets nest under. Its mount entry maps the path to the
+	 * dataset name to create: the dataset name plus the path
+	 * relative to the mountpoint.
 	 */
-	zfsp = zfs_path_to_zhandle(lz, parent, ZFS_TYPE_FILESYSTEM);
-	if (zfsp == NULL) {
-		DBG_ERR("Failed to obtain zhandle on %s: %s\n",
+	error = tn_mount_entry_get_path(tmp_ctx, parent, &parent_entry);
+	if (error != 0) {
+		DBG_ERR("%s: failed to look up mount entry: %s\n",
 			parent, strerror(errno));
 		goto fail;
 	}
-
-	target_ds = get_target_name(tmp_ctx, zfsp, path);
-	if (target_ds == NULL) {
-		zfs_close(zfsp);
+	if (!entry_is_zfs(parent_entry) ||
+	    (parent_entry->sb_source == NULL) ||
+	    (parent_entry->mnt_point == NULL)) {
+		DBG_ERR("%s: not a ZFS filesystem\n", parent);
+		errno = ENOTSUP;
 		goto fail;
 	}
-	zfs_close(zfsp);
 
-	if (to_create > 1 && create_ancestors) {
+	mp_len = strlen(parent_entry->mnt_point);
+	if (strncmp(path, parent_entry->mnt_point, mp_len) != 0) {
+		DBG_ERR("%s: path does not lie below mountpoint [%s]\n",
+			path, parent_entry->mnt_point);
+		errno = EINVAL;
+		goto fail;
+	}
+	relative = path + mp_len;
+	while (*relative == '/') {
+		relative++;
+	}
+
+	target_ds = talloc_asprintf(tmp_ctx, "%s/%s",
+				    parent_entry->sb_source, relative);
+	if (target_ds == NULL) {
+		errno = ENOMEM;
+		goto fail;
+	}
+
+	/*
+	 * How many datasets have to exist below the anchor, which is what
+	 * decides whether ancestors are needed -- not how many path
+	 * components are missing. The nearest existing ancestor of the path
+	 * may be a plain directory inside the anchor dataset, in which case
+	 * a dataset has to be created for it too.
+	 */
+	to_create = 1;
+	for (p = relative; *p != '\0'; p++) {
+		if (*p == '/') {
+			to_create++;
+		}
+	}
+
+	if (create_ancestors) {
+		/* a no-op when every ancestor dataset already exists */
 		rv = zfs_create_ancestors(lz, target_ds);
 		if (rv != 0 ) {
 			goto fail;
@@ -934,115 +864,87 @@ smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 
 	error = create_dataset_internal(lz, target_ds, quota);
 	if (error) {
+		rv = -1;
 		goto fail;
 	}
 
-	ok = path_to_dataset_list(mem_ctx, path, &ds_array,
-				  &nentries, to_create);
-	if (!ok) {
-		DBG_ERR("Failed to generate dataset list for %s\n",
-			path);
+	/*
+	 * Return the created datasets, deepest first, plus the pre-existing
+	 * dataset they nest under. Every dataset we created is mounted
+	 * somewhere below that one, so each is found by name in a
+	 * listmount() of its subtree rather than by scanning the whole
+	 * mount namespace: the same dataset mounted a second time elsewhere
+	 * is a different mount and must not match here.
+	 */
+	ds_array = talloc_zero_array(mem_ctx, const struct zfs_dataset *,
+				     to_create + 1);
+	if (ds_array == NULL) {
+		errno = ENOMEM;
+		rv = -1;
+		goto fail;
+	}
+
+	name = talloc_strdup(tmp_ctx, target_ds);
+	if (name == NULL) {
+		TALLOC_FREE(ds_array);
+		errno = ENOMEM;
+		rv = -1;
+		goto fail;
+	}
+
+	for (i = 0; i < to_create; i++) {
+		char *slashp = NULL;
+
+		ds_array[i] = name_get_dataset(parent_entry->mnt_id, name);
+		if (ds_array[i] == NULL) {
+			DBG_ERR("Failed to generate dataset list for %s\n",
+				path);
+			TALLOC_FREE(ds_array);
+			rv = -1;
+			goto fail;
+		}
+
+		slashp = strrchr(name, '/');
+		SMB_ASSERT(slashp != NULL);
+		*slashp = '\0';
+	}
+
+	/*
+	 * The anchor is the mount we already resolved from the nearest
+	 * existing ancestor of the path. It is not necessarily named by any
+	 * prefix of the new dataset name: the ancestor may be a plain
+	 * directory inside the dataset, as it is for a share of a
+	 * subdirectory.
+	 */
+	ds_array[to_create] = smb_zfs_lookup_dataset(parent_entry->mnt_id);
+	if (ds_array[to_create] == NULL) {
+		DBG_ERR("%s: failed to look up dataset for mount ID %" PRIx64
+			": %s\n", path, parent_entry->mnt_id, strerror(errno));
+		TALLOC_FREE(ds_array);
+		rv = -1;
 		goto fail;
 	}
 
 	*_array_out = ds_array;
-	*_nentries = nentries;
+	*_nentries = (size_t)to_create + 1;
 	rv = 0;
 fail:
 	TALLOC_FREE(tmp_ctx);
+	/*
+	 * The datasets we resolved above hold their own references; this
+	 * one was only needed for the creation itself.
+	 */
+	global_handle_decref();
 	return rv;
 }
 
-int
-smb_zfs_get_user_prop(struct smbzhandle *hdl,
-		      TALLOC_CTX *mem_ctx,
-		      const char *prop,
-		      char **value)
-{
-	int ret;
-	zfs_handle_t *zfsp = NULL;
-	nvlist_t *userprops = NULL;
-	nvlist_t *propval = NULL;
-	const char *propstr = NULL;
-	char prefixed_prop[ZFS_MAXPROPLEN] = {0};
-
-	snprintf(prefixed_prop, sizeof(prefixed_prop),
-		 "%s:%s", ZFS_PROP_SAMBA_PREFIX, prop);
-
-	zfsp = get_zhandle_from_smbzhandle(hdl);
-
-	userprops = zfs_get_user_props(zfsp);
-	ret = nvlist_lookup_nvlist(userprops, prefixed_prop, &propval);
-	if (ret != 0) {
-		DBG_INFO("Failed to look up custom user property %s on dataset [%s]: %s\n",
-			 prop, zfs_get_name(zfsp), strerror(errno));
-		goto out;
-	}
-	ret = nvlist_lookup_string(propval, ZPROP_VALUE, &propstr);
-	if (ret != 0) {
-		DBG_ERR("Failed to get nvlist string for property %s\n",
-			prop);
-		goto out;
-	}
-
-	*value = talloc_strdup(mem_ctx, propstr);
-
-out:
-	return ret;
-}
-
-int
-smb_zfs_set_user_prop(struct smbzhandle *hdl,
-		      const char *prop,
-		      const char *value)
-{
-	int ret;
-	zfs_handle_t *zfsp = NULL;
-	char prefixed_prop[ZFS_MAXPROPLEN] = {0};
-
-	zfsp = get_zhandle_from_smbzhandle(hdl);
-	if (zfsp == NULL) {
-		return -1;
-	}
-
-	snprintf(prefixed_prop, sizeof(prefixed_prop), "%s:%s",
-		 ZFS_PROP_SAMBA_PREFIX, prop);
-
-	ret = zfs_prop_set(zfsp, prefixed_prop, value);
-	if (ret != 0) {
-		DBG_ERR("Failed to set property [%s] on dataset [%s] to [%s]\n",
-			prefixed_prop, zfs_get_name(zfsp), value);
-	}
-	return ret;
-}
-
 static int
-zhandle_get_props(struct smbzhandle *zfsp_ext,
-		  TALLOC_CTX *mem_ctx,
-		  struct zfs_dataset_prop **pprop)
+zhandle_get_props(zfs_handle_t *zfsp,
+		  struct zfs_dataset_prop *props)
 {
-	int ret, i;
 	char buf[ZFS_MAXPROPLEN];
 	zprop_source_t sourcetype;
-	zfs_handle_t *zfsp = NULL;
-	struct zfs_dataset_prop *props = NULL;
-	props = *pprop;
 
-	zfsp = get_zhandle_from_smbzhandle(zfsp_ext);
-	if (zfsp == NULL) {
-		return -1;
-	}
-	if (zfs_prop_get(zfsp, ZFS_PROP_CASE,
-	    buf, sizeof(buf), &sourcetype,
-	    NULL, 0, B_FALSE) != 0) {
-		DBG_ERR("Failed to look up casesensitivity property\n");
-		return -1;
-	}
-	for (i = 0; i < ARRAY_SIZE(sens_enum_list); i++) {
-		if (strcmp(buf, sens_enum_list[i].sens_str) == 0) {
-			props->casesens = sens_enum_list[i].sens;
-		}
-	}
 	if (zfs_prop_get(zfsp, ZFS_PROP_SNAPDIR,
 	    buf, sizeof(buf), &sourcetype,
 	    NULL, 0, B_FALSE) != 0) {
@@ -1070,121 +972,48 @@ zhandle_get_props(struct smbzhandle *zfsp_ext,
 		props->checksum_enabled = true;
 	}
 
-	props->readonly = zfs_prop_get_int(zfsp, ZFS_PROP_READONLY);
 	props->record_size = zfs_prop_get_int(zfsp, ZFS_PROP_RECORDSIZE);
 	return 0;
 }
 
-static bool find_dataset_mp(FILE *mntinfo, struct zfs_dataset *ds)
+static void init_global_caches(void)
 {
-	const char *dsname = zfs_get_name(get_zhandle_from_smbzhandle(ds->zhandle));
-	char *line = NULL;
-	size_t linecap = 0;
-
-	/*
-	 * Sample line from /proc/self/mountinfo:
-	 * 27 1 0:24 / / rw,relatime shared:1 - zfs boot-pool/ROOT/22.02.3 rw,xattr,noacl
-	 * (0)(1)(2)(3)(4) (5)       (6)      (7)(8)(9)                    (10)
-	 * 0 - mount id
-	 * 1 - parent id
-	 * 2 - major:minor
-	 * 3 - root
-	 * 4 - mount point
-	 * 5 - mount options
-	 * 6 - optional fields
-	 * 7 - separator
-	 * 8 - filesystem type
-	 * 9 - mount source
-	 * 10 - super_options
-	 */
-	while (getline(&line, &linecap, mntinfo) > 0) {
-		char *saveptr = NULL, *found = NULL, *token = NULL;
-		int i;
-
-		found = strstr(line, dsname);
-		if (found == NULL) {
-			continue;
-		}
-
-		/* Spaces are escaped in proc mountinfo */
-		if (((found + strlen(dsname))[0] != ' ') ||
-		    ((found - 1)[0] != ' ')) {
-			continue;
-		}
-
-		token = strtok_r(line, " ", &saveptr);
-		for (i = 0; i < 4; i++) {
-			token = strtok_r(NULL, " ", &saveptr);
-			/*
-			 * Dump core if we have invalid lines in mountinfo
-			 * This would be something worth investigating.
-			 */
-			SMB_ASSERT(token != NULL);
-		}
-		strlcpy(ds->mountpoint, token, sizeof(ds->mountpoint));
-		free(line);
-		return true;
+	if (global_zcache == NULL) {
+		global_zcache = memcache_init(NULL, 0);
+		SMB_ASSERT(global_zcache != NULL);
 	}
-	DBG_ERR("Failed to find dataset %s in /proc/self/mountinfo\n", dsname);
-	errno = ENOENT;
-	free(line);
-	return false;
+	if (global_alias_cache == NULL) {
+		global_alias_cache = memcache_init(NULL,
+						   ZFS_ALIAS_CACHE_BYTES);
+		SMB_ASSERT(global_alias_cache != NULL);
+	}
 }
 
-static bool resolve_legacy(struct zfs_dataset *ds)
+/*
+ * Build the cache entry for a dataset mount: the ZFS dataset handle the
+ * entry owns, plus the facts we publish about it. The mount entry has
+ * already been resolved to the dataset mount by the caller.
+ *
+ * The dataset handle and its reference on the global libzfs handle are
+ * consumed either way -- on failure they are released here.
+ */
+static dataset_t *dataset_entry_create(const struct tn_mount_entry *entry,
+				       zfs_handle_t *zfsp)
 {
-	FILE *mnt = NULL;
-	bool ok;
-	int fd;
-
-	fd = open("/proc/self/mountinfo", O_RDONLY);
-	if (fd == -1) {
-		DBG_ERR("Failed to open mountinfo %s\n", strerror(errno));
-		return NULL;
-	}
-
-	mnt = fdopen(fd, "r");
-	if (mnt == NULL) {
-		DBG_ERR("fdopen() failed: %s\n",
-			strerror(errno));
-		close(fd);
-		return NULL;
-	}
-
-	ok = find_dataset_mp(mnt, ds);
-	fclose(mnt);
-	return ok;
-}
-
-static dataset_t *lookup_dataset_by_devid(dev_t dev_id)
-{
-	return zcache_lookup_dataset(dev_id);
-}
-
-static struct zfs_dataset *zhandle_get_dataset(TALLOC_CTX *mem_ctx,
-					struct smbzhandle *zfsp_ext,
-					bool open_zhandle,
-					bool get_props)
-{
-	int ret;
-	zfs_handle_t *zfsp = NULL;
-	struct zfs_dataset *ds = NULL;
 	dataset_t *dsentry = NULL;
-	struct stat ds_st;
+	struct zfs_dataset *ds = NULL;
+	int ret;
+	int i;
 
-	SMB_ASSERT(zfsp_ext->dev_id != 0);
-	dsentry = lookup_dataset_by_devid(zfsp_ext->dev_id);
-	if (dsentry != NULL) {
-		return copy_to_external(mem_ctx, dsentry,
-					get_props, open_zhandle);
-	}
-
-	zfsp = get_zhandle_from_smbzhandle(zfsp_ext);
 	dsentry = talloc_zero(global_zcache, dataset_t);
 	if (dsentry == NULL) {
+		zfs_close(zfsp);
+		global_handle_decref();
 		errno = ENOMEM;
 		return NULL;
 	}
+	dsentry->zhandle = zfsp;
+	talloc_set_destructor(dsentry, dataset_entry_destructor);
 
 	ds = talloc_zero(dsentry, struct zfs_dataset);
 	if (ds == NULL) {
@@ -1193,40 +1022,10 @@ static struct zfs_dataset *zhandle_get_dataset(TALLOC_CTX *mem_ctx,
 	}
 	dsentry->ds = ds;
 
-	ds->zhandle = smbzhandle_dup(ds, zfsp_ext);
-	ds->zhandle->location = zfsp_ext->location;
-
-	strlcpy(ds->dataset_name, zfs_get_name(zfsp),
+	strlcpy(ds->dataset_name, entry->sb_source,
 		sizeof(ds->dataset_name));
-
-	ret = zfs_prop_get(zfsp, ZFS_PROP_MOUNTPOINT, ds->mountpoint,
-			   sizeof(ds->mountpoint), NULL, NULL,
-			   0, 0);
-	if (ret != 0) {
-		DBG_ERR("Failed to get mountpoint for %s: %s\n",
-			ds->dataset_name, strerror(errno));
-		goto fail;
-	}
-
-	if (strcmp(ds->mountpoint, "legacy") == 0) {
-		bool ok;
-		ok = resolve_legacy(ds);
-		if (!ok) {
-			DBG_ERR("%s: Failed to resolve dataset mountpoint\n",
-				ds->dataset_name);
-			goto fail;
-		}
-	}
-
-	ret = stat(ds->mountpoint, &ds_st);
-	if (ret != 0) {
-		DBG_ERR("%s: stat() failed: %s\n",
-			ds->mountpoint, strerror(errno));
-		goto fail;
-	}
-
-	ds->devid = ds_st.st_dev;
-	ds->zhandle->dev_id = ds_st.st_dev;
+	strlcpy(ds->mountpoint, entry->mnt_point, sizeof(ds->mountpoint));
+	ds->mnt_id = entry->mnt_id;
 
 	ds->properties = talloc_zero(ds, struct zfs_dataset_prop);
 	if (ds->properties == NULL) {
@@ -1234,70 +1033,151 @@ static struct zfs_dataset *zhandle_get_dataset(TALLOC_CTX *mem_ctx,
 		goto fail;
 	}
 
-	ret = zhandle_get_props(zfsp_ext, ds, &ds->properties);
+	/*
+	 * Case sensitivity and the read-only state are reported through
+	 * the mount table; only the remaining properties need libzfs.
+	 */
+	ds->properties->casesens = SMBZFS_SENSITIVE;
+	for (i = 0; i < ARRAY_SIZE(sens_opt_list); i++) {
+		if (tn_mount_has_opt(entry, sens_opt_list[i].opt)) {
+			ds->properties->casesens = sens_opt_list[i].sens;
+			break;
+		}
+	}
+	ds->properties->readonly = tn_mount_is_readonly(entry);
+
+	ret = zhandle_get_props(zfsp, ds->properties);
 	if (ret != 0) {
-		DBG_ERR("Failed to get properties for dataset\n");
+		DBG_ERR("%s: failed to get dataset properties\n",
+			ds->dataset_name);
 		goto fail;
 	}
 
-	add_to_global_datasets(dsentry);
-	/*
-	 * Change zone to ROOT to prevent destructor from closing
-	 * ZFS dataset handle that is now in our cache
-	 */
-	zfsp_ext->zone = ZHANDLE_ROOT;
-	return copy_to_external(mem_ctx, dsentry,
-				get_props, open_zhandle);
+	return dsentry;
+
 fail:
+	/*
+	 * The entry owns the handle from the point it was attached, so
+	 * unwinding here closes it exactly once.
+	 */
 	TALLOC_FREE(dsentry);
 	return NULL;
 }
 
-struct zfs_dataset *_smb_zfs_path_get_dataset(TALLOC_CTX *mem_ctx,
-					      const char *path,
-					      bool get_props,
-					      bool open_zhandle,
-					      bool resolve_path,
-					      const char *location)
+static dataset_t *mntid_get_entry(uint64_t mnt_id)
 {
+	TALLOC_CTX *tmp_ctx = NULL;
+	struct tn_mount_entry *entry = NULL;
+	dataset_t *dsentry = NULL;
+	zfs_handle_t *zfsp = NULL;
+	libzfs_handle_t *lz = NULL;
+	uint64_t dataset_id;
+	bool found;
 	int ret;
-	struct zfs_dataset *dsout = NULL;
-	struct smbzhandle *zfs_ext = NULL;
 
-	ret = _get_smbzhandle(mem_ctx, path, &zfs_ext, resolve_path, location);
-	if (ret != 0) {
-		DBG_ERR("Failed to get zhandle\n");
+	if (mnt_id == 0) {
+		DBG_ERR("Refusing to resolve a zero mount ID\n");
+		errno = ENOTSUP;
 		return NULL;
 	}
-	dsout = zhandle_get_dataset(mem_ctx, zfs_ext, get_props, open_zhandle);
-	TALLOC_FREE(zfs_ext);
-	if (dsout == NULL) {
-		return dsout;
+
+	init_global_caches();
+
+	/*
+	 * A mount ID we have seen before is answered without any syscall
+	 * or libzfs call at all. Mount IDs that are not dataset mounts --
+	 * snapshot automounts -- reach their dataset through the alias
+	 * recorded the first time they were resolved.
+	 */
+	dsentry = zcache_lookup_dataset(mnt_id);
+	if (dsentry != NULL) {
+		return dsentry;
 	}
-	return dsout;
+
+	found = alias_cache_lookup(mnt_id, &dataset_id);
+	if (found) {
+		dsentry = zcache_lookup_dataset(dataset_id);
+		if (dsentry != NULL) {
+			return dsentry;
+		}
+	}
+
+	tmp_ctx = talloc_new(NULL);
+	if (tmp_ctx == NULL) {
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	ret = tn_mount_entry_get(tmp_ctx, mnt_id, &entry);
+	if (ret != 0) {
+		DBG_ERR("Failed to look up mount entry for mount ID "
+			"%" PRIx64 ": %s\n", mnt_id, strerror(errno));
+		TALLOC_FREE(tmp_ctx);
+		return NULL;
+	}
+
+	if (!entry_is_zfs(entry) || (entry->sb_source == NULL)) {
+		DBG_INFO("mount ID %" PRIx64 ": not a ZFS filesystem "
+			 "[%s]\n", mnt_id,
+			 entry->fs_type ? entry->fs_type : "unknown");
+		TALLOC_FREE(tmp_ctx);
+		errno = ENOTSUP;
+		return NULL;
+	}
+
+	ret = entry_resolve_base(tmp_ctx, &entry);
+	if (ret != 0) {
+		TALLOC_FREE(tmp_ctx);
+		return NULL;
+	}
+
+	if (entry->mnt_point == NULL) {
+		DBG_ERR("Kernel did not report a mountpoint for mount ID "
+			"%" PRIx64 "\n", entry->mnt_id);
+		TALLOC_FREE(tmp_ctx);
+		errno = EINVAL;
+		return NULL;
+	}
+
+	if (entry->mnt_id != mnt_id) {
+		/* a snapshot automount: remember where it resolved to */
+		alias_cache_add(mnt_id, entry->mnt_id);
+
+		dsentry = zcache_lookup_dataset(entry->mnt_id);
+		if (dsentry != NULL) {
+			TALLOC_FREE(tmp_ctx);
+			return dsentry;
+		}
+	}
+
+	lz = get_global_smblibzfs_handle();
+	zfsp = zhandle_from_entry(lz, entry);
+	if (zfsp == NULL) {
+		global_handle_decref();
+		TALLOC_FREE(tmp_ctx);
+		return NULL;
+	}
+
+	/* the entry takes over both the handle and its libzfs reference */
+	dsentry = dataset_entry_create(entry, zfsp);
+	TALLOC_FREE(tmp_ctx);
+	if (dsentry == NULL) {
+		return NULL;
+	}
+
+	zcache_add_dataset(dsentry);
+	return dsentry;
 }
 
-struct zfs_dataset *_smb_zfs_fd_get_dataset(TALLOC_CTX *mem_ctx,
-					    int fd,
-					    bool get_props,
-					    bool open_zhandle,
-					    const char *location)
+const struct zfs_dataset *smb_zfs_lookup_dataset(uint64_t mnt_id)
 {
-	int ret;
-	struct zfs_dataset *dsout = NULL;
-	struct smbzhandle *zfs_ext = NULL;
+	dataset_t *dsentry = NULL;
 
-	ret = _fget_smbzhandle(mem_ctx, fd, &zfs_ext, location);
-	if (ret != 0) {
-		DBG_ERR("Failed to get zhandle\n");
+	dsentry = mntid_get_entry(mnt_id);
+	if (dsentry == NULL) {
 		return NULL;
 	}
-	dsout = zhandle_get_dataset(mem_ctx, zfs_ext, get_props, open_zhandle);
-	TALLOC_FREE(zfs_ext);
-	if (dsout == NULL) {
-		return dsout;
-	}
-	return dsout;
+	return dsentry->ds;
 }
 
 static bool check_pattern(char **pattern, const char *snap_name)
@@ -1418,8 +1298,8 @@ done:
 }
 
 struct
-snapshot_list *zhandle_list_snapshots(struct smbzhandle *zhandle_ext,
-				      TALLOC_CTX *mem_ctx,
+snapshot_list *smb_zfs_list_snapshots(TALLOC_CTX *mem_ctx,
+				      uint64_t mnt_id,
 				      struct snap_filter *iter_info)
 {
 	TALLOC_CTX *tmp_ctx = NULL;
@@ -1427,8 +1307,13 @@ snapshot_list *zhandle_list_snapshots(struct smbzhandle *zhandle_ext,
 	struct snapshot_list *snapshots = NULL;
 	int rc;
 	zfs_handle_t *zfs = NULL;
+	dataset_t *dsentry = NULL;
 
-	zfs = get_zhandle_from_smbzhandle(zhandle_ext);
+	dsentry = mntid_get_entry(mnt_id);
+	if (dsentry == NULL) {
+		return NULL;
+	}
+	zfs = dsentry->zhandle;
 
 	tmp_ctx = talloc_new(mem_ctx);
 	if (tmp_ctx == NULL) {
@@ -1450,19 +1335,11 @@ snapshot_list *zhandle_list_snapshots(struct smbzhandle *zhandle_ext,
 
 	state->snapshots = snapshots;
 
-	strlcpy(snapshots->dataset_name, zfs_get_name(zfs),
+	/* name and mountpoint are already known to the cache */
+	strlcpy(snapshots->dataset_name, dsentry->ds->dataset_name,
 		sizeof(snapshots->dataset_name));
-
-	rc = zfs_prop_get(zfs, ZFS_PROP_MOUNTPOINT, snapshots->mountpoint,
-			  sizeof(snapshots->mountpoint), NULL, NULL,
-			  0, 0);
-	if (rc != 0) {
-		DBG_ERR("smb_zfs_list_snapshots: error getting "
-			"mountpoint for '%s': %s\n",
-			snapshots->dataset_name,
-			strerror(errno));
-		goto error;
-	}
+	strlcpy(snapshots->mountpoint, dsentry->ds->mountpoint,
+		sizeof(snapshots->mountpoint));
 
 	state->iter_info = iter_info;
 
@@ -1488,7 +1365,7 @@ error:
 	return NULL;
 }
 
-bool update_snapshot_list(smbzhandle_t zh,
+bool update_snapshot_list(uint64_t mnt_id,
 			  struct snapshot_list *snaps,
 			  struct snap_filter *iter_info)
 {
@@ -1510,7 +1387,11 @@ bool update_snapshot_list(smbzhandle_t zh,
 		return false;
 	}
 
-	zfs = get_zhandle_from_smbzhandle(zh);
+	zfs = mntid_get_zhandle_cached(mnt_id);
+	if (zfs == NULL) {
+		TALLOC_FREE(tmp_ctx);
+		return false;
+	}
 
 	state->iter_info = iter_info;
 	state->snapshots = snaps;
@@ -1522,24 +1403,6 @@ bool update_snapshot_list(smbzhandle_t zh,
 	time(&snaps->timestamp);
 	TALLOC_FREE(tmp_ctx);
 	return true;
-}
-
-struct
-snapshot_list *smb_zfs_list_snapshots(TALLOC_CTX *mem_ctx,
-				      const char *path,
-				      struct snap_filter *iter_info)
-{
-	int ret;
-	smbzhandle_t hdl = NULL;
-	struct snapshot_list *out = NULL;
-	ret = _get_smbzhandle(mem_ctx, path, &hdl, false, __location__);
-	if (ret != 0) {
-		DBG_ERR("Failed to get zhandle\n");
-		return NULL;
-	}
-	out = zhandle_list_snapshots(hdl, mem_ctx, iter_info);
-	TALLOC_FREE(hdl);
-	return out;
 }
 
 /*
@@ -1583,7 +1446,7 @@ smb_zfs_delete_snapshots(struct snapshot_list *snaps)
 }
 
 int
-smb_zfs_snapshot(smbzhandle_t hdl,
+smb_zfs_snapshot(uint64_t mnt_id,
 		 const char *snapshot_name,
 		 bool recursive)
 {
@@ -1592,7 +1455,10 @@ smb_zfs_snapshot(smbzhandle_t hdl,
 	char snap[ZFS_MAXPROPLEN] = {0};
 	const char *dataset_name;
 
-	zfsp = get_zhandle_from_smbzhandle(hdl);
+	zfsp = mntid_get_zhandle_cached(mnt_id);
+	if (zfsp == NULL) {
+		return -1;
+	}
 	dataset_name = zfs_get_name(zfsp);
 	ret = snprintf(snap, sizeof(snap), "%s@%s",
 		       dataset_name, snapshot_name);
@@ -1601,7 +1467,7 @@ smb_zfs_snapshot(smbzhandle_t hdl,
 			strerror(errno));
 		return -1;
 	}
-	ret = zfs_snapshot(hdl->lz, snap, recursive, NULL);
+	ret = zfs_snapshot(zfs_get_handle(zfsp), snap, recursive, NULL);
 	if (ret != 0) {
 		DBG_ERR("Failed to create snapshot %s: %s\n",
 			snap, strerror(errno));
@@ -1610,7 +1476,7 @@ smb_zfs_snapshot(smbzhandle_t hdl,
 }
 
 bool
-smb_zfs_pool_feature_enabled(struct zfs_dataset *ds,
+smb_zfs_pool_feature_enabled(uint64_t mnt_id,
 			     enum zfs_feature feature,
 			     bool *enabled_out)
 {
@@ -1621,8 +1487,6 @@ smb_zfs_pool_feature_enabled(struct zfs_dataset *ds,
 	bool enabled;
 	const char *feature_name = NULL;
 
-	SMB_ASSERT(ds != NULL);
-
 	for (i = 0; i < ARRAY_SIZE(zfs_feature_enum_list); i++) {
 		if (zfs_feature_enum_list[i].feature == feature) {
 			feature_name = zfs_feature_enum_list[i].feature_str;
@@ -1632,16 +1496,15 @@ smb_zfs_pool_feature_enabled(struct zfs_dataset *ds,
 
 	SMB_ASSERT(feature_name != NULL);
 
-	if (ds->zhandle == NULL) {
-		DBG_ERR("%s: no dataset handle.\n", ds->dataset_name);
+	zfsp = mntid_get_zhandle_cached(mnt_id);
+	if (zfsp == NULL) {
 		return false;
 	}
 
-	zfsp = get_zhandle_from_smbzhandle(ds->zhandle);
-
 	pool = zfs_get_pool_handle(zfsp);
 	if (pool == NULL) {
-		DBG_ERR("%s: pool handle not initialized\n", ds->dataset_name);
+		DBG_ERR("%s: pool handle not initialized\n",
+			zfs_get_name(zfsp));
 		return false;
 	}
 	error = zpool_prop_get_feature(pool, feature_name,
@@ -1649,7 +1512,7 @@ smb_zfs_pool_feature_enabled(struct zfs_dataset *ds,
 
 	if (error) {
 		DBG_ERR("%s: failed to retrieve status of %s: %s\n",
-			ds->dataset_name, feature_name, strerror(error));
+			zfs_get_name(zfsp), feature_name, strerror(error));
 		return false;
 	}
 
@@ -1659,7 +1522,7 @@ smb_zfs_pool_feature_enabled(struct zfs_dataset *ds,
 
 	} else {
 		DBG_INFO("%s: %s on dataset [%s] is not active\n",
-			 statebuf, feature_name, ds->dataset_name);
+			 statebuf, feature_name, zfs_get_name(zfsp));
 
 		*enabled_out = false;
 	}
@@ -1667,135 +1530,73 @@ smb_zfs_pool_feature_enabled(struct zfs_dataset *ds,
 	return true;
 }
 
-static struct zfs_dataset *share_lookup_dataset_list(TALLOC_CTX *mem_ctx,
-						     const char *connectpath)
+int conn_zfs_init(const char *connectpath,
+		  const struct zfs_dataset **pds)
 {
-	dataset_t *ds_internal;
-	dev_t dev_id = 0;
-	struct share_dataset_list *to_check = NULL;
+	TALLOC_CTX *tmp_ctx = NULL;
+	struct tn_mount_entry *entry = NULL;
+	const struct zfs_dataset *ds = NULL;
+	uint64_t mnt_id;
+	bool is_zfs;
+	int ret;
 
+	*pds = NULL;
 
-	for (to_check=shareds; to_check; to_check = to_check->next) {
-		if (strcmp(connectpath, to_check->connectpath) == 0) {
-			dev_id = to_check->dev_id;
-			break;
+	ret = tn_mount_path_get_mnt_id(connectpath, &mnt_id);
+	if ((ret != 0) && (errno == ENOENT)) {
+		char parent[PATH_MAX] = {0};
+
+		ret = existing_parent_name(connectpath, parent,
+					   sizeof(parent));
+		if (ret == 0) {
+			DBG_INFO("Path [%s] does not exist, resolving "
+				 "dataset from path [%s]\n",
+				 connectpath, parent);
+			ret = tn_mount_path_get_mnt_id(parent, &mnt_id);
 		}
 	}
-
-	if (dev_id == 0) {
-		DBG_DEBUG("%s: path is uncached\n", connectpath);
-		return NULL;
+	if (ret != 0) {
+		DBG_ERR("%s: failed to look up mount ID: %s\n",
+			connectpath, strerror(errno));
+		return -1;
 	}
 
-	ds_internal = lookup_dataset_by_devid(dev_id);
-	SMB_ASSERT(ds_internal != NULL);
-
-	DBG_DEBUG("%s: cache entry found - dataset: %s\n",
-		  connectpath, ds_internal->ds->dataset_name);
-
-	return copy_to_external(mem_ctx, ds_internal, true, true);
-}
-
-static int put_share_dataset_list(TALLOC_CTX *mem_ctx, const char *connectpath,
-				  struct zfs_dataset *ds)
-{
-	int ret = -1;
-
-	struct share_dataset_list *new_shareds= NULL;
-	new_shareds = talloc_zero(mem_ctx, struct share_dataset_list);
-	if (new_shareds == NULL) {
+	tmp_ctx = talloc_new(NULL);
+	if (tmp_ctx == NULL) {
 		errno = ENOMEM;
-		goto out;
+		return -1;
 	}
 
-	new_shareds->dev_id = ds->devid;
-	new_shareds->connectpath = talloc_strdup(mem_ctx, connectpath);
-	if (new_shareds->connectpath == NULL) {
-		errno = ENOMEM;
-		goto out;
+	ret = tn_mount_entry_get(tmp_ctx, mnt_id, &entry);
+	if (ret != 0) {
+		DBG_ERR("%s: failed to look up mount entry: %s\n",
+			connectpath, strerror(errno));
+		TALLOC_FREE(tmp_ctx);
+		return -1;
 	}
 
-	ret = 0;
+	is_zfs = entry_is_zfs(entry);
+	TALLOC_FREE(tmp_ctx);
 
-	if (shareds == NULL) {
-		shareds = new_shareds;
-	} else {
-		DLIST_ADD(shareds, new_shareds);
-	}
-
-out:
-	return ret;
-}
-
-static void init_global_zcache()
-{
-	if (global_zcache == NULL) {
-		global_zcache = memcache_init(NULL, 0);
-		SMB_ASSERT(global_zcache != NULL);
-	}
-}
-
-int conn_zfs_init(TALLOC_CTX *mem_ctx,
-		  const char *connectpath,
-		  struct zfs_dataset **pds,
-		  bool has_tcon)
-{
-	int ret = 0;
-	smbzhandle_t conn_zfsp = NULL;
-	size_t to_remove, new_len;
-	struct zfs_dataset *ds = NULL;
-
-	if (has_tcon) {
-		init_global_zcache();
-		ds = share_lookup_dataset_list(mem_ctx, connectpath);
-		if (ds != NULL) {
-			*pds = ds;
-			return 0;
-		}
-	}
-
-	_get_smbzhandle(mem_ctx, connectpath, &conn_zfsp, true, __location__);
-	/*
-	 * Attempt to get zfs dataset handle will fail if the dataset is a
-	 * snapshot. This may occur if the share is one dynamically created
-	 * by FSRVP when it exposes a snapshot.
-	 */
-	if ((conn_zfsp == NULL) && (strlen(connectpath) > 15)) {
-		char *tmp_name = NULL;
-		char *ptr;
-
-		tmp_name = talloc_strdup(mem_ctx, connectpath);
-		if (tmp_name == NULL) {
-			errno = ENOMEM;
-			return -1;
-		}
-
-		DBG_ERR("Failed to obtain zhandle on connectpath: %s\n",
-			strerror(errno));
-		ptr = strstr(connectpath, "/.zfs/snapshot/");
-		if (ptr != NULL) {
-			*ptr = '\0';
-			_get_smbzhandle(mem_ctx, tmp_name,
-				        &conn_zfsp, true, __location__);
-		}
-		TALLOC_FREE(tmp_name);
-	}
-
-	if (conn_zfsp == NULL) {
+	if (!is_zfs) {
 		/*
-		 * The filesystem is most likely not ZFS. Jailed processes
-		 * on FreeBSD may not be able to obtain ZFS dataset handles.
+		 * Not an error. A NULL dataset with a return value of 0
+		 * tells the caller that the share is not on ZFS.
 		 */
-		*pds = NULL;
+		DBG_INFO("%s: filesystem is not ZFS\n", connectpath);
 		return 0;
 	}
 
-	ds = zhandle_get_dataset(mem_ctx, conn_zfsp, true, true);
-	if (has_tcon && ds) {
-		ret = put_share_dataset_list(mem_ctx, connectpath, ds);
-		if (ret != 0) {
-			DBG_ERR("Failed to store share dataset list\n");
-		}
+	/*
+	 * A connectpath inside a ZFS snapshot automount (a share
+	 * dynamically created by FSRVP to expose a snapshot) is
+	 * transparently resolved to the underlying dataset.
+	 */
+	ds = smb_zfs_lookup_dataset(mnt_id);
+	if (ds == NULL) {
+		DBG_ERR("%s: failed to look up dataset for mount ID %" PRIx64
+			": %s\n", connectpath, mnt_id, strerror(errno));
+		return -1;
 	}
 
 	*pds = ds;

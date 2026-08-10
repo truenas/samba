@@ -29,6 +29,7 @@
 #include "system/filesys.h"
 #include "include/ntioctl.h"
 #include "modules/smb_libzfs.h"
+#include "source3/lib/truenas_mount.h"
 #include "../lib/util/memcache.h"
 #include "../lib/util/time.h"
 
@@ -81,8 +82,8 @@ typedef struct open_snapdir {
 } snapdir_open_t;
 
 struct shadow_copy_zfs_config {
-	struct zfs_dataset	*ds;
-	struct zfs_dataset	*singleton;
+	const struct zfs_dataset *ds;
+	bool snapshot_share;	/* share root is inside a snapshot */
 	struct memcache		*zcache;
 
 	int			timedelta;
@@ -208,16 +209,16 @@ out:
 	return true;
 }
 
-static struct zfs_dataset *shadow_path_to_dataset(
+static const struct zfs_dataset *shadow_path_to_dataset(
     struct vfs_handle_struct *handle,
     struct shadow_copy_zfs_config *config,
     const char *path)
 {
 	int err;
-	struct stat st;
-	struct zfs_dataset *resolved = NULL;
+	uint64_t mnt_id = 0;
+	const struct zfs_dataset *resolved = NULL;
 
-	err = stat(path, &st);
+	err = tn_mount_path_get_mnt_id(path, &mnt_id);
 	if (err && errno == ENOENT) {
 		char tmp_path[PATH_MAX];
 		char *slashp = NULL;
@@ -229,49 +230,42 @@ static struct zfs_dataset *shadow_path_to_dataset(
 				break;
 			}
 			*slashp = '\0';
-			err = stat(tmp_path, &st);
+			err = tn_mount_path_get_mnt_id(tmp_path, &mnt_id);
 		}
 	}
-	if (err == 0) {
-		if (st.st_dev == config->ds->devid) {
-			return config->ds;
-		}
-
-		if (config->singleton &&
-		    (config->singleton->devid == st.st_dev)) {
-			return config->singleton;
-		}
+	if (err != 0) {
+		DBG_ERR("%s: failed to resolve mount id: %s\n",
+			path, strerror(errno));
+		errno = ENOENT;
+		return NULL;
 	}
 
-	/*
-	 * Our current cache of datasets does not contain the path in
-	 * question. Use libzfs to try to get it. Allocate under
-	 * memory context of our dataset list.
-	 */
-	resolved = smb_zfs_path_get_dataset(config, path, true, true, true);
+	if (mnt_id == config->ds->mnt_id) {
+		return config->ds;
+	}
+
+	resolved = smb_zfs_lookup_dataset(mnt_id);
 	if (resolved != NULL) {
-		TALLOC_FREE(config->singleton);
-		config->singleton = resolved;
 		return resolved;
 	}
 
-	DBG_ERR("No dataset found for %s with device id: %lu\n",
-		path, st.st_dev);
+	DBG_ERR("No dataset found for %s with mount id: %" PRIu64 "\n",
+		path, mnt_id);
 	errno = ENOENT;
 	return NULL;
 }
 
-static struct zfs_dataset *shadow_fsp_to_dataset(
+static const struct zfs_dataset *shadow_fsp_to_dataset(
     struct vfs_handle_struct *handle,
     struct shadow_copy_zfs_config *config,
     files_struct *fsp)
 {
 	int ret;
-	dev_t devid;
-	struct zfs_dataset *resolved = NULL;
+	uint64_t mnt_id;
+	const struct zfs_dataset *resolved = NULL;
 
 	if (VALID_STAT(fsp->fsp_name->st)) {
-		devid = fsp->fsp_name->st.st_ex_dev;
+		mnt_id = fsp->fsp_name->st.st_ex_mnt_id;
 	} else {
 		SMB_STRUCT_STAT st;
 		ret = SMB_VFS_NEXT_FSTAT(handle, fsp, &st);
@@ -280,22 +274,15 @@ static struct zfs_dataset *shadow_fsp_to_dataset(
 				fsp_str_dbg(fsp), strerror(errno));
 			return NULL;
 		}
-		devid = st.st_ex_dev;
+		mnt_id = st.st_ex_mnt_id;
 	}
 
-	if (devid == config->ds->devid) {
+	if (mnt_id == config->ds->mnt_id) {
 		return config->ds;
 	}
 
-	if ((config->singleton != NULL) &&
-	    (devid == config->singleton->devid)) {
-		return config->singleton;
-	}
-
-	resolved = smb_zfs_fd_get_dataset(config, fsp_get_pathref_fd(fsp), true, true);
+	resolved = smb_zfs_lookup_dataset(mnt_id);
 	if (resolved != NULL) {
-		TALLOC_FREE(config->singleton);
-		config->singleton = resolved;
 		return resolved;
 	}
 
@@ -322,6 +309,78 @@ static bool put_cached_snapshot(TDB_DATA key,
 				data_blob_const(key.dptr, key.dsize),
 				&snaps);
 	return true;
+}
+
+/*
+ * Position of the share root below the dataset mountpoint, e.g. "sub/dir"
+ * when a directory inside a dataset is shared rather than the dataset
+ * mountpoint itself (most commonly a [homes] share). NULL when the share is
+ * rooted at the mountpoint.
+ *
+ * A share may also be rooted inside a snapshot automount, which is how
+ * FSRVP exposes a shadow copy: the connectpath is then
+ * <mountpoint>/.zfs/snapshot/<snap>[/<sub>]. That prefix identifies a
+ * snapshot rather than a position within the dataset, so it is skipped --
+ * previous versions of such a share are the same paths in other snapshots.
+ */
+/*
+ * Whether the share root itself lies inside a snapshot automount. FSRVP
+ * creates such shares to expose a shadow copy; their contents are already
+ * a snapshot, so there are no previous versions of them to offer and
+ * every path in them is inside the ctldir.
+ */
+static bool shadow_copy_zfs_in_snapshot(const char *connectpath,
+					const char *mountpoint)
+{
+	const char *snapdir = SHADOW_COPY_ZFS_SNAP_DIR "/";
+	size_t mplen = strlen(mountpoint);
+
+	if (mplen == 1) {
+		mplen = 0;
+	}
+	if (strncmp(connectpath, mountpoint, mplen) != 0) {
+		return false;
+	}
+	if (connectpath[mplen] != '/') {
+		return false;
+	}
+	return strncmp(connectpath + mplen + 1, snapdir, strlen(snapdir)) == 0;
+}
+
+static const char *shadow_copy_zfs_mp_offset(const char *connectpath,
+					     const char *mountpoint)
+{
+	const char *snapdir = SHADOW_COPY_ZFS_SNAP_DIR "/";
+	size_t snapdir_len = strlen(snapdir);
+	size_t mplen = strlen(mountpoint);
+	const char *offset = NULL;
+	const char *slash = NULL;
+
+	/* A dataset mounted at "/" has no path component of its own. */
+	if (mplen == 1) {
+		mplen = 0;
+	}
+
+	if (strncmp(connectpath, mountpoint, mplen) != 0) {
+		return NULL;
+	}
+	if (connectpath[mplen] != '/') {
+		return NULL;
+	}
+	offset = connectpath + mplen + 1;
+
+	if (strncmp(offset, snapdir, snapdir_len) == 0) {
+		slash = strchr(offset + snapdir_len, '/');
+		if (slash == NULL) {
+			return NULL;
+		}
+		offset = slash + 1;
+	}
+
+	if (offset[0] == '\0') {
+		return NULL;
+	}
+	return offset;
 }
 
 char *get_snapshot_path(TALLOC_CTX *mem_ctx,
@@ -465,7 +524,7 @@ static bool shadow_copy_zfs_update_snaplist(struct vfs_handle_struct *handle,
 	TDB_DATA key = { .dptr = NULL, .dsize = 0 };
 	struct shadow_copy_zfs_config *config = NULL;
 	struct snapshot_list *cached_snaps = NULL;
-	struct zfs_dataset *ds = NULL;
+	const struct zfs_dataset *ds = NULL;
 
 	time(&snap_time);
 	SMB_VFS_HANDLE_GET_DATA(handle, config, struct shadow_copy_zfs_config,
@@ -498,7 +557,8 @@ static bool shadow_copy_zfs_update_snaplist(struct vfs_handle_struct *handle,
 			 "permitted timedelta: %d, dataset: %s\n",
 			 seconds, config->timedelta, ds->dataset_name);
 
-		ok = update_snapshot_list(ds->zhandle, cached_snaps, config->filter);
+		ok = update_snapshot_list(ds->mnt_id, cached_snaps,
+					  config->filter);
 		if (!ok) {
 			DBG_ERR("%s: Failed to update snapshot list: %s\n",
 				cached_snaps->mountpoint, strerror(errno));
@@ -514,8 +574,7 @@ static bool shadow_copy_zfs_update_snaplist(struct vfs_handle_struct *handle,
 	 */
 	else if (cached_snaps == NULL) {
 		struct snapshot_list *snapshots = NULL;
-		snapshots = zhandle_list_snapshots(ds->zhandle,
-						   mem_ctx,
+		snapshots = smb_zfs_list_snapshots(mem_ctx, ds->mnt_id,
 						   config->filter);
 		if (snapshots != NULL) {
 			snaplist_updated = put_cached_snapshot(key, snapshots,
@@ -554,25 +613,6 @@ static bool shadow_copy_zfs_match_name(vfs_handle_struct *handle,
 	}
 
 	return true;
-}
-
-static char *snapshot_mp_to_dataset(TALLOC_CTX *mem_ctx,
-				    vfs_handle_struct *handle,
-				    const char *snapshot_mp)
-{
-	char *ds_path = NULL;
-	size_t to_remove, new_len;
-	if (strlen(snapshot_mp) < (strlen(SHADOW_COPY_ZFS_SNAP_DIR) + 2)) {
-		DBG_ERR("Invalid snapshot name: %s\n", snapshot_mp);
-		return NULL;
-	}
-	ds_path = strstr(snapshot_mp, SHADOW_COPY_ZFS_SNAP_DIR);
-	if (ds_path != NULL) {
-		to_remove = strlen(ds_path);
-		new_len = strlen(snapshot_mp) - to_remove;
-		ds_path = talloc_strndup(mem_ctx, snapshot_mp, new_len);
-	}
-	return ds_path;
 }
 
 static bool path_in_ctldir(const char *path, bool *is_snapdir)
@@ -804,8 +844,6 @@ static char *_do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 	struct shadow_copy_zfs_config *config = NULL;
 	struct snapshot_data snapshots;
 	const char *mpoffset = NULL;
-	int offset;
-	size_t mplen;
 	char *ret = NULL, *res_fname = NULL;
 	char buf[PATH_MAX] = {0};
 	bool found = false;
@@ -818,6 +856,13 @@ static char *_do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 	if (config->ds == NULL) {
 		DBG_ERR("[%s()]: Refusing to convert to shadow copy due to "
 			"path not supporting snapshots.\n", location);
+		errno = EINVAL;
+		return NULL;
+	}
+
+	if (config->snapshot_share) {
+		DBG_INFO("[%s()]: share is rooted inside a snapshot\n",
+			 location);
 		errno = EINVAL;
 		return NULL;
 	}
@@ -842,12 +887,8 @@ static char *_do_convert_shadow_zfs_name(vfs_handle_struct *handle,
 		res_fname++;
 	}
 
-	mplen = strlen(snapshots.mountpoint);
-	if (strlen(handle->conn->connectpath) > mplen &&
-	    strncmp(handle->conn->connectpath, snapshots.mountpoint, mplen) == 0 &&
-	    handle->conn->connectpath[mplen] == '/') {
-		mpoffset = handle->conn->connectpath + mplen + 1;
-	}
+	mpoffset = shadow_copy_zfs_mp_offset(handle->conn->connectpath,
+					     snapshots.mountpoint);
 
 	ret = get_snapshot_path(talloc_tos(), handle->conn->connectpath,
 				snapshots.mountpoint, res_fname,
@@ -1308,7 +1349,6 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 	const SMB_STRUCT_STAT *psbuf = NULL;
 	uint idx = 0;
 	const char *mpoffset = NULL;
-	ssize_t len, cpathlen, mplen, flen;
 	enum casesensitivity sens;
 	int rv;
 
@@ -1321,7 +1361,11 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 		return 0;
 	}
 
-	cpathlen = strlen(handle->conn->connectpath);
+	if (config->snapshot_share) {
+		DBG_INFO("%s: share is rooted inside a snapshot\n",
+			 handle->conn->connectpath);
+		return 0;
+	}
 
 	if (VALID_STAT(fsp->fsp_name->st)) {
 		psbuf = &fsp->fsp_name->st;
@@ -1367,16 +1411,8 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 		shadow_copy_zfs_data->labels = NULL;
 	}
 
-	mplen = strlen(snapshots->mountpoint);
-	flen = strlen(fsp->fsp_name->base_name);
-	if (cpathlen > mplen) {
-		/*
-		 * Connectpath for share is longer than the dataset mountpoint.
-		 * This happens if share is directory outside of mountpoint, which
-		 * most commonly occurs when share is a [homes] share.
-		 */
-		mpoffset = handle->conn->connectpath + mplen + 1;
-	}
+	mpoffset = shadow_copy_zfs_mp_offset(handle->conn->connectpath,
+					     snapshots->mountpoint);
 
 	for (entry = snapshots->entries; entry && idx < MAX_SNAPSHOT_COUNT; entry = entry->next) {
 		/*
@@ -1657,14 +1693,22 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 		goto disconnect_out;
 	}
 
-	ret = conn_zfs_init(handle->conn->sconn,
-			    handle->conn->connectpath,
-			    &config->ds,
-			    handle->conn->tcon != NULL);
+	ret = conn_zfs_init(handle->conn->connectpath, &config->ds);
 
 	if (ret != 0) {
 		DBG_ERR("Failed to initialize zfs: %s\n", strerror(errno));
 		goto disconnect_out;
+	}
+
+	if (config->ds != NULL) {
+		config->snapshot_share = shadow_copy_zfs_in_snapshot(
+					handle->conn->connectpath,
+					config->ds->mountpoint);
+		if (config->snapshot_share) {
+			DBG_NOTICE("%s: share is rooted inside a snapshot; "
+				   "previous versions are not available for "
+				   "it\n", handle->conn->connectpath);
+		}
 	}
 
 	inclusions = lp_parm_string_list(SNUM(handle->conn), "shadow",
