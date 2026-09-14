@@ -184,12 +184,13 @@ int get_ea_value_fsp(TALLOC_CTX *mem_ctx,
 		     const char *ea_name,
 		     struct ea_struct *pea)
 {
-	/* Get the value of this xattr. Max size is 64k. */
+	/* Get the value of this xattr. Max size is "smbd max xattr size". */
 	size_t attr_size = 256;
 	char *val = NULL;
 	ssize_t sizeret;
 	size_t max_xattr_size = 0;
 	bool refuse;
+	bool probed = false;
 
 	if (fsp == NULL) {
 		return EINVAL;
@@ -210,7 +211,27 @@ int get_ea_value_fsp(TALLOC_CTX *mem_ctx,
 
 	sizeret = SMB_VFS_FGETXATTR(fsp, ea_name, val, attr_size);
 	if (sizeret == -1 && errno == ERANGE && attr_size < max_xattr_size) {
-		attr_size = max_xattr_size;
+		ssize_t needed = -1;
+
+		/*
+		 * Ask for the length and allocate just that. On Linux the
+		 * kernel allocates and zeroes the whole buffer we ask for,
+		 * so retrying at max_xattr_size is expensive.
+		 *
+		 * Ask once, and fall back to the old retry if the answer
+		 * is unusable.
+		 */
+		if (!probed) {
+			probed = true;
+			needed = SMB_VFS_FGETXATTR(fsp, ea_name, NULL, 0);
+		}
+
+		if ((needed >= 0) && ((size_t)needed <= max_xattr_size)) {
+			/* talloc_realloc() to zero would free the buffer. */
+			attr_size = (needed > 0) ? (size_t)needed : 1;
+		} else {
+			attr_size = max_xattr_size;
+		}
 		goto again;
 	}
 
