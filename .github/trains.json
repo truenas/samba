@@ -1,0 +1,33 @@
+{
+  "docs": [
+    "Branch -> TrueNAS train mapping.  Builds and tests use the",
+    "truenas/zfs and truenas/linux <train>-nightly releases of the",
+    "branch's train (for a PR, the base branch's), or of default_train",
+    "if the branch is not listed.  Pushes to a listed branch also",
+    "publish this repo's <train>-nightly release.",
+    "",
+    "Each branch reads its own copy of this file.  on: in",
+    "workflows/publish-debs.yml cannot read it; keep its push branches",
+    "in step.  To retire a train, remove its entry on that branch before",
+    "deleting the release and tag, or the next push recreates them.",
+    "",
+    "workflows/scripts/resolve-train.py validates this file on every",
+    "lookup: required fields, allowed characters, no duplicate branch or",
+    "train, default_train listed."
+  ],
+  "default_train": "master",
+  "trains": [
+    {
+      "train": "master",
+      "branch": "truenas/v4-24-stable"
+    },
+    {
+      "train": "26",
+      "branch": "stable/26"
+    },
+    {
+      "train": "27",
+      "branch": "stable/27"
+    }
+  ]
+}
