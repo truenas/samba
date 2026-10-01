@@ -26,12 +26,12 @@ on:
   workflow_call:
     inputs:
       train:
-        # TrueNAS train (master or 26) whose rolling <train>-nightly kernel
+        # TrueNAS train whose rolling <train>-nightly kernel
         # and OpenZFS releases to build and test against.  Empty (the
         # default, used by nightly.yml and PR runs) means derive it from the
         # branch via train-for-ref.sh.  Callers may pass a specific train to
         # pin one.
-        description: "(optional) TrueNAS train to build against ('master' or '26'; default: derived from branch)"
+        description: "(optional) TrueNAS train to build against (default: derived from branch)"
         type: string
         required: false
         default: ""
@@ -41,7 +41,7 @@ on:
         type: string
         required: false
         default: ""
-        description: "(optional) TrueNAS train to build against ('master' or '26'; default: derived from branch)"
+        description: "(optional) TrueNAS train to build against (default: derived from branch)"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
