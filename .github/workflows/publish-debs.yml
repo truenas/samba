@@ -26,7 +26,8 @@ name: Publish debs
 # so a rapid second push can never tear a half-written release.
 on:
   push:
-    branches: [truenas/v4-24-stable, stable/26]
+    # on: cannot read .github/trains.json; keep this list in step with it.
+    branches: [truenas/v4-24-stable, stable/26, stable/27]
 
 jobs:
   build-deb:
@@ -38,6 +39,9 @@ jobs:
     defaults:
       run:
         shell: bash
+
+    outputs:
+      publish: ${{ steps.train.outputs.publish }}
 
     steps:
       # Install deps (including git) before checkout: the base debian:trixie
@@ -57,12 +61,19 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Map branch to TrueNAS train
+        id: train
         run: |
-          # train-for-ref.sh is the single source of truth for the
-          # branch -> train mapping.
+          # .github/trains.json maps the branch to its train.  Only
+          # listed branches publish.
           train="$(.github/workflows/scripts/train-for-ref.sh "$GITHUB_REF_NAME")"
           echo "TRAIN=$train" >> "$GITHUB_ENV"
           echo "Building against the $train train"
+          publish=false
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = branch ] &&
+              .github/workflows/scripts/resolve-train.py branch "$GITHUB_REF_NAME" > /dev/null; then
+            publish=true
+          fi
+          echo "publish=$publish" | tee -a "$GITHUB_OUTPUT"
 
       - name: Fetch and install TrueNAS kernel UAPI headers
         run: |
@@ -153,8 +164,8 @@ jobs:
           path: artifacts
 
   # On every push to a mapped branch, republish the debs built above as the
-  # single asset set of a per-train rolling prerelease (master-nightly /
-  # 26-nightly).  Release assets never expire and are downloadable
+  # single asset set of a per-train rolling prerelease (<train>-nightly).
+  # Release assets never expire and are downloadable
   # anonymously at stable URLs:
   #   https://github.com/truenas/samba/releases/download/master-nightly/<file>
   # Consumers fetch manifest.json first, then verify against SHA256SUMS --
@@ -162,7 +173,7 @@ jobs:
   # the truenas/linux and truenas/zfs releases this repo consumes.
   publish:
     needs: build-deb
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/truenas/v4-24-stable' || github.ref == 'refs/heads/stable/26') }}
+    if: ${{ needs.build-deb.outputs.publish == 'true' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
