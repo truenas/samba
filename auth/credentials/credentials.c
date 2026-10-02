@@ -33,6 +33,18 @@
 #include "system/filesys.h"
 #include "system/passwd.h"
 
+static bool str_is_ascii(const char *s) {
+	if (s != NULL) {
+		for (; s[0] != '\0'; s++) {
+			if (!isascii(s[0])) {
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
 /**
  * Create a new credentials structure
  * @param mem_ctx TALLOC_CTX parent for credentials structure
@@ -367,9 +379,31 @@ _PUBLIC_ char *cli_credentials_get_principal_and_obtained(struct cli_credentials
 
 	if (cred->principal_obtained == CRED_CALLBACK &&
 	    !cred->callback_running) {
+		const char *princ = NULL;
+
 	    	cred->callback_running = true;
-		cred->principal = cred->principal_cb(cred);
+		princ = cred->principal_cb(cred);
 	    	cred->callback_running = false;
+
+		cred->principal = NULL;
+		if (princ != NULL) {
+			char *p = NULL;
+
+			cred->principal = talloc_strdup(cred, princ);
+			if (cred->principal == NULL) {
+				return NULL;
+			}
+
+			p = strchr(cred->principal, '@');
+			if (p != NULL) {
+				p += 1;
+
+				for (; p[0] != '\0'; p++) {
+					*p = toupper(p[0]);
+				}
+			}
+		}
+
 		if (cred->principal_obtained == CRED_CALLBACK) {
 			cred->principal_obtained = CRED_CALLBACK_RESULT;
 			cli_credentials_invalidate_ccache(cred, cred->principal_obtained);
@@ -427,17 +461,52 @@ _PUBLIC_ char *cli_credentials_get_principal(struct cli_credentials *cred, TALLO
 	return cli_credentials_get_principal_and_obtained(cred, mem_ctx, &obtained);
 }
 
+/**
+ * @brief Set the principal for the credentials context.
+ *
+ * The realm of the principal will be checked if it is ASCII only and upper
+ * cased if it isn't yet.
+ *
+ * @param cred The credential context.
+ *
+ * @param val  The principal to set or NULL to reset.
+ *
+ * @param obtained            This way the described principal was specified.
+ *
+ * @return true on success, false if the realm is not ASCII or the allocation
+ * failed.
+ */
 _PUBLIC_ bool cli_credentials_set_principal(struct cli_credentials *cred,
-				   const char *val,
-				   enum credentials_obtained obtained)
+					    const char *val,
+					    enum credentials_obtained obtained)
 {
 	if (obtained >= cred->principal_obtained) {
-		cred->principal = talloc_strdup(cred, val);
-		if (cred->principal == NULL) {
-			return false;
+		/* If `val = NULL` is passed, principal is reset */
+		cred->principal = NULL;
+		if (val != NULL) {
+			char *p = strchr(val, '@');
+			if (p != NULL) {
+				/* For realm names, only ASCII is allowed */
+				if (!str_is_ascii(p + 1)) {
+					return false;
+				}
+			}
+
+			cred->principal = talloc_strdup(cred, val);
+			if (cred->principal == NULL) {
+				return false;
+			}
+
+			p = strchr(cred->principal, '@');
+			if (p != NULL) {
+				p += 1;
+
+				for (; p[0] != '\0'; p++) {
+					*p = toupper(p[0]);
+				}
+			}
 		}
 		cred->principal_obtained = obtained;
-
 		cli_credentials_invalidate_ccache(cred, cred->principal_obtained);
 		return true;
 	}
@@ -912,9 +981,20 @@ _PUBLIC_ const char *cli_credentials_get_realm(struct cli_credentials *cred)
 
 	if (cred->realm_obtained == CRED_CALLBACK &&
 	    !cred->callback_running) {
+		const char *realm = NULL;
+
 	    	cred->callback_running = true;
-		cred->realm = cred->realm_cb(cred);
+		realm = cred->realm_cb(cred);
 	    	cred->callback_running = false;
+
+		cred->realm = NULL;
+		if (realm != NULL) {
+			cred->realm = strupper_talloc(cred, realm);
+			if (cred->realm == NULL) {
+				return NULL;
+			}
+		}
+
 		if (cred->realm_obtained == CRED_CALLBACK) {
 			cred->realm_obtained = CRED_CALLBACK_RESULT;
 			cli_credentials_invalidate_ccache(cred, cred->realm_obtained);
@@ -925,15 +1005,37 @@ _PUBLIC_ const char *cli_credentials_get_realm(struct cli_credentials *cred)
 }
 
 /**
- * Set the realm for this credentials context, and force it to
- * uppercase for the sanity of our local kerberos libraries
+ * @brief Set the realm for this credentials context.
+ *
+ * The realm be checked if it is ASCII only and upper cased if it isn't yet.
+ *
+ * @param cred The credential context.
+ *
+ * @param val  The realm to set or NULL to reset.
+ *
+ * @param obtained            This way the described realm was specified.
+ *
+ * @return true on success, false if the realm is not ASCII or the allocation
+ * failed.
  */
 _PUBLIC_ bool cli_credentials_set_realm(struct cli_credentials *cred,
-			       const char *val,
-			       enum credentials_obtained obtained)
+					const char *val,
+					enum credentials_obtained obtained)
 {
 	if (obtained >= cred->realm_obtained) {
-		cred->realm = strupper_talloc(cred, val);
+		/* If `val = NULL` is passed, realm is reset */
+		cred->realm = NULL;
+		if (val != NULL) {
+			/* For realm names, only ASCII is allowed */
+			if (!str_is_ascii(val)) {
+				return false;
+			}
+
+			cred->realm = strupper_talloc(cred, val);
+			if (cred->realm == NULL) {
+				return false;
+			}
+		}
 		cred->realm_obtained = obtained;
 		cli_credentials_invalidate_ccache(cred, cred->realm_obtained);
 		return true;
@@ -1528,7 +1630,9 @@ _PUBLIC_ void cli_credentials_get_ntlm_username_domain(struct cli_credentials *c
 					      const char **username,
 					      const char **domain)
 {
-	if (cred->principal_obtained >= cred->username_obtained) {
+	if (!cli_credentials_is_anonymous(cred) &&
+	    cred->principal_obtained >= cred->username_obtained)
+	{
 		*domain = talloc_strdup(mem_ctx, "");
 		*username = cli_credentials_get_principal(cred, mem_ctx);
 	} else {
