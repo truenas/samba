@@ -56,26 +56,121 @@ static bool can_write_ea(files_struct *fsp)
 	return NT_STATUS_IS_OK(status);
 }
 
-static ssize_t get_xattr_size_fsp(vfs_handle_struct *handle,
-				  struct files_struct *fsp,
-			          const char *xattr_name)
+/*
+ * Length of the xattr holding a stream, trailing compat byte included,
+ * without reading it: a size-only getxattr makes neither the kernel nor ZFS
+ * allocate or copy a value buffer. Fails on symlinks and on values over
+ * "smbd max xattr size", which get_xattr_value_fsp() won't read either.
+ */
+static ssize_t get_xattr_len_fsp(struct files_struct *fsp,
+				 const char *xattr_name)
 {
-	int ret;
-	struct ea_struct ea;
-	ssize_t result;
+	ssize_t len;
+
+	if (refuse_symlink_fsp(fsp)) {
+		errno = EACCES;
+		return -1;
+	}
+
+	len = SMB_VFS_FGETXATTR(fsp, xattr_name, NULL, 0);
+	if ((len != -1) && (len > lp_smbd_max_xattr_size(SNUM(fsp->conn)))) {
+		errno = ERANGE;
+		return -1;
+	}
+
+	return len;
+}
+
+/*
+ * Size of the stream in xattr_name as clients see it: get_xattr_len_fsp()
+ * minus the trailing byte xattr_compat = no stores. A zero length is an empty
+ * stream with xattr_compat = yes; values too short to hold that byte fail
+ * with EINVAL, as pread and pwrite do.
+ */
+static ssize_t get_stream_size_fsp(vfs_handle_struct *handle,
+				   struct files_struct *fsp,
+				   const char *xattr_name)
+{
+	ssize_t len;
 	struct streams_xattr_config *config = NULL;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config, struct streams_xattr_config,
 				return -1);
 
-	ret = get_ea_value_fsp(talloc_tos(), fsp, xattr_name, &ea);
-	if (ret != 0) {
+	len = get_xattr_len_fsp(fsp, xattr_name);
+	if (len == -1) {
 		return -1;
 	}
 
-	result = ea.value.length - config->xattr_compat_bytes;
-	TALLOC_FREE(ea.value.data);
-	return result;
+	if (len < config->xattr_compat_bytes) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	return len - config->xattr_compat_bytes;
+}
+
+/* SMB_VFS_FGETXATTR() into *pval, (re)allocated to exactly size bytes */
+static ssize_t fgetxattr_talloc(TALLOC_CTX *mem_ctx,
+				struct files_struct *fsp,
+				const char *xattr_name,
+				uint8_t **pval,
+				size_t size)
+{
+	uint8_t *val = talloc_realloc(mem_ctx, *pval, uint8_t, size);
+
+	if (val == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	*pval = val;
+
+	return SMB_VFS_FGETXATTR(fsp, xattr_name, val, size);
+}
+
+/*
+ * Read the whole xattr holding a stream. A 256-byte first guess fits most
+ * streams. Past that, ask for the exact size rather than retrying with
+ * "smbd max xattr size", a buffer the kernel would allocate and zero in full
+ * (2 MiB on TrueNAS).
+ */
+static int get_xattr_value_fsp(TALLOC_CTX *mem_ctx,
+			       struct files_struct *fsp,
+			       const char *xattr_name,
+			       struct ea_struct *pea)
+{
+	uint8_t *val = NULL;
+	ssize_t len;
+
+	if (refuse_symlink_fsp(fsp)) {
+		return EACCES;
+	}
+
+	len = fgetxattr_talloc(mem_ctx, fsp, xattr_name, &val, 256);
+	if ((len == -1) && (errno == ERANGE)) {
+		len = get_xattr_len_fsp(fsp, xattr_name);
+		if (len != -1) {
+			len = fgetxattr_talloc(mem_ctx, fsp, xattr_name, &val,
+					       MAX(len, 1));
+			if ((len == -1) && (errno == ERANGE)) {
+				/* It grew since we asked: take the largest */
+				len = fgetxattr_talloc(
+					mem_ctx, fsp, xattr_name, &val,
+					lp_smbd_max_xattr_size(SNUM(fsp->conn)));
+			}
+		}
+	}
+
+	if (len == -1) {
+		int err = errno;
+		TALLOC_FREE(val);
+		return err;
+	}
+
+	*pea = (struct ea_struct) {
+		.value = { .data = val, .length = len },
+	};
+	return 0;
 }
 
 /**
@@ -208,9 +303,9 @@ static int streams_xattr_fstat(vfs_handle_struct *handle, files_struct *fsp,
 		return -1;
 	}
 
-	sbuf->st_ex_size = get_xattr_size_fsp(handle,
-					      fsp->base_fsp,
-					      io->xattr_name);
+	sbuf->st_ex_size = get_stream_size_fsp(handle,
+					       fsp->base_fsp,
+					       io->xattr_name);
 	if (sbuf->st_ex_size == -1) {
 		SET_STAT_INVALID(*sbuf);
 		return -1;
@@ -288,8 +383,8 @@ static int streams_xattr_stat(vfs_handle_struct *handle,
 		fsp = fsp->base_fsp;
 	}
 
-	smb_fname->st.st_ex_size = get_xattr_size_fsp(handle, fsp,
-						      xattr_name);
+	smb_fname->st.st_ex_size = get_stream_size_fsp(handle, fsp,
+							xattr_name);
 	if (smb_fname->st.st_ex_size == -1) {
 		TALLOC_FREE(xattr_name);
 		TALLOC_FREE(pathref);
@@ -383,7 +478,7 @@ static int streams_xattr_fstatat(struct vfs_handle_struct *handle,
 
 	*sbuf = fsp->fsp_name->st;
 
-	size = get_xattr_size_fsp(handle, fsp, xattr_name);
+	size = get_stream_size_fsp(handle, fsp, xattr_name);
 	if (size == -1) {
 		errno = ENOENT;
 		ret = -1;
@@ -413,7 +508,6 @@ static int streams_xattr_openat(struct vfs_handle_struct *handle,
 {
 	struct streams_xattr_config *config = NULL;
 	struct stream_io *sio = NULL;
-	struct ea_struct ea;
 	char *xattr_name = NULL;
 	int fakefd = -1;
 	bool set_empty_xattr = false;
@@ -451,9 +545,10 @@ static int streams_xattr_openat(struct vfs_handle_struct *handle,
 		goto fail;
 	}
 
-	ret = get_ea_value_fsp(talloc_tos(), fsp->base_fsp, xattr_name, &ea);
-	if (ret != 0) {
-		DBG_DEBUG("get_ea_value_fsp returned %s\n", strerror(ret));
+	/* Only whether the stream exists matters here, not its value */
+	if (get_xattr_len_fsp(fsp->base_fsp, xattr_name) == -1) {
+		ret = errno;
+		DBG_DEBUG("get_xattr_len_fsp returned %s\n", strerror(ret));
 
 		if (ret != ENOATTR) {
 			/*
@@ -739,10 +834,10 @@ static int streams_xattr_renameat(vfs_handle_struct *handle,
 	}
 
 	/* Read the old stream from the base file fsp. */
-	ret = get_ea_value_fsp(talloc_tos(),
-			       pathref_src->fsp,
-			       src_xattr_name,
-			       &ea);
+	ret = get_xattr_value_fsp(talloc_tos(),
+				  pathref_src->fsp,
+				  src_xattr_name,
+				  &ea);
 	if (ret != 0) {
 		errno = ret;
 		goto fail;
@@ -801,139 +896,53 @@ static int streams_xattr_renameat(vfs_handle_struct *handle,
 	return ret;
 }
 
-static NTSTATUS walk_xattr_streams(vfs_handle_struct *handle,
-				files_struct *fsp,
-				const struct smb_filename *smb_fname,
-				bool (*fn)(struct ea_struct *ea,
-					void *private_data),
-				void *private_data)
+/*
+ * Whether xattr_name holds a stream. samba_private_attr_name() flags every
+ * name under the default stream prefix as private, so it is only asked about
+ * names outside that prefix (on a share with "streams_xattr:prefix = user.",
+ * for example).
+ */
+static bool is_stream_xattr(const struct streams_xattr_config *config,
+			    const char *xattr_name)
 {
-	NTSTATUS status;
-	char **names;
-	size_t i, num_names;
-	struct streams_xattr_config *config;
-
-	SMB_VFS_HANDLE_GET_DATA(handle, config, struct streams_xattr_config,
-				return NT_STATUS_UNSUCCESSFUL);
-
-	status = get_ea_names_from_fsp(talloc_tos(),
-				smb_fname->fsp,
-				&names,
-				&num_names);
-	if (!NT_STATUS_IS_OK(status)) {
-		return status;
+	if (strncmp(xattr_name, config->prefix, config->prefix_len) != 0) {
+		return false;
 	}
 
-	for (i=0; i<num_names; i++) {
-		struct ea_struct ea;
-		int ret;
-
-		/*
-		 * We want to check with samba_private_attr_name()
-		 * whether the xattr name is a private one,
-		 * unfortunately it flags xattrs that begin with the
-		 * default streams prefix as private.
-		 *
-		 * By only calling samba_private_attr_name() in case
-		 * the xattr does NOT begin with the default prefix,
-		 * we know that if it returns 'true' it definitely one
-		 * of our internal xattr like "user.DOSATTRIB".
-		 */
-		if (strncasecmp_m(names[i], SAMBA_XATTR_DOSSTREAM_PREFIX,
-				  strlen(SAMBA_XATTR_DOSSTREAM_PREFIX)) != 0) {
-			if (samba_private_attr_name(names[i])) {
-				continue;
-			}
-		}
-
-		if (strncmp(names[i], config->prefix,
-			    config->prefix_len) != 0) {
-			continue;
-		}
-
-		ret = get_ea_value_fsp(names, smb_fname->fsp, names[i], &ea);
-		if (ret != 0) {
-			DBG_DEBUG("Could not get ea %s for file %s: %s\n",
-				  names[i],
-				  smb_fname->base_name,
-				  strerror(ret));
-			continue;
-		}
-
-		ea.name = talloc_asprintf(
-			ea.value.data, ":%s%s",
-			names[i] + config->prefix_len,
-			config->store_stream_type ? "" : ":$DATA");
-		if (ea.name == NULL) {
-			DEBUG(0, ("talloc failed\n"));
-			continue;
-		}
-
-		if (!fn(&ea, private_data)) {
-			TALLOC_FREE(ea.value.data);
-			return NT_STATUS_OK;
-		}
-
-		TALLOC_FREE(ea.value.data);
+	if (strncasecmp_m(xattr_name, SAMBA_XATTR_DOSSTREAM_PREFIX,
+			  strlen(SAMBA_XATTR_DOSSTREAM_PREFIX)) == 0) {
+		return true;
 	}
 
-	TALLOC_FREE(names);
-	return NT_STATUS_OK;
+	return !samba_private_attr_name(xattr_name);
 }
 
-static bool add_one_stream(TALLOC_CTX *mem_ctx, unsigned int *num_streams,
-			   struct stream_struct **streams,
-			   const char *name, off_t size,
-			   off_t alloc_size)
+/*
+ * Stream name for a stream xattr, the reverse of streams_xattr_get_name():
+ * ":" plus the name past the prefix, plus ":$DATA" when the type isn't
+ * stored. Built by copying, without a format string.
+ */
+static char *stream_name_from_xattr(TALLOC_CTX *mem_ctx,
+				    const struct streams_xattr_config *config,
+				    const char *xattr_name)
 {
-	struct stream_struct *tmp;
+	static const char stype[] = ":$DATA";
+	const char *name = xattr_name + config->prefix_len;
+	size_t namelen = strlen(name);
+	size_t typelen = config->store_stream_type ? 0 : sizeof(stype) - 1;
+	char *sname = NULL;
 
-	tmp = talloc_realloc(mem_ctx, *streams, struct stream_struct,
-				   (*num_streams)+1);
-	if (tmp == NULL) {
-		return false;
+	sname = talloc_array(mem_ctx, char, 1 + namelen + typelen + 1);
+	if (sname == NULL) {
+		return NULL;
 	}
 
-	tmp[*num_streams].name = talloc_strdup(tmp, name);
-	if (tmp[*num_streams].name == NULL) {
-		return false;
-	}
+	sname[0] = ':';
+	memcpy(sname + 1, name, namelen);
+	memcpy(sname + 1 + namelen, stype, typelen);
+	sname[1 + namelen + typelen] = '\0';
 
-	tmp[*num_streams].size = size;
-	tmp[*num_streams].alloc_size = alloc_size;
-
-	*streams = tmp;
-	*num_streams += 1;
-	return true;
-}
-
-struct streaminfo_state {
-	TALLOC_CTX *mem_ctx;
-	vfs_handle_struct *handle;
-	unsigned int num_streams;
-	struct stream_struct *streams;
-	NTSTATUS status;
-};
-
-static bool collect_one_stream(struct ea_struct *ea, void *private_data)
-{
-	struct streaminfo_state *state =
-		(struct streaminfo_state *)private_data;
-	struct streams_xattr_config *config = NULL;
-
-	SMB_VFS_HANDLE_GET_DATA(state->handle, config, struct streams_xattr_config,
-				return false);
-
-	if (!add_one_stream(state->mem_ctx,
-			    &state->num_streams, &state->streams,
-			    ea->name, ea->value.length - config->xattr_compat_bytes,
-			    smb_roundup(state->handle->conn,
-					ea->value.length - config->xattr_compat_bytes))) {
-		state->status = NT_STATUS_NO_MEMORY;
-		return false;
-	}
-
-	return true;
+	return sname;
 }
 
 static NTSTATUS streams_xattr_fstreaminfo(vfs_handle_struct *handle,
@@ -942,34 +951,106 @@ static NTSTATUS streams_xattr_fstreaminfo(vfs_handle_struct *handle,
 					 unsigned int *pnum_streams,
 					 struct stream_struct **pstreams)
 {
+	struct streams_xattr_config *config = NULL;
+	struct stream_struct *streams = NULL;
+	unsigned int num_streams = *pnum_streams;
+	unsigned int num_xattrs = 0;
+	char smallbuf[1024];
+	char *list = smallbuf;
+	char *to_free = NULL;
+	const char *name = NULL;
+	ssize_t listlen;
 	NTSTATUS status;
-	struct streaminfo_state state;
 
-	state.streams = *pstreams;
-	state.num_streams = *pnum_streams;
-	state.mem_ctx = mem_ctx;
-	state.handle = handle;
-	state.status = NT_STATUS_OK;
+	SMB_VFS_HANDLE_GET_DATA(handle, config, struct streams_xattr_config,
+				return NT_STATUS_UNSUCCESSFUL);
 
-	status = walk_xattr_streams(handle,
-				    fsp,
-				    fsp->fsp_name,
-				    collect_one_stream,
-				    &state);
+	if (refuse_symlink_fsp(fsp)) {
+		/* No xattrs on a symlink */
+		goto next;
+	}
 
-	if (!NT_STATUS_IS_OK(status)) {
-		TALLOC_FREE(state.streams);
+	/*
+	 * One listxattr into a stack buffer covers nearly every file. On
+	 * ERANGE retry at the kernel's list limit rather than asking for the
+	 * size: on ZFS a size-only listxattr walks the xattrs like a real one.
+	 */
+	listlen = SMB_VFS_FLISTXATTR(fsp, list, sizeof(smallbuf));
+	if ((listlen == -1) && (errno == ERANGE)) {
+		to_free = talloc_array(talloc_tos(), char, 65536);
+		if (to_free == NULL) {
+			return NT_STATUS_NO_MEMORY;
+		}
+		list = to_free;
+		listlen = SMB_VFS_FLISTXATTR(fsp, list, talloc_get_size(list));
+	}
+	if (listlen == -1) {
+		status = map_nt_error_from_unix(errno);
+		TALLOC_FREE(to_free);
 		return status;
 	}
-
-	if (!NT_STATUS_IS_OK(state.status)) {
-		TALLOC_FREE(state.streams);
-		return state.status;
+	if ((listlen > 0) && (list[listlen - 1] != '\0')) {
+		TALLOC_FREE(to_free);
+		return NT_STATUS_INTERNAL_ERROR;
 	}
 
-	*pnum_streams = state.num_streams;
-	*pstreams = state.streams;
+	for (name = list; name < list + listlen; name += strlen(name) + 1) {
+		if (is_stream_xattr(config, name)) {
+			num_xattrs += 1;
+		}
+	}
+	if (num_xattrs == 0) {
+		TALLOC_FREE(to_free);
+		goto next;
+	}
+	if (num_streams + num_xattrs < num_streams) {
+		/* Integer wrap. */
+		TALLOC_FREE(to_free);
+		return NT_STATUS_INVALID_PARAMETER;
+	}
 
+	/*
+	 * One allocation for all of them. Slots of xattrs skipped below stay
+	 * unused; everything downstream goes by *pnum_streams.
+	 */
+	streams = talloc_realloc(mem_ctx, *pstreams, struct stream_struct,
+				 num_streams + num_xattrs);
+	if (streams == NULL) {
+		TALLOC_FREE(to_free);
+		return NT_STATUS_NO_MEMORY;
+	}
+	*pstreams = streams;
+
+	for (name = list; name < list + listlen; name += strlen(name) + 1) {
+		struct stream_struct *s = NULL;
+		ssize_t size;
+
+		if (!is_stream_xattr(config, name)) {
+			continue;
+		}
+
+		size = get_stream_size_fsp(handle, fsp, name);
+		if (size == -1) {
+			/* Removed since the listxattr, or unreadable */
+			DBG_DEBUG("Skipping %s on %s: %s\n",
+				  name, fsp_str_dbg(fsp), strerror(errno));
+			continue;
+		}
+
+		s = &streams[num_streams];
+		s->name = stream_name_from_xattr(streams, config, name);
+		if (s->name == NULL) {
+			TALLOC_FREE(to_free);
+			return NT_STATUS_NO_MEMORY;
+		}
+		s->size = size;
+		s->alloc_size = smb_roundup(handle->conn, size);
+		num_streams += 1;
+	}
+	TALLOC_FREE(to_free);
+
+	*pnum_streams = num_streams;
+next:
 	return SMB_VFS_NEXT_FSTREAMINFO(handle,
 			fsp,
 			mem_ctx,
@@ -1081,12 +1162,19 @@ static ssize_t streams_xattr_pwrite(vfs_handle_struct *handle,
 		return -1;
 	}
 
-	ret = get_ea_value_fsp(talloc_tos(),
-			       fsp->base_fsp,
-			       sio->xattr_name,
-			       &ea);
+	ret = get_xattr_value_fsp(talloc_tos(),
+				  fsp->base_fsp,
+				  sio->xattr_name,
+				  &ea);
 	if (ret != 0) {
 		errno = ret;
+		return -1;
+	}
+
+	if (ea.value.length < (size_t)config->xattr_compat_bytes) {
+		/* No trailing byte: not written by this module */
+		TALLOC_FREE(ea.value.data);
+		errno = EINVAL;
 		return -1;
 	}
 
@@ -1166,18 +1254,25 @@ static ssize_t streams_xattr_pread(vfs_handle_struct *handle,
 		return -1;
 	}
 
-	ret = get_ea_value_fsp(talloc_tos(),
-			       fsp->base_fsp,
-			       sio->xattr_name,
-			       &ea);
+	ret = get_xattr_value_fsp(talloc_tos(),
+				  fsp->base_fsp,
+				  sio->xattr_name,
+				  &ea);
 	if (ret != 0) {
 		errno = ret;
 		return -1;
 	}
 
+	if (ea.value.length < (size_t)config->xattr_compat_bytes) {
+		/* No trailing byte: not written by this module */
+		TALLOC_FREE(ea.value.data);
+		errno = EINVAL;
+		return -1;
+	}
+
 	length = ea.value.length - config->xattr_compat_bytes;
 
-	DBG_DEBUG("get_ea_value_fsp returned %zu bytes\n", length);
+	DBG_DEBUG("get_xattr_value_fsp returned %zu bytes\n", length);
 
         /* Attempt to read past EOF. */
         if (length <= offset) {
@@ -1377,10 +1472,10 @@ static int streams_xattr_ftruncate(struct vfs_handle_struct *handle,
 		return -1;
 	}
 
-	ret = get_ea_value_fsp(talloc_tos(),
-			       fsp->base_fsp,
-			       sio->xattr_name,
-			       &ea);
+	ret = get_xattr_value_fsp(talloc_tos(),
+				  fsp->base_fsp,
+				  sio->xattr_name,
+				  &ea);
 	if (ret != 0) {
 		errno = ret;
 		return -1;
