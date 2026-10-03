@@ -994,7 +994,10 @@ static NTSTATUS streams_xattr_fstreaminfo(vfs_handle_struct *handle,
 	*pstreams = streams;
 
 	for (name = list; name < list + listlen; name += strlen(name) + 1) {
+		static const char stype[] = ":$DATA";
 		struct stream_struct *s = NULL;
+		size_t namelen, typelen;
+		char *sname = NULL;
 		ssize_t size;
 
 		if (!is_stream_xattr(config, name)) {
@@ -1009,14 +1012,21 @@ static NTSTATUS streams_xattr_fstreaminfo(vfs_handle_struct *handle,
 			continue;
 		}
 
-		s = &streams[num_streams];
-		s->name = talloc_asprintf(streams, ":%s%s",
-					  name + config->prefix_len,
-					  config->store_stream_type ? "" : ":$DATA");
-		if (s->name == NULL) {
+		/* ":" + name past the prefix [+ ":$DATA"], no format string */
+		namelen = strlen(name + config->prefix_len);
+		typelen = config->store_stream_type ? 0 : sizeof(stype) - 1;
+		sname = talloc_array(streams, char, 1 + namelen + typelen + 1);
+		if (sname == NULL) {
 			TALLOC_FREE(to_free);
 			return NT_STATUS_NO_MEMORY;
 		}
+		sname[0] = ':';
+		memcpy(sname + 1, name + config->prefix_len, namelen);
+		memcpy(sname + 1 + namelen, stype, typelen);
+		sname[1 + namelen + typelen] = '\0';
+
+		s = &streams[num_streams];
+		s->name = sname;
 		s->size = size;
 		s->alloc_size = smb_roundup(handle->conn, size);
 		num_streams += 1;
