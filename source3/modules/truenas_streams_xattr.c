@@ -82,9 +82,9 @@ static ssize_t get_xattr_len_fsp(struct files_struct *fsp,
 }
 
 /*
- * Size of the stream in xattr_name. Also fails for values too short to hold
- * the trailing byte xattr_compat = no stores: pread and pwrite assume it is
- * there.
+ * Size of the stream in xattr_name. A zero length is an empty stream with
+ * xattr_compat = yes; values too short to hold the trailing byte that
+ * xattr_compat = no stores fail with EINVAL, as pread and pwrite do.
  */
 static ssize_t get_xattr_size_fsp(vfs_handle_struct *handle,
 				  struct files_struct *fsp,
@@ -1144,6 +1144,13 @@ static ssize_t streams_xattr_pwrite(vfs_handle_struct *handle,
 		return -1;
 	}
 
+	if (ea.value.length < (size_t)config->xattr_compat_bytes) {
+		/* No trailing byte: not written by this module */
+		TALLOC_FREE(ea.value.data);
+		errno = EINVAL;
+		return -1;
+	}
+
         if ((offset + n) > ea.value.length - config->xattr_compat_bytes) {
 		uint8_t *tmp;
 		size_t new_sz = offset + n + 1;
@@ -1226,6 +1233,13 @@ static ssize_t streams_xattr_pread(vfs_handle_struct *handle,
 				  &ea);
 	if (ret != 0) {
 		errno = ret;
+		return -1;
+	}
+
+	if (ea.value.length < (size_t)config->xattr_compat_bytes) {
+		/* No trailing byte: not written by this module */
+		TALLOC_FREE(ea.value.data);
+		errno = EINVAL;
 		return -1;
 	}
 
