@@ -917,6 +917,34 @@ static bool is_stream_xattr(const struct streams_xattr_config *config,
 	return !samba_private_attr_name(xattr_name);
 }
 
+/*
+ * Stream name for a stream xattr, the reverse of streams_xattr_get_name():
+ * ":" plus the name past the prefix, plus ":$DATA" when the type isn't
+ * stored. Built by copying, without a format string.
+ */
+static char *stream_name_from_xattr(TALLOC_CTX *mem_ctx,
+				    const struct streams_xattr_config *config,
+				    const char *xattr_name)
+{
+	static const char stype[] = ":$DATA";
+	const char *name = xattr_name + config->prefix_len;
+	size_t namelen = strlen(name);
+	size_t typelen = config->store_stream_type ? 0 : sizeof(stype) - 1;
+	char *sname = NULL;
+
+	sname = talloc_array(mem_ctx, char, 1 + namelen + typelen + 1);
+	if (sname == NULL) {
+		return NULL;
+	}
+
+	sname[0] = ':';
+	memcpy(sname + 1, name, namelen);
+	memcpy(sname + 1 + namelen, stype, typelen);
+	sname[1 + namelen + typelen] = '\0';
+
+	return sname;
+}
+
 static NTSTATUS streams_xattr_fstreaminfo(vfs_handle_struct *handle,
 					 struct files_struct *fsp,
 					 TALLOC_CTX *mem_ctx,
@@ -994,10 +1022,7 @@ static NTSTATUS streams_xattr_fstreaminfo(vfs_handle_struct *handle,
 	*pstreams = streams;
 
 	for (name = list; name < list + listlen; name += strlen(name) + 1) {
-		static const char stype[] = ":$DATA";
 		struct stream_struct *s = NULL;
-		size_t namelen, typelen;
-		char *sname = NULL;
 		ssize_t size;
 
 		if (!is_stream_xattr(config, name)) {
@@ -1012,21 +1037,12 @@ static NTSTATUS streams_xattr_fstreaminfo(vfs_handle_struct *handle,
 			continue;
 		}
 
-		/* ":" + name past the prefix [+ ":$DATA"], no format string */
-		namelen = strlen(name + config->prefix_len);
-		typelen = config->store_stream_type ? 0 : sizeof(stype) - 1;
-		sname = talloc_array(streams, char, 1 + namelen + typelen + 1);
-		if (sname == NULL) {
+		s = &streams[num_streams];
+		s->name = stream_name_from_xattr(streams, config, name);
+		if (s->name == NULL) {
 			TALLOC_FREE(to_free);
 			return NT_STATUS_NO_MEMORY;
 		}
-		sname[0] = ':';
-		memcpy(sname + 1, name + config->prefix_len, namelen);
-		memcpy(sname + 1 + namelen, stype, typelen);
-		sname[1 + namelen + typelen] = '\0';
-
-		s = &streams[num_streams];
-		s->name = sname;
 		s->size = size;
 		s->alloc_size = smb_roundup(handle->conn, size);
 		num_streams += 1;
