@@ -345,6 +345,157 @@ done:
 	return ret;
 }
 
+/* The pattern test_truenas_streams_sizes() writes, by stream offset */
+static void truenas_stream_fill(uint8_t *buf, uint32_t off, uint32_t len)
+{
+	uint32_t k;
+
+	for (k = 0; k < len; k++) {
+		buf[k] = (uint8_t)(((off + k) * 2654435761u) >> 24);
+	}
+}
+
+/*
+ * Stream sizes and data with truenas_streams_xattr.
+ *
+ * The module takes a stream's size from the length of its xattr alone, both
+ * for FILE_STREAM_INFORMATION and when a stream is stat'ed, and reads values
+ * past a 256-byte first guess at their exact size. Sizes and data must match
+ * what was written: for empty and one-byte streams, around 256 bytes, and up
+ * to the cap. The trailing compat byte must not leak into either, so run this
+ * against shares with both streams_xattr:xattr_compat settings.
+ */
+static bool test_truenas_streams_sizes(struct torture_context *tctx,
+				       struct smb2_tree *tree)
+{
+	NTSTATUS status;
+	bool ret = true;
+	struct smb2_handle h = {{0}};
+	union smb_fileinfo finfo;
+	const char *fname = "streamsizes";
+	uint32_t cap = torture_setting_int(tctx, "streams_cap", 32768);
+	uint32_t sizes[] = { 0, 1, 254, 255, 256, 257, 350, 4096, 0, 0 };
+	size_t num_sizes = ARRAY_SIZE(sizes);
+	/* One credit per WRITE: smbtorture may hold too few for larger ones */
+	const uint32_t chunk = 65536;
+	uint8_t *buf = NULL;
+	size_t i, j;
+
+	sizes[num_sizes - 2] = cap / 2;
+	sizes[num_sizes - 1] = cap - 1;
+
+	buf = talloc_zero_array(tctx, uint8_t, chunk);
+	torture_assert_goto(tctx, buf != NULL, ret, done, "talloc buffer");
+
+	smb2_util_unlink(tree, fname);
+
+	status = torture_smb2_testfile(tree, fname, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"create base file");
+	smb2_util_close(tree, h);
+
+	for (i = 0; i < num_sizes; i++) {
+		const char *sname = talloc_asprintf(tctx, "%s:s%zu", fname, i);
+		uint32_t off;
+
+		status = truenas_open_stream(tree, sname, NTCREATEX_DISP_CREATE,
+					     &h);
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						"create stream");
+		for (off = 0; off < sizes[i]; off += chunk) {
+			uint32_t len = MIN(chunk, sizes[i] - off);
+
+			truenas_stream_fill(buf, off, len);
+			status = smb2_util_write(tree, h, buf, off, len);
+			torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+				talloc_asprintf(tctx, "write %" PRIu32
+						"-byte stream", sizes[i]));
+		}
+		smb2_util_close(tree, h);
+
+		/* The reopened stream's size comes from stat'ing it */
+		status = truenas_open_stream(tree, sname, NTCREATEX_DISP_OPEN,
+					     &h);
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						"reopen stream");
+		ZERO_STRUCT(finfo);
+		finfo.generic.level = RAW_FILEINFO_STANDARD_INFORMATION;
+		finfo.generic.in.file.handle = h;
+		status = smb2_getinfo_file(tree, tctx, &finfo);
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						"query stream standard info");
+		torture_assert_u64_equal_goto(tctx,
+					      finfo.standard_info.out.size,
+					      sizes[i], ret, done,
+					      "stream size via stat");
+
+		for (off = 0; off < sizes[i]; off += chunk) {
+			struct smb2_read rd;
+			uint32_t len = MIN(chunk, sizes[i] - off);
+
+			ZERO_STRUCT(rd);
+			rd.in.file.handle = h;
+			rd.in.offset = off;
+			rd.in.length = len;
+			status = smb2_read(tree, tctx, &rd);
+			torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+				talloc_asprintf(tctx, "read %" PRIu32
+						"-byte stream", sizes[i]));
+			torture_assert_int_equal_goto(tctx, rd.out.data.length,
+						      len, ret, done,
+						      "short stream read");
+			truenas_stream_fill(buf, off, len);
+			torture_assert_mem_equal_goto(tctx, rd.out.data.data,
+						      buf, len, ret, done,
+						      "stream data mismatch");
+			TALLOC_FREE(rd.out.data.data);
+		}
+		smb2_util_close(tree, h);
+	}
+
+	status = truenas_open_stream(tree, fname, NTCREATEX_DISP_OPEN, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"open base file (streaminfo)");
+	ZERO_STRUCT(finfo);
+	finfo.generic.level = RAW_FILEINFO_STREAM_INFORMATION;
+	finfo.generic.in.file.handle = h;
+	status = smb2_getinfo_file(tree, tctx, &finfo);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"query stream information");
+	smb2_util_close(tree, h);
+
+	/* every stream exactly once, plus ::$DATA */
+	torture_assert_int_equal_goto(tctx, finfo.stream_info.out.num_streams,
+				      num_sizes + 1, ret, done,
+				      "number of streams listed");
+
+	for (i = 0; i < num_sizes; i++) {
+		const char *want = talloc_asprintf(tctx, ":s%zu:$DATA", i);
+		bool found = false;
+
+		for (j = 0; j < finfo.stream_info.out.num_streams; j++) {
+			struct stream_struct *s = &finfo.stream_info.out.streams[j];
+
+			if (!strequal(s->stream_name.s, want)) {
+				continue;
+			}
+			found = true;
+			torture_assert_u64_equal_goto(tctx, s->size, sizes[i],
+						      ret, done,
+						      "stream size via streaminfo");
+			torture_assert_goto(tctx, s->alloc_size >= s->size,
+					    ret, done,
+					    "allocation size below stream size");
+		}
+		torture_assert_goto(tctx, found, ret, done,
+				    talloc_asprintf(tctx, "%s not listed", want));
+	}
+
+done:
+	smb2_util_unlink(tree, fname);
+	return ret;
+}
+
 /*
  * Enumerate snapshots over SMB (FSCTL_SRV_ENUM_SNAPS) and return the first
  * @GMT- label plus its NTTIME timewarp token. On a share without
@@ -643,6 +794,8 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 				     test_truenas_rename_case_insensitive);
 	torture_suite_add_1smb2_test(streams_suite, "cap_and_offset",
 				     test_truenas_streams_cap_and_offset);
+	torture_suite_add_1smb2_test(streams_suite, "sizes",
+				     test_truenas_streams_sizes);
 	torture_suite_add_1smb2_test(sc_suite, "browse",
 				     test_truenas_shadow_copy_browse);
 	torture_suite_add_1smb2_test(sc_suite, "readonly",
