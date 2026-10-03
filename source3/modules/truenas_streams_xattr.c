@@ -945,78 +945,106 @@ static char *stream_name_from_xattr(TALLOC_CTX *mem_ctx,
 	return sname;
 }
 
-static NTSTATUS streams_xattr_fstreaminfo(vfs_handle_struct *handle,
-					 struct files_struct *fsp,
-					 TALLOC_CTX *mem_ctx,
-					 unsigned int *pnum_streams,
-					 struct stream_struct **pstreams)
+/*
+ * List fsp's xattr names into buf, which covers nearly every file. If it is
+ * too small, list them into a talloc buffer of the kernel's list limit
+ * instead, returned in *plist for the caller to free: asking for the size
+ * first would cost a second full walk on ZFS. A symlink has no xattrs.
+ */
+static NTSTATUS list_xattrs_fsp(struct files_struct *fsp,
+				char *buf,
+				size_t bufsize,
+				char **plist,
+				size_t *plistlen)
+{
+	NTSTATUS status = NT_STATUS_OK;
+	char *list = buf;
+	ssize_t len;
+
+	*plist = buf;
+	*plistlen = 0;
+
+	if (refuse_symlink_fsp(fsp)) {
+		return NT_STATUS_OK;
+	}
+
+	len = SMB_VFS_FLISTXATTR(fsp, list, bufsize);
+	if ((len == -1) && (errno == ERANGE)) {
+		list = talloc_array(talloc_tos(), char, 65536);
+		if (list == NULL) {
+			return NT_STATUS_NO_MEMORY;
+		}
+		len = SMB_VFS_FLISTXATTR(fsp, list, talloc_get_size(list));
+	}
+
+	if (len == -1) {
+		status = map_nt_error_from_unix(errno);
+	} else if ((len > 0) && (list[len - 1] != '\0')) {
+		status = NT_STATUS_INTERNAL_ERROR;
+	}
+	if (!NT_STATUS_IS_OK(status)) {
+		if (list != buf) {
+			TALLOC_FREE(list);
+		}
+		return status;
+	}
+
+	*plist = list;
+	*plistlen = len;
+	return NT_STATUS_OK;
+}
+
+static unsigned int count_stream_xattrs(
+	const struct streams_xattr_config *config,
+	const char *list,
+	size_t listlen)
+{
+	const char *name = NULL;
+	unsigned int num = 0;
+
+	for (name = list; name < list + listlen; name += strlen(name) + 1) {
+		if (is_stream_xattr(config, name)) {
+			num += 1;
+		}
+	}
+
+	return num;
+}
+
+/*
+ * Append a stream for each stream xattr in list to *pstreams, with one
+ * allocation for all of them. Slots of xattrs skipped below stay unused;
+ * everything downstream goes by *pnum_streams.
+ */
+static NTSTATUS add_xattr_streams(vfs_handle_struct *handle,
+				  struct files_struct *fsp,
+				  TALLOC_CTX *mem_ctx,
+				  const char *list,
+				  size_t listlen,
+				  unsigned int *pnum_streams,
+				  struct stream_struct **pstreams)
 {
 	struct streams_xattr_config *config = NULL;
 	struct stream_struct *streams = NULL;
 	unsigned int num_streams = *pnum_streams;
-	unsigned int num_xattrs = 0;
-	char smallbuf[1024];
-	char *list = smallbuf;
-	char *to_free = NULL;
+	unsigned int num_xattrs;
 	const char *name = NULL;
-	ssize_t listlen;
-	NTSTATUS status;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config, struct streams_xattr_config,
 				return NT_STATUS_UNSUCCESSFUL);
 
-	if (refuse_symlink_fsp(fsp)) {
-		/* No xattrs on a symlink */
-		goto next;
-	}
-
-	/*
-	 * One listxattr into a stack buffer covers nearly every file. On
-	 * ERANGE retry at the kernel's list limit rather than asking for the
-	 * size: on ZFS a size-only listxattr walks the xattrs like a real one.
-	 */
-	listlen = SMB_VFS_FLISTXATTR(fsp, list, sizeof(smallbuf));
-	if ((listlen == -1) && (errno == ERANGE)) {
-		to_free = talloc_array(talloc_tos(), char, 65536);
-		if (to_free == NULL) {
-			return NT_STATUS_NO_MEMORY;
-		}
-		list = to_free;
-		listlen = SMB_VFS_FLISTXATTR(fsp, list, talloc_get_size(list));
-	}
-	if (listlen == -1) {
-		status = map_nt_error_from_unix(errno);
-		TALLOC_FREE(to_free);
-		return status;
-	}
-	if ((listlen > 0) && (list[listlen - 1] != '\0')) {
-		TALLOC_FREE(to_free);
-		return NT_STATUS_INTERNAL_ERROR;
-	}
-
-	for (name = list; name < list + listlen; name += strlen(name) + 1) {
-		if (is_stream_xattr(config, name)) {
-			num_xattrs += 1;
-		}
-	}
+	num_xattrs = count_stream_xattrs(config, list, listlen);
 	if (num_xattrs == 0) {
-		TALLOC_FREE(to_free);
-		goto next;
+		return NT_STATUS_OK;
 	}
 	if (num_streams + num_xattrs < num_streams) {
 		/* Integer wrap. */
-		TALLOC_FREE(to_free);
 		return NT_STATUS_INVALID_PARAMETER;
 	}
 
-	/*
-	 * One allocation for all of them. Slots of xattrs skipped below stay
-	 * unused; everything downstream goes by *pnum_streams.
-	 */
 	streams = talloc_realloc(mem_ctx, *pstreams, struct stream_struct,
 				 num_streams + num_xattrs);
 	if (streams == NULL) {
-		TALLOC_FREE(to_free);
 		return NT_STATUS_NO_MEMORY;
 	}
 	*pstreams = streams;
@@ -1040,17 +1068,43 @@ static NTSTATUS streams_xattr_fstreaminfo(vfs_handle_struct *handle,
 		s = &streams[num_streams];
 		s->name = stream_name_from_xattr(streams, config, name);
 		if (s->name == NULL) {
-			TALLOC_FREE(to_free);
 			return NT_STATUS_NO_MEMORY;
 		}
 		s->size = size;
 		s->alloc_size = smb_roundup(handle->conn, size);
 		num_streams += 1;
 	}
-	TALLOC_FREE(to_free);
 
 	*pnum_streams = num_streams;
-next:
+	return NT_STATUS_OK;
+}
+
+static NTSTATUS streams_xattr_fstreaminfo(vfs_handle_struct *handle,
+					 struct files_struct *fsp,
+					 TALLOC_CTX *mem_ctx,
+					 unsigned int *pnum_streams,
+					 struct stream_struct **pstreams)
+{
+	char smallbuf[1024];
+	char *list = NULL;
+	size_t listlen = 0;
+	NTSTATUS status;
+
+	status = list_xattrs_fsp(fsp, smallbuf, sizeof(smallbuf),
+				 &list, &listlen);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+
+	status = add_xattr_streams(handle, fsp, mem_ctx, list, listlen,
+				   pnum_streams, pstreams);
+	if (list != smallbuf) {
+		TALLOC_FREE(list);
+	}
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+
 	return SMB_VFS_NEXT_FSTREAMINFO(handle,
 			fsp,
 			mem_ctx,
