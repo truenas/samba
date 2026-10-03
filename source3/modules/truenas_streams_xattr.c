@@ -82,13 +82,14 @@ static ssize_t get_xattr_len_fsp(struct files_struct *fsp,
 }
 
 /*
- * Size of the stream in xattr_name. A zero length is an empty stream with
- * xattr_compat = yes; values too short to hold the trailing byte that
- * xattr_compat = no stores fail with EINVAL, as pread and pwrite do.
+ * Size of the stream in xattr_name as clients see it: get_xattr_len_fsp()
+ * minus the trailing byte xattr_compat = no stores. A zero length is an empty
+ * stream with xattr_compat = yes; values too short to hold that byte fail
+ * with EINVAL, as pread and pwrite do.
  */
-static ssize_t get_xattr_size_fsp(vfs_handle_struct *handle,
-				  struct files_struct *fsp,
-				  const char *xattr_name)
+static ssize_t get_stream_size_fsp(vfs_handle_struct *handle,
+				   struct files_struct *fsp,
+				   const char *xattr_name)
 {
 	ssize_t len;
 	struct streams_xattr_config *config = NULL;
@@ -302,9 +303,9 @@ static int streams_xattr_fstat(vfs_handle_struct *handle, files_struct *fsp,
 		return -1;
 	}
 
-	sbuf->st_ex_size = get_xattr_size_fsp(handle,
-					      fsp->base_fsp,
-					      io->xattr_name);
+	sbuf->st_ex_size = get_stream_size_fsp(handle,
+					       fsp->base_fsp,
+					       io->xattr_name);
 	if (sbuf->st_ex_size == -1) {
 		SET_STAT_INVALID(*sbuf);
 		return -1;
@@ -382,8 +383,8 @@ static int streams_xattr_stat(vfs_handle_struct *handle,
 		fsp = fsp->base_fsp;
 	}
 
-	smb_fname->st.st_ex_size = get_xattr_size_fsp(handle, fsp,
-						      xattr_name);
+	smb_fname->st.st_ex_size = get_stream_size_fsp(handle, fsp,
+							xattr_name);
 	if (smb_fname->st.st_ex_size == -1) {
 		TALLOC_FREE(xattr_name);
 		TALLOC_FREE(pathref);
@@ -477,7 +478,7 @@ static int streams_xattr_fstatat(struct vfs_handle_struct *handle,
 
 	*sbuf = fsp->fsp_name->st;
 
-	size = get_xattr_size_fsp(handle, fsp, xattr_name);
+	size = get_stream_size_fsp(handle, fsp, xattr_name);
 	if (size == -1) {
 		errno = ENOENT;
 		ret = -1;
@@ -1000,7 +1001,7 @@ static NTSTATUS streams_xattr_fstreaminfo(vfs_handle_struct *handle,
 			continue;
 		}
 
-		size = get_xattr_size_fsp(handle, fsp, name);
+		size = get_stream_size_fsp(handle, fsp, name);
 		if (size == -1) {
 			/* Removed since the listxattr, or unreadable */
 			DBG_DEBUG("Skipping %s on %s: %s\n",
