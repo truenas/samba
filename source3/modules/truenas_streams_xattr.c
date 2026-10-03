@@ -110,29 +110,71 @@ static ssize_t get_stream_size_fsp(vfs_handle_struct *handle,
 	return len - config->xattr_compat_bytes;
 }
 
-/* SMB_VFS_FGETXATTR() into *pval, (re)allocated to exactly size bytes */
-static ssize_t fgetxattr_talloc(TALLOC_CTX *mem_ctx,
-				struct files_struct *fsp,
-				const char *xattr_name,
-				uint8_t **pval,
-				size_t size)
+/*
+ * Read xattr_name into a new talloc buffer of size bytes. size must not be 0:
+ * a 0-byte getxattr only asks for the size. Nothing is allocated on failure.
+ */
+static ssize_t fgetxattr_alloc(TALLOC_CTX *mem_ctx,
+			       struct files_struct *fsp,
+			       const char *xattr_name,
+			       size_t size,
+			       uint8_t **pval)
 {
-	uint8_t *val = talloc_realloc(mem_ctx, *pval, uint8_t, size);
+	uint8_t *val = NULL;
+	ssize_t len;
 
+	val = talloc_array(mem_ctx, uint8_t, size);
 	if (val == NULL) {
 		errno = ENOMEM;
 		return -1;
 	}
-	*pval = val;
 
-	return SMB_VFS_FGETXATTR(fsp, xattr_name, val, size);
+	len = SMB_VFS_FGETXATTR(fsp, xattr_name, val, size);
+	if (len == -1) {
+		int err = errno;
+
+		TALLOC_FREE(val);
+		errno = err;
+		return -1;
+	}
+
+	*pval = val;
+	return len;
 }
 
 /*
- * Read the whole xattr holding a stream. A 256-byte first guess fits most
- * streams. Past that, ask for the exact size rather than retrying with
- * "smbd max xattr size", a buffer the kernel would allocate and zero in full
- * (2 MiB on TrueNAS).
+ * Read an xattr too large for get_xattr_value_fsp()'s first guess at its
+ * exact size, rather than at "smbd max xattr size" (2 MiB on TrueNAS), which
+ * the kernel would allocate and zero in full. Only if it grows between asking
+ * and reading fall back to that.
+ */
+static ssize_t fgetxattr_large(TALLOC_CTX *mem_ctx,
+			       struct files_struct *fsp,
+			       const char *xattr_name,
+			       uint8_t **pval)
+{
+	ssize_t len = get_xattr_len_fsp(fsp, xattr_name);
+
+	if (len == -1) {
+		return -1;
+	}
+
+	/* MAX: it may have been emptied since the first guess */
+	len = fgetxattr_alloc(mem_ctx, fsp, xattr_name, MAX(len, 1), pval);
+	if ((len == -1) && (errno == ERANGE)) {
+		len = fgetxattr_alloc(mem_ctx, fsp, xattr_name,
+				      lp_smbd_max_xattr_size(SNUM(fsp->conn)),
+				      pval);
+	}
+
+	return len;
+}
+
+/*
+ * Read the whole xattr holding a stream into a talloc buffer. The first guess
+ * of 8 KiB fits nearly every stream in one call, and costs the kernel about
+ * what a tiny buffer does: up to that size its copy comes from the kmalloc
+ * slab caches, beyond it from the page allocator.
  */
 static int get_xattr_value_fsp(TALLOC_CTX *mem_ctx,
 			       struct files_struct *fsp,
@@ -146,25 +188,12 @@ static int get_xattr_value_fsp(TALLOC_CTX *mem_ctx,
 		return EACCES;
 	}
 
-	len = fgetxattr_talloc(mem_ctx, fsp, xattr_name, &val, 256);
+	len = fgetxattr_alloc(mem_ctx, fsp, xattr_name, 8192, &val);
 	if ((len == -1) && (errno == ERANGE)) {
-		len = get_xattr_len_fsp(fsp, xattr_name);
-		if (len != -1) {
-			len = fgetxattr_talloc(mem_ctx, fsp, xattr_name, &val,
-					       MAX(len, 1));
-			if ((len == -1) && (errno == ERANGE)) {
-				/* It grew since we asked: take the largest */
-				len = fgetxattr_talloc(
-					mem_ctx, fsp, xattr_name, &val,
-					lp_smbd_max_xattr_size(SNUM(fsp->conn)));
-			}
-		}
+		len = fgetxattr_large(mem_ctx, fsp, xattr_name, &val);
 	}
-
 	if (len == -1) {
-		int err = errno;
-		TALLOC_FREE(val);
-		return err;
+		return errno;
 	}
 
 	*pea = (struct ea_struct) {
