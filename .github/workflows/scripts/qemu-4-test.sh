@@ -116,6 +116,10 @@ chmod 0777 /tank/vanilla
 # each other's files.
 zfs create -o atime=off tank/uring
 chmod 0777 /tank/uring
+# vfs_fruit over truenas_streams_xattr, as middleware configures AAPL shares,
+# for the truenas.fruit tests.
+zfs create -o casesensitivity=insensitive -o atime=off tank/fruit
+chmod 0777 /tank/fruit
 # Per-user recycle bin (vfs_truenas_recycle) validation datasets, one per ACL
 # flavour. The NFSv4 one is aclmode=restricted on purpose: that is the case
 # where a chmod of an inherited ACL fails EPERM, so recycle must set the bin
@@ -259,6 +263,15 @@ cat > /etc/smb4.conf <<CONF
     read only = no
     guest ok = yes
     vfs objects = io_uring
+
+[zfruit]
+    # Stream-backed metadata and resource forks, in middleware's object
+    # order, for truenas.fruit.
+    path = /tank/fruit
+    read only = no
+    vfs objects = fruit truenas_streams_xattr zfs_core
+    fruit:metadata = stream
+    fruit:resource = stream
 
 [zrecp]
     # Per-user recycle bin on a POSIX-ACL dataset.
@@ -429,6 +442,12 @@ if "$SMBTORTURE" //127.0.0.1/ztest -U 'smbtest%testpass123' \
   echo "truenas smbtorture suite PASSED"
 else
   echo "ERROR: truenas smbtorture suite FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
+fi
+# truenas.fruit.* self-skips on ztest (no vfs_fruit); run it where fruit is.
+if "$SMBTORTURE" //127.0.0.1/zfruit -U 'smbtest%testpass123' truenas.fruit; then
+  echo "truenas.fruit suite PASSED"
+else
+  echo "ERROR: truenas.fruit suite FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
 fi
 
 echo "=========================================="
