@@ -102,14 +102,15 @@ done:
 
 static NTSTATUS truenas_rename(struct smb2_tree *tree,
 			       struct smb2_handle handle,
-			       const char *new_name)
+			       const char *new_name,
+			       bool overwrite)
 {
 	union smb_setfileinfo sinfo;
 
 	ZERO_STRUCT(sinfo);
 	sinfo.rename_information.level = RAW_SFILEINFO_RENAME_INFORMATION;
 	sinfo.rename_information.in.file.handle = handle;
-	sinfo.rename_information.in.overwrite = 0;
+	sinfo.rename_information.in.overwrite = overwrite;
 	sinfo.rename_information.in.root_fid = 0;
 	sinfo.rename_information.in.new_name = new_name;
 
@@ -146,7 +147,7 @@ static bool test_truenas_rename_case_insensitive(struct torture_context *tctx,
 	status = torture_smb2_open(tree, "to_rename", SEC_STD_DELETE, &h);
 	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
 					"open to_rename");
-	status = truenas_rename(tree, h, "To_rename");
+	status = truenas_rename(tree, h, "To_rename", false);
 	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
 					"rename to_rename -> To_rename");
 	smb2_util_close(tree, h);
@@ -169,7 +170,7 @@ static bool test_truenas_rename_case_insensitive(struct torture_context *tctx,
 	status = torture_smb2_open(tree, "to_rename", SEC_STD_DELETE, &h);
 	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
 					"reopen to_rename (case-insensitive)");
-	status = truenas_rename(tree, h, "to_rename");
+	status = truenas_rename(tree, h, "to_rename", false);
 	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
 					"case-only rename To_rename -> to_rename");
 	smb2_util_close(tree, h);
@@ -492,6 +493,173 @@ static bool test_truenas_streams_sizes(struct torture_context *tctx,
 		torture_assert_goto(tctx, found, ret, done,
 				    talloc_asprintf(tctx, "%s not listed", want));
 	}
+
+done:
+	smb2_util_unlink(tree, fname);
+	return ret;
+}
+
+/*
+ * Check that stream sname holds exactly len bytes of data.
+ */
+static bool truenas_check_stream(struct torture_context *tctx,
+				 struct smb2_tree *tree,
+				 const char *sname,
+				 const uint8_t *data,
+				 uint32_t len)
+{
+	NTSTATUS status;
+	bool ret = true;
+	struct smb2_handle h = {{0}};
+	union smb_fileinfo finfo;
+	struct smb2_read rd;
+
+	status = truenas_open_stream(tree, sname, NTCREATEX_DISP_OPEN, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+		talloc_asprintf(tctx, "open %s", sname));
+
+	ZERO_STRUCT(finfo);
+	finfo.generic.level = RAW_FILEINFO_STANDARD_INFORMATION;
+	finfo.generic.in.file.handle = h;
+	status = smb2_getinfo_file(tree, tctx, &finfo);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"query stream standard info");
+	torture_assert_u64_equal_goto(tctx, finfo.standard_info.out.size, len,
+				      ret, done,
+		talloc_asprintf(tctx, "size of %s", sname));
+
+	ZERO_STRUCT(rd);
+	rd.in.file.handle = h;
+	rd.in.offset = 0;
+	rd.in.length = len;
+	status = smb2_read(tree, tctx, &rd);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+		talloc_asprintf(tctx, "read %s", sname));
+	torture_assert_int_equal_goto(tctx, rd.out.data.length, len, ret, done,
+				      "short stream read");
+	torture_assert_mem_equal_goto(tctx, rd.out.data.data, data, len,
+				      ret, done,
+		talloc_asprintf(tctx, "data of %s", sname));
+
+done:
+	smb2_util_close(tree, h);
+	return ret;
+}
+
+/*
+ * Renaming a stream ("file:old" to ":new"), which smbd hands to the module's
+ * rename_stream. The data must move with the name, an existing target is
+ * replaced only when asked, and renaming a stream onto its own name, in any
+ * case, leaves it intact.
+ */
+static bool test_truenas_streams_rename(struct torture_context *tctx,
+					struct smb2_tree *tree)
+{
+	NTSTATUS status;
+	bool ret = true;
+	struct smb2_handle h = {{0}};
+	union smb_fileinfo finfo;
+	const char *fname = "streamrename";
+	const uint8_t small[] = "small";
+	/* past get_xattr_value_fsp()'s first guess */
+	const uint32_t biglen = 20000;
+	uint8_t *big = NULL;
+
+	big = talloc_array(tctx, uint8_t, biglen);
+	torture_assert_goto(tctx, big != NULL, ret, done, "talloc buffer");
+	truenas_stream_fill(big, 0, biglen);
+
+	smb2_util_unlink(tree, fname);
+	status = torture_smb2_testfile(tree, fname, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"create base file");
+	smb2_util_close(tree, h);
+
+	status = truenas_open_stream(tree, "streamrename:one",
+				     NTCREATEX_DISP_CREATE, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"create stream one");
+	status = smb2_util_write(tree, h, big, 0, biglen);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"write stream one");
+	smb2_util_close(tree, h);
+
+	status = truenas_open_stream(tree, "streamrename:two",
+				     NTCREATEX_DISP_CREATE, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"create stream two");
+	status = smb2_util_write(tree, h, small, 0, sizeof(small));
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"write stream two");
+	smb2_util_close(tree, h);
+
+	/* one -> three: the data moves, the old name is gone */
+	status = truenas_open_stream(tree, "streamrename:one",
+				     NTCREATEX_DISP_OPEN, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"open stream one");
+	status = truenas_rename(tree, h, ":three", false);
+	smb2_util_close(tree, h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"rename one to three");
+	status = truenas_open_stream(tree, "streamrename:one",
+				     NTCREATEX_DISP_OPEN, &h);
+	torture_assert_ntstatus_equal_goto(tctx, status,
+					   NT_STATUS_OBJECT_NAME_NOT_FOUND,
+					   ret, done,
+					   "stream one still there");
+	ret = truenas_check_stream(tctx, tree, "streamrename:three",
+				   big, biglen);
+	torture_assert_goto(tctx, ret, ret, done, "stream three");
+
+	/* three -> two, an existing stream: only replaced when asked */
+	status = truenas_open_stream(tree, "streamrename:three",
+				     NTCREATEX_DISP_OPEN, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"open stream three");
+	status = truenas_rename(tree, h, ":two", false);
+	torture_assert_ntstatus_equal_goto(tctx, status,
+					   NT_STATUS_OBJECT_NAME_COLLISION,
+					   ret, done,
+					   "rename onto two without overwrite");
+	status = truenas_rename(tree, h, ":two", true);
+	smb2_util_close(tree, h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"rename onto two with overwrite");
+	status = truenas_open_stream(tree, "streamrename:three",
+				     NTCREATEX_DISP_OPEN, &h);
+	torture_assert_ntstatus_equal_goto(tctx, status,
+					   NT_STATUS_OBJECT_NAME_NOT_FOUND,
+					   ret, done,
+					   "stream three still there");
+	ret = truenas_check_stream(tctx, tree, "streamrename:two", big, biglen);
+	torture_assert_goto(tctx, ret, ret, done, "stream two replaced");
+
+	/* two -> TWO: its own name in another case, which changes nothing */
+	status = truenas_open_stream(tree, "streamrename:two",
+				     NTCREATEX_DISP_OPEN, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"open stream two");
+	status = truenas_rename(tree, h, ":TWO", true);
+	smb2_util_close(tree, h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"rename two onto itself");
+	ret = truenas_check_stream(tctx, tree, "streamrename:two", big, biglen);
+	torture_assert_goto(tctx, ret, ret, done, "stream two intact");
+
+	/* left: ::$DATA and the one stream */
+	status = truenas_open_stream(tree, fname, NTCREATEX_DISP_OPEN, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"open base file (streaminfo)");
+	ZERO_STRUCT(finfo);
+	finfo.generic.level = RAW_FILEINFO_STREAM_INFORMATION;
+	finfo.generic.in.file.handle = h;
+	status = smb2_getinfo_file(tree, tctx, &finfo);
+	smb2_util_close(tree, h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"query stream information");
+	torture_assert_int_equal_goto(tctx, finfo.stream_info.out.num_streams,
+				      2, ret, done, "number of streams left");
 
 done:
 	smb2_util_unlink(tree, fname);
@@ -967,6 +1135,8 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 				     test_truenas_streams_cap_and_offset);
 	torture_suite_add_1smb2_test(streams_suite, "sizes",
 				     test_truenas_streams_sizes);
+	torture_suite_add_1smb2_test(streams_suite, "rename",
+				     test_truenas_streams_rename);
 	torture_suite_add_1smb2_test(fruit_suite, "readdir_rfork_size",
 				     test_truenas_fruit_readdir_rfork_size);
 	torture_suite_add_1smb2_test(sc_suite, "browse",
