@@ -132,7 +132,8 @@ struct fruit_config_data {
 	bool aapl_zero_file_id;
 	const char *model;
 	char *macmeta_streamname;
-	char *rsrc_streamname;	/* pre-computed AFP_AfpResource xattr name */
+	char *rsrc_streamname;	/* pre-computed AFP_Resource xattr name */
+	int streams_compat_bytes; /* trailing byte truenas_streams_xattr stores */
 	bool time_machine;
 	off_t time_machine_max_size;
 	bool convert_adouble;
@@ -390,11 +391,25 @@ static int init_fruit_config(vfs_handle_struct *handle)
 					 "store_stream_type",
 					 true);
 
+	/* As truenas_streams_xattr: a trailing byte unless xattr_compat */
+	config->streams_compat_bytes = lp_parm_bool(SNUM(handle->conn),
+						    "streams_xattr",
+						    "xattr_compat",
+						    false) ? 0 : 1;
+
+	/*
+	 * The xattr names truenas_streams_xattr stores the AFP streams under.
+	 * Only a stream-backed resource fork lives in one.
+	 */
 	if (lp_parm_bool(SNUM(handle->conn), FRUIT_PARAM_TYPE_NAME, "streamname_optimization", true)) {
 		config->macmeta_streamname = talloc_asprintf(config, "%s%s%s",
-		    prefix, "AFP_AfpInfo", store_stream_type ? ":$DATA" : "");
-		config->rsrc_streamname = talloc_asprintf(config, "%s%s%s",
-		    prefix, "AFP_AfpResource", store_stream_type ? ":$DATA" : "");
+		    prefix, AFPINFO_STREAM_NAME + 1,
+		    store_stream_type ? ":$DATA" : "");
+		if (config->rsrc == FRUIT_RSRC_STREAM) {
+			config->rsrc_streamname = talloc_asprintf(config,
+			    "%s%s%s", prefix, AFPRESOURCE_STREAM_NAME + 1,
+			    store_stream_type ? ":$DATA" : "");
+		}
 	}
 	tm_size_str = lp_parm_const_string(
 		SNUM(handle->conn), FRUIT_PARAM_TYPE_NAME,
@@ -1164,16 +1179,17 @@ static uint64_t readdir_attr_rfork_size_stream(
 	/*
 	 * Fast path: the resource fork lives in a single xattr on the
 	 * base file. If the dir-enum entry already has an open pathref,
-	 * read the xattr's value-length directly — one syscall.
-	 * Falls through to the slow path on any unexpected error so
-	 * configurations without streamname_optimization still work.
+	 * read the xattr's value-length directly — one syscall — less
+	 * the trailing byte truenas_streams_xattr stores, as its stat
+	 * would. Falls through to the slow path on any unexpected error
+	 * so configurations without streamname_optimization still work.
 	 */
 	if (config->rsrc_streamname != NULL && smb_fname->fsp != NULL) {
 		ssize_t sz = SMB_VFS_FGETXATTR(smb_fname->fsp,
 					       config->rsrc_streamname,
 					       NULL, 0);
 		if (sz >= 0) {
-			return (uint64_t)sz;
+			return MAX(sz - config->streams_compat_bytes, 0);
 		}
 		if (errno == ENOATTR || errno == ENOTSUP) {
 			return 0;
