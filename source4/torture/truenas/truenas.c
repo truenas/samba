@@ -33,7 +33,9 @@
 
 #include "libcli/smb2/smb2.h"
 #include "libcli/smb2/smb2_calls.h"
+#include "libcli/smb/smb2_create_ctx.h"
 #include "libcli/security/security.h"
+#include "MacExtensions.h"
 
 #include "torture/torture.h"
 #include "torture/util.h"
@@ -497,6 +499,173 @@ done:
 }
 
 /*
+ * Ask for Apple's SMB2 extensions with directory attributes for this session,
+ * as a Mac does. *supported says whether the server offered them, which it
+ * only does with vfs_fruit.
+ */
+static bool truenas_enable_aapl(struct torture_context *tctx,
+				struct smb2_tree *tree,
+				bool *supported)
+{
+	struct smb2_create io;
+	struct smb2_create_blob *aapl = NULL;
+	DATA_BLOB data;
+	NTSTATUS status;
+	bool ret = true;
+
+	*supported = false;
+
+	ZERO_STRUCT(io);
+	io.in.desired_access = SEC_FLAG_MAXIMUM_ALLOWED;
+	io.in.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
+	io.in.create_disposition = NTCREATEX_DISP_OPEN;
+	io.in.share_access = NTCREATEX_SHARE_ACCESS_MASK;
+	io.in.fname = "";
+
+	data = data_blob_talloc(tctx, NULL, 3 * sizeof(uint64_t));
+	torture_assert_goto(tctx, data.data != NULL, ret, done, "talloc");
+	SBVAL(data.data, 0, SMB2_CRTCTX_AAPL_SERVER_QUERY);
+	SBVAL(data.data, 8, SMB2_CRTCTX_AAPL_SERVER_CAPS);
+	SBVAL(data.data, 16, (SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR |
+			      SMB2_CRTCTX_AAPL_UNIX_BASED));
+
+	status = smb2_create_blob_add(tctx, &io.in.blobs, "AAPL", data);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"smb2_create_blob_add");
+
+	status = smb2_create(tree, tctx, &io);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"open share root with AAPL context");
+	smb2_util_close(tree, io.out.file.handle);
+
+	aapl = smb2_create_blob_find(&io.out.blobs, SMB2_CREATE_TAG_AAPL);
+	if ((aapl != NULL) && (aapl->data.length >= 24)) {
+		*supported = (BVAL(aapl->data.data, 16) &
+			      SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR) != 0;
+	}
+
+done:
+	return ret;
+}
+
+/*
+ * Resource fork sizes in AAPL directory listings.
+ *
+ * With directory attributes negotiated, each entry carries the length of its
+ * resource fork in the short name field. With fruit:resource = stream,
+ * vfs_fruit takes that length straight from the truenas_streams_xattr xattr,
+ * so it must use the stream's xattr name and leave out the trailing byte the
+ * module stores. Sizes stay under the CI share's 32 KiB stream cap. Skipped
+ * on shares without vfs_fruit.
+ */
+static bool test_truenas_fruit_readdir_rfork_size(struct torture_context *tctx,
+						  struct smb2_tree *tree)
+{
+	NTSTATUS status;
+	bool ret = true;
+	bool supported = false;
+	bool found[5] = { false };
+	struct smb2_handle h = {{0}};
+	struct smb2_handle dirh = {{0}};
+	struct smb2_find f;
+	union smb_search_data *d = NULL;
+	const uint32_t sizes[] = { 0, 3, 300, 5000, 30000 };
+	uint8_t *buf = NULL;
+	unsigned int count;
+	size_t i;
+
+	ret = truenas_enable_aapl(tctx, tree, &supported);
+	if (!ret) {
+		return false;
+	}
+	if (!supported) {
+		torture_skip(tctx, "share does not offer AAPL directory "
+			     "attributes (no vfs_fruit)\n");
+	}
+
+	buf = talloc_zero_array(tctx, uint8_t, sizes[ARRAY_SIZE(sizes) - 1]);
+	torture_assert_goto(tctx, buf != NULL, ret, done, "talloc buffer");
+
+	for (i = 0; i < ARRAY_SIZE(sizes); i++) {
+		const char *fname = talloc_asprintf(tctx, "rforksize_%zu", i);
+		const char *sname = talloc_asprintf(tctx, "%s%s", fname,
+						    AFPRESOURCE_STREAM_NAME);
+
+		smb2_util_unlink(tree, fname);
+		status = torture_smb2_testfile(tree, fname, &h);
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						"create file");
+		smb2_util_close(tree, h);
+
+		if (sizes[i] == 0) {
+			continue;
+		}
+
+		status = truenas_open_stream(tree, sname,
+					     NTCREATEX_DISP_OPEN_IF, &h);
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						"create resource fork");
+		status = smb2_util_write(tree, h, buf, 0, sizes[i]);
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						"write resource fork");
+		smb2_util_close(tree, h);
+	}
+
+	status = smb2_util_roothandle(tree, &dirh);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"open share root for enumeration");
+
+	ZERO_STRUCT(f);
+	f.in.file.handle	= dirh;
+	f.in.pattern		= "rforksize_*";
+	f.in.max_response_size	= 0x10000;
+	f.in.level		= SMB2_FIND_ID_BOTH_DIRECTORY_INFO;
+
+	do {
+		unsigned int j;
+
+		status = smb2_find_level(tree, tree, &f, &count, &d);
+		if (NT_STATUS_EQUAL(status, STATUS_NO_MORE_FILES)) {
+			break;
+		}
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						"smb2_find_level");
+
+		for (j = 0; j < count; j++) {
+			const char *name = d[j].id_both_directory_info.name.s;
+			uint64_t rfork_len;
+			unsigned int n;
+
+			if ((sscanf(name, "rforksize_%u", &n) != 1) ||
+			    (n >= ARRAY_SIZE(sizes))) {
+				continue;
+			}
+			found[n] = true;
+
+			rfork_len = BVAL(
+				d[j].id_both_directory_info.short_name_buf, 0);
+			torture_assert_u64_equal_goto(tctx, rfork_len,
+						      sizes[n], ret, done,
+				talloc_asprintf(tctx, "resource fork length "
+						"of %s", name));
+		}
+	} while (count > 0);
+
+	for (i = 0; i < ARRAY_SIZE(sizes); i++) {
+		torture_assert_goto(tctx, found[i], ret, done,
+				    "file missing from listing");
+	}
+
+done:
+	smb2_util_close(tree, dirh);
+	for (i = 0; i < ARRAY_SIZE(sizes); i++) {
+		smb2_util_unlink(tree,
+				 talloc_asprintf(tctx, "rforksize_%zu", i));
+	}
+	return ret;
+}
+
+/*
  * Enumerate snapshots over SMB (FSCTL_SRV_ENUM_SNAPS) and return the first
  * @GMT- label plus its NTTIME timewarp token. On a share without
  * shadow_copy_zfs the FSCTL is unsupported: *supported is set false and true is
@@ -789,6 +958,8 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 		torture_suite_create(suite, "streams");
 	struct torture_suite *sc_suite =
 		torture_suite_create(suite, "shadow_copy");
+	struct torture_suite *fruit_suite =
+		torture_suite_create(suite, "fruit");
 
 	torture_suite_add_1smb2_test(rename_suite, "case_insensitive",
 				     test_truenas_rename_case_insensitive);
@@ -796,6 +967,8 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 				     test_truenas_streams_cap_and_offset);
 	torture_suite_add_1smb2_test(streams_suite, "sizes",
 				     test_truenas_streams_sizes);
+	torture_suite_add_1smb2_test(fruit_suite, "readdir_rfork_size",
+				     test_truenas_fruit_readdir_rfork_size);
 	torture_suite_add_1smb2_test(sc_suite, "browse",
 				     test_truenas_shadow_copy_browse);
 	torture_suite_add_1smb2_test(sc_suite, "readonly",
@@ -805,6 +978,7 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 
 	torture_suite_add_suite(suite, rename_suite);
 	torture_suite_add_suite(suite, streams_suite);
+	torture_suite_add_suite(suite, fruit_suite);
 	torture_suite_add_suite(suite, sc_suite);
 
 	/* ACL <-> Security-Descriptor mapping subtests (truenas_acl.c) */
