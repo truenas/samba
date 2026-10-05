@@ -53,6 +53,17 @@
 	<member>SET_QUOTA</member>
 	</simplelist>
 
+	<para>Operations that smbd or other VFS modules perform internally
+	while processing a client request, such as opening the streams of a
+	file before it is opened for deletion, creating a directory under a
+	temporary name, applying an inherited ACL to a new file, or retrying
+	an open that waits for an oplock or lease break, are not audited
+	separately. The audit record of the client request covers them.</para>
+
+	<para>A security descriptor sent with a CREATE is part of the CREATE
+	record. If smbd applies it, because the CREATE created the file, a
+	SET_ACL record for the new file follows the CREATE.</para>
+
 	<para><command>vfs_truenas_audit</command> records audit events in fixed
 	format consisting of string <command>"@cee:{"TNAUDIT": JSON object / event}"</command>
 	Contents of the JSON object are as follows: </para>

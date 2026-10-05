@@ -51,6 +51,13 @@ union tn_backend_config {
 typedef bool tn_audit_log_fn_t(struct json_object *msg, union tn_backend_config *conf,
 			       const char *loc);
 
+struct tn_audit_create_acl {
+	bool expected;
+	bool applied;
+	uint32_t secinfo;
+	char *sddl;
+};
+
 /*
  * TrueNAS audit module configuration is generated during SMB tree connect VFS
  * operation and stores configuration of the module as well as operation
@@ -65,6 +72,9 @@ typedef bool tn_audit_log_fn_t(struct json_object *msg, union tn_backend_config 
  * `audit_fn` - function that sends the generated audit message
  * `conn_info` - static connection info for audit message
  * `op_cnt` - operation counters that are printed on TDIS.
+ * `depth` - audited VFS operations in progress, see tn_audit_nested().
+ * `create_acl` - security descriptor of the CREATE in progress, logged as
+ *     SET_ACL after the CREATE if smbd applied it.
  */
 typedef struct truenas_audit_config {
 	int rw_interval;
@@ -81,6 +91,8 @@ typedef struct truenas_audit_config {
 		size_t create;
 		size_t close;
 	} op_cnt;
+	unsigned int depth;
+	struct tn_audit_create_acl create_acl;
 } tn_audit_conf_t;
 
 /*
@@ -90,6 +102,9 @@ typedef struct truenas_audit_config {
  * of counters). We have separate timespecs for each of the op types though
  * so that we can implement limits on how frequently we generate audit
  * messages.
+ *
+ * `last_mtime_set` - last write time set through this handle, see
+ *     tn_settime_is_internal().
  */
 typedef struct truenas_audit_vfs_extension {
 	struct {
@@ -102,6 +117,7 @@ typedef struct truenas_audit_vfs_extension {
 	struct timespec last_offload_read;
 	struct timespec last_write;
 	struct timespec last_offload_write;
+	struct timespec last_mtime_set;
 	struct file_id_buf fid_str;
 	struct smb_filename *cached_fname;
 } tn_audit_ext_t;
@@ -127,6 +143,46 @@ typedef union tn_result_val {
 	int error;
 	NTSTATUS status;
 } tn_rval_t;
+
+/*
+ * smbd and lower modules re-enter the top of the VFS stack while serving a
+ * request (stream opens before a delete, mkdir's temporary name, inherited
+ * ACLs, create time updates, sync I/O for async I/O on streams). Only the
+ * outermost operation is the client's: audited operations raise `depth`
+ * while calling the next module, and nested operations are neither logged
+ * nor counted. CLOSE of a logged handle and the SD of a CREATE still are.
+ * smbd doesn't run the main event loop inside VFS calls, so no other request
+ * can interleave.
+ */
+static inline tn_audit_conf_t *tn_audit_config(vfs_handle_struct *handle)
+{
+	if (!SMB_VFS_HANDLE_TEST_DATA(handle)) {
+		DBG_ERR("failed to get vfs_handle->data\n");
+		return NULL;
+	}
+	return (tn_audit_conf_t *)handle->data;
+}
+
+/* A connection without configuration is never audited. */
+static inline bool tn_audit_nested(const tn_audit_conf_t *conf)
+{
+	return (conf == NULL) || (conf->depth > 0);
+}
+
+static inline void tn_audit_enter(tn_audit_conf_t *conf)
+{
+	if (conf != NULL) {
+		conf->depth++;
+	}
+}
+
+static inline void tn_audit_leave(tn_audit_conf_t *conf)
+{
+	if (conf != NULL) {
+		SMB_ASSERT(conf->depth > 0);
+		conf->depth--;
+	}
+}
 
 /*
  * The following ops lookup table contains the following items that
