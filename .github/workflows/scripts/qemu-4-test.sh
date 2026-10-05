@@ -116,6 +116,9 @@ chmod 0777 /tank/vanilla
 # each other's files.
 zfs create -o atime=off tank/uring
 chmod 0777 /tank/uring
+# truenas_streams_xattr with xattr_compat = yes ([ztest_compat]).
+zfs create -o casesensitivity=insensitive -o atime=off tank/compat
+chmod 0777 /tank/compat
 # vfs_fruit over truenas_streams_xattr, as middleware configures AAPL shares,
 # for the truenas.fruit tests.
 zfs create -o casesensitivity=insensitive -o atime=off tank/fruit
@@ -201,7 +204,15 @@ cat > /etc/smb4.conf <<CONF
     read only = no
     guest ok = yes
     vfs objects = truenas_streams_xattr zfs_core
-    truenas_streams_xattr:xattr_compat = no
+    # Read under the streams_xattr: prefix whatever the module is called.
+    streams_xattr:xattr_compat = no
+
+[ztest_compat]
+    # The other on-disk stream layout (no trailing byte), for truenas.streams.
+    path = /tank/compat
+    read only = no
+    vfs objects = truenas_streams_xattr zfs_core
+    streams_xattr:xattr_compat = yes
 
 [zauto]
     # zfs_core auto-creates the per-user %U dataset via libzfs on connect.
@@ -448,6 +459,13 @@ if "$SMBTORTURE" //127.0.0.1/zfruit -U 'smbtest%testpass123' truenas.fruit; then
   echo "truenas.fruit suite PASSED"
 else
   echo "ERROR: truenas.fruit suite FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
+fi
+# Same stream tests on the xattr_compat = yes layout.
+if "$SMBTORTURE" //127.0.0.1/ztest_compat -U 'smbtest%testpass123' \
+     --option='torture:streams_cap=32768' truenas.streams; then
+  echo "truenas.streams (xattr_compat = yes) PASSED"
+else
+  echo "ERROR: truenas.streams (xattr_compat = yes) FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
 fi
 
 echo "=========================================="
