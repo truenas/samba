@@ -38,7 +38,7 @@
 unsigned leak_reporting_enabled;
 unsigned glock_enabled;
 
-pthread_mutex_t py_g_lock = PTHREAD_MUTEX_INITIALIZER;
+PyMutex py_g_lock;
 
 /*
  * Get nodemap allocated under python memory allocator. Does not require GIL,
@@ -385,6 +385,7 @@ static int py_ctdb_client_init(py_ctdb_client_ctx *self,
 	int err = 0;
 	uint64_t srvid_offset;
 	const char *errmsg = NULL;
+	bool glocked;
 
 	/*
 	 * Create a new talloc context. Since there are no other talloc chunks
@@ -392,7 +393,7 @@ static int py_ctdb_client_init(py_ctdb_client_ctx *self,
 	 * required for talloc leak check.
 	 */
 	Py_BEGIN_ALLOW_THREADS
-	PYCTDB_LEAK_LOCK();
+	PYCTDB_LEAK_LOCK(glocked);
 	self->mem_ctx = talloc_new(NULL);
 	if (self->mem_ctx == NULL) {
 		errmsg = "talloc_new() failed";
@@ -444,8 +445,6 @@ static int py_ctdb_client_init(py_ctdb_client_ctx *self,
 		if (err) {
 			errmsg = "ctdb_client_set_message_handler() failed";
 			errno = err;
-		} else {
-			pthread_mutex_init(&self->client_lock, NULL);
 		}
 	}
 
@@ -453,7 +452,7 @@ static int py_ctdb_client_init(py_ctdb_client_ctx *self,
 		TALLOC_FREE(self->mem_ctx);
 	}
 
-	PYCTDB_LEAK_UNLOCK();
+	PYCTDB_LEAK_UNLOCK(glocked);
 	Py_END_ALLOW_THREADS
 
 	/*
@@ -485,8 +484,6 @@ void py_ctdb_client_dealloc(py_ctdb_client_ctx *self)
 
 	PyMem_RawFree(self->nodemap_cached.node);
 	Py_END_ALLOW_THREADS
-
-	pthread_mutex_destroy(&self->client_lock);
 
 	Py_TYPE(self)->tp_free((PyObject *)self);
 }

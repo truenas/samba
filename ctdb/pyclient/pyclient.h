@@ -90,7 +90,9 @@ extern pyctdb_mod_state_t *pyctdb_get_state(PyObject *module_ref);
 typedef struct {
 	PyObject_HEAD;
 	TALLOC_CTX *mem_ctx;
-	pthread_mutex_t client_lock;
+	PyMutex client_lock;
+	/* Whether py_g_lock was taken too. Only used with client_lock held */
+	bool glocked;
 	struct tevent_context *ev;
 	struct ctdb_client_context *client;
 	const char *ctdb_socket;
@@ -124,22 +126,27 @@ typedef struct {
  * leak_reporting_enabled will only ever be changed while GIL is held and so we
  * shouldn't have to worry about toctou here. This is mostly a debugging feature
  * to generate a talloc leak report on script exit.
+ *
+ * glock_enabled can change while an operation is in progress, as operations
+ * do not hold the GIL. So PYCTDB_LEAK_LOCK() sets `locked` to whether it took
+ * the lock, and PYCTDB_LEAK_UNLOCK() has to be given that.
  */
 extern unsigned leak_reporting_enabled;
 extern unsigned glock_enabled;
-extern pthread_mutex_t py_g_lock;
+extern PyMutex py_g_lock;
 
 #define TIMEOUT(client)    timeval_current_ofs(client->timeout, 0)
 
-#define PYCTDB_LEAK_LOCK() do { \
-	if (_Py_atomic_load_uint(&glock_enabled)) { \
-		pthread_mutex_lock(&py_g_lock); \
+#define PYCTDB_LEAK_LOCK(locked) do { \
+	locked = _Py_atomic_load_uint(&glock_enabled); \
+	if (locked) { \
+		PyMutex_Lock(&py_g_lock); \
 	} \
 } while (0);
 
-#define PYCTDB_LEAK_UNLOCK() do { \
-	if (_Py_atomic_load_uint(&glock_enabled)) { \
-		pthread_mutex_unlock(&py_g_lock); \
+#define PYCTDB_LEAK_UNLOCK(locked) do { \
+	if (locked) { \
+		PyMutex_Unlock(&py_g_lock); \
 	} \
 } while (0);
 
@@ -148,15 +155,24 @@ extern pthread_mutex_t py_g_lock;
  * operations. Locks should be taken when python methods perform operations to
  * help protect python users from having multiple threads performing operations
  * concurrently on talloc-ed memory
+ *
+ * The locks are PyMutex rather than pthread mutexes because of the order in
+ * which waiting threads get them: one that has waited for a millisecond is
+ * handed the lock. A pthread mutex lets a thread that releases the lock and
+ * takes it again at once, as an iterator does for every record, keep the
+ * others out until it is done.
  */
 #define PYCTDB_LOCK(obj) do { \
-	PYCTDB_LEAK_LOCK(); \
-	pthread_mutex_lock(&obj->client_lock); \
+	bool _glocked; \
+	PYCTDB_LEAK_LOCK(_glocked); \
+	PyMutex_Lock(&obj->client_lock); \
+	obj->glocked = _glocked; \
 } while (0);
 
 #define PYCTDB_UNLOCK(obj) do { \
-	pthread_mutex_unlock(&obj->client_lock); \
-	PYCTDB_LEAK_UNLOCK(); \
+	bool _glocked = obj->glocked; \
+	PyMutex_Unlock(&obj->client_lock); \
+	PYCTDB_LEAK_UNLOCK(_glocked); \
 } while (0);
 
 /*

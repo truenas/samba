@@ -31,7 +31,9 @@ import errno
 import os
 import signal
 import subprocess
+import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -388,6 +390,141 @@ class DisconnectTest(ClusterTestCase):
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual([(type(e), e.errno) for e in errors],
                          [(pyctdb.CTDBError, errno.ENOTCONN)] * len(calls))
+
+
+class GlobalLockingTest(ClusterTestCase):
+    """The lock that all clients of a process share, if it is turned on.
+
+    The setting is for the whole process, and leak reporting can not be
+    turned off again. So each test does its part in a process of its own,
+    which also keeps a crash there from ending the test run.
+    """
+
+    def run_python(self, code, *args, node=0):
+        """Run code in a process whose clients use a node of the cluster."""
+        result = subprocess.run(
+            [sys.executable, '-c', textwrap.dedent(code), *map(str, args)],
+            env=cluster.env(node),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_set_global_locking(self):
+        self.run_python('''
+            import concurrent.futures
+
+            import pyctdb
+
+            assert pyctdb.get_global_locking() is False
+            for value, setting in ((True, True), (1, True), ('x', True),
+                                   (False, False), (0, False), ('', False)):
+                assert pyctdb.set_global_locking(value) is setting, value
+                assert pyctdb.get_global_locking() is setting, value
+
+            for args in ((), (True, True)):
+                try:
+                    pyctdb.set_global_locking(*args)
+                except TypeError:
+                    pass
+                else:
+                    raise AssertionError(args)
+
+            assert pyctdb.set_global_locking(value=True) is True
+            assert pyctdb.get_global_locking() is True
+
+            def use_database(number):
+                key = b'key %d' % number
+                db = pyctdb.Client().get_db('pyctdb_global_locking.tdb',
+                                            create_ok=True)
+                for n in range(20):
+                    db.store(key, b'value %d' % n)
+                    assert db.fetch(key) == b'value %d' % n
+
+            # Two clients, each of which now waits for the other
+            with concurrent.futures.ThreadPoolExecutor(2) as executor:
+                for future in [executor.submit(use_database, number)
+                               for number in range(2)]:
+                    future.result()
+        ''')
+
+    def test_leak_reporting_keeps_global_locking_on(self):
+        self.run_python('''
+            import pyctdb
+
+            assert pyctdb.get_leak_reporting() is False
+            pyctdb.enable_leak_reporting()
+            assert pyctdb.get_leak_reporting() is True
+            assert pyctdb.get_global_locking() is True
+            for value in (False, True):
+                try:
+                    pyctdb.set_global_locking(value)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(value)
+
+            assert pyctdb.get_global_locking() is True
+            pyctdb.Client().status()
+        ''')
+
+    def test_setting_changes_during_a_call(self):
+        node = NUM_NODES - 1
+        daemon = cluster.daemon_pid(node)
+        # In case the other process does not get to it
+        self.addCleanup(os.kill, daemon, signal.SIGCONT)
+        self.run_python('''
+            import os
+            import signal
+            import sys
+            import threading
+            import time
+
+            import pyctdb
+
+            daemon = int(sys.argv[1])
+            client = pyctdb.Client()
+            client.status()
+
+            def call(during=None):
+                """Make a call, and do something while it waits for a reply."""
+                errors = []
+
+                def status():
+                    try:
+                        client.status()
+                    except Exception as e:
+                        errors.append(e)
+
+                thread = threading.Thread(target=status, daemon=True)
+                if during is None:
+                    thread.start()
+                else:
+                    # A stopped process does not reply
+                    os.kill(daemon, signal.SIGSTOP)
+                    try:
+                        thread.start()
+                        time.sleep(1)
+                        assert thread.is_alive(), errors
+                        during()
+                    finally:
+                        os.kill(daemon, signal.SIGCONT)
+
+                thread.join(30)
+                assert not thread.is_alive(), 'the call does not return'
+                assert not errors, errors
+
+            # The call that is waiting has not taken the global lock
+            call(lambda: pyctdb.set_global_locking(True))
+            call()
+            # This one has taken it, and still has to release it
+            call(lambda: pyctdb.set_global_locking(False))
+            pyctdb.set_global_locking(True)
+            call()
+        ''', daemon, node=node)
 
 
 class StatusTest(ClusterTestCase):

@@ -395,6 +395,7 @@ The extension is designed to be thread-safe:
 - Each client context has its own mutex lock
 - Database operations acquire locks before accessing CTDB
 - The GIL is released during long-running operations
+- Threads that wait for a client get it in turn once they have waited a millisecond, so a thread that iterates over a large database does not keep the others waiting until it is done
 - Global locking can be enabled for talloc leak reporting
 
 ```python
@@ -463,7 +464,9 @@ is_locked = pyctdb.get_global_locking()
 pyctdb.set_global_locking(True)
 ```
 
-**Note:** Once leak reporting is enabled, it cannot be disabled for the module.
+`set_global_locking(value)` returns the new setting. An operation that is in progress when the setting changes is not affected.
+
+**Note:** Once leak reporting is enabled, it cannot be disabled for the module, and `set_global_locking()` raises `ValueError`.
 
 ## Database Types
 
