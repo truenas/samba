@@ -121,8 +121,9 @@ jobs:
 
     - name: Smoke-test the TrueNAS VFS stack on ZFS
       # Bumped from 25: now also runs the truenas streams/shadow_copy/acl torture
-      # suites and a curated set of upstream smb2.* regression suites.
-      timeout-minutes: 45
+      # suites and a curated set of upstream smb2.* regression suites. Bumped
+      # from 45 for the SMB auditing tests.
+      timeout-minutes: 60
       run: bash .github/workflows/scripts/qemu-4-test.sh
 
     - name: Collect logs
