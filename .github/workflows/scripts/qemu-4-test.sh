@@ -28,6 +28,9 @@
 #     case-sensitive vanilla share
 #   * the vfs_io_uring read/write path, which is linked against the pinned
 #     upstream liburing (debian/build-liburing.sh) rather than Debian's
+#   * SMB auditing (truenas_audit): the truenas.audit suite, the syslog
+#     backend, upstream smb2.* suites with and without truenas_audit, and
+#     the well-formedness of every record in the audit log
 ######################################################################
 
 set -eu
@@ -141,6 +144,13 @@ chmod 0777 /tank/recn/child
 # exercising the two-level shared parent chain (.recycle and .recycle/<domain>).
 zfs create -o acltype=posix -o casesensitivity=insensitive -o atime=off tank/recad
 chmod 0777 /tank/recad
+# SMB auditing datasets: audited shares and the unaudited reference share.
+for ds in audit auditref; do
+  zfs create -o acltype=nfsv4 -o aclmode=passthrough -o aclinherit=passthrough \
+             -o casesensitivity=insensitive -o atime=off "tank/$ds"
+  chmod 0777 "/tank/$ds"
+done
+mkdir -m 0777 /tank/audit/ignored /tank/audit/watched /tank/audit/syslog
 echo "Dataset:"; zfs get casesensitivity tank/share
 
 echo "=========================================="
@@ -196,7 +206,9 @@ cat > /etc/smb4.conf <<CONF
     # truenas.streams.cap_and_offset test hits the module's cap deterministically
     # (matches --option=torture:streams_cap=32768).
     smbd max xattr size = 32768
-    log level = 1
+    # truenas.audit reads the debug backend's records from this file, unrotated.
+    log level = 1 truenas_audit:1@/var/log/samba4/truenas_audit.log
+    max log size = 0
     log file = /var/log/samba4/smbd.log
 
 [ztest]
@@ -314,6 +326,71 @@ cat > /etc/smb4.conf <<CONF
     recycle:repository = .recycle/%D/%U
     recycle:keeptree = yes
     recycle:subdir_mode = 0700
+
+[zaudit]
+    # The stack middleware builds, minus io_uring (kernel.io_uring_disabled).
+    path = /tank/audit
+    read only = no
+    vfs objects = truenas_audit fruit truenas_streams_xattr shadow_copy_zfs ixnas zfs_core
+    truenas_audit:backend = debug
+    ea support = no
+    fruit:metadata = stream
+    fruit:resource = stream
+    fruit:convert_adouble = no
+    nfs4:mode = simple
+    nfs4:acedup = merge
+
+[zaudit_ref]
+    # [zaudit] without truenas_audit.
+    path = /tank/auditref
+    read only = no
+    vfs objects = fruit truenas_streams_xattr shadow_copy_zfs ixnas zfs_core
+    ea support = no
+    fruit:metadata = stream
+    fruit:resource = stream
+    fruit:convert_adouble = no
+    nfs4:mode = simple
+    nfs4:acedup = merge
+
+[zaudit_ignored]
+    # S-1-5-11 is in every token: nothing is audited.
+    path = /tank/audit/ignored
+    read only = no
+    vfs objects = truenas_audit fruit truenas_streams_xattr shadow_copy_zfs ixnas zfs_core
+    truenas_audit:backend = debug
+    truenas_audit:ignore_list = S-1-5-11
+    ea support = no
+    fruit:metadata = stream
+    fruit:resource = stream
+    fruit:convert_adouble = no
+    nfs4:mode = simple
+    nfs4:acedup = merge
+
+[zaudit_watched]
+    # The watch list wins: everything is audited.
+    path = /tank/audit/watched
+    read only = no
+    vfs objects = truenas_audit fruit truenas_streams_xattr shadow_copy_zfs ixnas zfs_core
+    truenas_audit:backend = debug
+    truenas_audit:watch_list = S-1-5-11
+    truenas_audit:ignore_list = S-1-5-11
+    ea support = no
+    fruit:metadata = stream
+    fruit:resource = stream
+    fruit:convert_adouble = no
+    nfs4:mode = simple
+    nfs4:acedup = merge
+
+[zaudit_syslog]
+    path = /tank/audit/syslog
+    read only = no
+    vfs objects = truenas_audit fruit truenas_streams_xattr shadow_copy_zfs ixnas zfs_core
+    ea support = no
+    fruit:metadata = stream
+    fruit:resource = stream
+    fruit:convert_adouble = no
+    nfs4:mode = simple
+    nfs4:acedup = merge
 CONF
 
 testparm -s /etc/smb4.conf >/dev/null && echo "testparm: OK"
@@ -904,6 +981,128 @@ if [ "$smb2_fail" -ne 0 ]; then
   echo "ERROR: $smb2_fail upstream smb2 suite(s) failed"; exit 1
 fi
 echo "all upstream smb2 suites passed"
+
+echo "=========================================="
+echo "SMB auditing (truenas_audit)"
+echo "=========================================="
+AUDIT_LOG=/var/log/samba4/truenas_audit.log
+if "$SMBTORTURE" //127.0.0.1/zaudit -U 'smbtest%testpass123' \
+     --option=torture:audit_log="$AUDIT_LOG" \
+     --option=torture:audit_ignored_share=zaudit_ignored \
+     --option=torture:audit_watched_share=zaudit_watched \
+     truenas.audit; then
+  echo "truenas.audit suite PASSED"
+else
+  echo "ERROR: truenas.audit suite FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
+fi
+
+# The default (syslog) backend's records reach the journal.
+if command -v journalctl >/dev/null 2>&1; then
+  since="$(date '+%Y-%m-%d %H:%M:%S')"
+  sleep 1
+  echo audit-syslog > /tmp/audit-syslog.txt
+  smbclient //127.0.0.1/zaudit_syslog -U 'smbtest%testpass123' \
+    -c 'put /tmp/audit-syslog.txt syslog.txt; rm syslog.txt' \
+    || { echo "ERROR: put/rm on [zaudit_syslog] failed"; tail -40 /var/log/samba4/smbd.log; exit 1; }
+  sleep 2
+  journalctl -t TNAUDIT_SMB --since "$since" -o cat --no-pager \
+    >/tmp/audit-syslog.log 2>&1 || true
+  if python3 - /tmp/audit-syslog.log <<'PY'
+import json, sys
+events = set()
+for line in open(sys.argv[1]):
+    if not line.startswith('@cee:'):
+        continue
+    rec = json.loads(line[len('@cee:'):])['TNAUDIT']
+    if json.loads(rec['svc_data'])['service'] == 'zaudit_syslog':
+        events.add(rec['event'])
+missing = {'CONNECT', 'CREATE', 'WRITE', 'CLOSE', 'UNLINK'} - events
+assert not missing, 'not in the journal: %s (found %s)' % (sorted(missing),
+                                                         sorted(events))
+print('syslog backend records in the journal:', ' '.join(sorted(events)))
+PY
+  then
+    echo "syslog backend PASSED"
+  else
+    echo "ERROR: syslog backend records missing from the journal"
+    tail -20 /tmp/audit-syslog.log; exit 1
+  fi
+else
+  echo "WARN: no journalctl; skipping the syslog backend check"
+fi
+
+# Upstream smb2.* subtests that pass on [zaudit_ref] must pass on [zaudit].
+# A differing suite is rerun once to rule out flakes.
+AUDIT_DIFF_SUITES="smb2.compound smb2.compound_async smb2.compound_find \
+smb2.create smb2.rename smb2.streams smb2.delete-on-close-perms smb2.setinfo \
+smb2.dosmode smb2.getinfo smb2.rw smb2.ioctl smb2.sharemode smb2.timestamps \
+smb2.maximum_allowed smb2.durable-open"
+audit_passed() {
+  # the subtests of suite $2 that pass on share $1
+  "$SMBTORTURE" "//127.0.0.1/$1" -U 'smbtest%testpass123' "$2" \
+    >"/tmp/tort-$1-$2.log" 2>&1
+  sed -n -E 's/^success: ([^ ]+).*/\1/p' "/tmp/tort-$1-$2.log" | sort -u
+}
+audit_diff_fail=0
+audit_ref_passed=0
+set +e
+for s in $AUDIT_DIFF_SUITES; do
+  ref="$(audit_passed zaudit_ref "$s")"
+  if [ -z "$ref" ]; then
+    echo "  skip $s: nothing passes on [zaudit_ref]"
+    continue
+  fi
+  audit_ref_passed=$((audit_ref_passed + $(echo "$ref" | grep -c .)))
+  aud="$(audit_passed zaudit "$s")"
+  lost="$(comm -23 <(echo "$ref") <(echo "$aud"))"
+  if [ -n "$lost" ]; then
+    aud="$(audit_passed zaudit "$s")"
+    lost="$(comm -23 <(echo "$ref") <(echo "$aud"))"
+  fi
+  if [ -n "$lost" ]; then
+    echo "  FAIL $s: passes without truenas_audit, fails with it:"
+    echo "$lost" | sed 's/^/    /'
+    grep -A3 -E '^(failure|error):' "/tmp/tort-zaudit-$s.log" | head -40
+    audit_diff_fail=$((audit_diff_fail + 1))
+  else
+    echo "  same $s ($(echo "$aud" | grep -c .) passed)"
+  fi
+done
+set -e
+if [ "$audit_ref_passed" -eq 0 ]; then
+  echo "ERROR: no upstream smb2 subtest passes on [zaudit_ref]"; exit 1
+fi
+if [ "$audit_diff_fail" -ne 0 ]; then
+  echo "ERROR: truenas_audit changed the results of $audit_diff_fail suite(s)"; exit 1
+fi
+echo "upstream smb2 suites behave the same with truenas_audit ($audit_ref_passed subtests compared)"
+
+# Every record is well-formed, none names an smbd temporary name, and every
+# event but SET_QUOTA occurs.
+python3 - "$AUDIT_LOG" <<'PY' || { echo "ERROR: bad records in $AUDIT_LOG"; exit 1; }
+import collections, json, sys
+EVENTS = {'CONNECT', 'DISCONNECT', 'CREATE', 'CLOSE', 'READ', 'WRITE',
+          'OFFLOAD_READ', 'OFFLOAD_WRITE', 'SET_ACL', 'RENAME', 'UNLINK',
+          'FSCTL', 'SET_ATTR', 'SET_QUOTA'}
+KEYS = {'aid', 'vers', 'time', 'addr', 'user', 'sess', 'svc', 'event',
+        'success', 'svc_data', 'event_data'}
+counts = collections.Counter()
+for n, line in enumerate(open(sys.argv[1]), 1):
+    line = line.strip()
+    if not line.startswith('{'):
+        continue
+    rec = json.loads(line)
+    assert KEYS <= rec.keys(), 'line %d lacks %s' % (n, sorted(KEYS - rec.keys()))
+    assert rec['event'] in EVENTS, 'line %d: unknown event %s' % (n, rec['event'])
+    json.loads(rec['svc_data'])
+    json.loads(rec['event_data'])
+    assert '.::TMPNAME:' not in rec['event_data'], 'line %d: %s' % (n, line)
+    counts[rec['event']] += 1
+missing = (EVENTS - {'SET_QUOTA'}) - counts.keys()
+assert not missing, 'no %s records' % sorted(missing)
+print('records in the audit log:', dict(sorted(counts.items())))
+PY
+echo "audit log records OK"
 
 echo "=========================================="
 echo "Check smbd log for module-load errors"

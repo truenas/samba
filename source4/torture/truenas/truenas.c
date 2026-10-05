@@ -1154,9 +1154,12 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 	/* ACL <-> Security-Descriptor mapping subtests (truenas_acl.c) */
 	torture_truenas_acl_suite(suite);
 
+	/* SMB auditing subtests (truenas_audit.c) */
+	torture_truenas_audit_suite(suite);
+
 	suite->description = talloc_strdup(suite,
 		"TrueNAS VFS stack tests (zfs_core, truenas_streams_xattr, "
-		"shadow_copy_zfs, ixnas)");
+		"shadow_copy_zfs, ixnas, truenas_audit)");
 
 	torture_register_suite(ctx, suite);
 

@@ -639,7 +639,91 @@ static tn_audit_ext_t *init_fsp_extension(vfs_handle_struct *handle,
 
 	file_id_str_buf(fsp->file_id, &fsp_ext->fid_str);
 	fsp_ext->cached_fname = cp_smb_filename(mem_ctx, fsp->fsp_name);
+	fsp_ext->last_mtime_set = make_omit_timespec();
 	return fsp_ext;
+}
+
+static bool tn_add_set_acl_payload(const struct smb_filename *fname,
+				   const tn_audit_ext_t *fsp_ext,
+				   uint32_t secinfo_sent,
+				   const char *sddl,
+				   struct json_object *entry)
+{
+	bool ok;
+	int error;
+
+	if (fsp_ext == NULL) {
+		ok = tn_add_file_to_object(fname,
+					   fsp_ext,
+					   "file",
+					   FILE_ADD_NAME | FILE_ADD_TYPE,
+					   entry);
+	} else {
+		ok = tn_add_file_to_object(fname,
+					   fsp_ext,
+					   "file",
+					   FILE_ADD_HANDLE,
+					   entry);
+	}
+	if (!ok) {
+		DBG_ERR("Failed to add file handle to audit message\n");
+		return false;
+	}
+
+	ok = json_add_map_to_object(entry, "secinfo", secinfo_sent);
+	if (!ok) {
+		DBG_ERR("Failed to add secinfo_sent to audit message\n");
+		return false;
+	}
+
+	error = json_add_string(entry, "sd", sddl);
+	if (error) {
+		DBG_ERR("Failed to add sd to audit message\n");
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * smbd applied the SD before the handle had an extension, so name the file
+ * like any SET_ACL on such a handle.
+ */
+static void tn_audit_log_create_acl(vfs_handle_struct *handle,
+				    tn_audit_conf_t *config,
+				    files_struct *fsp,
+				    const struct tn_audit_create_acl *acl)
+{
+	struct json_object msg, entry;
+	bool ok;
+
+	ok = tn_init_json_msg(&msg, &entry);
+	if (!ok) {
+		DBG_ERR("Failed to generate audit message.\n");
+		return;
+	}
+
+	ok = tn_add_set_acl_payload(fsp->fsp_name, NULL, acl->secinfo,
+				    acl->sddl, &entry);
+	if (!ok) {
+		goto cleanup;
+	}
+
+	ok = tn_add_result_ntstatus(NT_STATUS_OK, &msg, &entry);
+	if (!ok) {
+		goto cleanup;
+	}
+
+	ok = tn_format_log_entry(handle, config, TN_OP_SET_ACL, &msg, &entry);
+	if (!ok) {
+		goto cleanup;
+	}
+
+	tn_audit_do_log(config, &msg);
+
+cleanup:
+	json_free(&msg);
+	json_free(&entry);
 }
 
 static NTSTATUS tn_audit_create_file(vfs_handle_struct *handle,
@@ -695,13 +779,44 @@ static NTSTATUS tn_audit_create_file(vfs_handle_struct *handle,
 	 * operation specifies an ACL to set concurrently with file creation.
 	 */
 	NTSTATUS result;
-	tn_audit_conf_t *config = NULL;
+	tn_audit_conf_t *config = tn_audit_config(handle);
 	tn_audit_ext_t *fsp_ext = NULL;
+	struct tn_audit_create_acl acl;
 	struct json_object msg, entry;
 	struct smb_filename *fname = smb_fname;
 	uint32_t js_flags = FILE_ADD_NAME | FILE_NAME_IS_PATH;
 	char *sddl_str = NULL;
 	bool ok;
+
+	/*
+	 * create_file_unixpath() turns opens without a request into
+	 * INTERNAL_OPEN_ONLY, but only below this module.
+	 */
+	if ((req == NULL) || (oplock_request == INTERNAL_OPEN_ONLY) ||
+	    tn_audit_nested(config)) {
+		tn_audit_enter(config);
+		result = SMB_VFS_NEXT_CREATE_FILE(
+			handle,
+			req,
+			dirfsp,
+			smb_fname,
+			access_mask,
+			share_access,
+			create_disposition,
+			create_options,
+			file_attributes,
+			oplock_request,
+			lease,
+			allocation_size,
+			private_flags,
+			sd,
+			ea_list,
+			result_fsp,
+			pinfo,
+			in_context_blobs, out_context_blobs);
+		tn_audit_leave(config);
+		return result;
+	}
 
 	if (sd != NULL) {
 		sddl_str = sddl_encode(handle->conn,
@@ -716,6 +831,12 @@ static NTSTATUS tn_audit_create_file(vfs_handle_struct *handle,
 		}
 	}
 
+	/* filled in by tn_audit_fset_nt_acl() when smbd applies sd */
+	config->create_acl = (struct tn_audit_create_acl) {
+		.expected = (sd != NULL),
+	};
+
+	tn_audit_enter(config);
 	result = SMB_VFS_NEXT_CREATE_FILE(
 		handle,
 		req,
@@ -735,16 +856,24 @@ static NTSTATUS tn_audit_create_file(vfs_handle_struct *handle,
 		result_fsp,
 		pinfo,
 		in_context_blobs, out_context_blobs);
+	tn_audit_leave(config);
 
-	SMB_VFS_HANDLE_GET_DATA(handle, config, tn_audit_conf_t, return result);
-	if (oplock_request == INTERNAL_OPEN_ONLY) {
-		// This is interal op, don't log
+	acl = config->create_acl;
+	config->create_acl = (struct tn_audit_create_acl) { .expected = false };
+
+	if (!NT_STATUS_IS_OK(result) &&
+	    open_was_deferred(req->xconn, req->mid)) {
+		/* smbd retries the open, log only the final outcome */
+		TALLOC_FREE(acl.sddl);
 		TALLOC_FREE(sddl_str);
 		return result;
 	}
 
+	config->op_cnt.create++;
+
 	ok = tn_init_json_msg(&msg, &entry);
 	if (!ok) {
+		TALLOC_FREE(acl.sddl);
 		TALLOC_FREE(sddl_str);
 		return result;
 	}
@@ -782,7 +911,12 @@ static NTSTATUS tn_audit_create_file(vfs_handle_struct *handle,
 
 	tn_audit_do_log(config, &msg);
 
+	if (NT_STATUS_IS_OK(result) && acl.applied) {
+		tn_audit_log_create_acl(handle, config, *result_fsp, &acl);
+	}
+
 cleanup:
+	TALLOC_FREE(acl.sddl);
 	TALLOC_FREE(sddl_str);
 	json_free(&msg);
 	json_free(&entry);
@@ -848,20 +982,26 @@ static int tn_audit_close(vfs_handle_struct *handle, files_struct *fsp)
 	 *  }
 	 */
 	int result, error;
-	tn_audit_conf_t *config = NULL;
+	tn_audit_conf_t *config = tn_audit_config(handle);
 	tn_audit_ext_t *fsp_ext = NULL;
 	struct json_object msg, entry, counters;
 	uint32_t js_flags = FILE_ADD_NAME | FILE_NAME_IS_PATH | FILE_ADD_HANDLE;
 	bool ok;
 
+	tn_audit_enter(config);
 	result = SMB_VFS_NEXT_CLOSE(handle, fsp);
+	tn_audit_leave(config);
 
-	SMB_VFS_HANDLE_GET_DATA(handle, config, tn_audit_conf_t, return result);
+	if (config == NULL) {
+		return result;
+	}
 
 	fsp_ext = (tn_audit_ext_t *)VFS_FETCH_FSP_EXTENSION(handle, fsp);
 	if (fsp_ext == NULL) {
 		return result;
 	}
+
+	config->op_cnt.close++;
 
 	counters = json_new_object();
 	if (json_is_invalid(&counters)) {
@@ -907,6 +1047,15 @@ cleanup:
 	return result;
 }
 
+/* check_path_syntax() keeps clients away from smbd's temporary names */
+static bool tn_is_smbd_tmpname(const struct smb_filename *smb_fname)
+{
+	const char *name = strrchr(smb_fname->base_name, '/');
+
+	name = (name == NULL) ? smb_fname->base_name : name + 1;
+	return IS_SMBD_TMPNAME(name, NULL);
+}
+
 static int tn_audit_unlinkat(vfs_handle_struct *handle,
 			     struct files_struct *dirfsp,
 			     const struct smb_filename *smb_fname,
@@ -939,6 +1088,16 @@ static int tn_audit_unlinkat(vfs_handle_struct *handle,
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config, tn_audit_conf_t, return -1);
 
+	if (tn_audit_nested(config) || tn_is_smbd_tmpname(smb_fname)) {
+		tn_audit_enter(config);
+		result = SMB_VFS_NEXT_UNLINKAT(handle,
+					       dirfsp,
+					       smb_fname,
+					       flags);
+		tn_audit_leave(config);
+		return result;
+	}
+
 	full_fname = full_path_from_dirfsp_atname(talloc_tos(),
 						  dirfsp,
 						  smb_fname);
@@ -952,10 +1111,12 @@ static int tn_audit_unlinkat(vfs_handle_struct *handle,
 		return -1;
 	}
 
+	tn_audit_enter(config);
 	result = SMB_VFS_NEXT_UNLINKAT(handle,
 				       dirfsp,
 				       smb_fname,
 				       flags);
+	tn_audit_leave(config);
 
 	ok = tn_add_file_to_object(full_fname, NULL, "file", js_flags, &entry);
 	if (!ok) {
@@ -1021,6 +1182,18 @@ static int tn_audit_renameat(vfs_handle_struct *handle,
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config, tn_audit_conf_t, return -1);
 
+	if (tn_audit_nested(config) || tn_is_smbd_tmpname(smb_fname_src)) {
+		tn_audit_enter(config);
+		result = SMB_VFS_NEXT_RENAMEAT(handle,
+					srcfsp,
+					smb_fname_src,
+					dstfsp,
+					smb_fname_dst,
+					rhow);
+		tn_audit_leave(config);
+		return result;
+	}
+
 	full_fname_src = full_path_from_dirfsp_atname(talloc_tos(),
 						      srcfsp,
 						      smb_fname_src);
@@ -1035,12 +1208,14 @@ static int tn_audit_renameat(vfs_handle_struct *handle,
 		return -1;
 	}
 
+	tn_audit_enter(config);
 	result = SMB_VFS_NEXT_RENAMEAT(handle,
 				srcfsp,
 				smb_fname_src,
 				dstfsp,
 				smb_fname_dst,
 				rhow);
+	tn_audit_leave(config);
 
 	if (result == -1) {
 		TALLOC_FREE(full_fname_src);
@@ -1165,12 +1340,14 @@ static NTSTATUS tn_audit_fsctl(struct vfs_handle_struct *handle,
 	NTSTATUS result;
 	const char *parsed = NULL;
 	int i, error;
-	tn_audit_conf_t *config = NULL;
+	tn_audit_conf_t *config = tn_audit_config(handle);
 	tn_audit_ext_t *fsp_ext = NULL;
 	struct json_object msg, entry, jsfn;
 	uint32_t js_flags = FILE_ADD_NAME | FILE_NAME_IS_PATH | FILE_ADD_HANDLE;
+	bool nested = tn_audit_nested(config);
 	bool ok;
 
+	tn_audit_enter(config);
 	result = SMB_VFS_NEXT_FSCTL(handle,
 				    fsp,
 				    ctx,
@@ -1181,8 +1358,12 @@ static NTSTATUS tn_audit_fsctl(struct vfs_handle_struct *handle,
 				    _out_data,
 				    max_out_len,
 				    out_len);
+	tn_audit_leave(config);
 
-	SMB_VFS_HANDLE_GET_DATA(handle, config, tn_audit_conf_t, return result);
+	if (nested) {
+		return result;
+	}
+
 	fsp_ext = (tn_audit_ext_t *)VFS_FETCH_FSP_EXTENSION(handle, fsp);
 	if (fsp_ext == NULL) {
 		return result;
@@ -1251,7 +1432,7 @@ static void log_setattr_common(vfs_handle_struct *handle,
 			       files_struct *fsp,
 			       enum tn_setattr_tp attr_type,
 			       tn_rval_t rv,
-			       struct smb_file_time *ft,
+			       const struct smb_file_time *ft,
 			       uint32_t dosmode)
 {
 	bool ok;
@@ -1423,11 +1604,62 @@ static NTSTATUS tn_audit_fset_dos_attributes(struct vfs_handle_struct *handle,
 	 *   "vers": {"major": 0, "minor": 1}
 	 * }
 	 */
+	tn_audit_conf_t *config = tn_audit_config(handle);
+	bool nested = tn_audit_nested(config);
+	bool unchanged = false;
 	tn_rval_t rv;
 
+	tn_audit_enter(config);
+
+	if (!nested && (VFS_FETCH_FSP_EXTENSION(handle, fsp) != NULL)) {
+		uint32_t old_dosmode = 0;
+		NTSTATUS status;
+
+		/*
+		 * smbd rewrites unchanged attributes, e.g. the archive bit
+		 * after a rename; smb_set_file_dosmode() drops unchanged
+		 * client requests before they get here.
+		 */
+		status = SMB_VFS_NEXT_FGET_DOS_ATTRIBUTES(handle,
+							  fsp,
+							  &old_dosmode);
+		unchanged = NT_STATUS_IS_OK(status) && (old_dosmode == dosmode);
+	}
+
 	rv.status = SMB_VFS_NEXT_FSET_DOS_ATTRIBUTES(handle, fsp, dosmode);
+	tn_audit_leave(config);
+
+	if (nested || (unchanged && NT_STATUS_IS_OK(rv.status))) {
+		return rv.status;
+	}
+
 	log_setattr_common(handle, fsp, TN_SETATTR_DOSMODE, rv, NULL, dosmode);
 	return rv.status;
+}
+
+/*
+ * smb_set_file_time() is called with every time omitted for attribute-only
+ * FileBasicInformation, and mark_file_modified() puts a client-set write time
+ * back after each write, zeroing the cached mtime and setting only the mtime.
+ */
+static bool tn_settime_is_internal(const files_struct *fsp,
+				   const tn_audit_ext_t *fsp_ext,
+				   const struct smb_file_time *ft,
+				   const struct timespec *cached_mtime)
+{
+	if (!is_omit_timespec(&ft->create_time) ||
+	    !is_omit_timespec(&ft->atime) ||
+	    !is_omit_timespec(&ft->ctime)) {
+		return false;
+	}
+
+	if (is_omit_timespec(&ft->mtime)) {
+		return true;
+	}
+
+	return fsp->fsp_flags.write_time_forced &&
+	       (cached_mtime->tv_sec == 0) && (cached_mtime->tv_nsec == 0) &&
+	       timespec_equal(&ft->mtime, &fsp_ext->last_mtime_set);
 }
 
 static int tn_audit_fntimes(vfs_handle_struct *handle,
@@ -1458,10 +1690,38 @@ static int tn_audit_fntimes(vfs_handle_struct *handle,
 	 *   "vers": {"major": 0, "minor": 1}
 	 * }
 	 */
+	tn_audit_conf_t *config = tn_audit_config(handle);
+	tn_audit_ext_t *fsp_ext = NULL;
+	bool nested = tn_audit_nested(config);
+	/* lower modules fill in omitted times */
+	struct smb_file_time requested = *ft;
+	struct timespec cached_mtime = fsp->fsp_name->st.st_ex_mtime;
 	tn_rval_t rv;
 
+	tn_audit_enter(config);
 	rv.error = SMB_VFS_NEXT_FNTIMES(handle, fsp, ft);
-	log_setattr_common(handle, fsp, TN_SETATTR_TIME, rv, ft, 0);
+	tn_audit_leave(config);
+
+	if (nested) {
+		return rv.error;
+	}
+
+	fsp_ext = (tn_audit_ext_t *)VFS_FETCH_FSP_EXTENSION(handle, fsp);
+	if (fsp_ext == NULL) {
+		return rv.error;
+	}
+
+	if (rv.error == 0) {
+		if (tn_settime_is_internal(fsp, fsp_ext, &requested,
+					   &cached_mtime)) {
+			return rv.error;
+		}
+		if (!is_omit_timespec(&requested.mtime)) {
+			fsp_ext->last_mtime_set = requested.mtime;
+		}
+	}
+
+	log_setattr_common(handle, fsp, TN_SETATTR_TIME, rv, &requested, 0);
 	return rv.error;
 }
 
@@ -1500,12 +1760,43 @@ static NTSTATUS tn_audit_fset_nt_acl(vfs_handle_struct *handle,
 	NTSTATUS result = NT_STATUS_AUDIT_FAILED;
 	char *sd = NULL;
 	bool ok;
-	int error;
 	tn_audit_conf_t *config = NULL;
 	tn_audit_ext_t *fsp_ext = NULL;
-	struct json_object msg, entry, jsts;
+	struct json_object msg, entry;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config, tn_audit_conf_t, return result);
+
+	if (tn_audit_nested(config)) {
+		/*
+		 * smbd applying the SD of the CREATE in progress, logged after
+		 * the CREATE. ACLs smbd sets on its own (inherited) are not.
+		 */
+		bool create_sd = config->create_acl.expected &&
+				 !config->create_acl.applied &&
+				 (config->depth == 1);
+
+		if (create_sd) {
+			sd = sddl_encode(config, psd, get_global_sam_sid());
+			if (sd == NULL) {
+				return result;
+			}
+		}
+
+		tn_audit_enter(config);
+		result = SMB_VFS_NEXT_FSET_NT_ACL(handle, fsp,
+						  secinfo_sent, psd);
+		tn_audit_leave(config);
+
+		if (create_sd && NT_STATUS_IS_OK(result)) {
+			config->create_acl.applied = true;
+			config->create_acl.secinfo = secinfo_sent;
+			config->create_acl.sddl = sd;
+		} else {
+			TALLOC_FREE(sd);
+		}
+		return result;
+	}
+
 	fsp_ext = (tn_audit_ext_t *)VFS_FETCH_FSP_EXTENSION(handle, fsp);
 
 	sd = sddl_encode(talloc_tos(), psd, get_global_sam_sid());
@@ -1519,37 +1810,15 @@ static NTSTATUS tn_audit_fset_nt_acl(vfs_handle_struct *handle,
 		return result;
 	}
 
-	if (fsp_ext == NULL) {
-		ok = tn_add_file_to_object(fsp->fsp_name,
-					fsp_ext,
-					"file",
-					FILE_ADD_NAME | FILE_ADD_TYPE,
-					&entry);
-	} else {
-		ok = tn_add_file_to_object(fsp->fsp_name,
-					fsp_ext,
-					"file",
-					FILE_ADD_HANDLE,
-					&entry);
-	}
+	ok = tn_add_set_acl_payload(fsp->fsp_name, fsp_ext, secinfo_sent, sd,
+				    &entry);
 	if (!ok) {
-		DBG_ERR("Failed to add file handle to audit message\n");
 		goto cleanup;
 	}
 
-	ok = json_add_map_to_object(&entry, "secinfo", secinfo_sent);
-	if (!ok) {
-		DBG_ERR("Failed to add secinfo_sent to audit message\n");
-		goto cleanup;
-	}
-
-	error = json_add_string(&entry, "sd", sd);
-	if (error) {
-		DBG_ERR("Failed to add sd to audit message\n");
-		goto cleanup;
-	}
-
+	tn_audit_enter(config);
 	result = SMB_VFS_NEXT_FSET_NT_ACL(handle, fsp, secinfo_sent, psd);
+	tn_audit_leave(config);
 	SMB_ASSERT(tn_add_result_ntstatus(result, &msg, &entry));
 	SMB_ASSERT(tn_format_log_entry(handle,
 				    config,
@@ -1596,12 +1865,21 @@ static int tn_audit_set_quota(struct vfs_handle_struct *handle,
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config, tn_audit_conf_t, return result);
 
+	if (tn_audit_nested(config)) {
+		tn_audit_enter(config);
+		result = SMB_VFS_NEXT_SET_QUOTA(handle, qtype, id, qt);
+		tn_audit_leave(config);
+		return result;
+	}
+
 	ok = tn_init_json_msg(&msg, &entry);
 	if (!ok) {
 		return result;
 	}
 
+	tn_audit_enter(config);
 	result = SMB_VFS_NEXT_SET_QUOTA(handle, qtype, id, qt);
+	tn_audit_leave(config);
 
 	SMB_ASSERT(tn_add_smb_quota_to_obj(qtype, id, qt, &entry));
 	SMB_ASSERT(tn_add_result_unix(result, &msg, &entry));
