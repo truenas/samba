@@ -53,22 +53,26 @@ void py_ctdb_db_dealloc(py_ctdb_db_ctx *self)
 }
 
 static
-int get_generation(py_ctdb_client_ctx *pyclient, uint32_t *generation)
+int get_generation(py_ctdb_client_ctx *pyclient, uint32_t leader,
+		   uint32_t *generation)
 {
-	uint32_t leader = _Py_atomic_load_uint32(&cluster_leader);
 	int recmode;
 	struct ctdb_vnn_map *vnnmap;
 	TALLOC_CTX *tmp_ctx = NULL;
 	int err;
-	const char *errmsg;
+	const char *errmsg = NULL;
 
 	Py_BEGIN_ALLOW_THREADS
-	PYCTDB_LOCK(pyclient);
-	tmp_ctx = talloc_new(pyclient->mem_ctx);
-	if (tmp_ctx == NULL) {
-		err = ENOMEM;
-		errmsg = "Failed to allocate new memory context";
-	} else {
+	err = py_ctdb_client_lock(pyclient);
+	if (err == 0) {
+		tmp_ctx = talloc_new(pyclient->mem_ctx);
+		if (tmp_ctx == NULL) {
+			err = ENOMEM;
+			errmsg = "Failed to allocate new memory context";
+		}
+	}
+
+	if (!err) {
 		err = ctdb_ctrl_get_recmode(tmp_ctx,
 					    pyclient->ev,
 					    pyclient->client,
@@ -97,12 +101,12 @@ int get_generation(py_ctdb_client_ctx *pyclient, uint32_t *generation)
 		}
 	}
 	TALLOC_FREE(tmp_ctx);
-	PYCTDB_UNLOCK(pyclient);
+	py_ctdb_client_unlock(pyclient);
 	Py_END_ALLOW_THREADS
 
 	if (err) {
 		// Set python exception
-		pyctdb_err(err, errmsg);
+		pyctdb_client_err(pyclient, err, errmsg);
 	}
 
 	return err;
@@ -111,17 +115,22 @@ int get_generation(py_ctdb_client_ctx *pyclient, uint32_t *generation)
 static
 int py_ctdb_wipedb(py_ctdb_db_ctx *dbctx)
 {
-	uint32_t leader = _Py_atomic_load_uint32(&cluster_leader);
+	uint32_t leader;
 	int count, err;
 	bool frozen = false;
 	uint32_t *pnn_list;
 	uint32_t generation;
+	struct ctdb_node_map *nodemap = NULL;
 	struct ctdb_req_control request;
 	struct ctdb_transdb wipedb;
 	const char *errmsg = NULL;
 	TALLOC_CTX *tmp_ctx = NULL;
 
 	PYCTDB_ASSERT((dbctx != NULL), "uninitialized db context");
+
+	err = py_ctdb_current_leader(dbctx->client, &leader);
+	if (err)
+		return err;
 
 	if (leader != dbctx->client->pnn) {
 		PyErr_SetString(PyExc_ValueError,
@@ -130,32 +139,37 @@ int py_ctdb_wipedb(py_ctdb_db_ctx *dbctx)
 		return EINVAL;
 	}
 
-	if (dbctx->client->nodemap_cached.node == NULL) {
-		/*
-		 * This function requires an initialized nodemap
-		 * we'll use the python function because it's readily
-		 * available and having a cached nodemap is OK.
-		 */
-		PyObject *tmp = py_ctdb_get_nodemap(dbctx->client, true);
-		if (tmp == NULL) {
-			return EINVAL;
-		}
-
-		Py_DECREF(tmp);
-	}
-
-	err = get_generation(dbctx->client, &generation);
+	err = get_generation(dbctx->client, leader, &generation);
 	if (err)
 		return err;
 
 	Py_BEGIN_ALLOW_THREADS
-	PYCTDB_LOCK(dbctx->client);
-	tmp_ctx = talloc_new(dbctx->client->mem_ctx);
-	if (tmp_ctx == NULL) {
-		err = ENOMEM;
-		errmsg = "Failed to allocate new memory context";
-	} else {
-		count = list_of_active_nodes(&dbctx->client->nodemap_cached,
+	err = py_ctdb_client_lock(dbctx->client);
+	if (!err) {
+		tmp_ctx = talloc_new(dbctx->client->mem_ctx);
+		if (tmp_ctx == NULL) {
+			err = ENOMEM;
+			errmsg = "Failed to allocate new memory context";
+		}
+	}
+
+	if (!err) {
+		/*
+		 * Every node that is active now has to be wiped, so this
+		 * can not be the client's cached nodemap.
+		 */
+		err = ctdb_ctrl_get_nodemap(tmp_ctx, dbctx->client->ev,
+					    dbctx->client->client,
+					    dbctx->client->pnn,
+					    TIMEOUT(dbctx->client),
+					    &nodemap);
+		if (err) {
+			errmsg = "Failed to get nodemap";
+		}
+	}
+
+	if (!err) {
+		count = list_of_active_nodes(nodemap,
 					     CTDB_UNKNOWN_PNN,
 					     tmp_ctx,
 					     &pnn_list);
@@ -189,8 +203,20 @@ int py_ctdb_wipedb(py_ctdb_db_ctx *dbctx)
 						TIMEOUT(dbctx->client),
 						&request, NULL, NULL);
 		if (err) {
-			errmsg = "Failed to wipe database";
+			errmsg = "Failed to start transaction";
 		} else {
+			ctdb_req_control_wipe_database(&request, &wipedb);
+			err = ctdb_client_control_multi(tmp_ctx, dbctx->client->ev,
+							 dbctx->client->client,
+							 pnn_list, count,
+							 TIMEOUT(dbctx->client),
+							 &request, NULL, NULL);
+			if (err) {
+				errmsg = "Failed to wipe database";
+			}
+		}
+
+		if (!err) {
 			ctdb_req_control_db_set_healthy(&request, dbctx->db_id);
 			err = ctdb_client_control_multi(tmp_ctx, dbctx->client->ev,
 							 dbctx->client->client,
@@ -230,7 +256,7 @@ int py_ctdb_wipedb(py_ctdb_db_ctx *dbctx)
 
 	}
 
-	if (err) {
+	if (err && dbctx->client->client != NULL) {
 		ctdb_ctrl_set_recmode(tmp_ctx, dbctx->client->ev,
 				      dbctx->client->client,
 				      dbctx->client->pnn,
@@ -239,11 +265,11 @@ int py_ctdb_wipedb(py_ctdb_db_ctx *dbctx)
 	}
 
 	TALLOC_FREE(tmp_ctx);
-	PYCTDB_UNLOCK(dbctx->client);
+	py_ctdb_client_unlock(dbctx->client);
 	Py_END_ALLOW_THREADS
 
 	if (err)
-		pyctdb_err(err, errmsg);
+		pyctdb_client_err(dbctx->client, err, errmsg);
 
 	return err;
 }
@@ -271,6 +297,11 @@ int gen_del_list(TDB_DATA key, TDB_DATA data, struct ctdb_tdb_sync_state *state)
 	 */
 	if (key.dsize == (strlen(CTDB_DB_SEQNUM_KEY) + 1) &&
 	    memcmp(key.dptr, CTDB_DB_SEQNUM_KEY, key.dsize) == 0) {
+		return 0;
+	}
+
+	/* A record without data has already been deleted */
+	if (data.dsize == 0) {
 		return 0;
 	}
 
@@ -319,17 +350,22 @@ static
 int traverse_ctdb_local_for_del_list(struct ctdb_db_context *db,
 				     TALLOC_CTX *mem_ctx,
 				     TDB_CONTEXT *tctx,
-				     del_entry_t *del_list)
+				     del_entry_t **del_list)
 {
 	int err;
 	struct ctdb_tdb_sync_state state = (struct ctdb_tdb_sync_state) {
-		.del_list = del_list,
 		.tctx = tctx,
 		.mem_ctx = mem_ctx
 	};
 
-	return ctdb_db_traverse_local(db, true, false,
-				      traverse_gen_del_list_cb, &state);
+	/*
+	 * The record data is compared with what the tdb file has, so it
+	 * has to come without the ctdb header.
+	 */
+	err = ctdb_db_traverse_local(db, true, true,
+				     traverse_gen_del_list_cb, &state);
+	*del_list = state.del_list;
+	return err;
 }
 
 struct store_tdb_in_ctdb_state {
@@ -379,8 +415,8 @@ int sync_ctdb_and_tdb(py_ctdb_db_ctx *pydb, TDB_CONTEXT *tctx,
 {
 	int err;
 	TALLOC_CTX *tmp_ctx = NULL;
-	del_entry_t del_list = {0};
-	del_entry_t *de, *next;
+	del_entry_t *del_list = NULL;
+	del_entry_t *de;
 	struct ctdb_transaction_handle *h;
 
 	tmp_ctx = talloc_new(pydb->client->mem_ctx);
@@ -407,11 +443,7 @@ int sync_ctdb_and_tdb(py_ctdb_db_ctx *pydb, TDB_CONTEXT *tctx,
 	}
 
 	/* first delete any records in the ctdb db that don't need to be there */
-	for (de = &del_list; de; de = next) {
-		next = de->next;
-		if (de->key.dptr == NULL)
-			continue;
-
+	for (de = del_list; de != NULL; de = de->next) {
 		err = ctdb_transaction_delete_record(h, de->key);
 		if (err) {
 			pyctdb_set_error(error, err, "Failed to delete record");
@@ -449,9 +481,13 @@ int py_ctdb_db_synchronize(py_ctdb_db_ctx *pydb, const char *tdb_path, int tdb_f
 	int err;
 	pyctdb_error_t pyerr;
 	TDB_CONTEXT *tctx;
-	uint32_t leader = _Py_atomic_load_uint32(&cluster_leader);
+	uint32_t leader;
 
 	PYCTDB_ASSERT((pydb->client != NULL), "uninitialized db context");
+
+	err = py_ctdb_current_leader(pydb->client, &leader);
+	if (err)
+		return err;
 
 	if (pydb->client->pnn != leader) {
 		PyErr_SetString(PyExc_ValueError,
@@ -461,20 +497,24 @@ int py_ctdb_db_synchronize(py_ctdb_db_ctx *pydb, const char *tdb_path, int tdb_f
 	}
 
 	Py_BEGIN_ALLOW_THREADS
-	PYCTDB_LOCK(pydb->client);
-	tctx = tdb_open(tdb_path, 0, tdb_flags, open_flags, mode);
-	if (tctx == NULL) {
-		err = errno;
-		pyctdb_set_error(&pyerr, err, "%s: failed to open tdb file", tdb_path);
-	} else {
-		err = sync_ctdb_and_tdb(pydb, tctx, &pyerr);
-		tdb_close(tctx);
+	err = py_ctdb_client_lock(pydb->client);
+	if (err == 0) {
+		tctx = tdb_open(tdb_path, 0, tdb_flags, open_flags, mode);
+		if (tctx == NULL) {
+			err = errno;
+			pyctdb_set_error(&pyerr, err,
+					 "%s: failed to open tdb file",
+					 tdb_path);
+		} else {
+			err = sync_ctdb_and_tdb(pydb, tctx, &pyerr);
+			tdb_close(tctx);
+		}
 	}
-	PYCTDB_UNLOCK(pydb->client);
+	py_ctdb_client_unlock(pydb->client);
 	Py_END_ALLOW_THREADS
 
 	if (err) {
-		pyctdb_err(err, pyerr.message);
+		pyctdb_client_err(pydb->client, err, pyerr.message);
 	}
 
 	return err;
@@ -513,8 +553,11 @@ int py_ctdb_fetchrecord(py_ctdb_db_ctx *pydb, TDB_DATA key,
 		goto done;
 	}
 
-	/* Check if record exists - NULL dptr indicates non-existent key */
-	if (result.dptr == NULL) {
+	/*
+	 * A key that was never stored comes back with a NULL dptr. A record
+	 * that was deleted is still there, but without data.
+	 */
+	if (result.dptr == NULL || result.dsize == 0) {
 		pyctdb_set_error(pyerr, ENOENT, "Record not found");
 		err = ENOENT;
 		ctdb_transaction_cancel(h);
@@ -582,9 +625,11 @@ static PyObject *py_ctdb_db_fetch(PyObject *self, PyObject *args, PyObject *kwar
 	}
 
 	Py_BEGIN_ALLOW_THREADS
-	PYCTDB_LOCK(dbctx->client);
-	err = py_ctdb_fetchrecord(dbctx, key, &data, &pyerr);
-	PYCTDB_UNLOCK(dbctx->client);
+	err = py_ctdb_client_lock(dbctx->client);
+	if (err == 0) {
+		err = py_ctdb_fetchrecord(dbctx, key, &data, &pyerr);
+	}
+	py_ctdb_client_unlock(dbctx->client);
 	Py_END_ALLOW_THREADS
 
 	if (err == 0) {
@@ -595,7 +640,7 @@ static PyObject *py_ctdb_db_fetch(PyObject *self, PyObject *args, PyObject *kwar
 		PyErr_SetString(PyExc_FileNotFoundError,
 				"Record not found");
 	} else {
-		pyctdb_err(err, pyerr.message);
+		pyctdb_client_err(dbctx->client, err, pyerr.message);
 	}
 
 	return result;
@@ -685,13 +730,15 @@ static PyObject *py_ctdb_db_store(PyObject *self, PyObject *args, PyObject *kwar
 	}
 
 	Py_BEGIN_ALLOW_THREADS
-	PYCTDB_LOCK(dbctx->client);
-	err = py_ctdb_storerecord(dbctx, key, value, &pyerr);
-	PYCTDB_UNLOCK(dbctx->client);
+	err = py_ctdb_client_lock(dbctx->client);
+	if (err == 0) {
+		err = py_ctdb_storerecord(dbctx, key, value, &pyerr);
+	}
+	py_ctdb_client_unlock(dbctx->client);
 	Py_END_ALLOW_THREADS
 
 	if (err != 0) {
-		pyctdb_err(err, pyerr.message);
+		pyctdb_client_err(dbctx->client, err, pyerr.message);
 		return NULL;
 	}
 
@@ -778,13 +825,15 @@ static PyObject *py_ctdb_db_delete(PyObject *self, PyObject *args, PyObject *kwa
 	}
 
 	Py_BEGIN_ALLOW_THREADS
-	PYCTDB_LOCK(dbctx->client);
-	err = py_ctdb_deleterecord(dbctx, key, &pyerr);
-	PYCTDB_UNLOCK(dbctx->client);
+	err = py_ctdb_client_lock(dbctx->client);
+	if (err == 0) {
+		err = py_ctdb_deleterecord(dbctx, key, &pyerr);
+	}
+	py_ctdb_client_unlock(dbctx->client);
 	Py_END_ALLOW_THREADS
 
 	if (err != 0) {
-		pyctdb_err(err, pyerr.message);
+		pyctdb_client_err(dbctx->client, err, pyerr.message);
 		return NULL;
 	}
 
@@ -945,13 +994,15 @@ static PyObject *py_ctdb_db_batch_op(PyObject *self, PyObject *args, PyObject *k
 
 	/* Execute operations with GIL dropped */
 	Py_BEGIN_ALLOW_THREADS
-	PYCTDB_LOCK(dbctx->client);
-	err = execute_batch_operations(dbctx, &state);
-	PYCTDB_UNLOCK(dbctx->client);
+	err = py_ctdb_client_lock(dbctx->client);
+	if (err == 0) {
+		err = execute_batch_operations(dbctx, &state);
+	}
+	py_ctdb_client_unlock(dbctx->client);
 	Py_END_ALLOW_THREADS
 
 	if (err != 0) {
-		pyctdb_err(err, state.error.message);
+		pyctdb_client_err(dbctx->client, err, state.error.message);
 		free_batch_state(&state);
 		return NULL;
 	}
@@ -1114,17 +1165,21 @@ PyObject *py_get_or_create_db(py_ctdb_client_ctx *client,
 	uint32_t db_id;
 	uint8_t db_flags = db_flags_in;
 	int err;
-	const char *errmsg;
+	const char *errmsg = NULL;
 	TALLOC_CTX *tmp_ctx = NULL;
 	py_ctdb_db_ctx *pydb = NULL;
 
 	Py_BEGIN_ALLOW_THREADS
-	PYCTDB_LOCK(client);
-	tmp_ctx = talloc_new(client->mem_ctx);
-	if (tmp_ctx == NULL) {
-		err = ENOMEM;
-		errmsg = "Memory allocation failure";
-	} else {
+	err = py_ctdb_client_lock(client);
+	if (!err) {
+		tmp_ctx = talloc_new(client->mem_ctx);
+		if (tmp_ctx == NULL) {
+			err = ENOMEM;
+			errmsg = "Memory allocation failure";
+		}
+	}
+
+	if (!err) {
 		err = ctdb_ctrl_get_dbmap(tmp_ctx, client->ev, client->client,
 					  client->pnn, TIMEOUT(client), &dbmap);
 		if (err) {
@@ -1168,11 +1223,11 @@ PyObject *py_get_or_create_db(py_ctdb_client_ctx *client,
 	}
 
 	TALLOC_FREE(tmp_ctx);
-	PYCTDB_UNLOCK(client);
+	py_ctdb_client_unlock(client);
 	Py_END_ALLOW_THREADS
 
 	if (err) {
-		pyctdb_err(err, errmsg);
+		pyctdb_client_err(client, err, errmsg);
 		return NULL;
 	}
 
@@ -1181,21 +1236,30 @@ PyObject *py_get_or_create_db(py_ctdb_client_ctx *client,
 		return NULL;
 
 	Py_BEGIN_ALLOW_THREADS
-	PYCTDB_LOCK(client);
-	err = ctdb_attach(client->ev, client->client, TIMEOUT(client),
-			  db_name, db_flags, &pydb->db);
-	PYCTDB_UNLOCK(client);
+	err = py_ctdb_client_lock(client);
+	if (!err) {
+		err = ctdb_attach(client->ev, client->client, TIMEOUT(client),
+				  db_name, db_flags, &pydb->db);
+		if (err) {
+			errmsg = "Failed to attach to database";
+		} else {
+			/* pydb->db may only be used with the lock held */
+			db_id = pydb->db->db_id;
+			db_flags = pydb->db->db_flags;
+		}
+	}
+	py_ctdb_client_unlock(client);
 	Py_END_ALLOW_THREADS
 
 	if (err) {
 		Py_DECREF(pydb);
-		pyctdb_err(err, errmsg);
+		pyctdb_client_err(client, err, errmsg);
 		return NULL;
 	}
 
 	pydb->client = (py_ctdb_client_ctx *)Py_NewRef(client);
 	strlcpy(pydb->db_name, db_name, sizeof(pydb->db_name));
-	pydb->db_id = pydb->db->db_id;
-	pydb->db_flags = pydb->db->db_flags;
+	pydb->db_id = db_id;
+	pydb->db_flags = db_flags;
 	return (PyObject *)pydb;
 }

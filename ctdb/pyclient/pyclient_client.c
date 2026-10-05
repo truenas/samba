@@ -15,16 +15,28 @@
    along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
 
+/* Allow use of deprecated function tevent_loop_set_nesting_hook() */
+#define TEVENT_DEPRECATED
 #include "pyclient.h"
 #include "pyclient_tables.h"
 
 #define SRVID_PY_CTDB	(CTDB_SRVID_TOOL_RANGE | 0x0001000000000000LL)
 #define DEFAULT_TIMEOUT 10
+/*
+ * Long enough for two recoveries in a row, each of which may be held off by
+ * the default RerecoveryTimeout (10 seconds): one that was already due when
+ * the recovery was asked for, then the forced one.
+ */
+#define RECOVER_DEFAULT_TIMEOUT 60
+#define RECOVER_MAX_TIMEOUT 300
+#define RECOVER_POLL_USEC 100000
+/*
+ * How long a new client waits to hear from the leader. This is the default
+ * "leader timeout", which is how long the nodes themselves wait for it.
+ */
+#define LEADER_WAIT_SECS 5
 unsigned leak_reporting_enabled;
 unsigned glock_enabled;
-
-/* There's only ever one leader and so we'll store this as a global */
-uint32_t cluster_leader = CTDB_UNKNOWN_PNN;
 
 pthread_mutex_t py_g_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -184,6 +196,7 @@ PyObject *py_nodemap(const struct ctdb_node_map *nodemap, int this_node)
 
 static void leader_handler(uint64_t srvid, TDB_DATA data, void *private_data)
 {
+	py_ctdb_client_ctx *ctx = (py_ctdb_client_ctx *)private_data;
 	uint32_t leader_pnn;
 	size_t np;
 	int ret;
@@ -194,7 +207,174 @@ static void leader_handler(uint64_t srvid, TDB_DATA data, void *private_data)
 		return;
 	}
 
-	_Py_atomic_store_uint32(&cluster_leader, leader_pnn);
+	ctx->leader = leader_pnn;
+}
+
+/* What the wait for a leader in get_leader() ends on */
+static bool leader_known(void *private_data)
+{
+	py_ctdb_client_ctx *ctx = (py_ctdb_client_ctx *)private_data;
+
+	return ctx->leader != CTDB_UNKNOWN_PNN ||
+	       _Py_atomic_load_uint(&ctx->disconnected);
+}
+
+/*
+ * Get the leader as it was last announced to this client, CTDB_UNKNOWN_PNN
+ * if it never was. Does not require GIL, but does require the client context
+ * lock being held. A leader that has gone without a successor is still
+ * reported: nothing announces that.
+ *
+ * The leader announces itself once a second and there is no other way to
+ * find out who it is. Announcements are only read while a request runs the
+ * client's event loop, so this has to be called after a request: the reply
+ * to that came after every announcement that was waiting. A client that is
+ * too new to have been sent one waits for it here.
+ */
+static
+int get_leader(py_ctdb_client_ctx *ctx, uint32_t *leader)
+{
+	struct timespec now;
+	double left;
+
+	clock_gettime_mono(&now);
+	left = LEADER_WAIT_SECS - timespec_elapsed2(&ctx->created, &now);
+	if (ctx->leader == CTDB_UNKNOWN_PNN && left > 0) {
+		/* This times out if there is no leader */
+		ctdb_client_wait_func_timeout(
+			ctx->ev, leader_known, ctx,
+			timeval_current_ofs_msec(left * 1000 + 1));
+	}
+
+	if (_Py_atomic_load_uint(&ctx->disconnected)) {
+		return ENOTCONN;
+	}
+
+	*leader = ctx->leader;
+	return 0;
+}
+
+int py_ctdb_current_leader(py_ctdb_client_ctx *ctx, uint32_t *leader)
+{
+	TALLOC_CTX *tmp_ctx = NULL;
+	int num_clients;
+	int err;
+
+	Py_BEGIN_ALLOW_THREADS
+	err = py_ctdb_client_lock(ctx);
+	if (err == 0) {
+		tmp_ctx = talloc_new(ctx->mem_ctx);
+		if (tmp_ctx == NULL) {
+			err = ENOMEM;
+		}
+	}
+
+	if (err == 0) {
+		/* The request that get_leader() has to follow */
+		err = ctdb_ctrl_ping(tmp_ctx, ctx->ev, ctx->client, ctx->pnn,
+				     TIMEOUT(ctx), &num_clients);
+	}
+
+	if (err == 0) {
+		err = get_leader(ctx, leader);
+	}
+	TALLOC_FREE(tmp_ctx);
+	py_ctdb_client_unlock(ctx);
+	Py_END_ALLOW_THREADS
+
+	if (err) {
+		pyctdb_client_err(ctx, err, "Failed to get cluster leader");
+	}
+
+	return err;
+}
+
+/*
+ * The connection to ctdbd has been closed or has failed. The client library
+ * calls this in place of its default, which is exit().
+ *
+ * The library can not carry on after this. Requests that are waiting for a
+ * reply never complete, and if the event loop runs once more it finds the
+ * dead socket and aborts. So all that is done here is to make a note for
+ * disconnected_loop_hook(), which stops the loop.
+ */
+static void disconnect_handler(void *private_data)
+{
+	py_ctdb_client_ctx *ctx = (py_ctdb_client_ctx *)private_data;
+
+	_Py_atomic_store_uint(&ctx->disconnected, 1);
+}
+
+/*
+ * tevent calls this at the start and at the end of every turn of the
+ * client's event loop. A failure at the start makes tevent_loop_once() fail
+ * without having done anything, and that in turn makes the library give up
+ * on whatever request it is waiting for and return an error.
+ */
+static int disconnected_loop_hook(struct tevent_context *ev,
+				  void *private_data,
+				  uint32_t level,
+				  bool begin,
+				  void *stack_ptr,
+				  const char *location)
+{
+	py_ctdb_client_ctx *ctx = (py_ctdb_client_ctx *)private_data;
+
+	if (begin && _Py_atomic_load_uint(&ctx->disconnected)) {
+		return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * The hook is the only way that tevent has to keep a loop from running. It
+ * is part of tevent's deprecated support for nested event loops, which are
+ * not used here.
+ */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+static void set_disconnected_loop_hook(py_ctdb_client_ctx *ctx)
+{
+	tevent_loop_set_nesting_hook(ctx->ev, disconnected_loop_hook, ctx);
+}
+#pragma GCC diagnostic pop
+
+/*
+ * Free everything that a client which has lost its connection still holds.
+ * Requires the client context lock being held, and nothing of the client
+ * library to be in use.
+ *
+ * This is not only tidying up. The client has the local copies of its
+ * databases open, and a ctdbd that is started again aborts when it comes to
+ * attach a volatile database that another process still has open.
+ */
+static void release_disconnected(py_ctdb_client_ctx *ctx)
+{
+	TALLOC_FREE(ctx->mem_ctx);
+	ctx->ev = NULL;
+	ctx->client = NULL;
+	ctx->ctdb_socket = NULL;
+}
+
+int py_ctdb_client_lock(py_ctdb_client_ctx *ctx)
+{
+	PYCTDB_LOCK(ctx);
+	if (_Py_atomic_load_uint(&ctx->disconnected)) {
+		release_disconnected(ctx);
+		return ENOTCONN;
+	}
+
+	return 0;
+}
+
+void py_ctdb_client_unlock(py_ctdb_client_ctx *ctx)
+{
+	/* The operation that is ending may be the one that found out */
+	if (_Py_atomic_load_uint(&ctx->disconnected)) {
+		release_disconnected(ctx);
+	}
+	PYCTDB_UNLOCK(ctx);
 }
 
 /* CTDB client object functions */
@@ -245,6 +425,12 @@ static int py_ctdb_client_init(py_ctdb_client_ctx *self,
 			srvid_offset = getpid() & 0xFFFF;
 			self->srvid = SRVID_PY_CTDB | (srvid_offset << 16);
 			self->timeout = DEFAULT_TIMEOUT;
+			self->leader = CTDB_UNKNOWN_PNN;
+			clock_gettime_mono(&self->created);
+			ctdb_client_set_disconnect_callback(self->client,
+							    disconnect_handler,
+							    self);
+			set_disconnected_loop_hook(self);
 		}
 	}
 
@@ -254,7 +440,7 @@ static int py_ctdb_client_init(py_ctdb_client_ctx *self,
 						      self->client,
 						      CTDB_SRVID_LEADER,
 						      leader_handler,
-						      NULL);
+						      self);
 		if (err) {
 			errmsg = "ctdb_client_set_message_handler() failed";
 			errno = err;
@@ -315,7 +501,13 @@ PyObject *py_ctdb_get_pnn(PyObject *self, void *closure)
 static
 PyObject *py_ctdb_get_leader(PyObject *self, void *closure)
 {
-	uint32_t leader = _Py_atomic_load_uint32(&cluster_leader);
+	py_ctdb_client_ctx *ctx = (py_ctdb_client_ctx *)self;
+	uint32_t leader;
+
+	if (py_ctdb_current_leader(ctx, &leader) != 0) {
+		return NULL;
+	}
+
 	return Py_BuildValue("I", leader);
 }
 
@@ -364,7 +556,11 @@ PyDoc_STRVAR(py_ctdb_pnn__doc__,
 PyDoc_STRVAR(py_ctdb_leader__doc__,
 "leader -> int\n"
 "-------------\n"
-"The PNN of the current cluster leader node.\n"
+"The PNN of the current cluster leader node, 4294967295 if there is none.\n"
+"\n"
+"This is the node that last announced itself as the leader. Reading it\n"
+"makes a request to the daemon, and a client that is less than 5 seconds\n"
+"old waits for the first announcement if it has not had one yet.\n"
 );
 
 PyDoc_STRVAR(py_ctdb_timeout__doc__,
@@ -395,6 +591,8 @@ static PyGetSetDef ctdb_client_getsetters[] = {
 
 PyObject *py_ctdb_get_nodemap(py_ctdb_client_ctx *ctx, bool refresh)
 {
+	struct ctdb_node_and_flags *nodes = NULL;
+	uint32_t num = 0;
 	int err;
 
 	if (ctx->nodemap_cached.node == NULL) {
@@ -404,20 +602,31 @@ PyObject *py_ctdb_get_nodemap(py_ctdb_client_ctx *ctx, bool refresh)
 
 	if (refresh) {
 		Py_BEGIN_ALLOW_THREADS
-		PYCTDB_LOCK(ctx);
-		err = get_nodemap_internal(ctx->mem_ctx,
-					   ctx->ev,
-					   ctx->client,
-					   ctx->pnn,
-					   TIMEOUT(ctx),
-					   &ctx->nodemap_cached.node,
-					   &ctx->nodemap_cached.num);
-		PYCTDB_UNLOCK(ctx);
+		err = py_ctdb_client_lock(ctx);
+		if (err == 0) {
+			err = get_nodemap_internal(ctx->mem_ctx,
+						   ctx->ev,
+						   ctx->client,
+						   ctx->pnn,
+						   TIMEOUT(ctx),
+						   &nodes,
+						   &num);
+		}
+		py_ctdb_client_unlock(ctx);
 		Py_END_ALLOW_THREADS
 		if (err) {
-			pyctdb_err(err, "Failed to refresh nodemap");
+			pyctdb_client_err(ctx, err,
+					  "Failed to refresh nodemap");
 			return NULL;
 		}
+
+		/*
+		 * The cached nodemap is only used with the GIL held, so it
+		 * is replaced here rather than above.
+		 */
+		PyMem_RawFree(ctx->nodemap_cached.node);
+		ctx->nodemap_cached.node = nodes;
+		ctx->nodemap_cached.num = num;
 	}
 
 	return py_nodemap(&ctx->nodemap_cached, ctx->pnn);
@@ -443,31 +652,51 @@ PyObject *py_ctdb_status(PyObject *self, PyObject *args_unused)
 	py_ctdb_client_ctx *ctx = (py_ctdb_client_ctx *)self;
 	PyObject *pynodemap = NULL;
 	PyObject *out = NULL;
+	TALLOC_CTX *tmp_ctx = NULL;
 	enum ctdb_runstate runstate;
+	uint32_t leader = CTDB_UNKNOWN_PNN;
 	int err, recmode;
-	const char *errmsg;
+	const char *errmsg = NULL;
 
 	pynodemap = py_ctdb_get_nodemap(ctx, true);
 	if (pynodemap == NULL)
 		return NULL;
 
 	Py_BEGIN_ALLOW_THREADS
-	PYCTDB_LOCK(ctx);
-	err = ctdb_ctrl_get_recmode(ctx->mem_ctx, ctx->ev, ctx->client,
-				    ctx->target_pnn, TIMEOUT(ctx), &recmode);
+	err = py_ctdb_client_lock(ctx);
 	if (err == 0) {
-		err = ctdb_ctrl_get_runstate(ctx->mem_ctx, ctx->ev, ctx->client,
-					     ctx->target_pnn, TIMEOUT(ctx), &runstate);
+		tmp_ctx = talloc_new(ctx->mem_ctx);
+		if (tmp_ctx == NULL) {
+			err = ENOMEM;
+			errmsg = "Failed to allocate new memory context";
+		}
+	}
+
+	if (err == 0) {
+		err = ctdb_ctrl_get_recmode(tmp_ctx, ctx->ev, ctx->client,
+					    ctx->target_pnn, TIMEOUT(ctx),
+					    &recmode);
+		if (err)
+			errmsg = "Failed to get recovery mode";
+	}
+
+	if (err == 0) {
+		err = ctdb_ctrl_get_runstate(tmp_ctx, ctx->ev, ctx->client,
+					     ctx->target_pnn, TIMEOUT(ctx),
+					     &runstate);
 		if (err)
 			errmsg = "Failed to get runstate";
-	} else {
-		errmsg = "Failed to get recovery mode";
 	}
-	PYCTDB_UNLOCK(ctx);
+
+	if (err == 0) {
+		err = get_leader(ctx, &leader);
+	}
+	TALLOC_FREE(tmp_ctx);
+	py_ctdb_client_unlock(ctx);
 	Py_END_ALLOW_THREADS
 
 	if (err) {
-		pyctdb_err(err, errmsg);
+		pyctdb_client_err(ctx, err, errmsg);
 		Py_DECREF(pynodemap);
 		return NULL;
 	}
@@ -477,7 +706,7 @@ PyObject *py_ctdb_status(PyObject *self, PyObject *args_unused)
 		"nodemap", pynodemap,
 		"recovery_mode", recmode == CTDB_RECOVERY_NORMAL ? "NORMAL" : "RECOVERY",
 		"state", ctdb_runstate_to_string(runstate),
-		"leader_pnn", _Py_atomic_load_uint32(&cluster_leader)
+		"leader_pnn", leader
 	);
 	Py_DECREF(pynodemap);
 	return out;
@@ -565,6 +794,212 @@ PyDoc_STRVAR(py_ctdb_get_db__doc__,
 "    A CtdbDB object representing the opened database\n"
 );
 
+/*
+ * Get the timeout for the next control of a recovery wait that began at
+ * `start` and may take `timeout` seconds in total: the client timeout, or
+ * the time left to wait if that is shorter. Returns false once the wait
+ * has timed out.
+ */
+static
+bool recover_ctl_timeout(py_ctdb_client_ctx *ctx,
+			 const struct timespec *start,
+			 uint32_t timeout,
+			 struct timeval *ctl_timeout)
+{
+	struct timespec now;
+	double left;
+	uint32_t msecs;
+
+	clock_gettime_mono(&now);
+	left = (double)timeout - timespec_elapsed2(start, &now);
+	if (left <= 0) {
+		return false;
+	}
+
+	/* Rounded up, so that the wait is never cut short */
+	msecs = MIN(left, (double)ctx->timeout) * 1000 + 1;
+	*ctl_timeout = timeval_current_ofs_msec(msecs);
+	return true;
+}
+
+/*
+ * Read the generation and the recovery mode of the connected node. Does not
+ * require GIL, but does require the client context lock being held.
+ *
+ * The generation is read first. A recovery makes the node ACTIVE before it
+ * changes the generation, so if the mode is then NORMAL the generation is
+ * not that of a recovery still in progress.
+ */
+static
+int get_generation_and_recmode(py_ctdb_client_ctx *ctx,
+			       TALLOC_CTX *mem_ctx,
+			       struct timeval timeout,
+			       uint32_t *generation,
+			       int *recmode,
+			       const char **errmsg)
+{
+	struct ctdb_vnn_map *vnnmap = NULL;
+	int err;
+
+	err = ctdb_ctrl_getvnnmap(mem_ctx, ctx->ev, ctx->client,
+				  ctx->target_pnn, timeout, &vnnmap);
+	if (err) {
+		*errmsg = "Failed to get generation";
+		return err;
+	}
+	*generation = vnnmap->generation;
+
+	err = ctdb_ctrl_get_recmode(mem_ctx, ctx->ev, ctx->client,
+				    ctx->target_pnn, timeout, recmode);
+	if (err) {
+		*errmsg = "Failed to get recovery mode";
+	}
+
+	return err;
+}
+
+/*
+ * Force a recovery and wait for it to complete. Must be called without the
+ * GIL and without the client context lock. The lock is only held while the
+ * node is queried, so other threads can use the client during the wait.
+ *
+ * The node is settled when it is in NORMAL recovery mode with a valid
+ * generation. The recovery is only requested from a settled node, because
+ * one that is already running may have collected this node's records
+ * before the caller's last changes to them. It is complete when the node
+ * has settled again on a different generation.
+ */
+static
+int py_ctdb_do_recover(py_ctdb_client_ctx *ctx, uint32_t timeout,
+		       const char **errmsg)
+{
+	struct timespec start;
+	uint32_t old_generation = INVALID_GENERATION;
+	bool forced = false;
+
+	clock_gettime_mono(&start);
+
+	while (true) {
+		TALLOC_CTX *tmp_ctx = NULL;
+		struct timeval ctl_timeout;
+		uint32_t generation = INVALID_GENERATION;
+		int recmode = CTDB_RECOVERY_ACTIVE;
+		bool settled = false;
+		int err;
+
+		if (!recover_ctl_timeout(ctx, &start, timeout, &ctl_timeout)) {
+			*errmsg = forced ?
+				"Timed out waiting for recovery to complete" :
+				"Timed out waiting for node to leave recovery";
+			return ETIMEDOUT;
+		}
+
+		err = py_ctdb_client_lock(ctx);
+		if (err == 0) {
+			tmp_ctx = talloc_new(ctx->mem_ctx);
+			if (tmp_ctx == NULL) {
+				err = ENOMEM;
+				*errmsg = "Failed to allocate new memory "
+					  "context";
+			}
+		}
+
+		if (err == 0) {
+			err = get_generation_and_recmode(ctx, tmp_ctx,
+							 ctl_timeout,
+							 &generation,
+							 &recmode, errmsg);
+		}
+
+		if (err == 0) {
+			settled = (recmode == CTDB_RECOVERY_NORMAL &&
+				   generation != INVALID_GENERATION &&
+				   generation != old_generation);
+		}
+
+		if (settled && !forced) {
+			err = ctdb_ctrl_set_recmode(tmp_ctx, ctx->ev,
+						    ctx->client,
+						    ctx->target_pnn,
+						    ctl_timeout,
+						    CTDB_RECOVERY_ACTIVE);
+			if (err) {
+				*errmsg = "Failed to set recovery mode active";
+			}
+		}
+		TALLOC_FREE(tmp_ctx);
+		py_ctdb_client_unlock(ctx);
+
+		if (err) {
+			return err;
+		}
+
+		if (settled) {
+			if (forced) {
+				return 0;
+			}
+			old_generation = generation;
+			forced = true;
+		}
+
+		usleep(RECOVER_POLL_USEC);
+	}
+}
+
+static
+PyObject *py_ctdb_recover(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+	py_ctdb_client_ctx *ctx = (py_ctdb_client_ctx *)self;
+	long timeout = RECOVER_DEFAULT_TIMEOUT;
+	const char *errmsg = NULL;
+	int err;
+	static char *kwlist[] = {"timeout", NULL};
+
+	if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|l", kwlist,
+					 &timeout)) {
+		return NULL;
+	}
+
+	if (timeout < 1 || timeout > RECOVER_MAX_TIMEOUT) {
+		PyErr_Format(PyExc_ValueError,
+			     "Timeout must be between 1 and %d",
+			     RECOVER_MAX_TIMEOUT);
+		return NULL;
+	}
+
+	Py_BEGIN_ALLOW_THREADS
+	err = py_ctdb_do_recover(ctx, timeout, &errmsg);
+	Py_END_ALLOW_THREADS
+
+	if (err) {
+		pyctdb_client_err(ctx, err, errmsg);
+		return NULL;
+	}
+
+	Py_RETURN_NONE;
+}
+
+PyDoc_STRVAR(py_ctdb_recover__doc__,
+"recover(timeout=60) -> None\n"
+"---------------------------\n"
+"Force a database recovery and wait for it to complete.\n"
+"\n"
+"The recovery is requested through this node, as `ctdb recover` does.\n"
+"If a recovery is already in progress then that one is waited for first,\n"
+"so the recovery this method waits for always starts after the call.\n"
+"On return this node is back in normal recovery mode with a new database\n"
+"generation.\n"
+"\n"
+"Args:\n"
+"    timeout: Maximum time to wait in seconds (1-300, default: 60)\n"
+"\n"
+"Raises:\n"
+"    ValueError: If timeout is out of range\n"
+"    CTDBError: If the operation fails. errno is ETIMEDOUT if the\n"
+"        recovery did not complete in time. It may then still be\n"
+"        pending or in progress.\n"
+);
+
 static PyMethodDef ctdb_client_methods[] = {
 	{
 		.ml_name = "status",
@@ -583,6 +1018,12 @@ static PyMethodDef ctdb_client_methods[] = {
 		.ml_meth = (PyCFunction)py_ctdb_get_db,
 		.ml_flags = METH_VARARGS | METH_KEYWORDS,
 		.ml_doc = py_ctdb_get_db__doc__,
+	},
+	{
+		.ml_name = "recover",
+		.ml_meth = (PyCFunction)py_ctdb_recover,
+		.ml_flags = METH_VARARGS | METH_KEYWORDS,
+		.ml_doc = py_ctdb_recover__doc__,
 	},
 	{ NULL, NULL, 0, NULL }
 };

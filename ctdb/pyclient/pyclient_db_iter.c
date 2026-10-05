@@ -47,8 +47,8 @@ static int collect_keys_callback(uint32_t reqid,
 	struct key_collection_state *state =
 		(struct key_collection_state *)private_data;
 
-	/* Skip empty or deleted records */
-	if (key.dsize == 0 || data.dptr == NULL) {
+	/* Skip deleted records, which are still there but without data */
+	if (key.dsize == 0 || data.dsize == 0) {
 		return 0;
 	}
 
@@ -110,10 +110,16 @@ PyObject *py_ctdb_db_iter_new(py_ctdb_db_ctx *db_ctx)
 
 	/* Collect all keys via traverse */
 	Py_BEGIN_ALLOW_THREADS
-	PYCTDB_LOCK(db_ctx->client);
-	err = ctdb_db_traverse_local(db_ctx->db, true, false,
-				     collect_keys_callback, &state);
-	PYCTDB_UNLOCK(db_ctx->client);
+	err = py_ctdb_client_lock(db_ctx->client);
+	if (err == 0) {
+		/*
+		 * Without the ctdb header, so that a deleted record has no
+		 * data
+		 */
+		err = ctdb_db_traverse_local(db_ctx->db, true, true,
+					     collect_keys_callback, &state);
+	}
+	py_ctdb_client_unlock(db_ctx->client);
 	Py_END_ALLOW_THREADS
 
 	if (err != 0 || state.error_occurred) {
@@ -127,7 +133,8 @@ PyObject *py_ctdb_db_iter_new(py_ctdb_db_ctx *db_ctx)
 		if (state.error_occurred) {
 			PyErr_NoMemory();
 		} else {
-			pyctdb_err(err, "Failed to traverse database");
+			pyctdb_client_err(db_ctx->client, err,
+					  "Failed to traverse database");
 		}
 		return NULL;
 	}
@@ -181,28 +188,31 @@ static PyObject *py_ctdb_db_iter_next(PyObject *self)
 	pyctdb_error_t pyerr;
 	int err;
 
-	/* Check if we've exhausted all keys */
-	if (iter_ctx->current_index >= iter_ctx->num_keys) {
-		PyErr_SetNone(PyExc_StopIteration);
-		return NULL;
-	}
+	do {
+		/* Check if we've exhausted all keys */
+		if (iter_ctx->current_index >= iter_ctx->num_keys) {
+			PyErr_SetNone(PyExc_StopIteration);
+			return NULL;
+		}
 
-	key = iter_ctx->keys[iter_ctx->current_index];
-	iter_ctx->current_index++;
+		key = iter_ctx->keys[iter_ctx->current_index];
+		iter_ctx->current_index++;
 
-	/* Fetch the value for this key */
-	Py_BEGIN_ALLOW_THREADS
-	PYCTDB_LOCK(iter_ctx->db_ctx->client);
-	err = py_ctdb_fetchrecord(iter_ctx->db_ctx, key, &data, &pyerr);
-	PYCTDB_UNLOCK(iter_ctx->db_ctx->client);
-	Py_END_ALLOW_THREADS
+		/* Fetch the value for this key */
+		Py_BEGIN_ALLOW_THREADS
+		err = py_ctdb_client_lock(iter_ctx->db_ctx->client);
+		if (err == 0) {
+			err = py_ctdb_fetchrecord(iter_ctx->db_ctx, key,
+						  &data, &pyerr);
+		}
+		py_ctdb_client_unlock(iter_ctx->db_ctx->client);
+		Py_END_ALLOW_THREADS
+
+		/* Key was deleted between traverse and fetch - skip it */
+	} while (err == ENOENT);
 
 	if (err != 0) {
-		if (err == ENOENT) {
-			/* Key was deleted between traverse and fetch - skip it */
-			return py_ctdb_db_iter_next(self);
-		}
-		pyctdb_err(err, pyerr.message);
+		pyctdb_client_err(iter_ctx->db_ctx->client, err, pyerr.message);
 		return NULL;
 	}
 

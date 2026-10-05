@@ -31,6 +31,8 @@
 #   * SMB auditing (truenas_audit): the truenas.audit suite, the syslog
 #     backend, upstream smb2.* suites with and without truenas_audit, and
 #     the well-formedness of every record in the audit log
+#   * the ctdb Python bindings (ctdb/pyclient) against a two-node ctdb
+#     cluster run inside the VM
 ######################################################################
 
 set -eu
@@ -1103,6 +1105,29 @@ assert not missing, 'no %s records' % sorted(missing)
 print('records in the audit log:', dict(sorted(counts.items())))
 PY
 echo "audit log records OK"
+
+echo "=========================================="
+echo "ctdb Python bindings (pyctdb) on a local ctdb cluster"
+echo "=========================================="
+# The tests start their own cluster: two ctdbd daemons on loopback addresses
+# in ctdb's test mode, which keeps all of their files in one directory. That
+# takes no ZFS and no smbd, and leaves /etc/ctdb and /run/ctdb alone. Two
+# nodes rather than one, so that there is a node that is not the leader, the
+# leader can change, and a recovery has somewhere to copy records to;
+# PYCTDB_TEST_NODES=1 runs the tests that can do without. The tests are not
+# installed, so they come from the source tree that qemu-3-build.sh copied in.
+PYCTDB_TESTS=/home/debian/samba/ctdb/pyclient/tests
+PYCTDB_TEST_DIR=/var/tmp/pyctdb-test
+test -f "$PYCTDB_TESTS/test_pyctdb.py" \
+  || { echo "ERROR: pyctdb tests not found in $PYCTDB_TESTS"; exit 1; }
+if PYCTDB_TEST_NODES=2 PYCTDB_TEST_DIR="$PYCTDB_TEST_DIR" \
+     python3 "$PYCTDB_TESTS/test_pyctdb.py" -v </dev/null; then
+  echo "pyctdb tests PASSED"
+else
+  echo "ERROR: pyctdb tests FAILED"
+  tail -n 60 "$PYCTDB_TEST_DIR"/node.*/log.ctdb 2>/dev/null || true
+  exit 1
+fi
 
 echo "=========================================="
 echo "Check smbd log for module-load errors"

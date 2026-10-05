@@ -98,7 +98,13 @@ typedef struct {
 	uint32_t target_pnn;
 	uint64_t srvid;
 	uint32_t timeout;
+	/* Only used with the GIL held */
 	struct ctdb_node_map nodemap_cached;
+	/* Only used with client_lock held, see py_ctdb_current_leader() */
+	uint32_t leader;
+	struct timespec created;
+	/* Set for good once the connection to ctdbd is lost. Atomic. */
+	unsigned disconnected;
 } py_ctdb_client_ctx;
 
 typedef struct {
@@ -121,7 +127,6 @@ typedef struct {
  */
 extern unsigned leak_reporting_enabled;
 extern unsigned glock_enabled;
-extern uint32_t cluster_leader;
 extern pthread_mutex_t py_g_lock;
 
 #define TIMEOUT(client)    timeval_current_ofs(client->timeout, 0)
@@ -180,12 +185,42 @@ extern PyObject *py_get_or_create_db(py_ctdb_client_ctx *client,
 
 extern PyObject *py_ctdb_get_nodemap(py_ctdb_client_ctx *ctx, bool refresh);
 
+/*
+ * Take and release the client lock for an operation that uses the client's
+ * connection to ctdbd, in place of PYCTDB_LOCK() and PYCTDB_UNLOCK(). Neither
+ * requires GIL.
+ *
+ * py_ctdb_client_lock() returns ENOTCONN if the connection has been lost.
+ * The lock is held all the same and has to be released, but nothing of the
+ * ctdb client or of its databases may be used: all of it has been freed.
+ */
+extern int py_ctdb_client_lock(py_ctdb_client_ctx *ctx);
+extern void py_ctdb_client_unlock(py_ctdb_client_ctx *ctx);
+
+/*
+ * Get the PNN of the node that last announced itself as the cluster leader,
+ * CTDB_UNKNOWN_PNN if none has. This makes a request to the daemon. Requires
+ * GIL and sets a python exception on failure.
+ */
+extern int py_ctdb_current_leader(py_ctdb_client_ctx *ctx, uint32_t *leader);
+
 /* python exception */
 extern bool setup_ctdb_exception(PyObject *module_ref);
 extern void _set_ctdb_exc(int code, const char *additional_info,
 			  const char *location);
 #define pyctdb_err(code, info) \
 	_set_ctdb_exc(code, info, __location__)
+
+/*
+ * The same for a failed operation on a client. If the client has lost its
+ * connection to ctdbd then that is what gets reported, as ENOTCONN: the
+ * call that happened to notice fails with some error of its own.
+ */
+extern void _set_ctdb_client_exc(py_ctdb_client_ctx *ctx, int code,
+				 const char *additional_info,
+				 const char *location);
+#define pyctdb_client_err(ctx, code, info) \
+	_set_ctdb_client_exc(ctx, code, info, __location__)
 
 /* error structures for when GIL not held */
 typedef struct {
