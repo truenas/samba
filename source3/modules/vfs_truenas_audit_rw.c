@@ -88,6 +88,10 @@ static bool tn_log_rw_common(vfs_handle_struct *handle,
 	SMB_VFS_HANDLE_GET_DATA(handle, config, tn_audit_conf_t,
 				smb_panic("Failed to get config"));
 
+	if (tn_audit_nested(config)) {
+		return true;
+	}
+
 	fsp_ext = (tn_audit_ext_t *)VFS_FETCH_FSP_EXTENSION(handle, fsp);
 	if (fsp_ext == NULL) {
 		return true;
@@ -180,9 +184,12 @@ cleanup:
 ssize_t tn_audit_pread(vfs_handle_struct *handle, files_struct *fsp,
 			      void *data, size_t n, off_t offset)
 {
+	tn_audit_conf_t *config = tn_audit_config(handle);
 	ssize_t result;
 
+	tn_audit_enter(config);
 	result = SMB_VFS_NEXT_PREAD(handle, fsp, data, n, offset);
+	tn_audit_leave(config);
 
 	if (result > 0) {
 		tn_log_rw_common(handle, fsp, TN_OP_READ_DATA,
@@ -198,9 +205,12 @@ ssize_t tn_audit_pread(vfs_handle_struct *handle, files_struct *fsp,
 ssize_t tn_audit_pwrite(vfs_handle_struct *handle, files_struct *fsp,
 			       const void *data, size_t n, off_t offset)
 {
+	tn_audit_conf_t *config = tn_audit_config(handle);
 	ssize_t result;
 
+	tn_audit_enter(config);
 	result = SMB_VFS_NEXT_PWRITE(handle, fsp, data, n, offset);
+	tn_audit_leave(config);
 
 	if (result > 0) {
 		tn_log_rw_common(handle, fsp, TN_OP_WRITE_DATA,
@@ -226,6 +236,7 @@ typedef struct tn_audit_asnyc_op_state {
 	ssize_t ret;
 	struct vfs_aio_state vfs_aio_state;
 	enum tn_async_op_type op_type;
+	bool nested;
 } tn_op_state_t;
 
 static void tn_audit_async_common_done(struct tevent_req *subreq)
@@ -255,14 +266,19 @@ ssize_t tn_audit_pread_recv(struct tevent_req *req,
 	tn_op_state_t *state = tevent_req_data(req, tn_op_state_t);
 
 	if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
-		tn_log_rw_common(state->handle, state->fsp, TN_OP_READ_DATA,
-				 0, TN_RVAL_UNIX(vfs_aio_state->error));
+		if (!state->nested) {
+			tn_log_rw_common(state->handle, state->fsp,
+					 TN_OP_READ_DATA, 0,
+					 TN_RVAL_UNIX(vfs_aio_state->error));
+		}
 		return -1;
 	}
 
-	tn_log_rw_common(state->handle, state->fsp, TN_OP_READ_DATA,
-		         state->ret < 0 ? 0 : state->ret,
-			 TN_RVAL_UNIX(0));
+	if (!state->nested) {
+		tn_log_rw_common(state->handle, state->fsp, TN_OP_READ_DATA,
+				 state->ret < 0 ? 0 : state->ret,
+				 TN_RVAL_UNIX(0));
+	}
 	*vfs_aio_state = state->vfs_aio_state;
 	return state->ret;
 }
@@ -272,6 +288,7 @@ struct tevent_req *tn_audit_pread_send(
 	struct tevent_context *ev, struct files_struct *fsp,
 	void *data, size_t n, off_t offset)
 {
+	tn_audit_conf_t *config = tn_audit_config(handle);
 	struct tevent_req *req, *subreq;
 	tn_op_state_t *state;
 
@@ -284,9 +301,12 @@ struct tevent_req *tn_audit_pread_send(
 	state->handle = handle;
 	state->fsp = fsp;
 	state->op_type = TN_ASYNC_READ;
+	state->nested = tn_audit_nested(config);
 
+	tn_audit_enter(config);
 	subreq = SMB_VFS_NEXT_PREAD_SEND(state, ev, handle, fsp, data,
 					 n, offset);
+	tn_audit_leave(config);
 
 	if (tevent_req_nomem(subreq, req)) {
 		tn_log_rw_common(handle, fsp, TN_OP_READ_DATA, 0,
@@ -305,13 +325,19 @@ ssize_t tn_audit_pwrite_recv(struct tevent_req *req,
 	tn_op_state_t *state = tevent_req_data(req, tn_op_state_t);
 
 	if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
-		tn_log_rw_common(state->handle, state->fsp, TN_OP_WRITE_DATA,
-				 0, TN_RVAL_UNIX(vfs_aio_state->error));
+		if (!state->nested) {
+			tn_log_rw_common(state->handle, state->fsp,
+					 TN_OP_WRITE_DATA, 0,
+					 TN_RVAL_UNIX(vfs_aio_state->error));
+		}
 		return -1;
 	}
 
-	tn_log_rw_common(state->handle, state->fsp, TN_OP_WRITE_DATA,
-		         state->ret < 0 ? 0 : state->ret, TN_RVAL_UNIX(0));
+	if (!state->nested) {
+		tn_log_rw_common(state->handle, state->fsp, TN_OP_WRITE_DATA,
+				 state->ret < 0 ? 0 : state->ret,
+				 TN_RVAL_UNIX(0));
+	}
 	*vfs_aio_state = state->vfs_aio_state;
 	return state->ret;
 }
@@ -321,6 +347,7 @@ struct tevent_req *tn_audit_pwrite_send(
 	struct tevent_context *ev, struct files_struct *fsp,
 	const void *data, size_t n, off_t offset)
 {
+	tn_audit_conf_t *config = tn_audit_config(handle);
 	struct tevent_req *req, *subreq;
 	tn_op_state_t *state;
 
@@ -333,9 +360,12 @@ struct tevent_req *tn_audit_pwrite_send(
 	state->handle = handle;
 	state->fsp = fsp;
 	state->op_type = TN_ASYNC_WRITE;
+	state->nested = tn_audit_nested(config);
 
+	tn_audit_enter(config);
 	subreq = SMB_VFS_NEXT_PWRITE_SEND(state, ev, handle, fsp, data,
 					 n, offset);
+	tn_audit_leave(config);
 
 	if (tevent_req_nomem(subreq, req)) {
 		tn_log_rw_common(handle, fsp, TN_OP_WRITE_DATA, 0,
