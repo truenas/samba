@@ -765,163 +765,83 @@ static int streams_xattr_unlinkat(vfs_handle_struct *handle,
 	return ret;
 }
 
-static int streams_xattr_renameat(vfs_handle_struct *handle,
-				files_struct *srcfsp,
-				const struct smb_filename *smb_fname_src,
-				files_struct *dstfsp,
-				const struct smb_filename *smb_fname_dst,
-				const struct vfs_rename_how *how)
+/*
+ * Rename the stream src_fsp is open on: write its value under the new name,
+ * then remove the old one. smbd only gets here for a named stream renamed to
+ * another named stream.
+ */
+static int streams_xattr_rename_stream(struct vfs_handle_struct *handle,
+				       struct files_struct *src_fsp,
+				       const char *dst_name,
+				       bool replace_if_exists)
 {
-	NTSTATUS status;
-	int ret = -1;
+	struct files_struct *base_fsp = src_fsp->base_fsp;
 	char *src_xattr_name = NULL;
 	char *dst_xattr_name = NULL;
-	bool src_is_stream, dst_is_stream;
-	ssize_t oret;
-	ssize_t nret;
-	struct ea_struct ea;
-	struct smb_filename *pathref_src = NULL;
-	struct smb_filename *pathref_dst = NULL;
-	struct smb_filename *full_src = NULL;
-	struct smb_filename *full_dst = NULL;
+	struct ea_struct ea = { .flags = 0, };
+	int ret;
 
-	src_is_stream = is_ntfs_stream_smb_fname(smb_fname_src);
-	dst_is_stream = is_ntfs_stream_smb_fname(smb_fname_dst);
-
-	if (!src_is_stream && !dst_is_stream) {
-		return SMB_VFS_NEXT_RENAMEAT(handle,
-					srcfsp,
-					smb_fname_src,
-					dstfsp,
-					smb_fname_dst,
-					how);
-	}
-
-	if (how->flags != 0) {
-		errno = EINVAL;
-		goto done;
-	}
-
-	/* For now don't allow renames from or to the default stream. */
-	if (is_ntfs_default_stream_smb_fname(smb_fname_src) ||
-	    is_ntfs_default_stream_smb_fname(smb_fname_dst)) {
+	if (!fsp_is_alternate_stream(src_fsp)) {
 		errno = ENOSYS;
-		goto done;
+		return -1;
 	}
 
-	/* Don't rename if the streams are identical. */
-	if (strcasecmp_m(smb_fname_src->stream_name,
-		       smb_fname_dst->stream_name) == 0) {
-		goto done;
-	}
-
-	/* Get the xattr names. */
 	ret = streams_xattr_get_name(handle,
 				     talloc_tos(),
-				     smb_fname_src->stream_name,
+				     src_fsp->fsp_name->stream_name,
 				     &src_xattr_name);
+	if (ret == 0) {
+		ret = streams_xattr_get_name(handle,
+					     talloc_tos(),
+					     dst_name,
+					     &dst_xattr_name);
+	}
 	if (ret != 0) {
 		errno = ret;
-		goto fail;
-	}
-	ret = streams_xattr_get_name(handle,
-				     talloc_tos(),
-				     smb_fname_dst->stream_name,
-				     &dst_xattr_name);
-	if (ret != 0) {
-		errno = ret;
-		goto fail;
-	}
-
-	full_src = full_path_from_dirfsp_atname(talloc_tos(),
-						srcfsp,
-						smb_fname_src);
-	if (full_src == NULL) {
-		errno = ENOMEM;
-		goto fail;
-	}
-	full_dst = full_path_from_dirfsp_atname(talloc_tos(),
-						dstfsp,
-						smb_fname_dst);
-	if (full_dst == NULL) {
-		errno = ENOMEM;
-		goto fail;
-	}
-
-	/* Get a pathref for full_src (base file, no stream name). */
-	status = synthetic_pathref(talloc_tos(),
-				handle->conn->cwd_fsp,
-				full_src->base_name,
-				NULL,
-				NULL,
-				full_src->twrp,
-				full_src->flags,
-				&pathref_src);
-	if (!NT_STATUS_IS_OK(status)) {
-		errno = ENOENT;
-		goto fail;
-	}
-
-	/* Read the old stream from the base file fsp. */
-	ret = get_xattr_value_fsp(talloc_tos(),
-				  pathref_src->fsp,
-				  src_xattr_name,
-				  &ea);
-	if (ret != 0) {
-		errno = ret;
-		goto fail;
-	}
-
-	/* Get a pathref for full_dst (base file, no stream name). */
-	status = synthetic_pathref(talloc_tos(),
-				handle->conn->cwd_fsp,
-				full_dst->base_name,
-				NULL,
-				NULL,
-				full_dst->twrp,
-				full_dst->flags,
-				&pathref_dst);
-	if (!NT_STATUS_IS_OK(status)) {
-		errno = ENOENT;
-		goto fail;
-	}
-
-	/* (Over)write the new stream on the base file fsp. */
-	nret = SMB_VFS_FSETXATTR(
-			pathref_dst->fsp,
-			dst_xattr_name,
-			ea.value.data,
-			ea.value.length,
-			0);
-	if (nret < 0) {
-		if (errno == ENOATTR) {
-			errno = ENOENT;
-		}
-		goto fail;
+		ret = -1;
+		goto out;
 	}
 
 	/*
-	 * Remove the old stream from the base file fsp.
+	 * Same stream, if only in case: nothing to do. Writing the new name
+	 * and removing the old would lose the stream where the two names are
+	 * one xattr, as in the xattr directory of a case-insensitive dataset.
 	 */
-	oret = SMB_VFS_FREMOVEXATTR(pathref_src->fsp,
-				    src_xattr_name);
-	if (oret < 0) {
-		if (errno == ENOATTR) {
-			errno = ENOENT;
-		}
-		goto fail;
+	if (strcasecmp_m(src_xattr_name, dst_xattr_name) == 0) {
+		ret = 0;
+		goto out;
 	}
 
- done:
-	errno = 0;
-	ret = 0;
- fail:
-	TALLOC_FREE(pathref_src);
-	TALLOC_FREE(pathref_dst);
-	TALLOC_FREE(full_src);
-	TALLOC_FREE(full_dst);
-	TALLOC_FREE(src_xattr_name);
-	TALLOC_FREE(dst_xattr_name);
+	ret = get_xattr_value_fsp(talloc_tos(), base_fsp, src_xattr_name, &ea);
+	if (ret != 0) {
+		errno = (ret == ENOATTR) ? ENOENT : ret;
+		ret = -1;
+		goto out;
+	}
+
+	ret = SMB_VFS_FSETXATTR(base_fsp,
+				dst_xattr_name,
+				ea.value.data,
+				ea.value.length,
+				replace_if_exists ? 0 : XATTR_CREATE);
+	if (ret != 0) {
+		goto out;
+	}
+
+	ret = SMB_VFS_FREMOVEXATTR(base_fsp, src_xattr_name);
+	if ((ret != 0) && (errno == ENOATTR)) {
+		errno = ENOENT;
+	}
+
+out:
+	{
+		int err = errno;
+
+		TALLOC_FREE(ea.value.data);
+		TALLOC_FREE(src_xattr_name);
+		TALLOC_FREE(dst_xattr_name);
+		errno = err;
+	}
 	return ret;
 }
 
@@ -1939,7 +1859,7 @@ static struct vfs_fn_pointers vfs_truenas_streams_xattr_fns = {
 	.pwrite_send_fn = streams_xattr_pwrite_send,
 	.pwrite_recv_fn = streams_xattr_pwrite_recv,
 	.unlinkat_fn = streams_xattr_unlinkat,
-	.renameat_fn = streams_xattr_renameat,
+	.rename_stream_fn = streams_xattr_rename_stream,
 	.ftruncate_fn = streams_xattr_ftruncate,
 	.fallocate_fn = streams_xattr_fallocate,
 	.fstreaminfo_fn = streams_xattr_fstreaminfo,
