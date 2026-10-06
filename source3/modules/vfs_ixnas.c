@@ -158,8 +158,9 @@ static bool ixnas_get_native_dosmode(struct files_struct *fsp, uint64_t *_dosmod
 static bool ixnas_set_native_dosmode(struct files_struct *fsp, uint64_t dosmode)
 {
 	int err;
-	if (!fsp->fsp_flags.is_pathref) {
-		err = ioctl(fsp_get_io_fd(fsp), ZFS_IOC_SETDOSFLAGS, &dosmode);
+	if (fsp_has_read_access(fsp)) {
+		// ZFS checks ownership, not how the file was opened
+		err = ioctl(fsp_get_pathref_fd(fsp), ZFS_IOC_SETDOSFLAGS, &dosmode);
 	} else {
 		int fd;
 		fd = ixnas_pathref_reopen(fsp, O_RDWR);
