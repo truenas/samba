@@ -42,7 +42,7 @@ PyDoc_STRVAR(pyctdb_get_global_locking__doc__,
 "----------------------------\n"
 "Get the current global locking state for the pyctdb module.\n"
 "When global locking is enabled, then each ctdb client operation will be\n"
-"serialized behind a global pthread mutex for the module. The primary\n"
+"serialized behind a global mutex for the module. The primary\n"
 "reason why global locking would be enabled is that the user has enabled\n"
 "the talloc library feature to generate a leak report on close.\n"
 );
@@ -61,15 +61,18 @@ PyDoc_STRVAR(pyctdb_set_global_locking__doc__,
 "Set the global locking behavior for ctdb client operations. \n"
 "See discussion in `get_global_locking()` for explanation of feature.\n"
 "\n"
+"An operation that is in progress when the value changes is not affected.\n"
+"\n"
 "Once leak reporting has been enabled, this feature may no longer be\n"
 "disabled for the module.\n"
 );
 static PyObject *pyctdb_set_global_locking(PyObject *self, PyObject *args, PyObject *kwargs)
 {
-	bool enable = false;
+	/* What the "p" format stores is an int */
+	int enable = 0;
 	static char *kwlist[] = {"value", NULL};
 
-	if (PyArg_ParseTupleAndKeywords(args, kwargs, "p", kwlist, &enable) < 0) {
+	if (!PyArg_ParseTupleAndKeywords(args, kwargs, "p", kwlist, &enable)) {
 		return NULL;
 	}
 
