@@ -24,6 +24,8 @@
 #   * snapshot browsing via shadow_copy_zfs and Time Machine auto-snapshot
 #     via tmprotect
 #   * ACL<->Security-Descriptor mapping via ixnas on an NFSv4-ACL dataset
+#   * the smbd metadata cache filling, idling out and refilling
+#     (truenas.mdcache)
 #   * a curated set of upstream smb2.* protocol regression suites against a
 #     case-sensitive vanilla share
 #   * the vfs_io_uring read/write path, which is linked against the pinned
@@ -204,6 +206,9 @@ cat > /etc/smb4.conf <<CONF
     printing = bsd
     disable spoolss = yes
     smbd: backgroundqueue = no
+    # truenas.mdcache shortens the metadata cache's idle timeout through a
+    # test-only FSCTL.
+    smbd:FSCTL_SMBTORTURE = yes
     # Cap per-stream xattr size below the stock 64KiB kernel limit so the
     # truenas.streams.cap_and_offset test hits the module's cap deterministically
     # (matches --option=torture:streams_cap=32768).
@@ -703,6 +708,16 @@ assert "WRITE_ACL" in o and "WRITE_OWNER" in o, \
   fi
 else
   echo "WARN: ZFS does not expose system.nfs4_acl_xdr on /tank/acl; skipping ACL suite"
+fi
+
+echo "=========================================="
+echo "smbd metadata cache (truenas.mdcache)"
+echo "=========================================="
+# ixnas fills the cache on [zacl]; the test self-skips if nothing does.
+if "$SMBTORTURE" //127.0.0.1/zacl -U 'smbtest%testpass123' truenas.mdcache; then
+  echo "truenas.mdcache suite PASSED"
+else
+  echo "ERROR: truenas.mdcache suite FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
 fi
 
 echo "=========================================="

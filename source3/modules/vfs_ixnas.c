@@ -24,6 +24,7 @@
 #include "passdb/lookup_sid.h"
 #include "nfs4_acls.h"
 #include "zfsacl.h"
+#include "smbd/truenas_mdcache.h"
 
 static int vfs_ixnas_debug_level = DBGC_VFS;
 
@@ -51,6 +52,7 @@ enum ixnas_dacl_type {
 #define	UF_SPARSE		0x0000200000000000ull
 
 #define ACL4_XATTR "system.nfs4_acl_xdr"
+#define ACL4_XDR_MAX 20488	/* what libzfsacl reads, 1024 entries */
 #define ACL_XATTR "system.posix_acl_access"
 
 #define ZFS_IOC_GETDOSFLAGS     _IOR(0x83, 1, uint64_t)
@@ -191,12 +193,103 @@ static bool ixnas_set_native_dosmode(struct files_struct *fsp, uint64_t dosmode)
 	return true;
 }
 
+static uint32_t ixnas_merge_dosmode(struct files_struct *fsp,
+				    uint32_t xattr_dosmode,
+				    uint64_t kern_dosmode)
+{
+	uint32_t dosmode = xattr_dosmode;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(dosmode2flag); i++) {
+		if (kern_dosmode & dosmode2flag[i].flag) {
+			dosmode |= dosmode2flag[i].dosmode;
+		}
+	}
+
+	/*
+	 * Windows default behavior appears to be that the archive bit
+	 * on a directory is only explicitly set by clients. ZFS
+	 * sets this bit when the directory's contents are modified.
+	 *
+	 * This means that we _must_ rely on the xattr-encoded dosmode
+	 * to provide guidance as to whether it is set for the file.
+	 */
+	if (S_ISDIR(fsp->fsp_name->st.st_ex_mode) &&
+	    ((xattr_dosmode & FILE_ATTRIBUTE_ARCHIVE) == 0)) {
+		dosmode &= ~FILE_ATTRIBUTE_ARCHIVE;
+	}
+
+	return dosmode;
+}
+
+/*
+ * Read DOSATTRIB and the ZFS DOS flags into the inode's cache slot. The
+ * xattr is parsed into a copy of the name to learn whether it carries a
+ * create time, which every later hit applies to the stat as well.
+ */
+static bool ixnas_read_dosmode(struct files_struct *fsp,
+			       uint64_t cookie,
+			       uint32_t *dosmode)
+{
+	uint8_t buf[sizeof(fstring)];
+	struct smb_filename tmp;
+	struct mdcache_inode *slot = NULL;
+	uint32_t xattr_dosmode = 0;
+	uint64_t kern_dosmode = 0;
+	ssize_t len;
+	NTSTATUS status;
+
+	len = SMB_VFS_FGETXATTR(fsp, SAMBA_XATTR_DOS_ATTRIB, buf, sizeof(buf));
+	if ((len == -1) && ((errno == EPERM) || (errno == EACCES))) {
+		become_root();
+		len = SMB_VFS_FGETXATTR(fsp, SAMBA_XATTR_DOS_ATTRIB,
+					buf, sizeof(buf));
+		unbecome_root();
+	}
+	if (len == -1) {
+		if (errno != ENOATTR) {
+			return false;
+		}
+		len = 0;
+	}
+
+	if (!ixnas_get_native_dosmode(metadata_fsp(fsp), &kern_dosmode)) {
+		return false;
+	}
+
+	tmp = *fsp->fsp_name;
+	tmp.st.st_ex_btime = (struct timespec) { .tv_nsec = UTIME_OMIT };
+	if (len > 0) {
+		status = parse_dos_attribute_blob(&tmp,
+						  data_blob_const(buf, len),
+						  &xattr_dosmode);
+		if (!NT_STATUS_IS_OK(status)) {
+			return false;
+		}
+	}
+
+	*dosmode = ixnas_merge_dosmode(fsp, xattr_dosmode, kern_dosmode);
+	if (tmp.st.st_ex_btime.tv_nsec != UTIME_OMIT) {
+		update_stat_ex_create_time(&fsp->fsp_name->st,
+					   tmp.st.st_ex_btime);
+	}
+
+	slot = mdcache_inode_peek(&fsp->file_id, cookie);
+	if (slot != NULL) {
+		slot->dosmode = *dosmode;
+		slot->btime_sec = tmp.st.st_ex_btime.tv_sec;
+		slot->btime_nsec = tmp.st.st_ex_btime.tv_nsec;
+		slot->flags |= MDCACHE_HAVE_DOSMODE;
+	}
+	return true;
+}
+
 static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
 					  struct files_struct *fsp,
 				          uint32_t *dosmode)
 {
 	struct ixnas_config_data *config = NULL;
-	int i;
+	struct mdcache_inode *slot = NULL;
 	bool ok;
 	uint64_t kern_dosmode = 0;
 	uint32_t xattr_dosmode = 0;
@@ -205,6 +298,28 @@ static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct ixnas_config_data,
 				return NT_STATUS_INTERNAL_ERROR);
+
+	if (!config->dosattrib_xattr &&
+	    lp_store_dos_attributes(SNUM(handle->conn))) {
+		slot = mdcache_inode_fetch(fsp);
+	}
+	if (slot != NULL) {
+		if (slot->flags & MDCACHE_HAVE_DOSMODE) {
+			*dosmode = slot->dosmode;
+			if (slot->btime_nsec != UTIME_OMIT) {
+				update_stat_ex_create_time(
+					&fsp->fsp_name->st,
+					(struct timespec) {
+						.tv_sec = slot->btime_sec,
+						.tv_nsec = slot->btime_nsec,
+					});
+			}
+			return NT_STATUS_OK;
+		}
+		if (ixnas_read_dosmode(fsp, slot->cookie, dosmode)) {
+			return NT_STATUS_OK;
+		}
+	}
 
 	status = SMB_VFS_NEXT_FGET_DOS_ATTRIBUTES(handle,
 						  fsp,
@@ -228,27 +343,7 @@ static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
 		return map_nt_error_from_unix(errno);
 	}
 
-	*dosmode = xattr_dosmode;
-
-	for (i = 0; i < ARRAY_SIZE(dosmode2flag); i++) {
-		if (kern_dosmode & dosmode2flag[i].flag) {
-			*dosmode |= dosmode2flag[i].dosmode;
-		}
-	}
-
-	/*
-	 * Windows default behavior appears to be that the archive bit
-	 * on a directory is only explicitly set by clients. ZFS
-	 * sets this bit when the directory's contents are modified.
-	 *
-	 * This means that we _must_ rely on the xattr-encoded dosmode
-	 * to provide guidance as to whether it is set for the file.
-	 */
-	if (S_ISDIR(fsp->fsp_name->st.st_ex_mode) &&
-	    ((xattr_dosmode & FILE_ATTRIBUTE_ARCHIVE) == 0)) {
-		*dosmode &= ~FILE_ATTRIBUTE_ARCHIVE;
-	}
-
+	*dosmode = ixnas_merge_dosmode(fsp, xattr_dosmode, kern_dosmode);
 	return NT_STATUS_OK;
 }
 
@@ -1084,11 +1179,11 @@ static NTSTATUS ixnas_generate_special_dacl_sd(struct vfs_handle_struct *handle,
 	return NT_STATUS_OK;
 }
 
-static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
-				   struct files_struct *fsp,
-				   uint32_t security_info,
-				   TALLOC_CTX *mem_ctx,
-				   struct security_descriptor **ppdesc)
+static NTSTATUS ixnas_fget_nt_acl_uncached(struct vfs_handle_struct *handle,
+					    struct files_struct *fsp,
+					    uint32_t security_info,
+					    TALLOC_CTX *mem_ctx,
+					    struct security_descriptor **ppdesc)
 {
 	struct SMB4ACL_T *pacl = NULL;
 	TALLOC_CTX *frame = NULL;
@@ -1166,6 +1261,80 @@ static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 	status = smb_fget_nt_acl_nfs4(fsp, &config->nfs4_params, security_info, mem_ctx,
 				      ppdesc, pacl);
 	TALLOC_FREE(frame);
+	return status;
+}
+
+/*
+ * A converted security descriptor depends only on the raw NFSv4 ACL and
+ * the owner, group and mode, so files with the same ones share a
+ * variant.
+ */
+static uint64_t ixnas_sd_variant(struct files_struct *fsp)
+{
+	const SMB_STRUCT_STAT *st = &fsp->fsp_name->st;
+	struct {
+		uint32_t uid;
+		uint32_t gid;
+		uint32_t mode;
+		uint32_t pad;
+	} hdr = {
+		.uid = st->st_ex_uid,
+		.gid = st->st_ex_gid,
+		.mode = st->st_ex_mode,
+	};
+	uint8_t *buf = NULL;
+	ssize_t len;
+	uint64_t seq = 0;
+
+	buf = talloc_array(talloc_tos(), uint8_t, sizeof(hdr) + ACL4_XDR_MAX);
+	if (buf == NULL) {
+		return 0;
+	}
+
+	len = SMB_VFS_FGETXATTR(fsp, ACL4_XATTR, buf + sizeof(hdr),
+				ACL4_XDR_MAX);
+	if (len > 0) {
+		memcpy(buf, &hdr, sizeof(hdr));
+		seq = mdcache_sd_variant(data_blob_const(buf,
+							 sizeof(hdr) + len));
+	}
+	TALLOC_FREE(buf);
+	return seq;
+}
+
+static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
+				  struct files_struct *fsp,
+				  uint32_t security_info,
+				  TALLOC_CTX *mem_ctx,
+				  struct security_descriptor **ppdesc)
+{
+	struct mdcache_inode *slot = NULL;
+	uint64_t seq = 0, cookie = 0;
+	NTSTATUS status;
+
+	slot = mdcache_inode_fetch(fsp);
+	if (slot != NULL) {
+		cookie = slot->cookie;
+		seq = slot->sd_seq;
+		if (seq == 0) {
+			seq = ixnas_sd_variant(fsp);
+			slot = mdcache_inode_peek(&fsp->file_id, cookie);
+			if (slot != NULL) {
+				slot->sd_seq = seq;
+			}
+		}
+		if ((seq != 0) &&
+		    mdcache_sd_get(seq, security_info, mem_ctx, ppdesc)) {
+			return NT_STATUS_OK;
+		}
+	}
+
+	status = ixnas_fget_nt_acl_uncached(handle, fsp, security_info,
+					    mem_ctx, ppdesc);
+	if ((seq != 0) && NT_STATUS_IS_OK(status) &&
+	    mdcache_inode_unchanged(fsp, cookie)) {
+		mdcache_sd_put(seq, security_info, *ppdesc);
+	}
 	return status;
 }
 

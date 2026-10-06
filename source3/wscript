@@ -122,6 +122,12 @@ def configure(conf):
     conf.CHECK_HEADERS('linux/falloc.h linux/ioctl.h')
     conf.CHECK_HEADERS('linux/magic.h')
 
+    # file_ids and the metadata cache tell a reused inode number apart by
+    # its generation. Building without it would silently drop that.
+    if not conf.CHECK_DECLS('STATX_GEN', headers='linux/stat.h'):
+        conf.fatal('STATX_GEN is not declared in linux/stat.h. Build '
+                   'against the TrueNAS kernel headers.')
+
     conf.CHECK_FUNCS('getcwd fchown chmod fchmod mknod mknodat')
     conf.CHECK_FUNCS('strtol strchr strupr chflags fchflags')
     conf.CHECK_FUNCS('getrlimit fsync setpgid')
