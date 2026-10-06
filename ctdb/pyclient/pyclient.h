@@ -105,8 +105,30 @@ typedef struct {
 	/* Only used with client_lock held, see py_ctdb_current_leader() */
 	uint32_t leader;
 	struct timespec created;
-	/* Set for good once the connection to ctdbd is lost. Atomic. */
+	/*
+	 * Set when the connection to ctdbd is lost, cleared when a new one is
+	 * made. Atomic.
+	 */
 	unsigned disconnected;
+	/*
+	 * Counts the connections made to ctdbd. A database attached on an
+	 * earlier one has to be attached again, see py_ctdb_db_lock(). Only
+	 * used with client_lock held.
+	 */
+	unsigned connection;
+	/*
+	 * A thread watches the connection for ctdbd going away, so that a
+	 * client that is idle lets go of its databases at once. See
+	 * watch_connection() in pyclient_client.c. watch_fd is a copy of the
+	 * connection's socket for it to watch, handed over with client_lock
+	 * held. wake_fd is an eventfd that tells it of a new watch_fd, or to
+	 * exit, which watcher_exit says. Atomic.
+	 */
+	pthread_t watcher;
+	pid_t watcher_pid;
+	int wake_fd;
+	int watch_fd;
+	unsigned watcher_exit;
 } py_ctdb_client_ctx;
 
 typedef struct {
@@ -116,6 +138,8 @@ typedef struct {
 	struct ctdb_db_context *db;
 	uint32_t db_id;
 	uint8_t db_flags;
+	/* The connection that db was attached on. Only used with client_lock */
+	unsigned connection;
 } py_ctdb_db_ctx;
 
 /*
@@ -206,9 +230,14 @@ extern PyObject *py_ctdb_get_nodemap(py_ctdb_client_ctx *ctx, bool refresh);
  * connection to ctdbd, in place of PYCTDB_LOCK() and PYCTDB_UNLOCK(). Neither
  * requires GIL.
  *
- * py_ctdb_client_lock() returns ENOTCONN if the connection has been lost.
- * The lock is held all the same and has to be released, but nothing of the
- * ctdb client or of its databases may be used: all of it has been freed.
+ * If the connection has been lost, py_ctdb_client_lock() makes a new one.
+ * It returns ENOTCONN if that fails. The lock is held all the same and has
+ * to be released, but nothing of the ctdb client may be used. An operation
+ * that loses the connection while it runs fails; the next one connects.
+ *
+ * py_ctdb_db_lock() is py_ctdb_client_lock() for an operation on a database,
+ * which it attaches again if the connection it was attached on is gone. On
+ * failure it sets pyerr. The lock is released with py_ctdb_client_unlock().
  */
 extern int py_ctdb_client_lock(py_ctdb_client_ctx *ctx);
 extern void py_ctdb_client_unlock(py_ctdb_client_ctx *ctx);
@@ -243,6 +272,9 @@ typedef struct {
 	int code;
         char message[1024];
 } pyctdb_error_t;
+
+/* See py_ctdb_client_lock() above */
+extern int py_ctdb_db_lock(py_ctdb_db_ctx *pydb, pyctdb_error_t *pyerr);
 
 /* Database iterator */
 extern PyObject *py_ctdb_db_iter_new(py_ctdb_db_ctx *db_ctx);

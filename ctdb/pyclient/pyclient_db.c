@@ -26,6 +26,36 @@ static int py_ctdb_db_init(py_ctdb_db_ctx *self,
 	return 0;
 }
 
+int py_ctdb_db_lock(py_ctdb_db_ctx *pydb, pyctdb_error_t *pyerr)
+{
+	py_ctdb_client_ctx *client = pydb->client;
+	int err;
+
+	err = py_ctdb_client_lock(client);
+	if (err != 0) {
+		pyctdb_set_error(pyerr, err, "Connection to ctdbd lost");
+		return err;
+	}
+
+	if (pydb->connection != client->connection) {
+		/*
+		 * The connection that the database was attached on is gone,
+		 * and so is the library's context for it
+		 */
+		err = ctdb_attach(client->ev, client->client, TIMEOUT(client),
+				  pydb->db_name, pydb->db_flags, &pydb->db);
+		if (err != 0) {
+			pyctdb_set_error(pyerr, err,
+					 "Failed to attach to database");
+			return err;
+		}
+		pydb->db_id = pydb->db->db_id;
+		pydb->connection = client->connection;
+	}
+
+	return 0;
+}
+
 static
 void py_ctdb_db_dealloc(py_ctdb_db_ctx *self)
 {
@@ -112,19 +142,109 @@ int get_generation(py_ctdb_client_ctx *pyclient, uint32_t leader,
 	return err;
 }
 
+/*
+ * The wipe itself: every active node freezes the database, wipes it in a
+ * transaction, marks it healthy and thaws it. With the lock held.
+ */
+static
+int wipe_db_locked(py_ctdb_db_ctx *dbctx, uint32_t generation,
+		   TALLOC_CTX *tmp_ctx, const char **errmsg)
+{
+	py_ctdb_client_ctx *client = dbctx->client;
+	struct ctdb_node_map *nodemap = NULL;
+	struct ctdb_req_control request;
+	struct ctdb_transdb wipedb;
+	uint32_t *pnn_list;
+	int count, err;
+
+	/*
+	 * Every node that is active now has to be wiped, so this can not be
+	 * the client's cached nodemap.
+	 */
+	err = ctdb_ctrl_get_nodemap(tmp_ctx, client->ev, client->client,
+				    client->pnn, TIMEOUT(client), &nodemap);
+	if (err) {
+		*errmsg = "Failed to get nodemap";
+		return err;
+	}
+
+	count = list_of_active_nodes(nodemap, CTDB_UNKNOWN_PNN, tmp_ctx,
+				     &pnn_list);
+	if (count < 0) {
+		*errmsg = "Failed to list active nodes";
+		return ENOMEM;
+	}
+
+	ctdb_req_control_db_freeze(&request, dbctx->db_id);
+	err = ctdb_client_control_multi(tmp_ctx, client->ev, client->client,
+					pnn_list, count, TIMEOUT(client),
+					&request, NULL, NULL);
+	if (err) {
+		*errmsg = "Failed to issue freeze";
+		return err;
+	}
+
+	wipedb.db_id = dbctx->db_id;
+	wipedb.tid = generation;
+	ctdb_req_control_db_transaction_start(&request, &wipedb);
+	err = ctdb_client_control_multi(tmp_ctx, client->ev, client->client,
+					pnn_list, count, TIMEOUT(client),
+					&request, NULL, NULL);
+	if (err) {
+		*errmsg = "Failed to start transaction";
+		return err;
+	}
+
+	ctdb_req_control_wipe_database(&request, &wipedb);
+	err = ctdb_client_control_multi(tmp_ctx, client->ev, client->client,
+					pnn_list, count, TIMEOUT(client),
+					&request, NULL, NULL);
+	if (err) {
+		*errmsg = "Failed to wipe database";
+		return err;
+	}
+
+	ctdb_req_control_db_set_healthy(&request, dbctx->db_id);
+	err = ctdb_client_control_multi(tmp_ctx, client->ev, client->client,
+					pnn_list, count, TIMEOUT(client),
+					&request, NULL, NULL);
+	if (err) {
+		*errmsg = "Failed to set healthy";
+		return err;
+	}
+
+	/* commit the transaction */
+	ctdb_req_control_db_transaction_commit(&request, &wipedb);
+	err = ctdb_client_control_multi(tmp_ctx, client->ev, client->client,
+					pnn_list, count, TIMEOUT(client),
+					&request, NULL, NULL);
+	if (err) {
+		*errmsg = "Failed to commit transaction";
+		return err;
+	}
+
+	/* unfreeze */
+	ctdb_req_control_db_thaw(&request, dbctx->db_id);
+	err = ctdb_client_control_multi(tmp_ctx, client->ev, client->client,
+					pnn_list, count, TIMEOUT(client),
+					&request, NULL, NULL);
+	if (err) {
+		*errmsg = "Failed to unfreeze DB";
+		return err;
+	}
+
+	return 0;
+}
+
 static
 int py_ctdb_wipedb(py_ctdb_db_ctx *dbctx)
 {
 	uint32_t leader;
-	int count, err;
-	bool frozen = false;
-	uint32_t *pnn_list;
-	uint32_t generation;
-	struct ctdb_node_map *nodemap = NULL;
-	struct ctdb_req_control request;
-	struct ctdb_transdb wipedb;
+	uint32_t generation = 0;
 	const char *errmsg = NULL;
 	TALLOC_CTX *tmp_ctx = NULL;
+	pyctdb_error_t pyerr;
+	int err;
 
 	PYCTDB_ASSERT((dbctx != NULL), "uninitialized db context");
 
@@ -144,119 +264,23 @@ int py_ctdb_wipedb(py_ctdb_db_ctx *dbctx)
 		return err;
 
 	Py_BEGIN_ALLOW_THREADS
-	err = py_ctdb_client_lock(dbctx->client);
-	if (!err) {
+	err = py_ctdb_db_lock(dbctx, &pyerr);
+	if (err) {
+		errmsg = pyerr.message;
+	} else {
 		tmp_ctx = talloc_new(dbctx->client->mem_ctx);
 		if (tmp_ctx == NULL) {
 			err = ENOMEM;
 			errmsg = "Failed to allocate new memory context";
-		}
-	}
-
-	if (!err) {
-		/*
-		 * Every node that is active now has to be wiped, so this
-		 * can not be the client's cached nodemap.
-		 */
-		err = ctdb_ctrl_get_nodemap(tmp_ctx, dbctx->client->ev,
-					    dbctx->client->client,
-					    dbctx->client->pnn,
-					    TIMEOUT(dbctx->client),
-					    &nodemap);
-		if (err) {
-			errmsg = "Failed to get nodemap";
-		}
-	}
-
-	if (!err) {
-		count = list_of_active_nodes(nodemap,
-					     CTDB_UNKNOWN_PNN,
-					     tmp_ctx,
-					     &pnn_list);
-		if (count < 0) {
-			err = ENOMEM;
-			errmsg = "Failed to list active nodes";
-		}
-	}
-
-	if (!err) {
-		ctdb_req_control_db_freeze(&request, dbctx->db_id);
-		err = ctdb_client_control_multi(tmp_ctx, dbctx->client->ev,
-						dbctx->client->client,
-						pnn_list, count,
-						TIMEOUT(dbctx->client),
-						&request, NULL, NULL);
-		if (err) {
-			errmsg = "Failed to issue freeze";
 		} else {
-			frozen = true;
+			err = wipe_db_locked(dbctx, generation, tmp_ctx,
+					     &errmsg);
 		}
 	}
 
-	if (frozen) {
-		wipedb.db_id = dbctx->db_id;
-		wipedb.tid = generation;
-		ctdb_req_control_db_transaction_start(&request, &wipedb);
-		err = ctdb_client_control_multi(tmp_ctx, dbctx->client->ev,
-						dbctx->client->client,
-						pnn_list, count,
-						TIMEOUT(dbctx->client),
-						&request, NULL, NULL);
-		if (err) {
-			errmsg = "Failed to start transaction";
-		} else {
-			ctdb_req_control_wipe_database(&request, &wipedb);
-			err = ctdb_client_control_multi(tmp_ctx, dbctx->client->ev,
-							 dbctx->client->client,
-							 pnn_list, count,
-							 TIMEOUT(dbctx->client),
-							 &request, NULL, NULL);
-			if (err) {
-				errmsg = "Failed to wipe database";
-			}
-		}
-
-		if (!err) {
-			ctdb_req_control_db_set_healthy(&request, dbctx->db_id);
-			err = ctdb_client_control_multi(tmp_ctx, dbctx->client->ev,
-							 dbctx->client->client,
-							 pnn_list, count,
-							 TIMEOUT(dbctx->client),
-							 &request, NULL, NULL);
-			if (err) {
-				errmsg = "Failed to set healthy";
-			}
-		}
-
-		/* commit the transaction */
-		if (!err) {
-			ctdb_req_control_db_transaction_commit(&request, &wipedb);
-			err = ctdb_client_control_multi(tmp_ctx, dbctx->client->ev,
-							 dbctx->client->client,
-							 pnn_list, count,
-							 TIMEOUT(dbctx->client),
-							 &request, NULL, NULL);
-			if (err) {
-				errmsg = "Failed to commit transaction";
-			}
-		}
-
-		/* unfreeze */
-		if (!err) {
-			ctdb_req_control_db_thaw(&request, dbctx->db_id);
-			err = ctdb_client_control_multi(tmp_ctx, dbctx->client->ev,
-							 dbctx->client->client,
-							 pnn_list, count,
-							 TIMEOUT(dbctx->client),
-							 &request, NULL, NULL);
-			if (err) {
-				errmsg = "Failed to unfreeze DB";
-			}
-		}
-
-	}
-
-	if (err && dbctx->client->client != NULL) {
+	/* Leave a wipe that went wrong to a recovery */
+	if (err && tmp_ctx != NULL &&
+	    !_Py_atomic_load_uint(&dbctx->client->disconnected)) {
 		ctdb_ctrl_set_recmode(tmp_ctx, dbctx->client->ev,
 				      dbctx->client->client,
 				      dbctx->client->pnn,
@@ -497,7 +521,7 @@ int py_ctdb_db_synchronize(py_ctdb_db_ctx *pydb, const char *tdb_path, int tdb_f
 	}
 
 	Py_BEGIN_ALLOW_THREADS
-	err = py_ctdb_client_lock(pydb->client);
+	err = py_ctdb_db_lock(pydb, &pyerr);
 	if (err == 0) {
 		tctx = tdb_open(tdb_path, 0, tdb_flags, open_flags, mode);
 		if (tctx == NULL) {
@@ -625,7 +649,7 @@ static PyObject *py_ctdb_db_fetch(PyObject *self, PyObject *args, PyObject *kwar
 	}
 
 	Py_BEGIN_ALLOW_THREADS
-	err = py_ctdb_client_lock(dbctx->client);
+	err = py_ctdb_db_lock(dbctx, &pyerr);
 	if (err == 0) {
 		err = py_ctdb_fetchrecord(dbctx, key, &data, &pyerr);
 	}
@@ -730,7 +754,7 @@ static PyObject *py_ctdb_db_store(PyObject *self, PyObject *args, PyObject *kwar
 	}
 
 	Py_BEGIN_ALLOW_THREADS
-	err = py_ctdb_client_lock(dbctx->client);
+	err = py_ctdb_db_lock(dbctx, &pyerr);
 	if (err == 0) {
 		err = py_ctdb_storerecord(dbctx, key, value, &pyerr);
 	}
@@ -825,7 +849,7 @@ static PyObject *py_ctdb_db_delete(PyObject *self, PyObject *args, PyObject *kwa
 	}
 
 	Py_BEGIN_ALLOW_THREADS
-	err = py_ctdb_client_lock(dbctx->client);
+	err = py_ctdb_db_lock(dbctx, &pyerr);
 	if (err == 0) {
 		err = py_ctdb_deleterecord(dbctx, key, &pyerr);
 	}
@@ -994,7 +1018,7 @@ static PyObject *py_ctdb_db_batch_op(PyObject *self, PyObject *args, PyObject *k
 
 	/* Execute operations with GIL dropped */
 	Py_BEGIN_ALLOW_THREADS
-	err = py_ctdb_client_lock(dbctx->client);
+	err = py_ctdb_db_lock(dbctx, &state.error);
 	if (err == 0) {
 		err = execute_batch_operations(dbctx, &state);
 	}
@@ -1156,14 +1180,58 @@ PyTypeObject PyCtdbDB = {
 	.tp_flags = Py_TPFLAGS_DEFAULT|Py_TPFLAGS_BASETYPE,
 };
 
+/*
+ * Whether the cluster has a database of that name, and with which flags.
+ * With the lock held.
+ */
+static int find_db(py_ctdb_client_ctx *client, const char *db_name,
+		   TALLOC_CTX *tmp_ctx, bool *found, uint8_t *db_flags,
+		   const char **errmsg)
+{
+	struct ctdb_dbid_map *dbmap;
+	const char *name;
+	int err;
+	int i;
+
+	err = ctdb_ctrl_get_dbmap(tmp_ctx, client->ev, client->client,
+				  client->pnn, TIMEOUT(client), &dbmap);
+	if (err) {
+		*errmsg = "Failed to get ctdb dbmap";
+		return err;
+	}
+
+	*found = false;
+	for (i = 0; i < dbmap->num; i++) {
+		err = ctdb_ctrl_get_dbname(tmp_ctx, client->ev, client->client,
+					   client->pnn, TIMEOUT(client),
+					   dbmap->dbs[i].db_id, &name);
+		if (err) {
+			*errmsg = "Failed to get dbname";
+			return err;
+		}
+
+		if (strcmp(db_name, name) == 0) {
+			/*
+			 * If database already exists, use those flags
+			 * rather than user-supplied ones
+			 */
+			*db_flags = dbmap->dbs[i].flags;
+			*found = true;
+			break;
+		}
+	}
+
+	return 0;
+}
+
 PyObject *py_get_or_create_db(py_ctdb_client_ctx *client,
 			      const char *db_name,
 			      uint8_t db_flags_in,
 			      bool create_ok)
 {
-	struct ctdb_dbid_map *dbmap;
-	uint32_t db_id;
+	uint32_t db_id = 0;
 	uint8_t db_flags = db_flags_in;
+	bool found = false;
 	int err;
 	const char *errmsg = NULL;
 	TALLOC_CTX *tmp_ctx = NULL;
@@ -1180,46 +1248,13 @@ PyObject *py_get_or_create_db(py_ctdb_client_ctx *client,
 	}
 
 	if (!err) {
-		err = ctdb_ctrl_get_dbmap(tmp_ctx, client->ev, client->client,
-					  client->pnn, TIMEOUT(client), &dbmap);
-		if (err) {
-			errmsg = "Failed to get ctdb dbmap";
-		}
+		err = find_db(client, db_name, tmp_ctx, &found,
+			      &db_flags, &errmsg);
 	}
 
-	if (!err) {
-		/* check that this DB actually exists */
-		int i;
-		bool found = false;
-		const char *name;
-		for (i = 0; i < dbmap->num; i++) {
-			err = ctdb_ctrl_get_dbname(tmp_ctx,
-						   client->ev,
-						   client->client,
-						   client->pnn,
-						   TIMEOUT(client),
-						   dbmap->dbs[i].db_id,
-						   &name);
-			if (err) {
-				errmsg = "Failed to get dbname";
-				break;
-			}
-
-			if (strcmp(db_name, name) == 0) {
-				/*
-				 * If database already exists, use those flags
-				 * rather than user-supplied ones
-				 */
-				db_flags = dbmap->dbs[i].flags;
-				found = true;
-				break;
-			}
-		}
-
-		if (!found && !create_ok) {
-			err = ENOENT;
-			errmsg = "Database not found and create_ok not set";
-		}
+	if (!err && !found && !create_ok) {
+		err = ENOENT;
+		errmsg = "Database not found and create_ok not set";
 	}
 
 	TALLOC_FREE(tmp_ctx);
@@ -1238,14 +1273,16 @@ PyObject *py_get_or_create_db(py_ctdb_client_ctx *client,
 	Py_BEGIN_ALLOW_THREADS
 	err = py_ctdb_client_lock(client);
 	if (!err) {
-		err = ctdb_attach(client->ev, client->client, TIMEOUT(client),
-				  db_name, db_flags, &pydb->db);
+		err = ctdb_attach(client->ev, client->client,
+				  TIMEOUT(client), db_name, db_flags,
+				  &pydb->db);
 		if (err) {
 			errmsg = "Failed to attach to database";
 		} else {
-			/* pydb->db may only be used with the lock held */
+			/* pydb->db may only be used with the lock */
 			db_id = pydb->db->db_id;
 			db_flags = pydb->db->db_flags;
+			pydb->connection = client->connection;
 		}
 	}
 	py_ctdb_client_unlock(client);

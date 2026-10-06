@@ -287,13 +287,11 @@ class DisconnectTest(ClusterTestCase):
 
         # The daemon can only come back because the client has let go of
         # its databases: ctdbd aborts over a volatile one that is still open
-        # elsewhere. The client stays as it is. A new one works.
+        # elsewhere. Once it is back, the client and the database connect
+        # again on their own.
         cluster.start_daemon(node)
         cluster.wait_ready()
-        with self.assertRaises(pyctdb.CTDBError) as cm:
-            client.status()
-        self.assertEqual(cm.exception.errno, errno.ENOTCONN)
-        db = cluster.client(node).get_db(db_name)
+        client.status()
         self.assertEqual(db.fetch(b'key'), b'value')
 
     def test_call_fails_when_daemon_dies_during_it(self):
@@ -323,6 +321,10 @@ class DisconnectTest(ClusterTestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual([type(e) for e in errors], [pyctdb.CTDBError])
         self.assertEqual(errors[0].errno, errno.ENOTCONN)
+
+        cluster.start_daemon(node)
+        cluster.wait_ready()
+        client.status()
 
     def test_leader_wait_ends_when_daemon_dies(self):
         leader = cluster.status(0)['leader']
@@ -390,6 +392,133 @@ class DisconnectTest(ClusterTestCase):
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual([(type(e), e.errno) for e in errors],
                          [(pyctdb.CTDBError, errno.ENOTCONN)] * len(calls))
+
+        cluster.start_daemon(node)
+        cluster.wait_ready()
+        errors.clear()
+
+        def use_a_while(call):
+            try:
+                for _ in range(20):
+                    call()
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=use_a_while, args=(call,), daemon=True)
+            for call in calls
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+
+
+def open_databases():
+    """The ctdb database files this process has open."""
+    files = set()
+    for fd in os.listdir('/proc/self/fd'):
+        try:
+            path = os.readlink(f'/proc/self/fd/{fd}')
+        except OSError:
+            continue
+        if '/db/' in path and '.tdb' in path:
+            files.add(path)
+
+    return files
+
+
+class ReconnectTest(ClusterTestCase):
+    """A client connects again when ctdbd has been restarted."""
+
+    def restart_daemon(self, node):
+        cluster.stop_daemon(node)
+        cluster.start_daemon(node)
+        cluster.wait_ready()
+
+    def test_idle_client_lets_go_of_its_databases(self):
+        node = self.node_to_take_down()
+        client = cluster.client(node)
+        db = client.get_db('pyctdb_reconnect_idle.tdb', create_ok=True)
+        # A transaction attaches g_lock.tdb, which is volatile
+        db.store(b'key', b'value')
+        ours = {f for f in open_databases() if f'/node.{node}/' in f}
+        self.assertTrue(any('g_lock.tdb' in f for f in ours), ours)
+        self.assertTrue(any('pyctdb_reconnect_idle.tdb' in f for f in ours),
+                        ours)
+
+        # Without being used, the client notices and lets go, which is
+        # what lets ctdbd start again
+        cluster.stop_daemon(node)
+        deadline = time.monotonic() + 5
+        while ours & open_databases() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertEqual(ours & open_databases(), set())
+
+        cluster.start_daemon(node)
+        cluster.wait_ready()
+        self.assertEqual(db.fetch(b'key'), b'value')
+        self.assertTrue(any('g_lock.tdb' in f for f in open_databases()))
+
+    def test_idle_client_after_daemon_restart(self):
+        node = self.node_to_take_down()
+        client = cluster.client(node)
+        db = client.get_db('pyctdb_reconnect.tdb', create_ok=True)
+        db.store(b'before', b'restart')
+        iterator = db.iter()
+        pnn = client.pnn
+
+        self.restart_daemon(node)
+
+        # The client has not been told. Its first call finds out, connects
+        # again and is carried out all the same.
+        self.assertEqual(client.status()['leader_pnn'],
+                         cluster.status(node)['leader'])
+        self.assertEqual(client.pnn, pnn)
+
+        # So is a database opened before, and an iterator made before
+        self.assertEqual(db.fetch(b'before'), b'restart')
+        db.store(b'after', b'restart')
+        self.assertEqual(dict(iterator), {b'before': b'restart'})
+        self.assertEqual(dict(db.iter()),
+                         {b'before': b'restart', b'after': b'restart'})
+        self.assertEqual(
+            db.batch_op([pyctdb.BatchOp(('GET', b'after', None))]),
+            {0: b'restart'},
+        )
+
+        # And what the restart did not touch
+        self.assertEqual(cluster.client(node).get_db('pyctdb_reconnect.tdb')
+                         .fetch(b'after'), b'restart')
+        client.recover()
+        self.assertEqual(db.fetch(b'after'), b'restart')
+
+    def test_client_after_two_restarts(self):
+        node = self.node_to_take_down()
+        client = cluster.client(node)
+        db = client.get_db('pyctdb_reconnect_twice.tdb', create_ok=True)
+        for n in range(2):
+            db.store(b'key', b'value %d' % n)
+            self.restart_daemon(node)
+            self.assertEqual(db.fetch(b'key'), b'value %d' % n)
+            self.assertEqual(client.leader, cluster.status(node)['leader'])
+
+    def test_database_opened_while_daemon_is_down(self):
+        node = self.node_to_take_down()
+        client = cluster.client(node)
+        client.status()
+        cluster.stop_daemon(node)
+        with self.assertRaises(pyctdb.CTDBError) as cm:
+            client.get_db('pyctdb_reconnect_down.tdb', create_ok=True)
+        self.assertEqual(cm.exception.errno, errno.ENOTCONN)
+
+        cluster.start_daemon(node)
+        cluster.wait_ready()
+        db = client.get_db('pyctdb_reconnect_down.tdb', create_ok=True)
+        db.store(b'key', b'value')
+        self.assertEqual(db.fetch(b'key'), b'value')
 
 
 class GlobalLockingTest(ClusterTestCase):

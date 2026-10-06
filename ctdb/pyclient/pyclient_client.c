@@ -20,6 +20,11 @@
 #include "pyclient.h"
 #include "pyclient_tables.h"
 
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/eventfd.h>
+
 #define SRVID_PY_CTDB	(CTDB_SRVID_TOOL_RANGE | 0x0001000000000000LL)
 #define DEFAULT_TIMEOUT 10
 /*
@@ -296,7 +301,8 @@ int py_ctdb_current_leader(py_ctdb_client_ctx *ctx, uint32_t *leader)
  * The library can not carry on after this. Requests that are waiting for a
  * reply never complete, and if the event loop runs once more it finds the
  * dead socket and aborts. So all that is done here is to make a note for
- * disconnected_loop_hook(), which stops the loop.
+ * disconnected_loop_hook(), which stops the loop. The operation that was
+ * running fails, and the next one connects again: see py_ctdb_client_lock().
  */
 static void disconnect_handler(void *private_data)
 {
@@ -341,38 +347,230 @@ static void set_disconnected_loop_hook(py_ctdb_client_ctx *ctx)
 #pragma GCC diagnostic pop
 
 /*
- * Free everything that a client which has lost its connection still holds.
- * Requires the client context lock being held, and nothing of the client
- * library to be in use.
+ * Free what a client which has lost its connection still holds of it: the
+ * library's client context, and with it the socket and the databases it
+ * attached. Requires the client context lock being held, and nothing of
+ * the client library to be in use.
  *
  * This is not only tidying up. The client has the local copies of its
  * databases open, and a ctdbd that is started again aborts when it comes to
  * attach a volatile database that another process still has open.
  */
-static void release_disconnected(py_ctdb_client_ctx *ctx)
+static void drop_connection(py_ctdb_client_ctx *ctx)
 {
-	TALLOC_FREE(ctx->mem_ctx);
-	ctx->ev = NULL;
-	ctx->client = NULL;
-	ctx->ctdb_socket = NULL;
+	TALLOC_FREE(ctx->client);
+}
+
+/*
+ * The watcher thread. A client only runs the library's event loop during an
+ * operation, so one that is idle would not notice ctdbd going away until
+ * its next operation, and would keep its databases open all that while.
+ * That keeps a ctdbd that is started again from coming up: it aborts when
+ * it attaches a volatile database that another process has open with
+ * records in it.
+ *
+ * So this thread waits on a copy of the connection's socket for the other
+ * end to close, and then marks the client disconnected and drops the
+ * connection, unless an operation has found out first. It takes the client
+ * lock for that and for picking up the socket, briefly, and nothing else:
+ * no Python, and nobody waits for it with the lock held.
+ */
+static int poll_quietly(struct pollfd *fds, nfds_t nfds)
+{
+	int ret;
+
+	do {
+		ret = poll(fds, nfds, -1);
+	} while (ret < 0 && errno == EINTR);
+
+	return ret;
+}
+
+static void *watch_connection(void *arg)
+{
+	py_ctdb_client_ctx *ctx = (py_ctdb_client_ctx *)arg;
+
+	while (true) {
+		struct pollfd fds[2];
+		unsigned connection;
+		uint64_t count;
+		ssize_t nread;
+		int fd;
+
+		/* Wait to be given a connection, or to be told to go */
+		fds[0] = (struct pollfd) {
+			.fd = ctx->wake_fd, .events = POLLIN,
+		};
+		if (poll_quietly(fds, 1) < 0) {
+			return NULL;
+		}
+		nread = read(ctx->wake_fd, &count, sizeof(count));
+		if (nread < 0 && errno != EAGAIN) {
+			return NULL;
+		}
+		if (_Py_atomic_load_uint(&ctx->watcher_exit)) {
+			return NULL;
+		}
+
+		PYCTDB_LOCK(ctx);
+		fd = ctx->watch_fd;
+		ctx->watch_fd = -1;
+		connection = ctx->connection;
+		PYCTDB_UNLOCK(ctx);
+		if (fd < 0) {
+			continue;
+		}
+
+		fds[0] = (struct pollfd) { .fd = fd, .events = POLLRDHUP };
+		fds[1] = (struct pollfd) {
+			.fd = ctx->wake_fd, .events = POLLIN,
+		};
+		if (poll_quietly(fds, 2) < 0) {
+			close(fd);
+			return NULL;
+		}
+		close(fd);
+		if (fds[1].revents != 0) {
+			/* Something new: back to the top, which reads it */
+			continue;
+		}
+
+		/* The other end has gone */
+		PYCTDB_LOCK(ctx);
+		if (ctx->connection == connection &&
+		    !_Py_atomic_load_uint(&ctx->disconnected)) {
+			_Py_atomic_store_uint(&ctx->disconnected, 1);
+			drop_connection(ctx);
+		}
+		PYCTDB_UNLOCK(ctx);
+	}
+}
+
+/* Give the watcher the connection. Requires the lock. */
+static int watch_new_connection(py_ctdb_client_ctx *ctx)
+{
+	uint64_t one = 1;
+	int fd;
+
+	fd = fcntl(ctx->client->fd, F_DUPFD_CLOEXEC, 0);
+	if (fd < 0) {
+		return errno;
+	}
+
+	/* Not picked up yet: the watcher is still busy with the last one */
+	if (ctx->watch_fd >= 0) {
+		close(ctx->watch_fd);
+	}
+	ctx->watch_fd = fd;
+
+	if (write(ctx->wake_fd, &one, sizeof(one)) < 0) {
+		return errno;
+	}
+
+	return 0;
+}
+
+static int start_watcher(py_ctdb_client_ctx *ctx)
+{
+	sigset_t all, old;
+	int err;
+
+	/* Signals are for the interpreter's threads */
+	sigfillset(&all);
+	pthread_sigmask(SIG_BLOCK, &all, &old);
+	err = pthread_create(&ctx->watcher, NULL, watch_connection, ctx);
+	pthread_sigmask(SIG_SETMASK, &old, NULL);
+	if (err == 0) {
+		ctx->watcher_pid = getpid();
+	}
+
+	return err;
+}
+
+/* Stop the watcher and wait for it. Not with the lock held. */
+static void stop_watcher(py_ctdb_client_ctx *ctx)
+{
+	uint64_t one = 1;
+
+	/* A process that forked inherited the thread's state, not the thread */
+	if (ctx->watcher_pid == getpid()) {
+		_Py_atomic_store_uint(&ctx->watcher_exit, 1);
+		if (write(ctx->wake_fd, &one, sizeof(one)) == sizeof(one)) {
+			pthread_join(ctx->watcher, NULL);
+		}
+	}
+	ctx->watcher_pid = 0;
+}
+
+/*
+ * Connect to ctdbd, on the client's event context, which is kept for the
+ * life of the client. Requires the lock when the client is in use.
+ */
+static int connect_client(py_ctdb_client_ctx *ctx)
+{
+	int err;
+
+	/* Or the loop hook keeps the connection from being made */
+	_Py_atomic_store_uint(&ctx->disconnected, 0);
+
+	err = ctdb_client_init(ctx->mem_ctx, ctx->ev, ctx->ctdb_socket,
+			       &ctx->client);
+	if (err != 0) {
+		goto fail;
+	}
+
+	ctdb_client_set_disconnect_callback(ctx->client, disconnect_handler,
+					    ctx);
+
+	/* We want to update the client information if leader changes */
+	err = ctdb_client_set_message_handler(ctx->ev, ctx->client,
+					      CTDB_SRVID_LEADER, leader_handler,
+					      ctx);
+	if (err != 0) {
+		TALLOC_FREE(ctx->client);
+		goto fail;
+	}
+
+	ctx->pnn = ctdb_client_pnn(ctx->client);
+	/* What is known of the cluster came over the old connection */
+	ctx->leader = CTDB_UNKNOWN_PNN;
+	clock_gettime_mono(&ctx->created);
+	ctx->connection++;
+
+	err = watch_new_connection(ctx);
+	if (err != 0) {
+		TALLOC_FREE(ctx->client);
+		goto fail;
+	}
+
+	return 0;
+
+fail:
+	_Py_atomic_store_uint(&ctx->disconnected, 1);
+	return err;
 }
 
 int py_ctdb_client_lock(py_ctdb_client_ctx *ctx)
 {
+	int err = 0;
+
 	PYCTDB_LOCK(ctx);
 	if (_Py_atomic_load_uint(&ctx->disconnected)) {
-		release_disconnected(ctx);
-		return ENOTCONN;
+		drop_connection(ctx);
+		err = connect_client(ctx);
+		if (err != 0) {
+			err = ENOTCONN;
+		}
 	}
 
-	return 0;
+	return err;
 }
 
 void py_ctdb_client_unlock(py_ctdb_client_ctx *ctx)
 {
 	/* The operation that is ending may be the one that found out */
 	if (_Py_atomic_load_uint(&ctx->disconnected)) {
-		release_disconnected(ctx);
+		drop_connection(ctx);
 	}
 	PYCTDB_UNLOCK(ctx);
 }
@@ -412,43 +610,46 @@ static int py_ctdb_client_init(py_ctdb_client_ctx *self,
 		}
 	}
 
+	if (errmsg == NULL) {
+		self->wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+		if (self->wake_fd < 0) {
+			errmsg = "eventfd() failed";
+			err = errno;
+		}
+	}
+
 	/* We should have all required info set up to create the ctdb client connection */
 	if (errmsg == NULL) {
-		err = ctdb_client_init(
-			self->mem_ctx, self->ev, self->ctdb_socket, &self->client
-		);
+		set_disconnected_loop_hook(self);
+		err = connect_client(self);
 		if (err) {
 			errmsg = "ctdb_client_init() failed";
 			errno = err;
-		} else {
-			self->pnn = ctdb_client_pnn(self->client);
-			self->target_pnn = self->pnn;
-			srvid_offset = getpid() & 0xFFFF;
-			self->srvid = SRVID_PY_CTDB | (srvid_offset << 16);
-			self->timeout = DEFAULT_TIMEOUT;
-			self->leader = CTDB_UNKNOWN_PNN;
-			clock_gettime_mono(&self->created);
-			ctdb_client_set_disconnect_callback(self->client,
-							    disconnect_handler,
-							    self);
-			set_disconnected_loop_hook(self);
 		}
 	}
 
-	if (err == 0) {
-		/* We want to update the client information if leader changes */
-		err = ctdb_client_set_message_handler(self->ev,
-						      self->client,
-						      CTDB_SRVID_LEADER,
-						      leader_handler,
-						      self);
+	if (errmsg == NULL) {
+		err = start_watcher(self);
 		if (err) {
-			errmsg = "ctdb_client_set_message_handler() failed";
+			errmsg = "Failed to start the connection watcher";
 			errno = err;
 		}
 	}
 
-	if (err) {
+	if (errmsg == NULL) {
+		self->target_pnn = self->pnn;
+		srvid_offset = getpid() & 0xFFFF;
+		self->srvid = SRVID_PY_CTDB | (srvid_offset << 16);
+		self->timeout = DEFAULT_TIMEOUT;
+	} else {
+		if (self->watch_fd >= 0) {
+			close(self->watch_fd);
+			self->watch_fd = -1;
+		}
+		if (self->wake_fd >= 0) {
+			close(self->wake_fd);
+			self->wake_fd = -1;
+		}
 		TALLOC_FREE(self->mem_ctx);
 	}
 
@@ -468,6 +669,23 @@ static int py_ctdb_client_init(py_ctdb_client_ctx *self,
 	return 0;
 }
 
+static PyObject *py_ctdb_client_new(PyTypeObject *type, PyObject *args,
+				    PyObject *kwargs)
+{
+	py_ctdb_client_ctx *self;
+
+	self = (py_ctdb_client_ctx *)type->tp_alloc(type, 0);
+	if (self == NULL) {
+		return NULL;
+	}
+
+	/* So that dealloc() knows them for not open before init() */
+	self->wake_fd = -1;
+	self->watch_fd = -1;
+
+	return (PyObject *)self;
+}
+
 static
 void py_ctdb_client_dealloc(py_ctdb_client_ctx *self)
 {
@@ -476,12 +694,21 @@ void py_ctdb_client_dealloc(py_ctdb_client_ctx *self)
 	 * be involved and long-running.
 	 */
 	Py_BEGIN_ALLOW_THREADS
+	/* Before taking the lock: the watcher may be waiting for it */
+	stop_watcher(self);
+
 	PYCTDB_LOCK(self);
 
 	TALLOC_FREE(self->mem_ctx);
 
 	PYCTDB_UNLOCK(self);
 
+	if (self->watch_fd >= 0) {
+		close(self->watch_fd);
+	}
+	if (self->wake_fd >= 0) {
+		close(self->wake_fd);
+	}
 	PyMem_RawFree(self->nodemap_cached.node);
 	Py_END_ALLOW_THREADS
 
@@ -1031,7 +1258,7 @@ PyTypeObject PyCtdbClient = {
 	.tp_methods = ctdb_client_methods,
 	.tp_getset = ctdb_client_getsetters,
 	.tp_doc = "A CTDB client",
-	.tp_new = PyType_GenericNew,
+	.tp_new = py_ctdb_client_new,
 	.tp_init = (initproc)py_ctdb_client_init,
 	.tp_dealloc = (destructor)py_ctdb_client_dealloc,
 	.tp_flags = Py_TPFLAGS_DEFAULT|Py_TPFLAGS_BASETYPE,

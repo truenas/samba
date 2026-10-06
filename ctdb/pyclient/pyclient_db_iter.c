@@ -94,6 +94,17 @@ static int collect_keys_callback(uint32_t reqid,
 	return 0;
 }
 
+static void free_collected_keys(struct key_collection_state *state)
+{
+	size_t i;
+
+	for (i = 0; i < state->num_keys; i++) {
+		PyMem_RawFree(state->keys[i].dptr);
+	}
+	PyMem_RawFree(state->keys);
+	*state = (struct key_collection_state) {0};
+}
+
 /*
  * Create iterator for a database
  */
@@ -101,6 +112,7 @@ PyObject *py_ctdb_db_iter_new(py_ctdb_db_ctx *db_ctx)
 {
 	py_ctdb_db_iter_ctx *iter_ctx = NULL;
 	struct key_collection_state state = {0};
+	pyctdb_error_t pyerr;
 	int err;
 
 	if (db_ctx->db == NULL) {
@@ -110,7 +122,7 @@ PyObject *py_ctdb_db_iter_new(py_ctdb_db_ctx *db_ctx)
 
 	/* Collect all keys via traverse */
 	Py_BEGIN_ALLOW_THREADS
-	err = py_ctdb_client_lock(db_ctx->client);
+	err = py_ctdb_db_lock(db_ctx, &pyerr);
 	if (err == 0) {
 		/*
 		 * Without the ctdb header, so that a deleted record has no
@@ -118,23 +130,20 @@ PyObject *py_ctdb_db_iter_new(py_ctdb_db_ctx *db_ctx)
 		 */
 		err = ctdb_db_traverse_local(db_ctx->db, true, true,
 					     collect_keys_callback, &state);
+		if (err != 0) {
+			pyctdb_set_error(&pyerr, err,
+					 "Failed to traverse database");
+		}
 	}
 	py_ctdb_client_unlock(db_ctx->client);
 	Py_END_ALLOW_THREADS
 
 	if (err != 0 || state.error_occurred) {
-		/* Clean up any allocated keys */
-		size_t i;
-		for (i = 0; i < state.num_keys; i++) {
-			PyMem_RawFree(state.keys[i].dptr);
-		}
-		PyMem_RawFree(state.keys);
-
+		free_collected_keys(&state);
 		if (state.error_occurred) {
 			PyErr_NoMemory();
 		} else {
-			pyctdb_client_err(db_ctx->client, err,
-					  "Failed to traverse database");
+			pyctdb_client_err(db_ctx->client, err, pyerr.message);
 		}
 		return NULL;
 	}
@@ -142,11 +151,7 @@ PyObject *py_ctdb_db_iter_new(py_ctdb_db_ctx *db_ctx)
 	/* Create the iterator object */
 	iter_ctx = PyObject_New(py_ctdb_db_iter_ctx, &PyCtdbDBIter);
 	if (iter_ctx == NULL) {
-		size_t i;
-		for (i = 0; i < state.num_keys; i++) {
-			PyMem_RawFree(state.keys[i].dptr);
-		}
-		PyMem_RawFree(state.keys);
+		free_collected_keys(&state);
 		return NULL;
 	}
 
@@ -200,7 +205,7 @@ static PyObject *py_ctdb_db_iter_next(PyObject *self)
 
 		/* Fetch the value for this key */
 		Py_BEGIN_ALLOW_THREADS
-		err = py_ctdb_client_lock(iter_ctx->db_ctx->client);
+		err = py_ctdb_db_lock(iter_ctx->db_ctx, &pyerr);
 		if (err == 0) {
 			err = py_ctdb_fetchrecord(iter_ctx->db_ctx, key,
 						  &data, &pyerr);

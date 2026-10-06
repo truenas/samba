@@ -368,25 +368,17 @@ except CTDBError as e:
 
 ### Losing the connection to ctdbd
 
-If ctdbd stops or restarts, the client that was connected to it is of no further use. Every call on it, and on the databases opened through it, raises `CTDBError` with `errno` set to `ENOTCONN`. That includes a call that is in progress when the connection goes. Calls that need nothing from the daemon, such as `nodemap()` without `refresh`, still work.
-
-A client only finds out that the connection has gone when it is next used. Until then it keeps the local copies of its databases open, and a ctdbd that is started again aborts if another process still has one of its volatile databases open with records in it. A client that has run a transaction, which every `fetch`, `store`, `delete` and `batch_op` does, has `g_lock.tdb` open. So before ctdbd is restarted on purpose, drop the client and the databases opened through it.
-
-A client does not reconnect. Create a new `Client` and open the databases again:
+A client survives ctdbd stopping or restarting. While ctdbd is away, every call on the client, and on the databases opened through it, raises `CTDBError` with `errno` set to `ENOTCONN`, at once rather than after a timeout. That includes a call that is in progress when the connection goes. Calls that need nothing from the daemon, such as `nodemap()` without `refresh`, still work. Once ctdbd is back, the next call connects again, and a database object attaches its database again before its next operation. Nothing has to be created anew:
 
 ```python
-import errno
-
-try:
-    value = db.fetch(b'key')
-except CTDBError as e:
-    if e.errno != errno.ENOTCONN:
-        raise
-
-    client = Client()
-    db = client.get_db("mydb")
-    value = db.fetch(b'key')
+db = client.get_db("mydb")
+# ctdbd is restarted here
+value = db.fetch(b'key')   # works, on a new connection
 ```
+
+A thread in the client notices ctdbd going away as it happens, even while the client is idle, and closes the client's copies of its databases. That is what lets ctdbd start again: it aborts if another process still has one of its volatile databases open with records in it, and a client that has run a transaction, which every `fetch`, `store`, `delete` and `batch_op` does, has `g_lock.tdb` open. The thread never runs Python code.
+
+What a client knew of the cluster, its leader in particular, is learnt afresh over the new connection.
 
 ## Thread Safety
 
