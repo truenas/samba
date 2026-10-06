@@ -305,7 +305,8 @@ int execute_batch_operations(py_ctdb_db_ctx *pydb,
 				goto cancel;
 			}
 
-			if (result.dptr == NULL) {
+			/* A deleted record is still there, without data */
+			if (result.dptr == NULL || result.dsize == 0) {
 				pyctdb_set_error(&state->error, ENOENT,
 						 "Record not found in batch operation %zu", i);
 				err = ENOENT;

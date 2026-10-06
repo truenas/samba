@@ -90,7 +90,9 @@ extern pyctdb_mod_state_t *pyctdb_get_state(PyObject *module_ref);
 typedef struct {
 	PyObject_HEAD;
 	TALLOC_CTX *mem_ctx;
-	pthread_mutex_t client_lock;
+	PyMutex client_lock;
+	/* Whether py_g_lock was taken too. Only used with client_lock held */
+	bool glocked;
 	struct tevent_context *ev;
 	struct ctdb_client_context *client;
 	const char *ctdb_socket;
@@ -98,7 +100,35 @@ typedef struct {
 	uint32_t target_pnn;
 	uint64_t srvid;
 	uint32_t timeout;
+	/* Only used with the GIL held */
 	struct ctdb_node_map nodemap_cached;
+	/* Only used with client_lock held, see py_ctdb_current_leader() */
+	uint32_t leader;
+	struct timespec created;
+	/*
+	 * Set when the connection to ctdbd is lost, cleared when a new one is
+	 * made. Atomic.
+	 */
+	unsigned disconnected;
+	/*
+	 * Counts the connections made to ctdbd. A database attached on an
+	 * earlier one has to be attached again, see py_ctdb_db_lock(). Only
+	 * used with client_lock held.
+	 */
+	unsigned connection;
+	/*
+	 * A thread watches the connection for ctdbd going away, so that a
+	 * client that is idle lets go of its databases at once. See
+	 * watch_connection() in pyclient_client.c. watch_fd is a copy of the
+	 * connection's socket for it to watch, handed over with client_lock
+	 * held. wake_fd is an eventfd that tells it of a new watch_fd, or to
+	 * exit, which watcher_exit says. Atomic.
+	 */
+	pthread_t watcher;
+	pid_t watcher_pid;
+	int wake_fd;
+	int watch_fd;
+	unsigned watcher_exit;
 } py_ctdb_client_ctx;
 
 typedef struct {
@@ -108,6 +138,8 @@ typedef struct {
 	struct ctdb_db_context *db;
 	uint32_t db_id;
 	uint8_t db_flags;
+	/* The connection that db was attached on. Only used with client_lock */
+	unsigned connection;
 } py_ctdb_db_ctx;
 
 /*
@@ -118,23 +150,27 @@ typedef struct {
  * leak_reporting_enabled will only ever be changed while GIL is held and so we
  * shouldn't have to worry about toctou here. This is mostly a debugging feature
  * to generate a talloc leak report on script exit.
+ *
+ * glock_enabled can change while an operation is in progress, as operations
+ * do not hold the GIL. So PYCTDB_LEAK_LOCK() sets `locked` to whether it took
+ * the lock, and PYCTDB_LEAK_UNLOCK() has to be given that.
  */
 extern unsigned leak_reporting_enabled;
 extern unsigned glock_enabled;
-extern uint32_t cluster_leader;
-extern pthread_mutex_t py_g_lock;
+extern PyMutex py_g_lock;
 
 #define TIMEOUT(client)    timeval_current_ofs(client->timeout, 0)
 
-#define PYCTDB_LEAK_LOCK() do { \
-	if (_Py_atomic_load_uint(&glock_enabled)) { \
-		pthread_mutex_lock(&py_g_lock); \
+#define PYCTDB_LEAK_LOCK(locked) do { \
+	locked = _Py_atomic_load_uint(&glock_enabled); \
+	if (locked) { \
+		PyMutex_Lock(&py_g_lock); \
 	} \
 } while (0);
 
-#define PYCTDB_LEAK_UNLOCK() do { \
-	if (_Py_atomic_load_uint(&glock_enabled)) { \
-		pthread_mutex_unlock(&py_g_lock); \
+#define PYCTDB_LEAK_UNLOCK(locked) do { \
+	if (locked) { \
+		PyMutex_Unlock(&py_g_lock); \
 	} \
 } while (0);
 
@@ -143,15 +179,24 @@ extern pthread_mutex_t py_g_lock;
  * operations. Locks should be taken when python methods perform operations to
  * help protect python users from having multiple threads performing operations
  * concurrently on talloc-ed memory
+ *
+ * The locks are PyMutex rather than pthread mutexes because of the order in
+ * which waiting threads get them: one that has waited for a millisecond is
+ * handed the lock. A pthread mutex lets a thread that releases the lock and
+ * takes it again at once, as an iterator does for every record, keep the
+ * others out until it is done.
  */
 #define PYCTDB_LOCK(obj) do { \
-	PYCTDB_LEAK_LOCK(); \
-	pthread_mutex_lock(&obj->client_lock); \
+	bool _glocked; \
+	PYCTDB_LEAK_LOCK(_glocked); \
+	PyMutex_Lock(&obj->client_lock); \
+	obj->glocked = _glocked; \
 } while (0);
 
 #define PYCTDB_UNLOCK(obj) do { \
-	pthread_mutex_unlock(&obj->client_lock); \
-	PYCTDB_LEAK_UNLOCK(); \
+	bool _glocked = obj->glocked; \
+	PyMutex_Unlock(&obj->client_lock); \
+	PYCTDB_LEAK_UNLOCK(_glocked); \
 } while (0);
 
 /*
@@ -180,6 +225,30 @@ extern PyObject *py_get_or_create_db(py_ctdb_client_ctx *client,
 
 extern PyObject *py_ctdb_get_nodemap(py_ctdb_client_ctx *ctx, bool refresh);
 
+/*
+ * Take and release the client lock for an operation that uses the client's
+ * connection to ctdbd, in place of PYCTDB_LOCK() and PYCTDB_UNLOCK(). Neither
+ * requires GIL.
+ *
+ * If the connection has been lost, py_ctdb_client_lock() makes a new one.
+ * It returns ENOTCONN if that fails. The lock is held all the same and has
+ * to be released, but nothing of the ctdb client may be used. An operation
+ * that loses the connection while it runs fails; the next one connects.
+ *
+ * py_ctdb_db_lock() is py_ctdb_client_lock() for an operation on a database,
+ * which it attaches again if the connection it was attached on is gone. On
+ * failure it sets pyerr. The lock is released with py_ctdb_client_unlock().
+ */
+extern int py_ctdb_client_lock(py_ctdb_client_ctx *ctx);
+extern void py_ctdb_client_unlock(py_ctdb_client_ctx *ctx);
+
+/*
+ * Get the PNN of the node that last announced itself as the cluster leader,
+ * CTDB_UNKNOWN_PNN if none has. This makes a request to the daemon. Requires
+ * GIL and sets a python exception on failure.
+ */
+extern int py_ctdb_current_leader(py_ctdb_client_ctx *ctx, uint32_t *leader);
+
 /* python exception */
 extern bool setup_ctdb_exception(PyObject *module_ref);
 extern void _set_ctdb_exc(int code, const char *additional_info,
@@ -187,11 +256,25 @@ extern void _set_ctdb_exc(int code, const char *additional_info,
 #define pyctdb_err(code, info) \
 	_set_ctdb_exc(code, info, __location__)
 
+/*
+ * The same for a failed operation on a client. If the client has lost its
+ * connection to ctdbd then that is what gets reported, as ENOTCONN: the
+ * call that happened to notice fails with some error of its own.
+ */
+extern void _set_ctdb_client_exc(py_ctdb_client_ctx *ctx, int code,
+				 const char *additional_info,
+				 const char *location);
+#define pyctdb_client_err(ctx, code, info) \
+	_set_ctdb_client_exc(ctx, code, info, __location__)
+
 /* error structures for when GIL not held */
 typedef struct {
 	int code;
         char message[1024];
 } pyctdb_error_t;
+
+/* See py_ctdb_client_lock() above */
+extern int py_ctdb_db_lock(py_ctdb_db_ctx *pydb, pyctdb_error_t *pyerr);
 
 /* Database iterator */
 extern PyObject *py_ctdb_db_iter_new(py_ctdb_db_ctx *db_ctx);
