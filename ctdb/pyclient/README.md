@@ -90,24 +90,40 @@ db = client.get_db(
     replicated=False,     # Not replicated (default)
     create_ok=False       # Don't create if doesn't exist (default)
 )
+
+# Force a database recovery and wait for it to complete
+client.recover(timeout=60)
 ```
 
 #### Client Properties
 
 - `pnn` (int, read-only): Physical node number of this client
-- `leader` (int, read-only): PNN of the current cluster leader
+- `leader` (int, read-only): PNN of the current cluster leader, 4294967295 if there is none. This is the node that last announced itself as the leader. Reading it makes a request to the daemon, and a client that is less than 5 seconds old waits for the first announcement if it has not had one yet
 - `timeout` (int, read/write): Timeout in seconds for operations (1-300)
 
 #### Client Methods
 
 ##### `status() -> dict`
-Retrieve comprehensive cluster status including nodemap, recovery mode, run state, and leader.
+Retrieve comprehensive cluster status including nodemap, recovery mode, run state, and leader. `leader_pnn` is found in the same way as the `leader` property.
 
 ##### `nodemap(refresh=False) -> list`
 Get the cluster node map. If `refresh=True`, fetches fresh data from the cluster; otherwise returns cached data.
 
 ##### `get_db(db_name, persistent=True, readonly=False, replicated=False, create_ok=False) -> CtdbDB`
 Open or create a CTDB database with specified flags.
+
+##### `recover(timeout=60) -> None`
+Force a database recovery and wait for it to complete, as `ctdb recover` does. The recovery is requested through the node the client is connected to, which does not have to be the leader. On return that node is back in normal recovery mode with a new database generation.
+
+A recovery leaves all active nodes with a full copy of every database. Until then the data of a volatile record is only on the node that last wrote it.
+
+If a recovery is already in progress then that one is waited for first and another is forced, so the recovery this method waits for always starts after the call. CTDB holds off a new recovery for `RerecoveryTimeout` seconds (10 by default) after one has finished, and the wait includes that.
+
+`timeout` is the maximum time to wait in seconds (1-300). The client is not locked during the wait, so other threads can keep using it.
+
+**Raises:**
+- `ValueError`: `timeout` is out of range
+- `CTDBError`: Operation failed. `errno` is `ETIMEDOUT` if the recovery did not complete in time, in which case it may still be pending or in progress and the node may still be in recovery mode.
 
 ### CtdbDB Class
 
@@ -161,11 +177,11 @@ results = db.batch_op([
 Fetch a record from the database.
 
 **Raises:**
-- `FileNotFoundError`: Record does not exist
+- `FileNotFoundError`: Record does not exist, or has been deleted
 - `CtdbError`: Operation failed
 
 ##### `store(key, value) -> None`
-Store a record in the database.
+Store a record in the database. CTDB has no empty records: storing an empty value deletes the record.
 
 **Raises:**
 - `CtdbError`: Operation failed
@@ -191,7 +207,7 @@ Synchronize the CTDB database with a local TDB file. Records in CTDB but not in 
 - `CtdbError`: Operation failed or file cannot be opened
 
 ##### `iter() -> CtdbDBIterator`
-Create an iterator for the database that yields `(key, value)` tuples.
+Create an iterator for the database that yields `(key, value)` tuples. Deleted records are left out, including ones that are deleted while the iteration is under way.
 
 **Raises:**
 - `ValueError`: Database is not persistent or replicated
@@ -209,7 +225,7 @@ Execute multiple operations atomically under a single transaction. All operation
 **Raises:**
 - `TypeError`: Operations are not BatchOp instances
 - `ValueError`: Database is not persistent/replicated or invalid operation
-- `CtdbError`: Any operation failed (transaction rolled back)
+- `CtdbError`: Any operation failed (transaction rolled back). A GET of a record that does not exist, or has been deleted, is such a failure, with `errno` set to `ENOENT`
 
 ### BatchOp Type
 
@@ -308,8 +324,9 @@ print(f"Cluster state: {status['state']}")
 
 # Get node information
 nodemap = client.nodemap(refresh=True)
+leader = client.leader
 for node in nodemap:
-    status_str = "LEADER" if node['pnn'] == client.leader else "MEMBER"
+    status_str = "LEADER" if node['pnn'] == leader else "MEMBER"
     flags_str = ", ".join(node['flags']) if node['flags'] else "NONE"
     print(f"Node {node['pnn']}: {node['address']} [{status_str}] flags: {flags_str}")
 ```
@@ -349,6 +366,20 @@ except CTDBError as e:
     print(f"CTDB error: {e}")
 ```
 
+### Losing the connection to ctdbd
+
+A client survives ctdbd stopping or restarting. While ctdbd is away, every call on the client, and on the databases opened through it, raises `CTDBError` with `errno` set to `ENOTCONN`, at once rather than after a timeout. That includes a call that is in progress when the connection goes. Calls that need nothing from the daemon, such as `nodemap()` without `refresh`, still work. Once ctdbd is back, the next call connects again, and a database object attaches its database again before its next operation. Nothing has to be created anew:
+
+```python
+db = client.get_db("mydb")
+# ctdbd is restarted here
+value = db.fetch(b'key')   # works, on a new connection
+```
+
+A thread in the client notices ctdbd going away as it happens, even while the client is idle, and closes the client's copies of its databases. That is what lets ctdbd start again: it aborts if another process still has one of its volatile databases open with records in it, and a client that has run a transaction, which every `fetch`, `store`, `delete` and `batch_op` does, has `g_lock.tdb` open. The thread never runs Python code.
+
+What a client knew of the cluster, its leader in particular, is learnt afresh over the new connection.
+
 ## Thread Safety
 
 The extension is designed to be thread-safe:
@@ -356,6 +387,7 @@ The extension is designed to be thread-safe:
 - Each client context has its own mutex lock
 - Database operations acquire locks before accessing CTDB
 - The GIL is released during long-running operations
+- Threads that wait for a client get it in turn once they have waited a millisecond, so a thread that iterates over a large database does not keep the others waiting until it is done
 - Global locking can be enabled for talloc leak reporting
 
 ```python
@@ -424,7 +456,9 @@ is_locked = pyctdb.get_global_locking()
 pyctdb.set_global_locking(True)
 ```
 
-**Note:** Once leak reporting is enabled, it cannot be disabled for the module.
+`set_global_locking(value)` returns the new setting. An operation that is in progress when the setting changes is not affected.
+
+**Note:** Once leak reporting is enabled, it cannot be disabled for the module, and `set_global_locking()` raises `ValueError`.
 
 ## Database Types
 
@@ -475,6 +509,31 @@ When adding new functionality:
 4. Add proper error handling
 5. Release GIL for long-running operations
 6. Update this README with documentation
+
+## Testing
+
+`tests/` holds tests that run against a real CTDB cluster, which they start themselves: `tests/local_cluster.py` runs a few `ctdbd` daemons on loopback addresses in CTDB's test mode, with all of their files in one directory.
+
+```bash
+# Against the installed packages
+python3 ctdb/pyclient/tests/test_pyctdb.py -v
+```
+
+`PYCTDB_TEST_NODES` sets the number of daemons (default: 2). Tests that need a second node are skipped with one. `PYCTDB_TEST_DIR` names a directory for the cluster's files and logs, which is then kept; the default is a temporary directory.
+
+To test a build tree (configured `--with-cluster-support`), put its binaries, module and helpers in place of the installed ones:
+
+```bash
+B=$PWD/bin
+export PATH=$B:$PATH PYTHONPATH=$PWD/bin/python
+export CTDB_EVENTD=$B/ctdb-eventd CTDB_LOCK_HELPER=$B/ctdb_lock_helper
+export CTDB_RECOVERY_HELPER=$B/ctdb_recovery_helper
+export CTDB_TAKEOVER_HELPER=$B/ctdb_takeover_helper
+export CTDB_CLUSTER_MUTEX_HELPER=$B/ctdb_mutex_fcntl_helper
+python3 ctdb/pyclient/tests/test_pyctdb.py -v
+```
+
+The GitHub workflow runs these tests in its VM after the smoke tests (`.github/workflows/scripts/qemu-4-test.sh`).
 
 ## License
 

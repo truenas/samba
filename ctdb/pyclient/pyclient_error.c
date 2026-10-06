@@ -135,6 +135,18 @@ _set_ctdb_exc(int code, const char *additional_info, const char *location)
 }
 
 void
+_set_ctdb_client_exc(py_ctdb_client_ctx *ctx, int code,
+		     const char *additional_info, const char *location)
+{
+	if (_Py_atomic_load_uint(&ctx->disconnected)) {
+		code = ENOTCONN;
+		additional_info = "Connection to ctdbd lost";
+	}
+
+	_set_ctdb_exc(code, additional_info, location);
+}
+
+void
 _pyctdb_set_error(pyctdb_error_t *error, int error_code, const char *fmt,
 		  const char *location, ...)
 {
