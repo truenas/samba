@@ -2771,8 +2771,8 @@ static int vfswrap_fchmod(vfs_handle_struct *handle, files_struct *fsp, mode_t m
 
 	START_PROFILE_X(SNUM(handle->conn), syscall_fchmod);
 
-	if (!fsp->fsp_flags.is_pathref) {
-		result = fchmod(fsp_get_io_fd(fsp), mode);
+	if (fsp_has_read_access(fsp)) {
+		result = fchmod(fsp_get_pathref_fd(fsp), mode);
 		END_PROFILE_X(syscall_fchmod);
 		return result;
 	}
@@ -2802,8 +2802,8 @@ static int vfswrap_fchown(vfs_handle_struct *handle, files_struct *fsp, uid_t ui
 	int result;
 
 	START_PROFILE_X(SNUM(handle->conn), syscall_fchown);
-	if (!fsp->fsp_flags.is_pathref) {
-		result = fchown(fsp_get_io_fd(fsp), uid, gid);
+	if (fsp_has_read_access(fsp)) {
+		result = fchown(fsp_get_pathref_fd(fsp), uid, gid);
 		END_PROFILE_X(syscall_fchown);
 		return result;
 	}
@@ -2927,8 +2927,8 @@ static int vfswrap_fntimes(vfs_handle_struct *handle,
 		times = NULL;
 	}
 
-	if (!fsp->fsp_flags.is_pathref) {
-		result = futimens(fsp_get_io_fd(fsp), times);
+	if (fsp_has_read_access(fsp)) {
+		result = futimens(fsp_get_pathref_fd(fsp), times);
 		goto out;
 	}
 
@@ -3922,7 +3922,7 @@ static int vfswrap_fremovexattr(struct vfs_handle_struct *handle, struct files_s
 
 	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
 
-	if (!fsp->fsp_flags.is_pathref) {
+	if (fsp_has_read_access(fsp)) {
 		return fremovexattr(fd, name);
 	}
 
@@ -3944,7 +3944,7 @@ static int vfswrap_fsetxattr(struct vfs_handle_struct *handle, struct files_stru
 
 	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
 
-	if (!fsp->fsp_flags.is_pathref) {
+	if (fsp_has_read_access(fsp)) {
 		return fsetxattr(fd, name, value, size, flags);
 	}
 

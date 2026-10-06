@@ -946,7 +946,7 @@ static bool fsp_is_automount_mountpoint(struct files_struct *fsp, int old_fd)
 }
 
 #define SETFL_MASK (O_APPEND | O_NONBLOCK | O_NDELAY | O_DIRECT)
-#define COMPARE_MASK (O_ACCMODE | O_PATH | O_DIRECTORY | SETFL_MASK)
+#define COMPARE_MASK (O_ACCMODE | O_PATH | O_DIRECTORY | (SETFL_MASK & ~O_NONBLOCK))
 
 
 static int tn_reopen_from_fsp_fast(struct files_struct *fsp,
@@ -990,8 +990,8 @@ static int tn_reopen_from_fsp_fast(struct files_struct *fsp,
 		return -1;
 	}
 
-	if (how->flags == (fd_status & COMPARE_MASK)) {
-		// current status matches desired one
+	if ((how->flags & ~O_NONBLOCK) == (fd_status & COMPARE_MASK)) {
+		// current status matches desired one, ignoring O_NONBLOCK
 		return old_fd;
 	}
 
