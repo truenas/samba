@@ -5701,7 +5701,18 @@ static NTSTATUS open_streams_for_delete(connection_struct *conn,
 
 	DBG_DEBUG("open_streams_for_delete found %u streams\n", num_streams);
 
-	if (num_streams == 0) {
+	for (i = 0; i < num_streams; i++) {
+		if (!strequal(stream_info[i].name, "::$DATA")) {
+			break;
+		}
+	}
+
+	/*
+	 * Only named streams can conflict, and each open one holds an open of
+	 * the base file, which file_id_may_have_open_streams() looks for.
+	 */
+	if ((i == num_streams) ||
+	    !file_id_may_have_open_streams(pathref->fsp->file_id)) {
 		TALLOC_FREE(frame);
 		return NT_STATUS_OK;
 	}

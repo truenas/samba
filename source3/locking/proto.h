@@ -177,6 +177,7 @@ bool set_delete_on_close(files_struct *fsp, bool delete_on_close,
 			const struct security_unix_token *tok);
 bool is_delete_on_close_set(struct share_mode_lock *lck, uint32_t name_hash);
 bool file_has_open_streams(files_struct *fsp);
+bool file_id_may_have_open_streams(struct file_id id);
 bool share_mode_forall_leases(
 	struct share_mode_lock *lck,
 	bool (*fn)(struct share_mode_entry *e,
