@@ -667,6 +667,87 @@ done:
 }
 
 /*
+ * smbd only checks the streams of a file opened for delete while one of them
+ * is open. A stream open without FILE_SHARE_DELETE on another connection must
+ * still block the delete, and once it is closed the streams go with the file.
+ */
+static bool test_truenas_streams_delete_open_stream(struct torture_context *tctx,
+						    struct smb2_tree *tree1,
+						    struct smb2_tree *tree2)
+{
+	NTSTATUS status;
+	bool ret = true;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle hs = {{0}};
+	struct smb2_create cr;
+	union smb_fileinfo finfo;
+	const char *fname = "streamdelete";
+	const char *sname = "streamdelete:s";
+	const uint8_t data[] = "stream data";
+
+	smb2_util_unlink(tree1, fname);
+
+	status = torture_smb2_testfile(tree1, fname, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"create base file");
+	smb2_util_close(tree1, h);
+
+	status = truenas_open_stream(tree1, sname, NTCREATEX_DISP_CREATE, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"create stream");
+	status = smb2_util_write(tree1, h, data, 0, sizeof(data));
+	smb2_util_close(tree1, h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"write stream");
+
+	ZERO_STRUCT(cr);
+	cr.in.desired_access = SEC_FILE_READ_DATA;
+	cr.in.file_attributes = FILE_ATTRIBUTE_NORMAL;
+	cr.in.create_disposition = NTCREATEX_DISP_OPEN;
+	cr.in.share_access = NTCREATEX_SHARE_ACCESS_READ |
+			     NTCREATEX_SHARE_ACCESS_WRITE;
+	cr.in.fname = sname;
+	status = smb2_create(tree2, tctx, &cr);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"open stream on the other connection");
+	hs = cr.out.file.handle;
+
+	status = smb2_util_unlink(tree1, fname);
+	torture_assert_ntstatus_equal_goto(tctx, status,
+					   NT_STATUS_SHARING_VIOLATION,
+					   ret, done,
+					   "delete with the stream open");
+
+	smb2_util_close(tree2, hs);
+	ZERO_STRUCT(hs);
+
+	status = smb2_util_unlink(tree1, fname);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"delete after the stream was closed");
+
+	status = torture_smb2_testfile(tree1, fname, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"recreate base file");
+	ZERO_STRUCT(finfo);
+	finfo.generic.level = RAW_FILEINFO_STREAM_INFORMATION;
+	finfo.generic.in.file.handle = h;
+	status = smb2_getinfo_file(tree1, tctx, &finfo);
+	smb2_util_close(tree1, h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"query stream information");
+	torture_assert_int_equal_goto(tctx, finfo.stream_info.out.num_streams,
+				      1, ret, done,
+				      "streams on the recreated file");
+
+done:
+	if (!smb2_util_handle_empty(hs)) {
+		smb2_util_close(tree2, hs);
+	}
+	smb2_util_unlink(tree1, fname);
+	return ret;
+}
+
+/*
  * Ask for Apple's SMB2 extensions with directory attributes for this session,
  * as a Mac does. *supported says whether the server offered them, which it
  * only does with vfs_fruit.
@@ -1137,6 +1218,8 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 				     test_truenas_streams_sizes);
 	torture_suite_add_1smb2_test(streams_suite, "rename",
 				     test_truenas_streams_rename);
+	torture_suite_add_2smb2_test(streams_suite, "delete_open_stream",
+				     test_truenas_streams_delete_open_stream);
 	torture_suite_add_1smb2_test(fruit_suite, "readdir_rfork_size",
 				     test_truenas_fruit_readdir_rfork_size);
 	torture_suite_add_1smb2_test(sc_suite, "browse",

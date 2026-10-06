@@ -1119,6 +1119,49 @@ bool file_has_open_streams(files_struct *fsp)
 	return state.found_one;
 }
 
+static bool file_may_have_open_streams_fn(
+	struct share_mode_entry *e,
+	bool *modified,
+	void *private_data)
+{
+	bool *found = private_data;
+
+	if (e->flags & SHARE_ENTRY_FLAG_STREAM_BASEOPEN) {
+		*found = true;
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Every open stream holds an open of its base file flagged
+ * SHARE_ENTRY_FLAG_STREAM_BASEOPEN, so false means no stream of the file is
+ * open anywhere. Reads the record without taking its lock, and counts stale
+ * entries as open so that nothing is written back.
+ */
+bool file_id_may_have_open_streams(struct file_id id)
+{
+	struct share_mode_lock *lck = NULL;
+	bool found = false;
+	bool ok;
+
+	lck = fetch_share_mode_unlocked(talloc_tos(), id);
+	if (lck == NULL) {
+		return false;
+	}
+
+	ok = share_mode_forall_entries(lck,
+				       file_may_have_open_streams_fn,
+				       &found);
+	TALLOC_FREE(lck);
+	if (!ok) {
+		DBG_DEBUG("share_mode_forall_entries failed\n");
+		return true;
+	}
+
+	return found;
+}
+
 /*
  * Walk share mode entries, looking at every lease only once
  */
