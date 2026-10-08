@@ -752,9 +752,14 @@ done:
  * as a Mac does. *supported says whether the server offered them, which it
  * only does with vfs_fruit.
  */
-static bool truenas_enable_aapl(struct torture_context *tctx,
-				struct smb2_tree *tree,
-				bool *supported)
+/*
+ * Send an AAPL server query offering client_caps. *server_caps stays 0 on
+ * shares without vfs_fruit.
+ */
+static bool truenas_negotiate_aapl(struct torture_context *tctx,
+				   struct smb2_tree *tree,
+				   uint64_t client_caps,
+				   uint64_t *server_caps)
 {
 	struct smb2_create io;
 	struct smb2_create_blob *aapl = NULL;
@@ -762,7 +767,7 @@ static bool truenas_enable_aapl(struct torture_context *tctx,
 	NTSTATUS status;
 	bool ret = true;
 
-	*supported = false;
+	*server_caps = 0;
 
 	ZERO_STRUCT(io);
 	io.in.desired_access = SEC_FLAG_MAXIMUM_ALLOWED;
@@ -775,8 +780,7 @@ static bool truenas_enable_aapl(struct torture_context *tctx,
 	torture_assert_goto(tctx, data.data != NULL, ret, done, "talloc");
 	SBVAL(data.data, 0, SMB2_CRTCTX_AAPL_SERVER_QUERY);
 	SBVAL(data.data, 8, SMB2_CRTCTX_AAPL_SERVER_CAPS);
-	SBVAL(data.data, 16, (SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR |
-			      SMB2_CRTCTX_AAPL_UNIX_BASED));
+	SBVAL(data.data, 16, client_caps);
 
 	status = smb2_create_blob_add(tctx, &io.in.blobs, "AAPL", data);
 	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
@@ -789,11 +793,26 @@ static bool truenas_enable_aapl(struct torture_context *tctx,
 
 	aapl = smb2_create_blob_find(&io.out.blobs, SMB2_CREATE_TAG_AAPL);
 	if ((aapl != NULL) && (aapl->data.length >= 24)) {
-		*supported = (BVAL(aapl->data.data, 16) &
-			      SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR) != 0;
+		*server_caps = BVAL(aapl->data.data, 16);
 	}
 
 done:
+	return ret;
+}
+
+static bool truenas_enable_aapl(struct torture_context *tctx,
+				struct smb2_tree *tree,
+				bool *supported)
+{
+	uint64_t server_caps = 0;
+	bool ret;
+
+	ret = truenas_negotiate_aapl(tctx, tree,
+				     SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR |
+				     SMB2_CRTCTX_AAPL_UNIX_BASED,
+				     &server_caps);
+	*supported = (server_caps &
+		      SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR) != 0;
 	return ret;
 }
 
@@ -910,6 +929,253 @@ done:
 	for (i = 0; i < ARRAY_SIZE(sizes); i++) {
 		smb2_util_unlink(tree,
 				 talloc_asprintf(tctx, "rforksize_%zu", i));
+	}
+	return ret;
+}
+
+/* Whether the UTF-16LE name of len bytes is the ASCII string s */
+static bool truenas_utf16_is(const uint8_t *p, size_t len, const char *s)
+{
+	size_t i, n = strlen(s);
+
+	if (len != 2 * n) {
+		return false;
+	}
+	for (i = 0; i < n; i++) {
+		if ((p[2 * i] != (uint8_t)s[i]) || (p[2 * i + 1] != 0)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * List the share root with SMB2_FIND_ID_BOTH_DIRECTORY_INFO and return, for
+ * each of names, the 16-bit word after the EA size: the short name length and
+ * reserved byte in V1, the flags in READ_DIR_ATTR_V2. Unlisted names get -1.
+ */
+static bool truenas_aapl_entry_words(struct torture_context *tctx,
+				     struct smb2_tree *tree,
+				     const char **names,
+				     size_t num_names,
+				     int *words)
+{
+	struct smb2_handle h = {{0}};
+	struct smb2_find f;
+	NTSTATUS status;
+	bool ret = true;
+	size_t i;
+
+	for (i = 0; i < num_names; i++) {
+		words[i] = -1;
+	}
+
+	status = smb2_util_roothandle(tree, &h);
+	torture_assert_ntstatus_ok(tctx, status, "open share root");
+
+	ZERO_STRUCT(f);
+	f.in.file.handle	= h;
+	f.in.pattern		= "rdattr*";
+	f.in.max_response_size	= 0x10000;
+	f.in.level		= SMB2_FIND_ID_BOTH_DIRECTORY_INFO;
+
+	for (;;) {
+		const uint8_t *b = NULL;
+		size_t len, ofs = 0;
+
+		status = smb2_find(tree, tctx, &f);
+		if (NT_STATUS_EQUAL(status, STATUS_NO_MORE_FILES)) {
+			break;
+		}
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						"smb2_find");
+		b = f.out.blob.data;
+		len = f.out.blob.length;
+
+		while (ofs + 104 <= len) {
+			uint32_t next = IVAL(b, ofs);
+			uint32_t name_len = IVAL(b, ofs + 60);
+
+			torture_assert_goto(tctx, ofs + 104 + name_len <= len,
+					    ret, done, "entry overruns buffer");
+			for (i = 0; i < num_names; i++) {
+				if (truenas_utf16_is(b + ofs + 104, name_len,
+						     names[i])) {
+					words[i] = SVAL(b, ofs + 68);
+				}
+			}
+			if (next == 0) {
+				break;
+			}
+			ofs += next;
+		}
+	}
+
+done:
+	smb2_util_close(tree, h);
+	return ret;
+}
+
+/*
+ * A client that only offers READ_DIR_ATTR keeps the V1 layout: no V2 bit, and
+ * the word after the EA size is the short name length Samba always sent.
+ */
+static bool test_truenas_fruit_readdir_attr_v1(struct torture_context *tctx,
+					       struct smb2_tree *tree)
+{
+	const char *names[] = { "rdattr_v1_plain" };
+	int words[ARRAY_SIZE(names)];
+	struct smb2_handle h = {{0}};
+	uint64_t server_caps = 0;
+	NTSTATUS status;
+	bool ret = true;
+
+	ret = truenas_negotiate_aapl(tctx, tree,
+				     SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR |
+				     SMB2_CRTCTX_AAPL_UNIX_BASED,
+				     &server_caps);
+	if (!ret) {
+		return false;
+	}
+	if (!(server_caps & SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR)) {
+		torture_skip(tctx, "share does not offer AAPL directory "
+			     "attributes (no vfs_fruit)\n");
+	}
+	torture_assert(tctx,
+		       !(server_caps &
+			 SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR_V2),
+		       "V2 only when the client offers it");
+
+	smb2_util_unlink(tree, names[0]);
+	status = torture_smb2_testfile(tree, names[0], &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"create file");
+	smb2_util_close(tree, h);
+
+	ret = truenas_aapl_entry_words(tctx, tree, names, ARRAY_SIZE(names),
+				       words);
+	if (!ret) {
+		goto done;
+	}
+	torture_assert_int_equal_goto(tctx, words[0], 24, ret, done,
+				      "V1 short name length");
+
+done:
+	smb2_util_unlink(tree, names[0]);
+	return ret;
+}
+
+/*
+ * AAPL READ_DIR_ATTR_V2. A client offering V2 gets only the V2 bit back, and
+ * each entry's flags say whether it has no stream besides its data, which
+ * lets macOS skip asking for its xattrs. The entries live in the share root,
+ * as fruit:resource = file can't create resource forks in subdirectories.
+ * Skipped without vfs_fruit or with fruit:readdir_attr_version = 1.
+ */
+static bool test_truenas_fruit_readdir_attr_v2(struct torture_context *tctx,
+					       struct smb2_tree *tree)
+{
+	struct {
+		const char *name;
+		bool dir;
+		const char *stream;
+		size_t len;
+		int flags;
+	} e[] = {
+		{ "rdattr_v2_plain", false, NULL, 0,
+		  SMB2_CRTCTX_AAPL_READ_DIR_NO_XATTR },
+		{ "rdattr_v2_dir", true, NULL, 0,
+		  SMB2_CRTCTX_AAPL_READ_DIR_NO_XATTR },
+		{ "rdattr_v2_stream", false, ":foo", 3, 0 },
+		{ "rdattr_v2_finderinfo", false, AFPINFO_STREAM_NAME,
+		  AFP_INFO_SIZE, 0 },
+		{ "rdattr_v2_rsrc", false, AFPRESOURCE_STREAM_NAME, 300, 0 },
+		{ "rdattr_v2_dirfinderinfo", true, AFPINFO_STREAM_NAME,
+		  AFP_INFO_SIZE, 0 },
+	};
+	const char *names[ARRAY_SIZE(e)];
+	int words[ARRAY_SIZE(e)];
+	uint8_t data[300] = {0};
+	struct smb2_handle h = {{0}};
+	uint64_t server_caps = 0;
+	NTSTATUS status;
+	bool ret = true;
+	size_t i;
+
+	ret = truenas_negotiate_aapl(tctx, tree,
+				     SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR |
+				     SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR_V2 |
+				     SMB2_CRTCTX_AAPL_UNIX_BASED,
+				     &server_caps);
+	if (!ret) {
+		return false;
+	}
+	if (!(server_caps & (SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR |
+			     SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR_V2))) {
+		torture_skip(tctx, "share does not offer AAPL directory "
+			     "attributes (no vfs_fruit)\n");
+	}
+	if (!(server_caps & SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR_V2)) {
+		torture_skip(tctx, "fruit:readdir_attr_version = 1\n");
+	}
+	torture_assert(tctx,
+		       !(server_caps & SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR),
+		       "a V2 server answers with only the V2 bit");
+
+	/* AfpInfo with a FinderInfo type and creator */
+	RSIVAL(data, 0, AFP_Signature);
+	RSIVAL(data, 4, AFP_Version);
+	RSIVAL(data, 12, AFP_BackupTime);
+	memcpy(data + AFP_OFF_FinderInfo, "TEXTttxt", 8);
+
+	for (i = 0; i < ARRAY_SIZE(e); i++) {
+		names[i] = e[i].name;
+		smb2_deltree(tree, e[i].name);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(e); i++) {
+		const char *path = e[i].name;
+
+		if (e[i].dir) {
+			status = torture_smb2_testdir(tree, path, &h);
+		} else {
+			status = torture_smb2_testfile(tree, path, &h);
+		}
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						path);
+		smb2_util_close(tree, h);
+
+		if (e[i].stream == NULL) {
+			continue;
+		}
+		path = talloc_asprintf(tctx, "%s%s", path, e[i].stream);
+		status = truenas_open_stream(tree, path,
+					     NTCREATEX_DISP_OPEN_IF, &h);
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						path);
+		if (e[i].len > 0) {
+			status = smb2_util_write(tree, h, data, 0, e[i].len);
+			torture_assert_ntstatus_ok_goto(tctx, status, ret,
+							done, path);
+		}
+		smb2_util_close(tree, h);
+	}
+
+	ret = truenas_aapl_entry_words(tctx, tree, names, ARRAY_SIZE(e),
+				       words);
+	if (!ret) {
+		goto done;
+	}
+	for (i = 0; i < ARRAY_SIZE(e); i++) {
+		torture_assert_int_equal_goto(tctx, words[i], e[i].flags,
+					      ret, done,
+			talloc_asprintf(tctx, "READ_DIR_ATTR_V2 flags of %s",
+					e[i].name));
+	}
+
+done:
+	for (i = 0; i < ARRAY_SIZE(e); i++) {
+		smb2_deltree(tree, e[i].name);
 	}
 	return ret;
 }
@@ -1222,6 +1488,10 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 				     test_truenas_streams_delete_open_stream);
 	torture_suite_add_1smb2_test(fruit_suite, "readdir_rfork_size",
 				     test_truenas_fruit_readdir_rfork_size);
+	torture_suite_add_1smb2_test(fruit_suite, "readdir_attr_v1",
+				     test_truenas_fruit_readdir_attr_v1);
+	torture_suite_add_1smb2_test(fruit_suite, "readdir_attr_v2",
+				     test_truenas_fruit_readdir_attr_v2);
 	torture_suite_add_1smb2_test(sc_suite, "browse",
 				     test_truenas_shadow_copy_browse);
 	torture_suite_add_1smb2_test(sc_suite, "readonly",
