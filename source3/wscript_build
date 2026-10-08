@@ -657,6 +657,7 @@ bld.SAMBA3_LIBRARY('smbd_base',
                    source='''
                           smbd/server_reload.c
                           smbd/files.c
+                          smbd/truenas_mdcache.c
                           smbd/connection.c
                           smbd/utmp.c
                           smbd/session.c
