@@ -24,6 +24,12 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/eventfd.h>
+#ifdef __linux__
+#include <linux/inet_diag.h>
+#include <linux/netlink.h>
+#include <linux/sock_diag.h>
+#include <netinet/tcp.h>
+#endif
 
 #define SRVID_PY_CTDB	(CTDB_SRVID_TOOL_RANGE | 0x0001000000000000LL)
 #define DEFAULT_TIMEOUT 10
@@ -1203,6 +1209,309 @@ PyObject *py_ctdb_recover(PyObject *self, PyObject *args, PyObject *kwargs)
 	Py_RETURN_NONE;
 }
 
+/*
+ * This host's TCP connections with another node, found and destroyed through
+ * the kernel's socket diagnostics interface, which is how `ss -K` does it.
+ * ctdbd then finds its sockets gone and treats the node as disconnected at
+ * once, instead of after its keepalives time out.
+ *
+ * A node is connected to another twice, once in each direction, and binds the
+ * connection it makes to its own address. So from here the links with the
+ * node are the established sockets whose remote address is the node's: the
+ * one to its port, and the one from it to ours.
+ */
+#ifdef __linux__
+
+#define NODE_LINKS_MAX 8
+
+struct node_links {
+	struct inet_diag_sockid id[NODE_LINKS_MAX];
+	unsigned int num;
+};
+
+static int diag_request(int fd, uint16_t type, uint16_t flags,
+			const struct inet_diag_req_v2 *req)
+{
+	struct {
+		struct nlmsghdr nlh;
+		struct inet_diag_req_v2 req;
+	} msg = {
+		.nlh = {
+			.nlmsg_len = sizeof(msg),
+			.nlmsg_type = type,
+			.nlmsg_flags = flags,
+		},
+		.req = *req,
+	};
+	struct sockaddr_nl kernel = { .nl_family = AF_NETLINK };
+	ssize_t n;
+
+	n = sendto(fd, &msg, sizeof(msg), 0, (struct sockaddr *)&kernel,
+		   sizeof(kernel));
+	if (n < 0) {
+		return errno;
+	}
+
+	return 0;
+}
+
+static bool is_link_with(const struct inet_diag_msg *m,
+			 const ctdb_sock_addr *addr,
+			 unsigned int port, unsigned int own_port)
+{
+	const void *node_ip;
+	size_t len;
+
+	if (addr->sa.sa_family == AF_INET) {
+		node_ip = &addr->ip.sin_addr;
+		len = sizeof(addr->ip.sin_addr);
+	} else {
+		node_ip = &addr->ip6.sin6_addr;
+		len = sizeof(addr->ip6.sin6_addr);
+	}
+
+	if (memcmp(m->id.idiag_dst, node_ip, len) != 0) {
+		return false;
+	}
+
+	return ntohs(m->id.idiag_dport) == port ||
+	       ntohs(m->id.idiag_sport) == own_port;
+}
+
+/* Find the links. The dump answers in as many messages as it takes. */
+static int find_node_links(int fd, const ctdb_sock_addr *addr,
+			   unsigned int port, unsigned int own_port,
+			   struct node_links *links)
+{
+	struct inet_diag_req_v2 req = {
+		.sdiag_family = addr->sa.sa_family,
+		.sdiag_protocol = IPPROTO_TCP,
+		.idiag_states = 1 << TCP_ESTABLISHED,
+	};
+	char buf[16384];
+	int err;
+
+	err = diag_request(fd, SOCK_DIAG_BY_FAMILY,
+			   NLM_F_REQUEST | NLM_F_DUMP, &req);
+	if (err != 0) {
+		return err;
+	}
+
+	links->num = 0;
+	while (true) {
+		struct nlmsghdr *h;
+		ssize_t n;
+
+		n = recv(fd, buf, sizeof(buf), 0);
+		if (n < 0) {
+			return errno;
+		}
+		for (h = (struct nlmsghdr *)buf; NLMSG_OK(h, n);
+		     h = NLMSG_NEXT(h, n)) {
+			const struct inet_diag_msg *m;
+
+			if (h->nlmsg_type == NLMSG_DONE) {
+				return 0;
+			}
+			if (h->nlmsg_type == NLMSG_ERROR) {
+				const struct nlmsgerr *e = NLMSG_DATA(h);
+				return e->error < 0 ? -e->error : EIO;
+			}
+			m = NLMSG_DATA(h);
+			if (!is_link_with(m, addr, port, own_port)) {
+				continue;
+			}
+			if (links->num == NODE_LINKS_MAX) {
+				return E2BIG;
+			}
+			links->id[links->num++] = m->id;
+		}
+	}
+}
+
+/* Destroy one link. ENOENT when it is already gone. */
+static int destroy_link(int fd, uint8_t family,
+			const struct inet_diag_sockid *id)
+{
+	struct inet_diag_req_v2 req = {
+		.sdiag_family = family,
+		.sdiag_protocol = IPPROTO_TCP,
+		.idiag_states = ~0U,
+		.id = *id,
+	};
+	char buf[256];
+	struct nlmsghdr *h;
+	ssize_t n;
+	int err;
+
+	err = diag_request(fd, SOCK_DESTROY, NLM_F_REQUEST | NLM_F_ACK, &req);
+	if (err != 0) {
+		return err;
+	}
+
+	n = recv(fd, buf, sizeof(buf), 0);
+	if (n < 0) {
+		return errno;
+	}
+	h = (struct nlmsghdr *)buf;
+	if (!NLMSG_OK(h, n) || h->nlmsg_type != NLMSG_ERROR) {
+		return EIO;
+	}
+	{
+		const struct nlmsgerr *e = NLMSG_DATA(h);
+		return -e->error;
+	}
+}
+
+/* Destroy this host's links with the node. *count is how many were. */
+static int destroy_node_links(const ctdb_sock_addr *addr, unsigned int port,
+			      unsigned int own_port, int *count)
+{
+	struct node_links links;
+	unsigned int i;
+	int fd, err;
+
+	fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_SOCK_DIAG);
+	if (fd < 0) {
+		return errno;
+	}
+
+	err = find_node_links(fd, addr, port, own_port, &links);
+	if (err != 0) {
+		close(fd);
+		return err;
+	}
+
+	*count = 0;
+	for (i = 0; i < links.num; i++) {
+		err = destroy_link(fd, addr->sa.sa_family, &links.id[i]);
+		if (err == 0) {
+			(*count)++;
+		} else if (err != ENOENT) {
+			/* ctdbd may have closed it on seeing the first go */
+			close(fd);
+			return err;
+		}
+	}
+	close(fd);
+
+	return 0;
+}
+
+#else /* __linux__ */
+
+static int destroy_node_links(const ctdb_sock_addr *addr, unsigned int port,
+			      unsigned int own_port, int *count)
+{
+	return ENOSYS;
+}
+
+#endif /* __linux__ */
+
+PyDoc_STRVAR(py_ctdb_disconnect_node__doc__,
+"disconnect_node(pnn) -> int\n"
+"---------------------------\n"
+"Make this node's ctdbd treat node pnn as disconnected now.\n"
+"\n"
+"Destroys this host's TCP connections with that node, the way `ss -K`\n"
+"does, through the kernel's socket diagnostics interface. ctdbd finds\n"
+"its sockets gone, marks the node DISCONNECTED and recovers without\n"
+"it, instead of waiting for its keepalives to time out. It reconnects\n"
+"by itself, so a node that is in fact alive costs a reconnect and two\n"
+"recoveries, nothing more. Returns the number of connections destroyed.\n"
+"\n"
+"Requires CAP_NET_ADMIN. Linux only.\n"
+"\n"
+"Args:\n"
+"    pnn: The node, which may not be this one\n"
+"\n"
+"Raises:\n"
+"    ValueError: pnn is this node, or there is no such node\n"
+"    CTDBError: The node map could not be read, or the connections\n"
+"        could not be destroyed. errno is EPERM without CAP_NET_ADMIN.\n"
+);
+static PyObject *py_ctdb_disconnect_node(PyObject *self, PyObject *args,
+					 PyObject *kwargs)
+{
+	py_ctdb_client_ctx *ctx = (py_ctdb_client_ctx *)self;
+	struct ctdb_node_map *nodemap = NULL;
+	TALLOC_CTX *tmp_ctx = NULL;
+	ctdb_sock_addr addr;
+	unsigned int pnn, port = 0, own_port = 0;
+	bool found = false;
+	const char *errmsg = NULL;
+	int count = 0;
+	int err;
+	static char *kwlist[] = {"pnn", NULL};
+
+	if (!PyArg_ParseTupleAndKeywords(args, kwargs, "I", kwlist, &pnn)) {
+		return NULL;
+	}
+
+	if (pnn == ctx->pnn) {
+		PyErr_SetString(PyExc_ValueError, "That is this node");
+		return NULL;
+	}
+
+	Py_BEGIN_ALLOW_THREADS
+	err = py_ctdb_client_lock(ctx);
+	if (err == 0) {
+		tmp_ctx = talloc_new(ctx->mem_ctx);
+		if (tmp_ctx == NULL) {
+			err = ENOMEM;
+			errmsg = "Failed to allocate new memory context";
+		}
+	}
+
+	if (err == 0) {
+		err = ctdb_ctrl_get_nodemap(tmp_ctx, ctx->ev, ctx->client,
+					    ctx->pnn, TIMEOUT(ctx), &nodemap);
+		if (err) {
+			errmsg = "Failed to get nodemap";
+		}
+	}
+
+	if (err == 0) {
+		unsigned int i;
+
+		for (i = 0; i < nodemap->num; i++) {
+			struct ctdb_node_and_flags *node = &nodemap->node[i];
+
+			if (node->pnn == pnn) {
+				addr = node->addr;
+				port = ctdb_sock_addr_port(&node->addr);
+				found = true;
+			} else if (node->pnn == ctx->pnn) {
+				own_port = ctdb_sock_addr_port(&node->addr);
+			}
+		}
+	}
+	TALLOC_FREE(tmp_ctx);
+	py_ctdb_client_unlock(ctx);
+
+	/* Not under the lock: this is between us and the kernel */
+	if (err == 0 && found) {
+		err = destroy_node_links(&addr, port, own_port, &count);
+		if (err) {
+			errmsg = "Failed to destroy the connections with "
+				 "the node";
+		}
+	}
+	Py_END_ALLOW_THREADS
+
+	if (err) {
+		pyctdb_client_err(ctx, err, errmsg);
+		return NULL;
+	}
+
+	if (!found) {
+		PyErr_Format(PyExc_ValueError, "There is no node %u", pnn);
+		return NULL;
+	}
+
+	return PyLong_FromLong(count);
+}
+
 PyDoc_STRVAR(py_ctdb_recover__doc__,
 "recover(timeout=60) -> None\n"
 "---------------------------\n"
@@ -1248,6 +1557,12 @@ static PyMethodDef ctdb_client_methods[] = {
 		.ml_meth = (PyCFunction)py_ctdb_recover,
 		.ml_flags = METH_VARARGS | METH_KEYWORDS,
 		.ml_doc = py_ctdb_recover__doc__,
+	},
+	{
+		.ml_name = "disconnect_node",
+		.ml_meth = (PyCFunction)py_ctdb_disconnect_node,
+		.ml_flags = METH_VARARGS | METH_KEYWORDS,
+		.ml_doc = py_ctdb_disconnect_node__doc__,
 	},
 	{ NULL, NULL, 0, NULL }
 };
