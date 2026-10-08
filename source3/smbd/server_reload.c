@@ -31,6 +31,7 @@
 #include "auth.h"
 #include "messages.h"
 #include "lib/param/loadparm.h"
+#include "smbd/truenas_mdcache.h"
 
 /*
  * The persistent pcap cache is populated by the background print process. Per
@@ -171,6 +172,7 @@ bool reload_services(struct smbd_server_connection *sconn,
 
 	mangle_reset_cache();
 	flush_dfree_cache();
+	mdcache_flush_access();
 
 	return(ret);
 }

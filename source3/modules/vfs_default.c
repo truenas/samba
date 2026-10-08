@@ -3376,7 +3376,7 @@ static struct file_id vfswrap_file_id_create(struct vfs_handle_struct *handle,
 
 	key.devid = sbuf->st_ex_dev;
 	key.inode = sbuf->st_ex_ino;
-	/* key.extid is unused by default. */
+	key.extid = sbuf->st_ex_gen;
 
 	return key;
 }

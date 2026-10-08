@@ -277,15 +277,17 @@ void init_stat_ex_from_stat (struct stat_ex *dst,
 #ifdef STATX_CHANGE_COOKIE
 	dst->st_ex_change_cookie = src->stx_change_cookie;
 #endif
+	dst->st_ex_gen = src->stx_gen;
 	dst->st_ex_mnt_id = src->stx_mnt_id;
 	dst->st_ex_attributes = src->stx_attributes;
 }
 
 #ifdef STATX_CHANGE_COOKIE
 #define TNSTATX_FLAGS (STATX_BASIC_STATS|STATX_BTIME|STATX_MNT_ID_UNIQUE| \
-	STATX_CHANGE_COOKIE)
+	STATX_CHANGE_COOKIE|STATX_GEN)
 #else
-#define TNSTATX_FLAGS (STATX_BASIC_STATS|STATX_BTIME|STATX_MNT_ID_UNIQUE)
+#define TNSTATX_FLAGS (STATX_BASIC_STATS|STATX_BTIME|STATX_MNT_ID_UNIQUE| \
+	STATX_GEN)
 #endif
 
 /*******************************************************************
