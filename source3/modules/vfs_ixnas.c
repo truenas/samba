@@ -1227,11 +1227,13 @@ static NTSTATUS ixnas_fget_nt_acl_uncached(struct vfs_handle_struct *handle,
 
 	ok = ixnas_zfsacl_get_dacl_type(zfsacl, &dtype);
 	if (!ok) {
+		zfsacl_free(&zfsacl);
 		return map_nt_error_from_unix(errno);
 	}
 	switch (dtype) {
 	case IXNAS_NULL_DACL:
 	case IXNAS_EMPTY_DACL:
+		zfsacl_free(&zfsacl);
 		return ixnas_generate_special_dacl_sd(handle,
 						      fsp,
 						      security_info,
