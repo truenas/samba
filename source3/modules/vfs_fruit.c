@@ -102,6 +102,7 @@ static int vfs_fruit_debug_level = DBGC_VFS;
 
 static struct global_fruit_config {
 	bool nego_aapl;	/* client negotiated AAPL */
+	bool readdir_attr_v2;	/* and READ_DIR_ATTR_V2 */
 
 } global_fruit_config;
 
@@ -124,6 +125,7 @@ struct fruit_config_data {
 	enum fruit_encoding encoding;
 	bool use_aapl;		/* config from smb.conf */
 	bool use_copyfile;
+	bool use_readdir_attr_v2;
 	bool readdir_attr_enabled;
 	bool posix_opens;
 	bool unix_info_enabled;
@@ -133,6 +135,7 @@ struct fruit_config_data {
 	const char *model;
 	char *macmeta_streamname;
 	char *rsrc_streamname;	/* pre-computed AFP_Resource xattr name */
+	char *stream_prefix;	/* xattr name prefix of all streams */
 	int streams_compat_bytes; /* trailing byte truenas_streams_xattr stores */
 	bool time_machine;
 	off_t time_machine_max_size;
@@ -281,6 +284,7 @@ static int init_fruit_config(vfs_handle_struct *handle)
 {
 	struct fruit_config_data *config;
 	int enumval = -1;
+	int readdir_attr_version;
 	const char *tm_size_str = NULL;
 	const char *prefix = NULL;
 	bool store_stream_type;
@@ -358,6 +362,14 @@ static int init_fruit_config(vfs_handle_struct *handle)
 	config->use_copyfile = lp_parm_bool(-1, FRUIT_PARAM_TYPE_NAME,
 					   "copyfile", false);
 
+	readdir_attr_version = lp_parm_int(-1, FRUIT_PARAM_TYPE_NAME,
+					   "readdir_attr_version", 2);
+	if ((readdir_attr_version != 1) && (readdir_attr_version != 2)) {
+		DBG_ERR("fruit:readdir_attr_version must be 1 or 2, using 2\n");
+		readdir_attr_version = 2;
+	}
+	config->use_readdir_attr_v2 = (readdir_attr_version == 2);
+
 	config->posix_opens = lp_parm_bool(
 		SNUM(handle->conn), FRUIT_PARAM_TYPE_NAME, "posix_opens", true);
 
@@ -410,6 +422,7 @@ static int init_fruit_config(vfs_handle_struct *handle)
 			    "%s%s%s", prefix, AFPRESOURCE_STREAM_NAME + 1,
 			    store_stream_type ? ":$DATA" : "");
 		}
+		config->stream_prefix = talloc_strdup(config, prefix);
 	}
 	tm_size_str = lp_parm_const_string(
 		SNUM(handle->conn), FRUIT_PARAM_TYPE_NAME,
@@ -825,6 +838,7 @@ static NTSTATUS check_aapl(vfs_handle_struct *handle,
 	DATA_BLOB blob = data_blob_talloc(req, NULL, 0);
 	uint64_t req_bitmap, client_caps;
 	uint64_t server_caps = SMB2_CRTCTX_AAPL_UNIX_BASED;
+	bool readdir_attr_v2 = false;
 	smb_ucs2_t *model;
 	size_t modellen;
 
@@ -867,8 +881,16 @@ static NTSTATUS check_aapl(vfs_handle_struct *handle,
 	}
 
 	if (req_bitmap & SMB2_CRTCTX_AAPL_SERVER_CAPS) {
-		if ((client_caps & SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR) &&
+		if ((client_caps & SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR_V2) &&
+		    config->use_readdir_attr_v2 &&
 		    (handle->conn->fs_capabilities & FILE_NAMED_STREAMS)) {
+			/* A V2 server answers with only the V2 bit */
+			server_caps |= SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR_V2;
+			config->readdir_attr_enabled = true;
+			readdir_attr_v2 = true;
+		} else if ((client_caps &
+			    SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR) &&
+			   (handle->conn->fs_capabilities & FILE_NAMED_STREAMS)) {
 			server_caps |= SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR;
 			config->readdir_attr_enabled = true;
 		}
@@ -951,6 +973,7 @@ static NTSTATUS check_aapl(vfs_handle_struct *handle,
 				      blob);
 	if (NT_STATUS_IS_OK(status)) {
 		global_fruit_config.nego_aapl = true;
+		global_fruit_config.readdir_attr_v2 = readdir_attr_v2;
 	}
 
 	return status;
@@ -1250,9 +1273,15 @@ static uint64_t readdir_attr_rfork_size(struct vfs_handle_struct *handle,
 	return rfork_size;
 }
 
+/*
+ * afpinfo and rsrc are false when the file is known to have no FinderInfo or
+ * resource fork stream.
+ */
 static NTSTATUS readdir_attr_macmeta(struct vfs_handle_struct *handle,
 				     const struct smb_filename *smb_fname,
-				     struct readdir_attr_data *attr_data)
+				     struct readdir_attr_data *attr_data,
+				     bool afpinfo,
+				     bool rsrc)
 {
 	NTSTATUS status = NT_STATUS_OK;
 	struct fruit_config_data *config = NULL;
@@ -1270,7 +1299,7 @@ static NTSTATUS readdir_attr_macmeta(struct vfs_handle_struct *handle,
 	 * Resource fork length
 	 */
 
-	if (config->readdir_attr_rsize) {
+	if (config->readdir_attr_rsize && rsrc) {
 		uint64_t rfork_size;
 
 		rfork_size = readdir_attr_rfork_size(handle, smb_fname);
@@ -1281,7 +1310,7 @@ static NTSTATUS readdir_attr_macmeta(struct vfs_handle_struct *handle,
 	 * FinderInfo
 	 */
 
-	if (config->readdir_attr_finder_info) {
+	if (config->readdir_attr_finder_info && afpinfo) {
 		ok = readdir_attr_meta_finderi(handle, smb_fname, attr_data);
 		if (!ok) {
 			status = NT_STATUS_INTERNAL_ERROR;
@@ -4595,6 +4624,89 @@ fail:
 	return status;
 }
 
+/*
+ * Which streams a file has, from one listxattr, where fruit knows the xattr
+ * names truenas_streams_xattr keeps them under. Unlike a stream listing this
+ * can't tell empty streams apart, so they count.
+ */
+static bool readdir_attr_list_streams(struct vfs_handle_struct *handle,
+				      struct fruit_config_data *config,
+				      struct files_struct *fsp,
+				      bool *any,
+				      bool *afpinfo,
+				      bool *rsrc)
+{
+	char buf[1024];
+	const char *name = NULL;
+	size_t prefix_len;
+	ssize_t len;
+
+	if ((config->meta != FRUIT_META_STREAM) ||
+	    (config->rsrc_streamname == NULL)) {
+		return false;
+	}
+
+	len = SMB_VFS_NEXT_FLISTXATTR(handle, fsp, buf, sizeof(buf));
+	if (len == -1) {
+		return false;
+	}
+
+	*any = *afpinfo = *rsrc = false;
+	prefix_len = strlen(config->stream_prefix);
+	for (name = buf; name < buf + len; name += strlen(name) + 1) {
+		/* As truenas_streams_xattr's is_stream_xattr() */
+		if ((strncmp(name, config->stream_prefix, prefix_len) != 0) ||
+		    ((strncasecmp_m(name, SAMBA_XATTR_DOSSTREAM_PREFIX,
+				    strlen(SAMBA_XATTR_DOSSTREAM_PREFIX)) != 0) &&
+		     samba_private_attr_name(name))) {
+			continue;
+		}
+		*any = true;
+		if (strcmp(name, config->macmeta_streamname) == 0) {
+			*afpinfo = true;
+		} else if (strcmp(name, config->rsrc_streamname) == 0) {
+			*rsrc = true;
+		}
+	}
+	return true;
+}
+
+/*
+ * Whether the client would see no stream besides the file's data. With
+ * fruit:metadata = stream, list the streams below fruit, as fruit's own
+ * listing deletes AFP_AfpInfo streams of the wrong size.
+ */
+static bool readdir_attr_no_streams(struct vfs_handle_struct *handle,
+				    struct fruit_config_data *config,
+				    struct files_struct *fsp)
+{
+	struct stream_struct *streams = NULL;
+	unsigned int i, num_streams = 0;
+	NTSTATUS status;
+	bool none = true;
+
+	if (config->meta == FRUIT_META_STREAM) {
+		status = SMB_VFS_NEXT_FSTREAMINFO(handle, fsp, talloc_tos(),
+						  &num_streams, &streams);
+	} else {
+		status = SMB_VFS_FSTREAMINFO(fsp, talloc_tos(),
+					     &num_streams, &streams);
+	}
+	if (!NT_STATUS_IS_OK(status)) {
+		return false;
+	}
+
+	for (i = 0; i < num_streams; i++) {
+		if ((streams[i].size > 0) &&
+		    !strequal_m(streams[i].name, "::$DATA")) {
+			none = false;
+			break;
+		}
+	}
+	TALLOC_FREE(streams);
+	return none;
+}
+
 static NTSTATUS fruit_freaddir_attr(struct vfs_handle_struct *handle,
 				    struct files_struct *fsp,
 				    TALLOC_CTX *mem_ctx,
@@ -4603,6 +4715,9 @@ static NTSTATUS fruit_freaddir_attr(struct vfs_handle_struct *handle,
 	struct fruit_config_data *config = NULL;
 	struct readdir_attr_data *attr_data;
 	uint32_t conv_flags  = 0;
+	bool any = true, afpinfo = true, rsrc = true;
+	bool listed;
+	bool no_xattr = false;
 	NTSTATUS status;
 	int ret;
 
@@ -4643,11 +4758,23 @@ static NTSTATUS fruit_freaddir_attr(struct vfs_handle_struct *handle,
 	}
 	*attr_data = (struct readdir_attr_data){.type = RDATTR_AAPL};
 
+	listed = readdir_attr_list_streams(handle, config, fsp,
+					   &any, &afpinfo, &rsrc);
+	if (global_fruit_config.readdir_attr_v2) {
+		attr_data->attr_data.aapl.v2 = true;
+		if (listed) {
+			no_xattr = !any;
+		} else {
+			no_xattr = readdir_attr_no_streams(handle, config, fsp);
+		}
+	}
+
 	/*
 	 * Mac metadata: compressed FinderInfo, resource fork length
 	 * and creation date
 	 */
-	status = readdir_attr_macmeta(handle, fsp->fsp_name, attr_data);
+	status = readdir_attr_macmeta(handle, fsp->fsp_name, attr_data,
+				      afpinfo, rsrc);
 	if (!NT_STATUS_IS_OK(status)) {
 		/*
 		 * Error handling is tricky: if we return failure from
@@ -4658,6 +4785,17 @@ static NTSTATUS fruit_freaddir_attr(struct vfs_handle_struct *handle,
 		if  (!NT_STATUS_EQUAL(status, NT_STATUS_ACCESS_DENIED)) {
 			goto fail;
 		}
+	}
+
+	if ((config->meta == FRUIT_META_STREAM) &&
+	    (config->rsrc != FRUIT_RSRC_STREAM)) {
+		/* The resource fork isn't one of the streams */
+		no_xattr = no_xattr && config->readdir_attr_rsize &&
+			   (attr_data->attr_data.aapl.rfork_size == 0);
+	}
+	if (no_xattr) {
+		attr_data->attr_data.aapl.flags |=
+			SMB2_CRTCTX_AAPL_READ_DIR_NO_XATTR;
 	}
 
 	/*
