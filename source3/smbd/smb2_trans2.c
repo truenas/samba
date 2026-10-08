@@ -1539,9 +1539,16 @@ static NTSTATUS smbd_marshall_dir_entry(TALLOC_CTX *ctx,
 			 *
 			 * According to documentation short_name_len
 			 * should be 0, but on the wire behaviour
-			 * shows its set to 24 by clients.
+			 * shows its set to 24 by clients. With
+			 * READ_DIR_ATTR_V2, short_name_len and the
+			 * reserved byte are flags instead.
 			 */
-			SSVAL(p, 0, 24);
+			if (readdir_attr_data->attr_data.aapl.v2) {
+				SSVAL(p, 0,
+				      readdir_attr_data->attr_data.aapl.flags);
+			} else {
+				SSVAL(p, 0, 24);
+			}
 
 			/* Resourefork length */
 			SBVAL(p, 2, readdir_attr_data->attr_data.aapl.rfork_size);

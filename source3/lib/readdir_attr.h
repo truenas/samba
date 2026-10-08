@@ -30,6 +30,8 @@ struct readdir_attr_data {
 			char finder_info[16];
 			uint32_t max_access;
 			mode_t unix_mode;
+			bool v2;	/* READ_DIR_ATTR_V2, send flags */
+			uint16_t flags;
 		} aapl;
 	} attr_data;
 };
