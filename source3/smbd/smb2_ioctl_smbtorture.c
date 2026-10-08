@@ -22,6 +22,7 @@
 #include "includes.h"
 #include "smbd/smbd.h"
 #include "smbd/globals.h"
+#include "smbd/truenas_mdcache.h"
 #include "../libcli/smb/smb_common.h"
 #include "../lib/util/tevent_ntstatus.h"
 #include "include/ntioctl.h"
@@ -213,6 +214,37 @@ struct tevent_req *smb2_ioctl_smbtorture(uint32_t ctl_code,
 					req);
 		return req;
         }
+
+	case FSCTL_SMBTORTURE_MDCACHE: {
+		uint32_t idle_timeout = 0, slots, count;
+
+		/* Optional 4-byte idle timeout in seconds */
+		if (state->in_input.length == 4) {
+			idle_timeout = IVAL(state->in_input.data, 0);
+		} else if (state->in_input.length != 0) {
+			tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
+			return tevent_req_post(req, ev);
+		}
+		if (state->fsp == NULL) {
+			tevent_req_nterror(req, NT_STATUS_INVALID_HANDLE);
+			return tevent_req_post(req, ev);
+		}
+		if (state->in_max_output < 8) {
+			tevent_req_nterror(req, NT_STATUS_BUFFER_TOO_SMALL);
+			return tevent_req_post(req, ev);
+		}
+
+		mdcache_smbtorture(state->fsp, idle_timeout, &slots, &count);
+
+		state->out_output = data_blob_talloc(state, NULL, 8);
+		if (tevent_req_nomem(state->out_output.data, req)) {
+			return tevent_req_post(req, ev);
+		}
+		SIVAL(state->out_output.data, 0, slots);
+		SIVAL(state->out_output.data, 4, count);
+		tevent_req_done(req);
+		return tevent_req_post(req, ev);
+	}
 
 	default:
 		goto not_supported;

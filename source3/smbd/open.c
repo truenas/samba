@@ -22,6 +22,7 @@
 
 #include "includes.h"
 #include "system/filesys.h"
+#include "smbd/truenas_mdcache.h"
 #include "lib/util/server_id.h"
 #include "printing.h"
 #include "locking/share_mode_lock.h"
@@ -3384,6 +3385,43 @@ static NTSTATUS check_and_store_share_mode(
  Work out what access_mask to use from what the client sent us.
 ****************************************************************************/
 
+/*
+ * Maximum access is a function of the security descriptor variant, the
+ * read-only attribute, the user and the share, so files with the same
+ * ACL share it.
+ */
+static bool max_access_key(struct files_struct *fsp,
+			   const struct mdcache_inode *slot,
+			   bool use_privs,
+			   bool ignore_readonly,
+			   uint32_t access_mask,
+			   struct mdcache_access_key *key)
+{
+	bool readonly = false;
+
+	if (slot->sd_seq == 0) {
+		return false;
+	}
+
+	if (!ignore_readonly && S_ISREG(fsp->fsp_name->st.st_ex_mode)) {
+		if (!(slot->flags & MDCACHE_HAVE_DOSMODE)) {
+			return false;
+		}
+		readonly = (slot->dosmode & FILE_ATTRIBUTE_READONLY) != 0;
+	}
+
+	*key = (struct mdcache_access_key) {
+		.sd_seq = slot->sd_seq,
+		.vuid = fsp->vuid,
+		.cnum = fsp->conn->cnum,
+		.uid = get_current_uid(fsp->conn),
+		.access_mask = access_mask,
+		.flags = (use_privs ? 1 : 0) | (ignore_readonly ? 2 : 0) |
+			 (readonly ? 4 : 0),
+	};
+	return true;
+}
+
 static NTSTATUS smbd_calculate_maximum_allowed_access_fsp(
 			struct files_struct *dirfsp,
 			struct files_struct *fsp,
@@ -3393,7 +3431,12 @@ static NTSTATUS smbd_calculate_maximum_allowed_access_fsp(
 {
 	struct security_descriptor *sd = NULL;
 	uint32_t access_granted = 0;
+	uint32_t orig_access_mask = *p_access_mask;
 	uint32_t dosattrs;
+	struct mdcache_inode *slot = NULL;
+	struct mdcache_access_key key;
+	uint64_t cookie = 0;
+	bool cacheable = false;
 	NTSTATUS status;
 
 	/* Cope with symlinks */
@@ -3411,6 +3454,17 @@ static NTSTATUS smbd_calculate_maximum_allowed_access_fsp(
 	if (!use_privs && (get_current_uid(fsp->conn) == (uid_t)0)) {
 		*p_access_mask |= FILE_GENERIC_ALL;
 		return NT_STATUS_OK;
+	}
+
+	slot = mdcache_inode_fetch(fsp);
+	if (slot != NULL) {
+		cookie = slot->cookie;
+		cacheable = true;
+		if (max_access_key(fsp, slot, use_privs, ignore_readonly,
+				   orig_access_mask, &key) &&
+		    mdcache_access_get(&key, p_access_mask)) {
+			return NT_STATUS_OK;
+		}
 	}
 
 	status = SMB_VFS_FGET_NT_ACL(metadata_fsp(fsp),
@@ -3463,6 +3517,8 @@ static NTSTATUS smbd_calculate_maximum_allowed_access_fsp(
 	*p_access_mask = (access_granted | FILE_READ_ATTRIBUTES);
 
 	if (!(access_granted & DELETE_ACCESS)) {
+		// depends on the parent, which changes with every entry
+		cacheable = false;
 		if (can_delete_file_in_directory(fsp->conn,
 				dirfsp,
 				fsp->fsp_name)) {
@@ -3501,6 +3557,14 @@ static NTSTATUS smbd_calculate_maximum_allowed_access_fsp(
 	}
 
 done:
+	if (cacheable && mdcache_inode_unchanged(fsp, cookie)) {
+		slot = mdcache_inode_peek(&fsp->file_id, cookie);
+		if ((slot != NULL) &&
+		    max_access_key(fsp, slot, use_privs, ignore_readonly,
+				   orig_access_mask, &key)) {
+			mdcache_access_put(&key, *p_access_mask);
+		}
+	}
 	return NT_STATUS_OK;
 }
 
