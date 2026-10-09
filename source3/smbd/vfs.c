@@ -27,6 +27,7 @@
 #include "system/filesys.h"
 #include "smbd/smbd.h"
 #include "smbd/globals.h"
+#include "smbd/truenas_mdcache.h"
 #include "../lib/util/memcache.h"
 #include "transfer_file.h"
 #include "ntioctl.h"
@@ -894,6 +895,66 @@ const char *vfs_readdirname(connection_struct *conn,
 	return translated;
 }
 
+/*
+ * The tree connect whose share_root_fh is the working directory. Any chdir
+ * through the VFS clears it.
+ */
+static const struct connection_struct *share_root_cwd;
+
+/* The fd of "." of conn->cwd_fsp, if smbd keeps one open */
+struct fd_handle *vfs_share_root_fh(const struct connection_struct *conn)
+{
+	if (share_root_cwd != conn) {
+		return NULL;
+	}
+	return conn->share_root_fh;
+}
+
+/*
+ * fh was just opened as "." of conn->cwd_fsp. Keep it when that is the
+ * share root of a tree connect, which close_cnum() closes.
+ */
+void vfs_keep_share_root_fh(struct connection_struct *conn,
+			    struct fd_handle *fh)
+{
+	if ((conn->share_root_fh != NULL) ||
+	    !conn->tcon_done ||
+	    (conn->cnum == TID_FIELD_INVALID) ||
+	    !strcsequal(LastDir, conn->connectpath))
+	{
+		return;
+	}
+	fh_set_refcount(fh, fh_get_refcount(fh) + 1);
+	conn->share_root_fh = fh;
+	share_root_cwd = conn;
+}
+
+void vfs_close_share_root_fh(struct connection_struct *conn)
+{
+	struct files_struct *fsp = NULL;
+
+	if (conn->share_root_fh == NULL) {
+		return;
+	}
+	if (share_root_cwd == conn) {
+		share_root_cwd = NULL;
+	}
+
+	fsp = fsp_new(conn, conn);
+	if (fsp == NULL) {
+		smb_panic("fsp_new failed");
+	}
+	fsp->fsp_flags.is_pathref = true;
+	fsp->fsp_flags.is_directory = true;
+	fsp->fsp_name = cp_smb_basename(fsp, ".");
+	TALLOC_FREE(fsp->fh);
+	fsp->fh = conn->share_root_fh;
+	conn->share_root_fh = NULL;
+
+	fd_close(fsp);
+	file_free(NULL, fsp);
+}
+
 /*******************************************************************
  A wrapper for vfs_chdir().
 ********************************************************************/
@@ -933,6 +994,23 @@ int vfs_ChDir(connection_struct *conn, const struct smb_filename *smb_fname)
 			errno = EINVAL;
 			return -1;
 		}
+		return 0;
+	}
+
+	if ((conn->share_root_fh != NULL) &&
+	    strcsequal(smb_fname->base_name, conn->connectpath))
+	{
+		/* Return to the directory the kept fd refers to */
+		if (share_root_cwd != conn) {
+			ret = fchdir(fh_get_fd(conn->share_root_fh));
+			if (ret != 0) {
+				return -1;
+			}
+			share_root_cwd = conn;
+			SAFE_FREE(LastDir);
+			LastDir = SMB_STRDUP(conn->connectpath);
+		}
+		fsp_set_fd(conn->cwd_fsp, AT_FDCWD);
 		return 0;
 	}
 
@@ -1504,12 +1582,16 @@ NTSTATUS smb_vfs_call_create_dfs_pathat(struct vfs_handle_struct *handle,
 				const struct referral *reflist,
 				size_t referral_count)
 {
+	NTSTATUS result;
+
 	VFS_FIND(create_dfs_pathat);
-	return handle->fns->create_dfs_pathat_fn(handle,
+	result = handle->fns->create_dfs_pathat_fn(handle,
 						dirfsp,
 						smb_fname,
 						reflist,
 						referral_count);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 NTSTATUS smb_vfs_call_read_dfs_pathat(struct vfs_handle_struct *handle,
@@ -1557,11 +1639,15 @@ int smb_vfs_call_mkdirat(struct vfs_handle_struct *handle,
 			const struct smb_filename *smb_fname,
 			mode_t mode)
 {
+	int result;
+
 	VFS_FIND(mkdirat);
-	return handle->fns->mkdirat_fn(handle,
+	result = handle->fns->mkdirat_fn(handle,
 			dirfsp,
 			smb_fname,
 			mode);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 int smb_vfs_call_closedir(struct vfs_handle_struct *handle,
@@ -1577,12 +1663,18 @@ int smb_vfs_call_openat(struct vfs_handle_struct *handle,
 			struct files_struct *fsp,
 			const struct vfs_open_how *how)
 {
+	int fd;
+
 	VFS_FIND(openat);
-	return handle->fns->openat_fn(handle,
-				      dirfsp,
-				      smb_fname,
-				      fsp,
-				      how);
+	fd = handle->fns->openat_fn(handle,
+				    dirfsp,
+				    smb_fname,
+				    fsp,
+				    how);
+	if (how->flags & (O_CREAT | O_TRUNC)) {
+		mdcache_bump_epoch(handle->conn->sconn);
+	}
+	return fd;
 }
 
 NTSTATUS smb_vfs_call_create_file(struct vfs_handle_struct *handle,
@@ -1701,8 +1793,12 @@ ssize_t smb_vfs_call_pwrite(struct vfs_handle_struct *handle,
 			    struct files_struct *fsp, const void *data,
 			    size_t n, off_t offset)
 {
+	ssize_t result;
+
 	VFS_FIND(pwrite);
-	return handle->fns->pwrite_fn(handle, fsp, data, n, offset);
+	result = handle->fns->pwrite_fn(handle, fsp, data, n, offset);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 struct smb_vfs_call_pwrite_state {
@@ -1733,6 +1829,7 @@ struct tevent_req *smb_vfs_call_pwrite_send(struct vfs_handle_struct *handle,
 
 	subreq = handle->fns->pwrite_send_fn(handle, state, ev, fsp, data, n,
 					     offset);
+	mdcache_bump_epoch(handle->conn->sconn);
 	if (tevent_req_nomem(subreq, req)) {
 		return tevent_req_post(req, ev);
 	}
@@ -1794,8 +1891,12 @@ ssize_t smb_vfs_call_recvfile(struct vfs_handle_struct *handle, int fromfd,
 			      files_struct *tofsp, off_t offset,
 			      size_t count)
 {
+	ssize_t result;
+
 	VFS_FIND(recvfile);
-	return handle->fns->recvfile_fn(handle, fromfd, tofsp, offset, count);
+	result = handle->fns->recvfile_fn(handle, fromfd, tofsp, offset, count);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 int smb_vfs_call_renameat(struct vfs_handle_struct *handle,
@@ -1805,13 +1906,17 @@ int smb_vfs_call_renameat(struct vfs_handle_struct *handle,
 			const struct smb_filename *smb_fname_dst,
 			const struct vfs_rename_how *how)
 {
+	int result;
+
 	VFS_FIND(renameat);
-	return handle->fns->renameat_fn(handle,
+	result = handle->fns->renameat_fn(handle,
 				srcfsp,
 				smb_fname_src,
 				dstfsp,
 				smb_fname_dst,
 				how);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 int smb_vfs_call_rename_stream(struct vfs_handle_struct *handle,
@@ -1819,11 +1924,15 @@ int smb_vfs_call_rename_stream(struct vfs_handle_struct *handle,
 			       const char *dst_name,
 			       bool replace_if_exists)
 {
+	int result;
+
 	VFS_FIND(rename_stream);
-	return handle->fns->rename_stream_fn(handle,
-					     src_fsp,
-					     dst_name,
-					     replace_if_exists);
+	result = handle->fns->rename_stream_fn(handle,
+					       src_fsp,
+					       dst_name,
+					       replace_if_exists);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 struct smb_vfs_call_fsync_state {
@@ -1976,25 +2085,37 @@ int smb_vfs_call_unlinkat(struct vfs_handle_struct *handle,
 			const struct smb_filename *smb_fname,
 			int flags)
 {
+	int result;
+
 	VFS_FIND(unlinkat);
-	return handle->fns->unlinkat_fn(handle,
+	result = handle->fns->unlinkat_fn(handle,
 			dirfsp,
 			smb_fname,
 			flags);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 int smb_vfs_call_fchmod(struct vfs_handle_struct *handle,
 			struct files_struct *fsp, mode_t mode)
 {
+	int result;
+
 	VFS_FIND(fchmod);
-	return handle->fns->fchmod_fn(handle, fsp, mode);
+	result = handle->fns->fchmod_fn(handle, fsp, mode);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 int smb_vfs_call_fchown(struct vfs_handle_struct *handle,
 			struct files_struct *fsp, uid_t uid, gid_t gid)
 {
+	int result;
+
 	VFS_FIND(fchown);
-	return handle->fns->fchown_fn(handle, fsp, uid, gid);
+	result = handle->fns->fchown_fn(handle, fsp, uid, gid);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 int smb_vfs_call_lchown(struct vfs_handle_struct *handle,
@@ -2002,14 +2123,19 @@ int smb_vfs_call_lchown(struct vfs_handle_struct *handle,
 			uid_t uid,
 			gid_t gid)
 {
+	int result;
+
 	VFS_FIND(lchown);
-	return handle->fns->lchown_fn(handle, smb_fname, uid, gid);
+	result = handle->fns->lchown_fn(handle, smb_fname, uid, gid);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 int smb_vfs_call_chdir(struct vfs_handle_struct *handle,
 			const struct smb_filename *smb_fname)
 {
 	VFS_FIND(chdir);
+	share_root_cwd = NULL;
 	return handle->fns->chdir_fn(handle, smb_fname);
 }
 
@@ -2024,15 +2150,23 @@ int smb_vfs_call_fntimes(struct vfs_handle_struct *handle,
 			 struct files_struct *fsp,
 			 struct smb_file_time *ft)
 {
+	int result;
+
 	VFS_FIND(fntimes);
-	return handle->fns->fntimes_fn(handle, fsp, ft);
+	result = handle->fns->fntimes_fn(handle, fsp, ft);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 int smb_vfs_call_ftruncate(struct vfs_handle_struct *handle,
 			   struct files_struct *fsp, off_t offset)
 {
+	int result;
+
 	VFS_FIND(ftruncate);
-	return handle->fns->ftruncate_fn(handle, fsp, offset);
+	result = handle->fns->ftruncate_fn(handle, fsp, offset);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 int smb_vfs_call_fallocate(struct vfs_handle_struct *handle,
@@ -2041,8 +2175,12 @@ int smb_vfs_call_fallocate(struct vfs_handle_struct *handle,
 			   off_t offset,
 			   off_t len)
 {
+	int result;
+
 	VFS_FIND(fallocate);
-	return handle->fns->fallocate_fn(handle, fsp, mode, offset, len);
+	result = handle->fns->fallocate_fn(handle, fsp, mode, offset, len);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 int smb_vfs_call_filesystem_sharemode(struct vfs_handle_struct *handle,
@@ -2084,11 +2222,15 @@ int smb_vfs_call_symlinkat(struct vfs_handle_struct *handle,
 			struct files_struct *dirfsp,
 			const struct smb_filename *new_smb_fname)
 {
+	int result;
+
 	VFS_FIND(symlinkat);
-	return handle->fns->symlinkat_fn(handle,
+	result = handle->fns->symlinkat_fn(handle,
 				link_target,
 				dirfsp,
 				new_smb_fname);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 int smb_vfs_call_readlinkat(struct vfs_handle_struct *handle,
@@ -2112,13 +2254,17 @@ int smb_vfs_call_linkat(struct vfs_handle_struct *handle,
 			const struct smb_filename *new_smb_fname,
 			int flags)
 {
+	int result;
+
 	VFS_FIND(linkat);
-	return handle->fns->linkat_fn(handle,
+	result = handle->fns->linkat_fn(handle,
 				srcfsp,
 				old_smb_fname,
 				dstfsp,
 				new_smb_fname,
 				flags);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 int smb_vfs_call_mknodat(struct vfs_handle_struct *handle,
@@ -2127,12 +2273,16 @@ int smb_vfs_call_mknodat(struct vfs_handle_struct *handle,
 			mode_t mode,
 			SMB_DEV_T dev)
 {
+	int result;
+
 	VFS_FIND(mknodat);
-	return handle->fns->mknodat_fn(handle,
+	result = handle->fns->mknodat_fn(handle,
 				dirfsp,
 				smb_fname,
 				mode,
 				dev);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 struct smb_filename *smb_vfs_call_realpath(struct vfs_handle_struct *handle,
@@ -2147,8 +2297,12 @@ int smb_vfs_call_fchflags(struct vfs_handle_struct *handle,
 			struct files_struct *fsp,
 			unsigned int flags)
 {
+	int result;
+
 	VFS_FIND(fchflags);
-	return handle->fns->fchflags_fn(handle, fsp, flags);
+	result = handle->fns->fchflags_fn(handle, fsp, flags);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 struct file_id smb_vfs_call_file_id_create(struct vfs_handle_struct *handle,
@@ -2231,10 +2385,14 @@ NTSTATUS smb_vfs_call_fsctl(struct vfs_handle_struct *handle,
 			    uint32_t max_out_len,
 			    uint32_t *out_len)
 {
+	NTSTATUS result;
+
 	VFS_FIND(fsctl);
-	return handle->fns->fsctl_fn(handle, fsp, ctx, function, req_flags,
-				     in_data, in_len, out_data, max_out_len,
-				     out_len);
+	result = handle->fns->fsctl_fn(handle, fsp, ctx, function, req_flags,
+				       in_data, in_len, out_data, max_out_len,
+				       out_len);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 NTSTATUS smb_vfs_call_fget_dos_attributes(struct vfs_handle_struct *handle,
@@ -2249,8 +2407,12 @@ NTSTATUS smb_vfs_call_fset_dos_attributes(struct vfs_handle_struct *handle,
 					  struct files_struct *fsp,
 					  uint32_t dosmode)
 {
+	NTSTATUS result;
+
 	VFS_FIND(fset_dos_attributes);
-	return handle->fns->fset_dos_attributes_fn(handle, fsp, dosmode);
+	result = handle->fns->fset_dos_attributes_fn(handle, fsp, dosmode);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 struct tevent_req *smb_vfs_call_offload_read_send(TALLOC_CTX *mem_ctx,
@@ -2289,18 +2451,26 @@ struct tevent_req *smb_vfs_call_offload_write_send(struct vfs_handle_struct *han
 						   off_t dest_off,
 						   off_t num)
 {
+	struct tevent_req *result;
+
 	VFS_FIND(offload_write_send);
-	return handle->fns->offload_write_send_fn(handle, mem_ctx, ev, fsctl,
+	result = handle->fns->offload_write_send_fn(handle, mem_ctx, ev, fsctl,
 					       token, transfer_offset,
 					       dest_fsp, dest_off, num);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 NTSTATUS smb_vfs_call_offload_write_recv(struct vfs_handle_struct *handle,
 					 struct tevent_req *req,
 					 off_t *copied)
 {
+	NTSTATUS result;
+
 	VFS_FIND(offload_write_recv);
-	return handle->fns->offload_write_recv_fn(handle, req, copied);
+	result = handle->fns->offload_write_recv_fn(handle, req, copied);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 struct smb_vfs_call_get_dos_attributes_state {
@@ -2419,9 +2589,13 @@ NTSTATUS smb_vfs_call_set_compression(vfs_handle_struct *handle,
 				      struct files_struct *fsp,
 				      uint16_t compression_fmt)
 {
+	NTSTATUS result;
+
 	VFS_FIND(set_compression);
-	return handle->fns->set_compression_fn(handle, mem_ctx, fsp,
-					       compression_fmt);
+	result = handle->fns->set_compression_fn(handle, mem_ctx, fsp,
+						 compression_fmt);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 NTSTATUS smb_vfs_call_snap_check_path(vfs_handle_struct *handle,
@@ -2442,9 +2616,13 @@ NTSTATUS smb_vfs_call_snap_create(struct vfs_handle_struct *handle,
 				  char **base_path,
 				  char **snap_path)
 {
+	NTSTATUS result;
+
 	VFS_FIND(snap_create);
-	return handle->fns->snap_create_fn(handle, mem_ctx, base_volume, tstamp,
-					   rw, base_path, snap_path);
+	result = handle->fns->snap_create_fn(handle, mem_ctx, base_volume, tstamp,
+					     rw, base_path, snap_path);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 NTSTATUS smb_vfs_call_snap_delete(struct vfs_handle_struct *handle,
@@ -2452,9 +2630,13 @@ NTSTATUS smb_vfs_call_snap_delete(struct vfs_handle_struct *handle,
 				  char *base_path,
 				  char *snap_path)
 {
+	NTSTATUS result;
+
 	VFS_FIND(snap_delete);
-	return handle->fns->snap_delete_fn(handle, mem_ctx, base_path,
-					   snap_path);
+	result = handle->fns->snap_delete_fn(handle, mem_ctx, base_path,
+					     snap_path);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 NTSTATUS smb_vfs_call_fget_nt_acl(struct vfs_handle_struct *handle,
@@ -2473,9 +2655,13 @@ NTSTATUS smb_vfs_call_fset_nt_acl(struct vfs_handle_struct *handle,
 				  uint32_t security_info_sent,
 				  const struct security_descriptor *psd)
 {
+	NTSTATUS result;
+
 	VFS_FIND(fset_nt_acl);
-	return handle->fns->fset_nt_acl_fn(handle, fsp, security_info_sent,
-					   psd);
+	result = handle->fns->fset_nt_acl_fn(handle, fsp, security_info_sent,
+					     psd);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 SMB_ACL_T smb_vfs_call_sys_acl_get_fd(struct vfs_handle_struct *handle,
@@ -2502,15 +2688,23 @@ int smb_vfs_call_sys_acl_set_fd(struct vfs_handle_struct *handle,
 				SMB_ACL_TYPE_T type,
 				SMB_ACL_T theacl)
 {
+	int result;
+
 	VFS_FIND(sys_acl_set_fd);
-	return handle->fns->sys_acl_set_fd_fn(handle, fsp, type, theacl);
+	result = handle->fns->sys_acl_set_fd_fn(handle, fsp, type, theacl);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 int smb_vfs_call_sys_acl_delete_def_fd(struct vfs_handle_struct *handle,
 				struct files_struct *fsp)
 {
+	int result;
+
 	VFS_FIND(sys_acl_delete_def_fd);
-	return handle->fns->sys_acl_delete_def_fd_fn(handle, fsp);
+	result = handle->fns->sys_acl_delete_def_fd_fn(handle, fsp);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 struct smb_vfs_call_getxattrat_state {
@@ -2638,16 +2832,24 @@ ssize_t smb_vfs_call_flistxattr(struct vfs_handle_struct *handle,
 int smb_vfs_call_fremovexattr(struct vfs_handle_struct *handle,
 			      struct files_struct *fsp, const char *name)
 {
+	int result;
+
 	VFS_FIND(fremovexattr);
-	return handle->fns->fremovexattr_fn(handle, fsp, name);
+	result = handle->fns->fremovexattr_fn(handle, fsp, name);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 int smb_vfs_call_fsetxattr(struct vfs_handle_struct *handle,
 			   struct files_struct *fsp, const char *name,
 			   const void *value, size_t size, int flags)
 {
+	int result;
+
 	VFS_FIND(fsetxattr);
-	return handle->fns->fsetxattr_fn(handle, fsp, name, value, size, flags);
+	result = handle->fns->fsetxattr_fn(handle, fsp, name, value, size, flags);
+	mdcache_bump_epoch(handle->conn->sconn);
+	return result;
 }
 
 bool smb_vfs_call_aio_force(struct vfs_handle_struct *handle,

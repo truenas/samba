@@ -3731,16 +3731,21 @@ static int fruit_fstat_meta_stream(vfs_handle_struct *handle,
 		return 0;
 	}
 
-	smb_fname = (struct smb_filename) {
-		.base_name = fsp->fsp_name->base_name,
-		.twrp = fsp->fsp_name->twrp,
-	};
+	if (VALID_STAT(fsp->base_fsp->fsp_name->st)) {
+		/* dev/ino of the open base file can't change */
+		*sbuf = fsp->base_fsp->fsp_name->st;
+	} else {
+		smb_fname = (struct smb_filename) {
+			.base_name = fsp->fsp_name->base_name,
+			.twrp = fsp->fsp_name->twrp,
+		};
 
-	ret = fruit_stat_base(handle, &smb_fname, false);
-	if (ret != 0) {
-		return -1;
+		ret = fruit_stat_base(handle, &smb_fname, false);
+		if (ret != 0) {
+			return -1;
+		}
+		*sbuf = smb_fname.st;
 	}
-	*sbuf = smb_fname.st;
 
 	ino = hash_inode(sbuf, fsp->fsp_name->stream_name);
 

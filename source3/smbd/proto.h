@@ -355,6 +355,8 @@ bool fsp_set_smb_fname(struct files_struct *fsp,
 size_t fsp_fullbasepath(struct files_struct *fsp, char *buf, size_t buflen);
 void fsp_set_base_fsp(struct files_struct *fsp, struct files_struct *base_fsp);
 bool fsp_is_alternate_stream(const struct files_struct *fsp);
+bool conn_has_xattr_streams(const struct connection_struct *conn);
+bool fsp_is_xattr_stream(const struct files_struct *fsp);
 struct files_struct *metadata_fsp(struct files_struct *fsp);
 bool fsp_search_ask_sharemode(struct files_struct *fsp);
 bool fsp_getinfo_ask_sharemode(struct files_struct *fsp);
@@ -413,6 +415,9 @@ void smb_fname_fsp_unlink(struct smb_filename *smb_fname);
 
 NTSTATUS move_smb_fname_fsp_link(struct smb_filename *smb_fname_dst,
 				 struct smb_filename *smb_fname_src);
+
+NTSTATUS move_base_fsp_link(struct smb_filename *smb_fname_base,
+			    struct files_struct *stream_fsp);
 
 NTSTATUS reference_smb_fname_fsp_link(struct smb_filename *smb_fname_dst,
 				      const struct smb_filename *smb_fname_src);
@@ -1192,6 +1197,10 @@ const char *vfs_readdirname(connection_struct *conn,
 			    struct files_struct *dirfsp,
 			    DIR *d,
 			    char **talloced);
+struct fd_handle *vfs_share_root_fh(const struct connection_struct *conn);
+void vfs_keep_share_root_fh(struct connection_struct *conn,
+			    struct fd_handle *fh);
+void vfs_close_share_root_fh(struct connection_struct *conn);
 int vfs_ChDir(connection_struct *conn,
 			const struct smb_filename *smb_fname);
 struct smb_filename *vfs_GetWd(TALLOC_CTX *ctx, connection_struct *conn);

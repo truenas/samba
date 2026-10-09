@@ -779,6 +779,7 @@ struct pthreadpool_tevent;
 struct dcesrv_context;
 
 struct smbd_server_connection {
+	uint64_t mdcache_epoch; /* TrueNAS: see truenas_mdcache.c */
 	const struct tsocket_address *local_address;
 	const struct tsocket_address *remote_address;
 	const char *remote_hostname;

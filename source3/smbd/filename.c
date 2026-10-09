@@ -442,6 +442,65 @@ char *get_original_lcomp(TALLOC_CTX *ctx,
 }
 
 /*
+ * An xattr stream's xattr name contains the stream name, so if no xattr name
+ * on base_fsp contains it in any case, there is no such stream. This saves
+ * vfs_fstreaminfo() reading every stream's size.
+ */
+static bool xattr_stream_may_exist(struct files_struct *base_fsp,
+				   const char *stream_name)
+{
+	TALLOC_CTX *frame = talloc_stackframe();
+	const char *s = NULL;
+	const char *e = NULL;
+	char buf[1024];
+	char *list = buf;
+	char *key = NULL;
+	const char *name = NULL;
+	ssize_t len;
+	bool found = true;
+
+	if (stream_name[0] != ':') {
+		goto done;
+	}
+	s = stream_name + 1;
+	e = strchr(s, ':');
+
+	key = talloc_strndup(frame, s, (e == NULL) ? strlen(s) : PTR_DIFF(e, s));
+	if (key != NULL) {
+		key = talloc_strdup_upper(frame, key);
+	}
+	if (key == NULL) {
+		goto done;
+	}
+
+	len = SMB_VFS_FLISTXATTR(base_fsp, list, sizeof(buf));
+	if ((len == -1) && (errno == ERANGE)) {
+		list = talloc_array(frame, char, 65536);
+		if (list == NULL) {
+			goto done;
+		}
+		len = SMB_VFS_FLISTXATTR(base_fsp, list, talloc_get_size(list));
+	}
+	if ((len == -1) || ((len > 0) && (list[len - 1] != '\0'))) {
+		goto done;
+	}
+
+	found = false;
+	for (name = list; name < list + len; name += strlen(name) + 1) {
+		char *upper = talloc_strdup_upper(frame, name);
+
+		if ((upper == NULL) || (strstr(upper, key) != NULL)) {
+			found = true;
+			break;
+		}
+		TALLOC_FREE(upper);
+	}
+done:
+	TALLOC_FREE(frame);
+	return found;
+}
+
+/*
  * Get the correct capitalized stream name hanging off
  * base_fsp. Equivalent of get_real_filename(), but for streams.
  */
@@ -454,6 +513,11 @@ static NTSTATUS get_real_stream_name(
 	unsigned int i, num_streams = 0;
 	struct stream_struct *streams = NULL;
 	NTSTATUS status;
+
+	if (conn_has_xattr_streams(base_fsp->conn) &&
+	    !xattr_stream_may_exist(base_fsp, stream_name)) {
+		return NT_STATUS_OBJECT_NAME_NOT_FOUND;
+	}
 
 	status = vfs_fstreaminfo(
 		base_fsp, talloc_tos(), &num_streams, &streams);

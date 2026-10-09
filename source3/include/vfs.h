@@ -442,6 +442,18 @@ struct fsp_lease {
 	struct smb2_lease lease;
 };
 
+/* TrueNAS: a stat of a file's fd, see truenas_mdcache.c */
+struct mdcache_stat {
+	uint64_t epoch;
+	uint64_t cookie;
+	uint64_t gen;
+	dev_t dev;
+	ino_t ino;
+	uid_t uid;
+	gid_t gid;
+	mode_t mode;
+};
+
 typedef struct files_struct {
 	struct files_struct *next, *prev;
 	uint64_t fnum;
@@ -561,6 +573,8 @@ typedef struct files_struct {
 	 * lock attempts on the same offset.
 	 */
 	uint64_t lock_failure_offset;
+
+	struct mdcache_stat mdcache_stat; /* TrueNAS */
 } files_struct;
 
 /*
@@ -771,6 +785,7 @@ typedef struct connection_struct {
 
 	char *connectpath;
 	struct files_struct *cwd_fsp; /* Working directory. */
+	struct fd_handle *share_root_fh; /* "." of connectpath, see vfs_ChDir() */
 	bool tcon_done;
 
 	struct vfs_handle_struct *vfs_handles;		/* for the new plugins */

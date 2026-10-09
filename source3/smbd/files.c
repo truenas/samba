@@ -584,10 +584,15 @@ fail:
 	return status;
 }
 
+/*
+ * If fh is not NULL it already refers to name and the new fsp shares it
+ * instead of opening name again.
+ */
 static NTSTATUS openat_pathref_fsp_simple_openat(TALLOC_CTX *mem_ctx,
 						 struct files_struct *dirfsp,
 						 const char *name,
 						 uint32_t flags,
+						 struct fd_handle *fh,
 						 struct smb_filename **_fname)
 {
 	struct connection_struct *conn = dirfsp->conn;
@@ -644,6 +649,16 @@ static NTSTATUS openat_pathref_fsp_simple_openat(TALLOC_CTX *mem_ctx,
 		return NT_STATUS_NO_MEMORY;
 	}
 
+	if (fh != NULL) {
+		TALLOC_FREE(fsp->fh);
+		fsp->fh = fh;
+		fh_set_refcount(fh, fh_get_refcount(fh) + 1);
+		/* As vfswrap_openat() sets it on a successful open */
+		fsp->fsp_flags.have_proc_fds = conn->have_proc_fds;
+		fd = fsp_get_pathref_fd(fsp);
+		goto have_fd;
+	}
+
 	fd = SMB_VFS_OPENAT(conn, dirfsp, fname, fsp, &how);
 	if (fd == -1) {
 		status = map_nt_error_from_unix(errno);
@@ -658,6 +673,7 @@ static NTSTATUS openat_pathref_fsp_simple_openat(TALLOC_CTX *mem_ctx,
 
 	fsp_set_fd(fsp, fd);
 
+have_fd:
 	status = vfs_stat_fsp(fsp);
 
 	if (!NT_STATUS_IS_OK(status)) {
@@ -702,7 +718,7 @@ NTSTATUS openat_pathref_fsp_rootdir(TALLOC_CTX *mem_ctx,
 	NTSTATUS status;
 
 	status = openat_pathref_fsp_simple_openat(
-		mem_ctx, conn->cwd_fsp, "/", 0, &root);
+		mem_ctx, conn->cwd_fsp, "/", 0, NULL, &root);
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
@@ -1740,13 +1756,23 @@ NTSTATUS openat_pathref_fsp_dot(TALLOC_CTX *mem_ctx,
 				uint32_t flags,
 				struct smb_filename **_dot)
 {
+	struct connection_struct *conn = dirfsp->conn;
+	struct fd_handle *share_root_fh = NULL;
 	struct smb_filename *dot = NULL;
 	NTSTATUS status;
 
+	if (dirfsp == conn->cwd_fsp) {
+		share_root_fh = vfs_share_root_fh(conn);
+	}
+
 	status = openat_pathref_fsp_simple_openat(
-		mem_ctx, dirfsp, ".", flags, &dot);
+		mem_ctx, dirfsp, ".", flags, share_root_fh, &dot);
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
+	}
+
+	if ((dirfsp == conn->cwd_fsp) && (share_root_fh == NULL)) {
+		vfs_keep_share_root_fh(conn, dot->fsp->fh);
 	}
 
 	*_dot = dot;
@@ -1790,6 +1816,34 @@ NTSTATUS move_smb_fname_fsp_link(struct smb_filename *smb_fname_dst,
 	talloc_set_destructor(smb_fname_dst, smb_fname_fsp_destructor);
 
 	smb_fname_fsp_unlink(smb_fname_src);
+
+	return NT_STATUS_OK;
+}
+
+/*
+ * Detach the base pathref from the stream pathref stream_fsp and link it to
+ * smb_fname_base
+ */
+NTSTATUS move_base_fsp_link(struct smb_filename *smb_fname_base,
+			    struct files_struct *stream_fsp)
+{
+	struct files_struct *base_fsp = stream_fsp->base_fsp;
+	bool ok;
+
+	SMB_ASSERT(smb_fname_base->fsp == NULL);
+	SMB_ASSERT(smb_fname_base->fsp_link == NULL);
+
+	ok = fsp_smb_fname_link(base_fsp,
+				&smb_fname_base->fsp_link,
+				&smb_fname_base->fsp);
+	if (!ok) {
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	talloc_set_destructor(smb_fname_base, smb_fname_fsp_destructor);
+
+	fsp_set_base_fsp(stream_fsp, NULL);
+	smb_fname_base->st = base_fsp->fsp_name->st;
 
 	return NT_STATUS_OK;
 }
@@ -2651,6 +2705,24 @@ void fsp_set_base_fsp(struct files_struct *fsp, struct files_struct *base_fsp)
 bool fsp_is_alternate_stream(const struct files_struct *fsp)
 {
 	return (fsp->base_fsp != NULL);
+}
+
+/*
+ * All streams on conn are xattrs: the fd of a stream is only a placeholder,
+ * all I/O goes through the base file
+ */
+bool conn_has_xattr_streams(const struct connection_struct *conn)
+{
+	uint32_t flags = conn->internal_tcon_flags;
+
+	return (flags & TCON_FLAG_STREAMS_XATTR) &&
+	       !(flags & TCON_FLAG_STREAMS_FILE);
+}
+
+bool fsp_is_xattr_stream(const struct files_struct *fsp)
+{
+	return fsp_is_alternate_stream(fsp) &&
+	       conn_has_xattr_streams(fsp->conn);
 }
 
 struct files_struct *metadata_fsp(struct files_struct *fsp)
