@@ -3422,7 +3422,7 @@ static bool max_access_key(struct files_struct *fsp,
 
 	*key = (struct mdcache_access_key) {
 		.sd_seq = slot->sd_seq,
-		.vuid = fsp->vuid,
+		.vuid = get_current_vuid(fsp->conn),
 		.cnum = fsp->conn->cnum,
 		.uid = get_current_uid(fsp->conn),
 		.access_mask = access_mask,
