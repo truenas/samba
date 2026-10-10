@@ -18,6 +18,7 @@
 */
 
 #include "includes.h"
+#include "smbd/smbd.h"
 #include "fd_handle.h"
 
 struct fd_handle {
@@ -139,7 +140,8 @@ void fsp_set_fd(struct files_struct *fsp, int fd)
 
 	/* TrueNAS changes */
 	if (fd_changed || fsp->fh->status_flags == 0) {
-		if (fsp->fh->fd == -1 || fsp->fh->fd == AT_FDCWD) {
+		if (fsp->fh->fd == -1 || fsp->fh->fd == AT_FDCWD ||
+		    fsp_is_xattr_stream(fsp)) {
 			fsp->fh->status_flags = 0;
 		} else {
 			fsp->fh->status_flags = fcntl(fd, F_GETFL);

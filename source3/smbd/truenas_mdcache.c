@@ -32,6 +32,11 @@
  *
  * Both are freed once the process goes MDCACHE_IDLE_TIMEOUT seconds
  * without using them.
+ *
+ * Finding a file's slot takes a statx of its fd, unless one was taken in
+ * the current epoch. The epoch ends whenever smbd wakes up from waiting,
+ * with each request and with each change smbd makes, so a change made
+ * elsewhere goes unseen at most until smbd next waits.
  */
 
 #include "includes.h"
@@ -216,6 +221,62 @@ static void mdcache_idle(struct tevent_context *ev,
 	TALLOC_FREE(mdc.mc);
 }
 
+void mdcache_bump_epoch(struct smbd_server_connection *sconn)
+{
+	if (sconn != NULL) {
+		sconn->mdcache_epoch++;
+	}
+}
+
+/*
+ * Moves with every SMB request (num_requests) and with every wake-up and
+ * change of our own (mdcache_epoch). 0 is never current.
+ */
+static uint64_t mdcache_epoch(const struct files_struct *fsp)
+{
+	struct smbd_server_connection *sconn = fsp->conn->sconn;
+
+	if (sconn == NULL) {
+		return 0;
+	}
+	return sconn->num_requests + sconn->mdcache_epoch;
+}
+
+#ifdef STATX_CHANGE_COOKIE
+static void mdcache_set_stat(struct files_struct *fsp, const struct statx *stx)
+{
+	fsp->mdcache_stat = (struct mdcache_stat) {
+		.epoch = mdcache_epoch(fsp),
+		.cookie = stx->stx_change_cookie,
+		.gen = stx->stx_gen,
+		.dev = makedev(stx->stx_dev_major, stx->stx_dev_minor),
+		.ino = stx->stx_ino,
+		.uid = stx->stx_uid,
+		.gid = stx->stx_gid,
+		.mode = stx->stx_mode,
+	};
+}
+#endif
+
+/* sbuf is a stat of fsp's fd */
+void mdcache_stat_taken(struct files_struct *fsp, const SMB_STRUCT_STAT *sbuf)
+{
+#ifdef STATX_CHANGE_COOKIE
+	struct statx stx = {
+		.stx_change_cookie = sbuf->st_ex_change_cookie,
+		.stx_gen = sbuf->st_ex_gen,
+		.stx_dev_major = major(sbuf->st_ex_dev),
+		.stx_dev_minor = minor(sbuf->st_ex_dev),
+		.stx_ino = sbuf->st_ex_ino,
+		.stx_uid = sbuf->st_ex_uid,
+		.stx_gid = sbuf->st_ex_gid,
+		.stx_mode = sbuf->st_ex_mode,
+	};
+
+	mdcache_set_stat(fsp, &stx);
+#endif
+}
+
 /*
  * Return the slot for the current version of fsp's file, emptied if the
  * file changed since it was filled, or NULL if it can't be cached. Values
@@ -226,28 +287,35 @@ struct mdcache_inode *mdcache_inode_fetch(struct files_struct *fsp)
 {
 #ifdef STATX_CHANGE_COOKIE
 	const SMB_STRUCT_STAT *st = &fsp->fsp_name->st;
+	const struct mdcache_stat *m = &fsp->mdcache_stat;
+	uint64_t epoch = mdcache_epoch(fsp);
 	struct mdcache_inode *s = NULL;
-	struct statx stx;
 
 	if (fsp_is_alternate_stream(fsp)) {
 		return NULL;
 	}
 
-	if (statx(fsp_get_pathref_fd(fsp), "", AT_EMPTY_PATH,
-		  STATX_TYPE | STATX_MODE | STATX_UID | STATX_GID |
-		  STATX_INO | STATX_CHANGE_COOKIE | STATX_GEN, &stx) != 0) {
-		return NULL;
+	if ((epoch == 0) || (m->epoch != epoch)) {
+		struct statx stx;
+
+		if (statx(fsp_get_pathref_fd(fsp), "", AT_EMPTY_PATH,
+			  STATX_TYPE | STATX_MODE | STATX_UID | STATX_GID |
+			  STATX_INO | STATX_CHANGE_COOKIE | STATX_GEN,
+			  &stx) != 0) {
+			return NULL;
+		}
+		mdcache_set_stat(fsp, &stx);
 	}
 
-	if ((stx.stx_change_cookie == 0) ||
-	    (stx.stx_uid != st->st_ex_uid) ||
-	    (stx.stx_gid != st->st_ex_gid) ||
-	    (stx.stx_mode != st->st_ex_mode)) {
+	if ((m->cookie == 0) ||
+	    (m->uid != st->st_ex_uid) ||
+	    (m->gid != st->st_ex_gid) ||
+	    (m->mode != st->st_ex_mode)) {
 		// a zero cookie is the .zfs control directory
 		return NULL;
 	}
 
-	if (stx.stx_gen == 0) {
+	if (m->gen == 0) {
 		static bool logged;
 
 		if (!logged) {
@@ -259,10 +327,9 @@ struct mdcache_inode *mdcache_inode_fetch(struct files_struct *fsp)
 	}
 
 	/* The slot is keyed by fsp->file_id, so it must be this fd's file */
-	if ((makedev(stx.stx_dev_major, stx.stx_dev_minor) !=
-	     fsp->file_id.devid) ||
-	    (stx.stx_ino != fsp->file_id.inode) ||
-	    (stx.stx_gen != fsp->file_id.extid)) {
+	if ((m->dev != fsp->file_id.devid) ||
+	    (m->ino != fsp->file_id.inode) ||
+	    (m->gen != fsp->file_id.extid)) {
 		return NULL;
 	}
 
@@ -274,10 +341,10 @@ struct mdcache_inode *mdcache_inode_fetch(struct files_struct *fsp)
 		mdcache_idle_arm(fsp->conn->sconn->ev_ctx);
 	}
 
-	if (s->cookie != stx.stx_change_cookie) {
+	if (s->cookie != m->cookie) {
 		*s = (struct mdcache_inode) {
 			.id = s->id,
-			.cookie = stx.stx_change_cookie,
+			.cookie = m->cookie,
 			.btime_nsec = UTIME_OMIT,
 		};
 	}

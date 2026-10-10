@@ -1150,6 +1150,16 @@ NTSTATUS reopen_from_fsp(struct files_struct *dirfsp,
 {
 	int old_fd;
 
+	if (fsp_is_xattr_stream(fsp) && (fsp_get_pathref_fd(fsp) != -1)) {
+		/*
+		 * Reopening an existing xattr stream would only replace one
+		 * placeholder fd with another
+		 */
+		fsp->fsp_flags.is_pathref = false;
+		*p_file_created = false;
+		return NT_STATUS_OK;
+	}
+
 	if (fsp->fsp_flags.have_proc_fds &&
 	    ((old_fd = fsp_get_pathref_fd(fsp)) != -1))
 	{
@@ -1368,7 +1378,7 @@ static NTSTATUS open_file(
 			return status;
 		}
 
-		if (how.flags & O_NONBLOCK) {
+		if ((how.flags & O_NONBLOCK) && !fsp_is_xattr_stream(fsp)) {
 			/*
 			 * GPFS can return ETIMEDOUT for pread on
 			 * nonblocking file descriptors when files
@@ -3412,7 +3422,7 @@ static bool max_access_key(struct files_struct *fsp,
 
 	*key = (struct mdcache_access_key) {
 		.sd_seq = slot->sd_seq,
-		.vuid = fsp->vuid,
+		.vuid = get_current_vuid(fsp->conn),
 		.cnum = fsp->conn->cnum,
 		.uid = get_current_uid(fsp->conn),
 		.access_mask = access_mask,
@@ -3566,6 +3576,30 @@ done:
 		}
 	}
 	return NT_STATUS_OK;
+}
+
+/*
+ * smbd_calculate_access_mask_fsp(dirfsp, fsp, false, false,
+ * SEC_FLAG_MAXIMUM_ALLOWED, ...) answered from the metadata cache alone,
+ * for a file that wasn't opened
+ */
+bool smbd_cached_maximum_access(struct files_struct *fsp,
+				const struct mdcache_inode *slot,
+				uint32_t *access_mask_out)
+{
+	struct mdcache_access_key key;
+	uint32_t access_mask = SEC_FLAG_MAXIMUM_ALLOWED;
+
+	if (get_current_uid(fsp->conn) == (uid_t)0) {
+		access_mask |= FILE_GENERIC_ALL;
+	} else if (!max_access_key(fsp, slot, false, false,
+				   SEC_FLAG_MAXIMUM_ALLOWED, &key) ||
+		   !mdcache_access_get(&key, &access_mask)) {
+		return false;
+	}
+
+	*access_mask_out = access_mask & fsp->conn->share_access;
+	return true;
 }
 
 NTSTATUS smbd_calculate_access_mask_fsp(struct files_struct *dirfsp,
@@ -6392,6 +6426,59 @@ static NTSTATUS lease_match(connection_struct *conn,
 }
 
 /*
+ * We may be creating the basefile as part of creating the stream, so it's
+ * legal if the basefile doesn't exist at this point, create_file_unixpath()
+ * will create it. But if the basefile exists we want a handle so we can
+ * fstat() it.
+ */
+static NTSTATUS open_stream_base_pathref(connection_struct *conn,
+					 struct files_struct *dirfsp,
+					 struct smb_filename *smb_fname_base)
+{
+	struct smb_filename *parent = NULL;
+	struct smb_filename *atname = NULL;
+	NTSTATUS status;
+	int ret;
+
+	if (dirfsp != NULL) {
+		status = SMB_VFS_PARENT_PATHNAME(conn,
+						 talloc_tos(),
+						 smb_fname_base,
+						 &parent,
+						 &atname);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
+		status = openat_pathref_fsp(dirfsp, atname);
+		if (NT_STATUS_IS_OK(status)) {
+			smb_fname_base->st = atname->st;
+			status = move_smb_fname_fsp_link(smb_fname_base, atname);
+		} else if (NT_STATUS_EQUAL(status,
+					   NT_STATUS_OBJECT_NAME_NOT_FOUND)) {
+			SET_STAT_INVALID(smb_fname_base->st);
+			status = NT_STATUS_OK;
+		}
+		TALLOC_FREE(parent);
+		return status;
+	}
+
+	ret = vfs_stat(conn, smb_fname_base);
+	if (ret == -1 && errno != ENOENT) {
+		return map_nt_error_from_unix(errno);
+	}
+	if (ret == -1) {
+		return NT_STATUS_OK;
+	}
+	status = openat_pathref_fsp(conn->cwd_fsp, smb_fname_base);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("open_smb_fname_fsp [%s] failed: %s\n",
+			smb_fname_str_dbg(smb_fname_base),
+			nt_errstr(status));
+	}
+	return status;
+}
+
+/*
  * Wrapper around open_file_ntcreate and open_directory
  */
 
@@ -6420,7 +6507,6 @@ static NTSTATUS create_file_unixpath(connection_struct *conn,
 	files_struct *fsp = NULL;
 	bool free_fsp_on_error = false;
 	NTSTATUS status;
-	int ret;
 	struct smb_filename *parent_dir_fname = NULL;
 	struct smb_filename *smb_fname_atname = NULL;
 
@@ -6572,6 +6658,8 @@ static NTSTATUS create_file_unixpath(connection_struct *conn,
 	{
 		uint32_t base_create_disposition;
 		struct smb_filename *smb_fname_base = NULL;
+		struct files_struct *base_pathref = NULL;
+		bool base_from_stream;
 		uint32_t base_privflags;
 
 		if (create_options & FILE_DIRECTORY_FILE) {
@@ -6598,29 +6686,26 @@ static NTSTATUS create_file_unixpath(connection_struct *conn,
 		}
 
 		/*
-		 * We may be creating the basefile as part of creating the
-		 * stream, so it's legal if the basefile doesn't exist at this
-		 * point, the create_file_unixpath() below will create it. But
-		 * if the basefile exists we want a handle so we can fstat() it.
+		 * filename_convert_dirfsp() opens the base along with an
+		 * existing stream
 		 */
-
-		ret = vfs_stat(conn, smb_fname_base);
-		if (ret == -1 && errno != ENOENT) {
-			status = map_nt_error_from_unix(errno);
-			TALLOC_FREE(smb_fname_base);
-			goto fail;
-		}
-		if (ret == 0) {
-			status = openat_pathref_fsp(conn->cwd_fsp,
-						    smb_fname_base);
+		base_from_stream = ((smb_fname->fsp != NULL) &&
+				    fsp_is_alternate_stream(smb_fname->fsp) &&
+				    (smb_fname != smb_fname->fsp->fsp_name));
+		if (base_from_stream) {
+			base_pathref = smb_fname->fsp->base_fsp;
+		} else {
+			status = open_stream_base_pathref(conn,
+							  dirfsp,
+							  smb_fname_base);
 			if (!NT_STATUS_IS_OK(status)) {
-				DBG_ERR("open_smb_fname_fsp [%s] failed: %s\n",
-					smb_fname_str_dbg(smb_fname_base),
-					nt_errstr(status));
 				TALLOC_FREE(smb_fname_base);
 				goto fail;
 			}
+			base_pathref = smb_fname_base->fsp;
+		}
 
+		if (base_pathref != NULL) {
 			/*
 			 * https://bugzilla.samba.org/show_bug.cgi?id=10229
 			 * We need to check if the requested access mask
@@ -6628,7 +6713,7 @@ static NTSTATUS create_file_unixpath(connection_struct *conn,
 			 * it existed), as we're passing in zero for the
 			 * access mask to the base filename.
 			 */
-			status = check_base_file_access(smb_fname_base->fsp,
+			status = check_base_file_access(base_pathref,
 							access_mask);
 
 			if (!NT_STATUS_IS_OK(status)) {
@@ -6636,6 +6721,15 @@ static NTSTATUS create_file_unixpath(connection_struct *conn,
 					"for base %s failed: "
 					"%s\n", smb_fname->base_name,
 					nt_errstr(status)));
+				TALLOC_FREE(smb_fname_base);
+				goto fail;
+			}
+		}
+
+		if (base_from_stream) {
+			status = move_base_fsp_link(smb_fname_base,
+						    smb_fname->fsp);
+			if (!NT_STATUS_IS_OK(status)) {
 				TALLOC_FREE(smb_fname_base);
 				goto fail;
 			}

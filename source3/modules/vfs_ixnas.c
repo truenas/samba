@@ -301,7 +301,14 @@ static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
 
 	if (!config->dosattrib_xattr &&
 	    lp_store_dos_attributes(SNUM(handle->conn))) {
-		slot = mdcache_inode_fetch(fsp);
+		if (fsp_get_pathref_fd(fsp) == -1) {
+			/* A directory entry listed without an open */
+			slot = mdcache_inode_peek(
+				&fsp->file_id,
+				fsp->fsp_name->st.st_ex_change_cookie);
+		} else {
+			slot = mdcache_inode_fetch(fsp);
+		}
 	}
 	if (slot != NULL) {
 		if (slot->flags & MDCACHE_HAVE_DOSMODE) {
@@ -316,6 +323,11 @@ static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
 			}
 			return NT_STATUS_OK;
 		}
+	}
+	if (fsp_get_pathref_fd(fsp) == -1) {
+		return NT_STATUS_RETRY;
+	}
+	if (slot != NULL) {
 		if (ixnas_read_dosmode(fsp, slot->cookie, dosmode)) {
 			return NT_STATUS_OK;
 		}

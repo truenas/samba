@@ -23,6 +23,7 @@
 #include "system/filesys.h"
 #include "smbd/smbd.h"
 #include "smbd/globals.h"
+#include "smbd/truenas_mdcache.h"
 #include "ntioctl.h"
 #include "smbprofile.h"
 #include "../libcli/security/security.h"
@@ -1364,6 +1365,9 @@ static int vfswrap_fstat(vfs_handle_struct *handle, files_struct *fsp, SMB_STRUC
 	START_PROFILE_X(SNUM(handle->conn), syscall_fstat);
 	result = sys_fstat(fsp_get_pathref_fd(fsp),
 			   sbuf, lp_fake_directory_create_times(SNUM(handle->conn)));
+	if (result == 0) {
+		mdcache_stat_taken(fsp, sbuf);
+	}
 	END_PROFILE_X(syscall_fstat);
 	return result;
 }

@@ -214,6 +214,7 @@ uint32_t dos_mode_msdfs(connection_struct *conn,
 			const char *name,
 			const struct stat_ex *st);
 uint32_t fdos_mode(struct files_struct *fsp);
+NTSTATUS fdos_mode_vfs(struct files_struct *fsp, uint32_t *_dosmode);
 struct tevent_req *dos_mode_at_send(TALLOC_CTX *mem_ctx,
 				    struct tevent_context *ev,
 				    files_struct *dir_fsp,
@@ -355,6 +356,8 @@ bool fsp_set_smb_fname(struct files_struct *fsp,
 size_t fsp_fullbasepath(struct files_struct *fsp, char *buf, size_t buflen);
 void fsp_set_base_fsp(struct files_struct *fsp, struct files_struct *base_fsp);
 bool fsp_is_alternate_stream(const struct files_struct *fsp);
+bool conn_has_xattr_streams(const struct connection_struct *conn);
+bool fsp_is_xattr_stream(const struct files_struct *fsp);
 struct files_struct *metadata_fsp(struct files_struct *fsp);
 bool fsp_search_ask_sharemode(struct files_struct *fsp);
 bool fsp_getinfo_ask_sharemode(struct files_struct *fsp);
@@ -391,6 +394,8 @@ NTSTATUS openat_pathref_fsp_nosymlink(
 	bool posix,
 	struct smb_filename **_smb_fname,
 	struct reparse_data_buffer **_symlink_err);
+struct files_struct *fsp_new_fdless(struct files_struct *dirfsp,
+				    const struct smb_filename *smb_fname_rel);
 NTSTATUS openat_pathref_fsp_lcomp(struct files_struct *dirfsp,
 				  struct smb_filename *smb_fname_rel,
 				  uint32_t ucf_flags);
@@ -413,6 +418,9 @@ void smb_fname_fsp_unlink(struct smb_filename *smb_fname);
 
 NTSTATUS move_smb_fname_fsp_link(struct smb_filename *smb_fname_dst,
 				 struct smb_filename *smb_fname_src);
+
+NTSTATUS move_base_fsp_link(struct smb_filename *smb_fname_base,
+			    struct files_struct *stream_fsp);
 
 NTSTATUS reference_smb_fname_fsp_link(struct smb_filename *smb_fname_dst,
 				      const struct smb_filename *smb_fname_src);
@@ -1157,6 +1165,7 @@ bool become_user_without_service_by_session(connection_struct *conn,
 			    const struct auth_session_info *session_info);
 bool unbecome_user_without_service(void);
 uid_t get_current_uid(connection_struct *conn);
+uint64_t get_current_vuid(connection_struct *conn);
 gid_t get_current_gid(connection_struct *conn);
 const struct security_unix_token *get_current_utok(connection_struct *conn);
 const struct security_token *get_current_nttok(connection_struct *conn);
@@ -1192,6 +1201,10 @@ const char *vfs_readdirname(connection_struct *conn,
 			    struct files_struct *dirfsp,
 			    DIR *d,
 			    char **talloced);
+struct files_struct *vfs_share_root_fsp(const struct connection_struct *conn);
+void vfs_keep_share_root_fsp(struct connection_struct *conn,
+			     struct files_struct *dot);
+void vfs_close_share_root_fsp(struct connection_struct *conn);
 int vfs_ChDir(connection_struct *conn,
 			const struct smb_filename *smb_fname);
 struct smb_filename *vfs_GetWd(TALLOC_CTX *ctx, connection_struct *conn);

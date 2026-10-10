@@ -90,11 +90,13 @@ bool smbd_dirptr_get_entry(TALLOC_CTX *ctx,
 			   void *private_data,
 			   char **_fname,
 			   struct smb_filename **_smb_fname,
-			   uint32_t *_mode);
+			   uint32_t *_mode,
+			   struct readdir_attr_data **_rdattr);
 char *smbd_dirptr_get_last_name_sent(struct dptr_struct *dirptr);
 void smbd_dirptr_push_overflow(struct dptr_struct *dirptr,
 			       char **_fname,
 			       struct smb_filename **_smb_fname,
-			       uint32_t mode);
+			       uint32_t mode,
+			       struct readdir_attr_data **_rdattr);
 void smbd_dirptr_set_last_name_sent(struct dptr_struct *dirptr, char **_fname);
 #endif

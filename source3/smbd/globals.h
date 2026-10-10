@@ -187,6 +187,10 @@ NTSTATUS smbd_calculate_access_mask_fsp(struct files_struct *dirsfp,
 			bool ignore_readonly,
 			uint32_t access_mask,
 			uint32_t *access_mask_out);
+struct mdcache_inode;
+bool smbd_cached_maximum_access(struct files_struct *fsp,
+				const struct mdcache_inode *slot,
+				uint32_t *access_mask_out);
 
 void smbd_notify_cancel_by_smbreq(const struct smb_request *smbreq);
 
@@ -779,6 +783,7 @@ struct pthreadpool_tevent;
 struct dcesrv_context;
 
 struct smbd_server_connection {
+	uint64_t mdcache_epoch; /* TrueNAS: see truenas_mdcache.c */
 	const struct tsocket_address *local_address;
 	const struct tsocket_address *remote_address;
 	const char *remote_hostname;

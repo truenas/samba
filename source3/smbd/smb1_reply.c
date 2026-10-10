@@ -1229,7 +1229,8 @@ again:
 				   conn,
 				   &fname,
 				   &smb_fname,
-				   &mode);
+				   &mode,
+				   NULL);
 	if (!ok) {
 		return false;
 	}
