@@ -962,7 +962,7 @@ void close_cnum(connection_struct *conn,
 
 	/* make sure we leave the directory available for unmount */
 	vfs_ChDir(conn, &root_fname);
-	vfs_close_share_root_fh(conn);
+	vfs_close_share_root_fsp(conn);
 
 	/* Call VFS disconnect hook */
 	SMB_VFS_DISCONNECT(conn);

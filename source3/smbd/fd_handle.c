@@ -67,11 +67,6 @@ void fh_set_refcount(struct fd_handle *fh, size_t ref_count)
 	fh->ref_count = ref_count;
 }
 
-int fh_get_fd(struct fd_handle *fh)
-{
-	return fh->fd;
-}
-
 uint64_t fh_get_position_information(struct fd_handle *fh)
 {
 	return fh->position_information;

@@ -785,7 +785,7 @@ typedef struct connection_struct {
 
 	char *connectpath;
 	struct files_struct *cwd_fsp; /* Working directory. */
-	struct fd_handle *share_root_fh; /* "." of connectpath, see vfs_ChDir() */
+	struct files_struct *share_root_fsp; /* "." of connectpath, see vfs_ChDir() */
 	bool tcon_done;
 
 	struct vfs_handle_struct *vfs_handles;		/* for the new plugins */

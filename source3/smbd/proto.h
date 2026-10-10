@@ -1197,10 +1197,10 @@ const char *vfs_readdirname(connection_struct *conn,
 			    struct files_struct *dirfsp,
 			    DIR *d,
 			    char **talloced);
-struct fd_handle *vfs_share_root_fh(const struct connection_struct *conn);
-void vfs_keep_share_root_fh(struct connection_struct *conn,
-			    struct fd_handle *fh);
-void vfs_close_share_root_fh(struct connection_struct *conn);
+struct files_struct *vfs_share_root_fsp(const struct connection_struct *conn);
+void vfs_keep_share_root_fsp(struct connection_struct *conn,
+			     struct files_struct *dot);
+void vfs_close_share_root_fsp(struct connection_struct *conn);
 int vfs_ChDir(connection_struct *conn,
 			const struct smb_filename *smb_fname);
 struct smb_filename *vfs_GetWd(TALLOC_CTX *ctx, connection_struct *conn);

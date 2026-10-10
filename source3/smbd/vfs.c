@@ -896,63 +896,79 @@ const char *vfs_readdirname(connection_struct *conn,
 }
 
 /*
- * The tree connect whose share_root_fh is the working directory. Any chdir
+ * The tree connect whose share_root_fsp is the working directory. Any chdir
  * through the VFS clears it.
  */
 static const struct connection_struct *share_root_cwd;
 
-/* The fd of "." of conn->cwd_fsp, if smbd keeps one open */
-struct fd_handle *vfs_share_root_fh(const struct connection_struct *conn)
+/* "." of conn->cwd_fsp, if smbd keeps it open */
+struct files_struct *vfs_share_root_fsp(const struct connection_struct *conn)
 {
 	if (share_root_cwd != conn) {
 		return NULL;
 	}
-	return conn->share_root_fh;
+	return conn->share_root_fsp;
 }
 
 /*
- * fh was just opened as "." of conn->cwd_fsp. Keep it when that is the
- * share root of a tree connect, which close_cnum() closes.
+ * dot was just opened as "." of conn->cwd_fsp. Share its fd when that is the
+ * share root of a tree connect, which close_cnum() closes. Like cwd_fsp the
+ * fsp is not in sconn->files, so it is neither counted nor closed as a file.
  */
-void vfs_keep_share_root_fh(struct connection_struct *conn,
-			    struct fd_handle *fh)
+void vfs_keep_share_root_fsp(struct connection_struct *conn,
+			     struct files_struct *dot)
 {
-	if ((conn->share_root_fh != NULL) ||
+	struct files_struct *fsp = NULL;
+
+	if ((conn->share_root_fsp != NULL) ||
 	    !conn->tcon_done ||
 	    (conn->cnum == TID_FIELD_INVALID) ||
 	    !strcsequal(LastDir, conn->connectpath))
 	{
 		return;
 	}
-	fh_set_refcount(fh, fh_get_refcount(fh) + 1);
-	conn->share_root_fh = fh;
+
+	fsp = talloc_zero(conn, struct files_struct);
+	if (fsp == NULL) {
+		return;
+	}
+	fsp->fsp_name = cp_smb_basename(fsp, ".");
+	if (fsp->fsp_name == NULL) {
+		TALLOC_FREE(fsp);
+		return;
+	}
+	fsp->fnum = FNUM_FIELD_INVALID;
+	fsp->conn = conn;
+	fsp->fsp_flags.is_pathref = true;
+	fsp->fsp_flags.is_directory = true;
+	fsp->fh = dot->fh;
+	fh_set_refcount(fsp->fh, fh_get_refcount(fsp->fh) + 1);
+
+	conn->share_root_fsp = fsp;
 	share_root_cwd = conn;
 }
 
-void vfs_close_share_root_fh(struct connection_struct *conn)
+void vfs_close_share_root_fsp(struct connection_struct *conn)
 {
-	struct files_struct *fsp = NULL;
+	struct files_struct *fsp = conn->share_root_fsp;
+	size_t refcount;
 
-	if (conn->share_root_fh == NULL) {
+	if (fsp == NULL) {
 		return;
 	}
 	if (share_root_cwd == conn) {
 		share_root_cwd = NULL;
 	}
-
-	fsp = fsp_new(conn, conn);
-	if (fsp == NULL) {
-		smb_panic("fsp_new failed");
-	}
-	fsp->fsp_flags.is_pathref = true;
-	fsp->fsp_flags.is_directory = true;
-	fsp->fsp_name = cp_smb_basename(fsp, ".");
-	TALLOC_FREE(fsp->fh);
-	fsp->fh = conn->share_root_fh;
-	conn->share_root_fh = NULL;
+	conn->share_root_fsp = NULL;
 
 	fd_close(fsp);
-	file_free(NULL, fsp);
+	refcount = fh_get_refcount(fsp->fh);
+	if (refcount == 1) {
+		TALLOC_FREE(fsp->fh);
+	} else {
+		fh_set_refcount(fsp->fh, refcount - 1);
+	}
+	TALLOC_FREE(fsp);
 }
 
 /*******************************************************************
@@ -997,12 +1013,17 @@ int vfs_ChDir(connection_struct *conn, const struct smb_filename *smb_fname)
 		return 0;
 	}
 
-	if ((conn->share_root_fh != NULL) &&
+	if ((conn->share_root_fsp != NULL) &&
 	    strcsequal(smb_fname->base_name, conn->connectpath))
 	{
-		/* Return to the directory the kept fd refers to */
-		if (share_root_cwd != conn) {
-			ret = fchdir(fh_get_fd(conn->share_root_fh));
+		/*
+		 * Return to the directory the kept fd refers to, also after
+		 * set_sec_ctx() cleared LastDir so fchdir() checks the new user
+		 */
+		if ((share_root_cwd != conn) ||
+		    !strcsequal(LastDir, conn->connectpath))
+		{
+			ret = fchdir(fsp_get_pathref_fd(conn->share_root_fsp));
 			if (ret != 0) {
 				return -1;
 			}

@@ -585,14 +585,14 @@ fail:
 }
 
 /*
- * If fh is not NULL it already refers to name and the new fsp shares it
- * instead of opening name again.
+ * If share_fsp is not NULL it already refers to name and the new fsp shares
+ * its fd instead of opening name again.
  */
 static NTSTATUS openat_pathref_fsp_simple_openat(TALLOC_CTX *mem_ctx,
 						 struct files_struct *dirfsp,
 						 const char *name,
 						 uint32_t flags,
-						 struct fd_handle *fh,
+						 struct files_struct *share_fsp,
 						 struct smb_filename **_fname)
 {
 	struct connection_struct *conn = dirfsp->conn;
@@ -649,10 +649,10 @@ static NTSTATUS openat_pathref_fsp_simple_openat(TALLOC_CTX *mem_ctx,
 		return NT_STATUS_NO_MEMORY;
 	}
 
-	if (fh != NULL) {
+	if (share_fsp != NULL) {
 		TALLOC_FREE(fsp->fh);
-		fsp->fh = fh;
-		fh_set_refcount(fh, fh_get_refcount(fh) + 1);
+		fsp->fh = share_fsp->fh;
+		fh_set_refcount(fsp->fh, fh_get_refcount(fsp->fh) + 1);
 		/* As vfswrap_openat() sets it on a successful open */
 		fsp->fsp_flags.have_proc_fds = conn->have_proc_fds;
 		fd = fsp_get_pathref_fd(fsp);
@@ -1757,22 +1757,22 @@ NTSTATUS openat_pathref_fsp_dot(TALLOC_CTX *mem_ctx,
 				struct smb_filename **_dot)
 {
 	struct connection_struct *conn = dirfsp->conn;
-	struct fd_handle *share_root_fh = NULL;
+	struct files_struct *share_root = NULL;
 	struct smb_filename *dot = NULL;
 	NTSTATUS status;
 
 	if (dirfsp == conn->cwd_fsp) {
-		share_root_fh = vfs_share_root_fh(conn);
+		share_root = vfs_share_root_fsp(conn);
 	}
 
 	status = openat_pathref_fsp_simple_openat(
-		mem_ctx, dirfsp, ".", flags, share_root_fh, &dot);
+		mem_ctx, dirfsp, ".", flags, share_root, &dot);
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
 
-	if ((dirfsp == conn->cwd_fsp) && (share_root_fh == NULL)) {
-		vfs_keep_share_root_fh(conn, dot->fsp->fh);
+	if ((dirfsp == conn->cwd_fsp) && (share_root == NULL)) {
+		vfs_keep_share_root_fsp(conn, dot->fsp);
 	}
 
 	*_dot = dot;
