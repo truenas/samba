@@ -3578,6 +3578,30 @@ done:
 	return NT_STATUS_OK;
 }
 
+/*
+ * smbd_calculate_access_mask_fsp(dirfsp, fsp, false, false,
+ * SEC_FLAG_MAXIMUM_ALLOWED, ...) answered from the metadata cache alone,
+ * for a file that wasn't opened
+ */
+bool smbd_cached_maximum_access(struct files_struct *fsp,
+				const struct mdcache_inode *slot,
+				uint32_t *access_mask_out)
+{
+	struct mdcache_access_key key;
+	uint32_t access_mask = SEC_FLAG_MAXIMUM_ALLOWED;
+
+	if (get_current_uid(fsp->conn) == (uid_t)0) {
+		access_mask |= FILE_GENERIC_ALL;
+	} else if (!max_access_key(fsp, slot, false, false,
+				   SEC_FLAG_MAXIMUM_ALLOWED, &key) ||
+		   !mdcache_access_get(&key, &access_mask)) {
+		return false;
+	}
+
+	*access_mask_out = access_mask & fsp->conn->share_access;
+	return true;
+}
+
 NTSTATUS smbd_calculate_access_mask_fsp(struct files_struct *dirfsp,
 			struct files_struct *fsp,
 			bool use_privs,

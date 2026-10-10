@@ -1594,6 +1594,36 @@ fail:
 }
 
 /*
+ * A pathref fsp without an fd for dirfsp's entry smb_fname_rel, the file
+ * smb_fname_rel->st describes. VFS modules answer for it from what they
+ * cached, or fail with NT_STATUS_RETRY.
+ */
+struct files_struct *fsp_new_fdless(struct files_struct *dirfsp,
+				    const struct smb_filename *smb_fname_rel)
+{
+	struct connection_struct *conn = dirfsp->conn;
+	struct smb_filename *full_fname = NULL;
+	struct files_struct *fsp = NULL;
+
+	fsp = fsp_new(conn, conn);
+	if (fsp == NULL) {
+		return NULL;
+	}
+	fsp->fsp_flags.is_pathref = true;
+
+	full_fname = full_path_from_dirfsp_atname(conn, dirfsp, smb_fname_rel);
+	if ((full_fname == NULL) || !fsp_attach_smb_fname(fsp, &full_fname)) {
+		TALLOC_FREE(full_fname);
+		file_free(NULL, fsp);
+		return NULL;
+	}
+
+	fsp->fsp_flags.is_directory = S_ISDIR(fsp->fsp_name->st.st_ex_mode);
+	fsp->file_id = vfs_file_id_from_sbuf(conn, &fsp->fsp_name->st);
+	return fsp;
+}
+
+/*
  * Open smb_fname_rel->fsp as a pathref fsp with a case insensitive
  * fallback using GETREALFILENAME_CACHE and get_real_filename_at() if
  * the first attempt based on the filename sent by the client gives

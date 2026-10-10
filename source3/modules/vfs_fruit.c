@@ -37,6 +37,7 @@
 #include "lib/adouble.h"
 #include "lib/util_macstreams.h"
 #include "source3/smbd/dir.h"
+#include "smbd/truenas_mdcache.h"
 
 /*
  * Enhanced OS X and Netatalk compatibility
@@ -137,6 +138,7 @@ struct fruit_config_data {
 	char *rsrc_streamname;	/* pre-computed AFP_Resource xattr name */
 	char *stream_prefix;	/* xattr name prefix of all streams */
 	int streams_compat_bytes; /* trailing byte truenas_streams_xattr stores */
+	bool stock_streams;	/* stream xattr names, cached in the mdcache */
 	bool time_machine;
 	off_t time_machine_max_size;
 	bool convert_adouble;
@@ -424,6 +426,11 @@ static int init_fruit_config(vfs_handle_struct *handle)
 		}
 		config->stream_prefix = talloc_strdup(config, prefix);
 	}
+	/* Every share in smbd lists the same xattrs as the same streams */
+	config->stock_streams = (config->meta == FRUIT_META_STREAM) &&
+				(config->rsrc_streamname != NULL) &&
+				(strcmp(prefix, SAMBA_XATTR_DOSSTREAM_PREFIX) == 0) &&
+				store_stream_type;
 	tm_size_str = lp_parm_const_string(
 		SNUM(handle->conn), FRUIT_PARAM_TYPE_NAME,
 		"time machine max size", NULL);
@@ -4712,6 +4719,29 @@ static bool readdir_attr_no_streams(struct vfs_handle_struct *handle,
 	return none;
 }
 
+static void readdir_attr_cache_streams(struct fruit_config_data *config,
+				       struct files_struct *fsp,
+				       bool any,
+				       bool macmeta)
+{
+	struct mdcache_inode *slot = NULL;
+
+	if (!config->stock_streams) {
+		return;
+	}
+
+	/* fsp's stat predates the listing, so a change since moved the cookie */
+	slot = mdcache_inode_peek(&fsp->file_id,
+				  fsp->fsp_name->st.st_ex_change_cookie);
+	if (slot == NULL) {
+		return;
+	}
+	slot->flags &= ~(MDCACHE_STREAMS | MDCACHE_MACMETA);
+	slot->flags |= MDCACHE_HAVE_STREAMS |
+		       (any ? MDCACHE_STREAMS : 0) |
+		       (macmeta ? MDCACHE_MACMETA : 0);
+}
+
 static NTSTATUS fruit_freaddir_attr(struct vfs_handle_struct *handle,
 				    struct files_struct *fsp,
 				    TALLOC_CTX *mem_ctx,
@@ -4719,8 +4749,10 @@ static NTSTATUS fruit_freaddir_attr(struct vfs_handle_struct *handle,
 {
 	struct fruit_config_data *config = NULL;
 	struct readdir_attr_data *attr_data;
+	struct mdcache_inode *slot = NULL;
 	uint32_t conv_flags  = 0;
 	bool any = true, afpinfo = true, rsrc = true;
+	bool cached = (fsp_get_pathref_fd(fsp) == -1);
 	bool listed;
 	bool no_xattr = false;
 	NTSTATUS status;
@@ -4739,7 +4771,22 @@ static NTSTATUS fruit_freaddir_attr(struct vfs_handle_struct *handle,
 
 	DBG_DEBUG("Path [%s]\n", fsp_str_dbg(fsp));
 
-	if (config->convert_adouble) {
+	if (cached) {
+		/*
+		 * smbd_dirptr_get_entry() is listing the file without opening
+		 * it, so answer from the metadata cache or not at all.
+		 * FinderInfo and resource fork sizes aren't cached.
+		 */
+		slot = mdcache_inode_peek(&fsp->file_id,
+					  fsp->fsp_name->st.st_ex_change_cookie);
+		if (!config->stock_streams || (slot == NULL) ||
+		    ((slot->flags & (MDCACHE_HAVE_STREAMS | MDCACHE_MACMETA)) !=
+		     MDCACHE_HAVE_STREAMS) ||
+		    (config->convert_adouble &&
+		     is_adouble_file(fsp->fsp_name->base_name))) {
+			return NT_STATUS_RETRY;
+		}
+	} else if (config->convert_adouble) {
 		if (config->wipe_intentionally_left_blank_rfork) {
 			conv_flags |= AD_CONV_WIPE_BLANK;
 		}
@@ -4763,8 +4810,18 @@ static NTSTATUS fruit_freaddir_attr(struct vfs_handle_struct *handle,
 	}
 	*attr_data = (struct readdir_attr_data){.type = RDATTR_AAPL};
 
-	listed = readdir_attr_list_streams(handle, config, fsp,
-					   &any, &afpinfo, &rsrc);
+	if (cached) {
+		listed = true;
+		any = (slot->flags & MDCACHE_STREAMS) != 0;
+		afpinfo = rsrc = false;
+	} else {
+		listed = readdir_attr_list_streams(handle, config, fsp,
+						   &any, &afpinfo, &rsrc);
+		if (listed) {
+			readdir_attr_cache_streams(config, fsp, any,
+						   afpinfo || rsrc);
+		}
+	}
 	if (global_fruit_config.readdir_attr_v2) {
 		attr_data->attr_data.aapl.v2 = true;
 		if (listed) {
@@ -4816,6 +4873,12 @@ static NTSTATUS fruit_freaddir_attr(struct vfs_handle_struct *handle,
 	 */
 	if (!config->readdir_attr_max_access) {
 		attr_data->attr_data.aapl.max_access = FILE_GENERIC_ALL;
+	} else if (cached) {
+		if (!smbd_cached_maximum_access(
+			    fsp, slot, &attr_data->attr_data.aapl.max_access)) {
+			TALLOC_FREE(attr_data);
+			return NT_STATUS_RETRY;
+		}
 	} else {
 		status = smbd_calculate_access_mask_fsp(fsp->conn->cwd_fsp,
 			fsp,

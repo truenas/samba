@@ -1027,6 +1027,7 @@ static NTSTATUS smbd_marshall_dir_entry(TALLOC_CTX *ctx,
 				    uint32_t mode,
 				    const char *fname,
 				    const struct smb_filename *smb_fname,
+				    struct readdir_attr_data *readdir_attr_data,
 				    int space_remaining,
 				    uint8_t align,
 				    bool do_pad,
@@ -1051,7 +1052,6 @@ static NTSTATUS smbd_marshall_dir_entry(TALLOC_CTX *ctx,
 	int off;
 	int pad = 0;
 	NTSTATUS status;
-	struct readdir_attr_data *readdir_attr_data = NULL;
 	uint32_t ea_size;
 
 	if (!(mode & FILE_ATTRIBUTE_DIRECTORY)) {
@@ -1061,9 +1061,11 @@ static NTSTATUS smbd_marshall_dir_entry(TALLOC_CTX *ctx,
 
 	/*
 	 * Skip SMB_VFS_FREADDIR_ATTR if the directory entry is a symlink or
-	 * a DFS symlink.
+	 * a DFS symlink, or if smbd_dirptr_get_entry() got its result while
+	 * listing the entry without opening it.
 	 */
-	if (smb_fname->fsp != NULL &&
+	if (readdir_attr_data == NULL &&
+	    smb_fname->fsp != NULL &&
 	    !(mode & FILE_ATTRIBUTE_REPARSE_POINT)) {
 		status = SMB_VFS_FREADDIR_ATTR(smb_fname->fsp,
 					       ctx,
@@ -1789,6 +1791,7 @@ NTSTATUS smbd_dirptr_lanman2_entry(TALLOC_CTX *ctx,
 	uint32_t mode = 0;
 	char *fname = NULL;
 	struct smb_filename *smb_fname = NULL;
+	struct readdir_attr_data *rdattr = NULL;
 	struct smbd_dirptr_lanman2_state state = {
 		.conn = conn,
 		.info_level = info_level,
@@ -1830,7 +1833,8 @@ NTSTATUS smbd_dirptr_lanman2_entry(TALLOC_CTX *ctx,
 				   &state,
 				   &fname,
 				   &smb_fname,
-				   &mode);
+				   &mode,
+				   &rdattr);
 	if (!ok) {
 		return NT_STATUS_END_OF_FILE;
 	}
@@ -1847,6 +1851,7 @@ NTSTATUS smbd_dirptr_lanman2_entry(TALLOC_CTX *ctx,
 				     mode,
 				     fname,
 				     smb_fname,
+				     rdattr,
 				     space_remaining,
 				     align,
 				     do_pad,
@@ -1864,8 +1869,10 @@ NTSTATUS smbd_dirptr_lanman2_entry(TALLOC_CTX *ctx,
 	}
 
 	if (NT_STATUS_EQUAL(status, STATUS_MORE_ENTRIES)) {
-		smbd_dirptr_push_overflow(dirptr, &fname, &smb_fname, mode);
+		smbd_dirptr_push_overflow(dirptr, &fname, &smb_fname, mode,
+					  &rdattr);
 	}
+	TALLOC_FREE(rdattr);
 
 	if (!NT_STATUS_IS_OK(status)) {
 		TALLOC_FREE(smb_fname);

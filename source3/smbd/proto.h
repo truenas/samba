@@ -214,6 +214,7 @@ uint32_t dos_mode_msdfs(connection_struct *conn,
 			const char *name,
 			const struct stat_ex *st);
 uint32_t fdos_mode(struct files_struct *fsp);
+NTSTATUS fdos_mode_vfs(struct files_struct *fsp, uint32_t *_dosmode);
 struct tevent_req *dos_mode_at_send(TALLOC_CTX *mem_ctx,
 				    struct tevent_context *ev,
 				    files_struct *dir_fsp,
@@ -393,6 +394,8 @@ NTSTATUS openat_pathref_fsp_nosymlink(
 	bool posix,
 	struct smb_filename **_smb_fname,
 	struct reparse_data_buffer **_symlink_err);
+struct files_struct *fsp_new_fdless(struct files_struct *dirfsp,
+				    const struct smb_filename *smb_fname_rel);
 NTSTATUS openat_pathref_fsp_lcomp(struct files_struct *dirfsp,
 				  struct smb_filename *smb_fname_rel,
 				  uint32_t ucf_flags);
@@ -1162,6 +1165,7 @@ bool become_user_without_service_by_session(connection_struct *conn,
 			    const struct auth_session_info *session_info);
 bool unbecome_user_without_service(void);
 uid_t get_current_uid(connection_struct *conn);
+uint64_t get_current_vuid(connection_struct *conn);
 gid_t get_current_gid(connection_struct *conn);
 const struct security_unix_token *get_current_utok(connection_struct *conn);
 const struct security_token *get_current_nttok(connection_struct *conn);

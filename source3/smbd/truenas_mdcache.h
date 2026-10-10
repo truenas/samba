@@ -22,6 +22,9 @@
 struct smbd_server_connection;
 
 #define MDCACHE_HAVE_DOSMODE	0x1
+#define MDCACHE_HAVE_STREAMS	0x2	/* MDCACHE_STREAMS and MDCACHE_MACMETA */
+#define MDCACHE_STREAMS		0x4	/* has named streams */
+#define MDCACHE_MACMETA		0x8	/* has an AfpInfo or resource fork */
 
 /*
  * What smbd derived from one version of a file, keyed by its file_id
@@ -38,6 +41,9 @@ struct mdcache_inode {
 	uint32_t flags;
 	uint32_t tick;
 };
+
+/* mdcache_access_key flag: whether a TrueNAS ABE read-only open succeeded */
+#define MDCACHE_ACCESS_ABE	0x8
 
 struct mdcache_access_key {
 	uint64_t sd_seq;

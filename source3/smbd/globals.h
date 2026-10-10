@@ -187,6 +187,10 @@ NTSTATUS smbd_calculate_access_mask_fsp(struct files_struct *dirsfp,
 			bool ignore_readonly,
 			uint32_t access_mask,
 			uint32_t *access_mask_out);
+struct mdcache_inode;
+bool smbd_cached_maximum_access(struct files_struct *fsp,
+				const struct mdcache_inode *slot,
+				uint32_t *access_mask_out);
 
 void smbd_notify_cancel_by_smbreq(const struct smb_request *smbreq);
 
