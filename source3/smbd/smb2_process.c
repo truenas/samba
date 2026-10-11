@@ -23,6 +23,7 @@
 #include "system/filesys.h"
 #include "smbd/smbd.h"
 #include "smbd/globals.h"
+#include "smbd/truenas_mdcache.h"
 #include "source3/smbd/smbXsrv_session.h"
 #include "smbd/smbXsrv_open.h"
 #include "librpc/gen_ndr/netlogon.h"
@@ -1800,6 +1801,7 @@ static void smbd_tevent_trace_callback(enum tevent_trace_point point,
 	case TEVENT_TRACE_BEFORE_WAIT:
 		break;
 	case TEVENT_TRACE_AFTER_WAIT:
+		mdcache_bump_epoch(state->sconn);
 		break;
 	case TEVENT_TRACE_BEFORE_LOOP_ONCE:
 		smbd_tevent_trace_callback_before_loop_once(state);
@@ -1824,6 +1826,7 @@ static void smbd_tevent_trace_callback_debug(enum tevent_trace_point point,
 		break;
 	case TEVENT_TRACE_AFTER_WAIT:
 		smbd_tevent_trace_callback_after_wait(state);
+		mdcache_bump_epoch(state->sconn);
 		break;
 	case TEVENT_TRACE_BEFORE_LOOP_ONCE:
 		smbd_tevent_trace_callback_before_loop_once(state);
@@ -1858,6 +1861,7 @@ static void smbd_tevent_trace_callback_profile(enum tevent_trace_point point,
 		break;
 	case TEVENT_TRACE_AFTER_WAIT:
 		smbd_tevent_trace_callback_after_wait(state);
+		mdcache_bump_epoch(state->sconn);
 		SMBPROFILE_BASIC_ASYNC_END(state->profile_idle);
 		if (!smbprofile_dump_pending()) {
 			/*

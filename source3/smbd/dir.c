@@ -31,6 +31,7 @@
 #include "libcli/smb/reparse.h"
 #include "source3/smbd/dir.h"
 #include "source3/include/serverid.h"
+#include "smbd/truenas_mdcache.h"
 
 /*
    This module implements directory related functions for Samba.
@@ -65,10 +66,13 @@ struct dptr_struct {
 
 	char *last_name_sent;	/* for name-based trans2 resume */
 
+	unsigned int cache_misses; /* in a row, see DIRENT_CACHE_MISSES */
+
 	struct {
 		char *fname;
 		struct smb_filename *smb_fname;
 		uint32_t mode;
+		struct readdir_attr_data *rdattr;
 	} overflow;
 };
 
@@ -353,8 +357,10 @@ void dptr_RewindDir(struct dptr_struct *dptr)
 {
 	RewindDir(dptr->dir_hnd);
 	dptr->did_stat = false;
+	dptr->cache_misses = 0;
 	TALLOC_FREE(dptr->overflow.fname);
 	TALLOC_FREE(dptr->overflow.smb_fname);
+	TALLOC_FREE(dptr->overflow.rdattr);
 }
 
 unsigned int dptr_FileNumber(struct dptr_struct *dptr)
@@ -506,6 +512,147 @@ files_struct *dptr_fetch_lanman2_fsp(struct smbd_server_connection *sconn,
 	return dptr->dir_hnd->fsp;
 }
 
+/* Whether listing an entry without opening it can give the same answer */
+static bool dirent_cache_usable(connection_struct *conn,
+				const struct smb_filename *dir_fname,
+				bool get_dosmode)
+{
+	int snum = SNUM(conn);
+
+	return get_dosmode && !(dir_fname->flags & SMB_FILENAME_POSIX_PATH) &&
+	       (dir_fname->twrp == 0) && !lp_ea_support(snum) &&
+	       !(conn->fs_capabilities & FILE_FILE_COMPRESSION) &&
+	       !lp_hide_unreadable(snum) && !lp_hide_unwriteable_files(snum) &&
+	       !lp_hide_special_files(snum) &&
+	       (lp_hide_new_files_timeout(snum) == 0);
+}
+
+/*
+ * TrueNAS ABE lists a file if the user could open it read-only, which only
+ * the file's ACL, owner, group and mode and the user's token decide
+ */
+static bool dirent_abe_key(connection_struct *conn,
+			   const struct mdcache_inode *slot,
+			   struct mdcache_access_key *key)
+{
+	if (slot->sd_seq == 0) {
+		return false;
+	}
+
+	*key = (struct mdcache_access_key) {
+		.sd_seq = slot->sd_seq,
+		.vuid = get_current_vuid(conn),
+		.cnum = conn->cnum,
+		.uid = get_current_uid(conn),
+		.flags = MDCACHE_ACCESS_ABE,
+	};
+	return true;
+}
+
+static void dirent_abe_remember(struct files_struct *fsp)
+{
+	const SMB_STRUCT_STAT *st = &fsp->fsp_name->st;
+	struct mdcache_inode *slot = NULL;
+	struct mdcache_access_key key;
+
+	if (!S_ISREG(st->st_ex_mode) && !S_ISDIR(st->st_ex_mode)) {
+		return;
+	}
+
+	/* A slot matching the stat taken after the open predates the open */
+	slot = mdcache_inode_peek(&fsp->file_id, st->st_ex_change_cookie);
+	if ((slot != NULL) && dirent_abe_key(fsp->conn, slot, &key)) {
+		mdcache_access_put(&key,
+				   (fsp_get_status_flags(fsp) & O_PATH) ?
+				   0 : FILE_READ_DATA);
+	}
+}
+
+enum dirent_cached { DIRENT_OPEN, DIRENT_HIDDEN, DIRENT_LISTED };
+
+/* A listing stops trying the cache after this many entries in a row miss */
+#define DIRENT_CACHE_MISSES 32
+
+/*
+ * List smb_fname without opening it, from what the metadata cache holds
+ * for the version of the file a stat by name finds. DIRENT_OPEN means it
+ * has to be opened after all.
+ */
+static enum dirent_cached dirent_from_cache(TALLOC_CTX *ctx,
+					    struct smb_Dir *dir_hnd,
+					    struct smb_filename *smb_fname,
+					    uint32_t *_mode,
+					    struct readdir_attr_data **_rdattr)
+{
+	connection_struct *conn = dir_hnd->conn;
+	const SMB_STRUCT_STAT *st = &smb_fname->st;
+	struct files_struct *fsp = NULL;
+	struct mdcache_inode *slot = NULL;
+	struct mdcache_access_key key;
+	struct file_id id;
+	uint32_t read_access;
+	uint32_t mode;
+	enum dirent_cached ret = DIRENT_OPEN;
+	NTSTATUS status;
+	int rc;
+
+	rc = SMB_VFS_FSTATAT(conn,
+			     dir_hnd->fsp,
+			     smb_fname,
+			     &smb_fname->st,
+			     AT_SYMLINK_NOFOLLOW);
+	if ((rc != 0) ||
+	    (!S_ISREG(st->st_ex_mode) && !S_ISDIR(st->st_ex_mode)) ||
+	    ((conn->internal_tcon_flags & TCON_FLAG_NOXDEV) &&
+	     (st->st_ex_dev != dir_hnd->dir_smb_fname->st.st_ex_dev))) {
+		return DIRENT_OPEN;
+	}
+
+	id = vfs_file_id_from_sbuf(conn, st);
+	slot = mdcache_inode_peek(&id, st->st_ex_change_cookie);
+	if ((slot == NULL) || !(slot->flags & MDCACHE_HAVE_DOSMODE)) {
+		return DIRENT_OPEN;
+	}
+
+	if ((conn->internal_tcon_flags & TCON_FLAG_TRUENAS_ABE) &&
+	    !ISDOT(smb_fname->base_name) && !ISDOTDOT(smb_fname->base_name)) {
+		if (!dirent_abe_key(conn, slot, &key) ||
+		    !mdcache_access_get(&key, &read_access)) {
+			return DIRENT_OPEN;
+		}
+		if (read_access == 0) {
+			return DIRENT_HIDDEN;
+		}
+	}
+
+	fsp = fsp_new_fdless(dir_hnd->fsp, smb_fname);
+	if (fsp == NULL) {
+		return DIRENT_OPEN;
+	}
+
+	status = fdos_mode_vfs(fsp, &mode);
+	if (!NT_STATUS_IS_OK(status) ||
+	    (mode & FILE_ATTRIBUTE_REPARSE_POINT)) {
+		goto out;
+	}
+
+	if (_rdattr != NULL) {
+		status = SMB_VFS_FREADDIR_ATTR(fsp, ctx, _rdattr);
+		if (!NT_STATUS_IS_OK(status) &&
+		    !NT_STATUS_EQUAL(status, NT_STATUS_NOT_SUPPORTED)) {
+			TALLOC_FREE(*_rdattr);
+			goto out;
+		}
+	}
+
+	smb_fname->st = fsp->fsp_name->st;
+	*_mode = mode;
+	ret = DIRENT_LISTED;
+out:
+	file_free(NULL, fsp);
+	return ret;
+}
+
 bool smbd_dirptr_get_entry(TALLOC_CTX *ctx,
 			   struct dptr_struct *dirptr,
 			   const char *mask,
@@ -520,22 +667,33 @@ bool smbd_dirptr_get_entry(TALLOC_CTX *ctx,
 			   void *private_data,
 			   char **_fname,
 			   struct smb_filename **_smb_fname,
-			   uint32_t *_mode)
+			   uint32_t *_mode,
+			   struct readdir_attr_data **_rdattr)
 {
 	struct smb_Dir *dir_hnd = dirptr->dir_hnd;
 	connection_struct *conn = dir_hnd->conn;
 	struct smb_filename *dir_fname = dir_hnd->dir_smb_fname;
 	bool posix = (dir_fname->flags & SMB_FILENAME_POSIX_PATH);
 	const bool toplevel = ISDOT(dir_fname->base_name);
+	const bool try_cache = dirent_cache_usable(conn,
+						   dir_fname,
+						   get_dosmode_in);
 	NTSTATUS status;
 
 	*_smb_fname = NULL;
 	*_mode = 0;
+	if (_rdattr != NULL) {
+		*_rdattr = NULL;
+	}
 
 	if (dirptr->overflow.smb_fname != NULL) {
 		*_fname = talloc_move(ctx, &dirptr->overflow.fname);
 		*_smb_fname = talloc_move(ctx, &dirptr->overflow.smb_fname);
 		*_mode = dirptr->overflow.mode;
+		if (_rdattr != NULL) {
+			*_rdattr = talloc_move(ctx, &dirptr->overflow.rdattr);
+		}
+		TALLOC_FREE(dirptr->overflow.rdattr);
 		return true;
 	}
 
@@ -551,6 +709,7 @@ bool smbd_dirptr_get_entry(TALLOC_CTX *ctx,
 		char *dname = NULL;
 		char *fname = NULL;
 		struct smb_filename *smb_fname = NULL;
+		struct readdir_attr_data *rdattr = NULL;
 		uint32_t mode = 0;
 		bool get_dosmode = get_dosmode_in;
 		bool toplevel_dotdot;
@@ -600,6 +759,28 @@ bool smbd_dirptr_get_entry(TALLOC_CTX *ctx,
 			return false;
 		}
 
+		if (try_cache && (dirptr->cache_misses < DIRENT_CACHE_MISSES)) {
+			switch (dirent_from_cache(ctx,
+						  dir_hnd,
+						  smb_fname,
+						  &mode,
+						  (_rdattr != NULL) ? &rdattr
+								    : NULL)) {
+			case DIRENT_HIDDEN:
+				dirptr->cache_misses = 0;
+				TALLOC_FREE(smb_fname);
+				TALLOC_FREE(fname);
+				TALLOC_FREE(dname);
+				continue;
+			case DIRENT_LISTED:
+				dirptr->cache_misses = 0;
+				goto listed;
+			case DIRENT_OPEN:
+				dirptr->cache_misses++;
+				break;
+			}
+		}
+
 		/*
 		 * UCF_POSIX_PATHNAMES to avoid the readdir fallback
 		 * if we get raced between readdir and unlink.
@@ -618,6 +799,10 @@ bool smbd_dirptr_get_entry(TALLOC_CTX *ctx,
 		}
 
 		visible = is_visible_fsp(smb_fname->fsp);
+		if (try_cache &&
+		    (conn->internal_tcon_flags & TCON_FLAG_TRUENAS_ABE)) {
+			dirent_abe_remember(smb_fname->fsp);
+		}
 		if (!visible) {
 			TALLOC_FREE(smb_fname);
 			TALLOC_FREE(fname);
@@ -710,12 +895,14 @@ done:
 			smb_fname->st = smb_fname->fsp->fsp_name->st;
 		}
 
+listed:
 		if (!dir_check_ftype(mode, dirtype)) {
 			DBG_INFO("[%s] attribs 0x%" PRIx32 " didn't match "
 				 "0x%" PRIx32 "\n",
 				 fname,
 				 mode,
 				 dirtype);
+			TALLOC_FREE(rdattr);
 			TALLOC_FREE(smb_fname);
 			TALLOC_FREE(dname);
 			TALLOC_FREE(fname);
@@ -743,6 +930,9 @@ done:
 		*_smb_fname = talloc_move(ctx, &smb_fname);
 		*_fname = fname;
 		*_mode = mode;
+		if (_rdattr != NULL) {
+			*_rdattr = rdattr;
+		}
 
 		return true;
 	}
@@ -753,7 +943,8 @@ done:
 void smbd_dirptr_push_overflow(struct dptr_struct *dirptr,
 			       char **_fname,
 			       struct smb_filename **_smb_fname,
-			       uint32_t mode)
+			       uint32_t mode,
+			       struct readdir_attr_data **_rdattr)
 {
 	SMB_ASSERT(dirptr->overflow.fname == NULL);
 	SMB_ASSERT(dirptr->overflow.smb_fname == NULL);
@@ -761,6 +952,7 @@ void smbd_dirptr_push_overflow(struct dptr_struct *dirptr,
 	dirptr->overflow.fname = talloc_move(dirptr, _fname);
 	dirptr->overflow.smb_fname = talloc_move(dirptr, _smb_fname);
 	dirptr->overflow.mode = mode;
+	dirptr->overflow.rdattr = talloc_move(dirptr, _rdattr);
 }
 
 void smbd_dirptr_set_last_name_sent(struct dptr_struct *dirptr,
