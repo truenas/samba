@@ -359,6 +359,31 @@ static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
 	return NT_STATUS_OK;
 }
 
+/*
+ * DOSATTRIB adds nothing to a regular file whose attributes all live in
+ * the ZFS flags, as long as the create time to store is the native one.
+ */
+static bool ixnas_dosattrib_redundant(struct files_struct *fsp,
+				      uint32_t dosmode,
+				      uint32_t native_dosmode)
+{
+	SMB_STRUCT_STAT sbuf;
+	ssize_t len;
+
+	if (!S_ISREG(fsp->fsp_name->st.st_ex_mode) ||
+	    (dosmode != native_dosmode)) {
+		return false;
+	}
+	if ((sys_fstat(fsp_get_pathref_fd(fsp), &sbuf, false) != 0) ||
+	    (sbuf.st_ex_iflags & ST_EX_IFLAG_CALCULATED_BTIME) ||
+	    !timespec_equal(&sbuf.st_ex_btime,
+			    &fsp->fsp_name->st.st_ex_btime)) {
+		return false;
+	}
+	len = SMB_VFS_FGETXATTR(fsp, SAMBA_XATTR_DOS_ATTRIB, NULL, 0);
+	return (len == -1) && (errno == ENOATTR);
+}
+
 static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
                                             struct files_struct *fsp,
                                             uint32_t dosmode)
@@ -366,6 +391,8 @@ static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
 	NTSTATUS status;
 	struct ixnas_config_data *config = NULL;
 	uint64_t flags = 0;
+	uint64_t cur_flags = 0;
+	uint32_t native_dosmode = 0;
 	int ret, i;
 	bool set_dosmode_ok = false;
 	bool ok;
@@ -398,7 +425,12 @@ static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
 	for (i = 0; i < ARRAY_SIZE(dosmode2flag); i++) {
 		if (dosmode & dosmode2flag[i].dosmode) {
 			flags |= dosmode2flag[i].flag;
+			native_dosmode |= dosmode2flag[i].dosmode;
 		}
+	}
+
+	if (ixnas_get_native_dosmode(fsp, &cur_flags) && (cur_flags == flags)) {
+		goto out;
 	}
 
 	ok = ixnas_set_native_dosmode(fsp, flags);
@@ -435,6 +467,9 @@ static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
 	}
 
 out:
+	if (ixnas_dosattrib_redundant(fsp, dosmode, native_dosmode)) {
+		return NT_STATUS_OK;
+	}
 	return SMB_VFS_NEXT_FSET_DOS_ATTRIBUTES(handle,
 						fsp,
 						dosmode);
