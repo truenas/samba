@@ -880,6 +880,12 @@ uid_t get_current_uid(connection_struct *conn)
 	return current_user.ut.uid;
 }
 
+/* The session whose token smbd is running with */
+uint64_t get_current_vuid(connection_struct *conn)
+{
+	return current_user.vuid;
+}
+
 /****************************************************************************
  Return the current group we are running effectively as on this connection.
  I'd like to make this return conn->session_info->unix_token->gid, but become_root()
