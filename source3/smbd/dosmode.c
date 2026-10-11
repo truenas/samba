@@ -766,6 +766,25 @@ uint32_t fdos_mode(struct files_struct *fsp)
 	return fsp->fsp_name->st.cached_dos_attributes;
 }
 
+/*
+ * fdos_mode() for a regular file or directory that returns the VFS error
+ * instead of a default
+ */
+NTSTATUS fdos_mode_vfs(struct files_struct *fsp, uint32_t *_dosmode)
+{
+	uint32_t dosmode = 0;
+	NTSTATUS status;
+
+	status = SMB_VFS_FGET_DOS_ATTRIBUTES(fsp->conn, fsp, &dosmode);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+
+	fsp->fsp_name->st.cached_dos_attributes = dos_mode_post(dosmode, fsp, __func__);
+	*_dosmode = fsp->fsp_name->st.cached_dos_attributes;
+	return NT_STATUS_OK;
+}
+
 struct dos_mode_at_state {
 	files_struct *dir_fsp;
 	struct smb_filename *smb_fname;

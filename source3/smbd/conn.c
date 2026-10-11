@@ -23,6 +23,7 @@
 #include "smbd/smbd.h"
 #include "smbd/globals.h"
 #include "lib/util/bitmap.h"
+#include "smbd/truenas_mdcache.h"
 
 static void conn_free_internal(connection_struct *conn);
 
@@ -206,6 +207,9 @@ void conn_clear_vuid_caches(struct smbd_server_connection *sconn, uint64_t vuid)
 		}
 		conn_clear_vuid_cache(conn, vuid);
 	}
+
+	/* Cached access decisions assumed the session's old token */
+	mdcache_flush_access();
 }
 
 /****************************************************************************

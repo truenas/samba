@@ -586,13 +586,15 @@ static NTSTATUS close_remove_share_mode(files_struct *fsp,
 		goto done;
 	}
 
-	status = parent_pathref(talloc_tos(),
-				conn->cwd_fsp,
-				fsp->fsp_name,
-				&parent_fname,
-				&base_fname);
-	if (!NT_STATUS_IS_OK(status)) {
-		goto done;
+	if (!fsp_is_xattr_stream(fsp)) {
+		status = parent_pathref(talloc_tos(),
+					conn->cwd_fsp,
+					fsp->fsp_name,
+					&parent_fname,
+					&base_fname);
+		if (!NT_STATUS_IS_OK(status)) {
+			goto done;
+		}
 	}
 
 	if ((conn->fs_capabilities & FILE_NAMED_STREAMS)
@@ -625,10 +627,15 @@ static NTSTATUS close_remove_share_mode(files_struct *fsp,
 		fsp->fsp_flags.kernel_share_modes_taken = false;
 	}
 
-	ret = SMB_VFS_UNLINKAT(conn,
-			       parent_fname->fsp,
-			       base_fname,
-			       0);
+	if (fsp_is_xattr_stream(fsp)) {
+		/* Removing an xattr stream needs no parent directory */
+		ret = SMB_VFS_UNLINKAT(conn, conn->cwd_fsp, fsp->fsp_name, 0);
+	} else {
+		ret = SMB_VFS_UNLINKAT(conn,
+				       parent_fname->fsp,
+				       base_fname,
+				       0);
+	}
 	TALLOC_FREE(parent_fname);
 	base_fname = NULL;
 	if (ret != 0) {
