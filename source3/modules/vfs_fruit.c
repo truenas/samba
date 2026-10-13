@@ -891,8 +891,9 @@ static NTSTATUS check_aapl(vfs_handle_struct *handle,
 		if ((client_caps & SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR_V2) &&
 		    config->use_readdir_attr_v2 &&
 		    (handle->conn->fs_capabilities & FILE_NAMED_STREAMS)) {
-			/* A V2 server answers with only the V2 bit */
-			server_caps |= SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR_V2;
+			/* Like macOS servers, also set the V1 bit */
+			server_caps |= SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR |
+				       SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR_V2;
 			config->readdir_attr_enabled = true;
 			readdir_attr_v2 = true;
 		} else if ((client_caps &

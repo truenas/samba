@@ -896,15 +896,13 @@ static void smbd_smb2_create_finish(struct tevent_req *req);
  * with the CLOSE. If smbd rejects that CLOSE, smbd_smb2_request_reply()
  * closes the handle, so it can't outlive the compound.
  */
-static bool smbd_smb2_create_is_lookup(struct smbd_smb2_request *smb2req,
-				       uint8_t oplock_level,
-				       uint32_t desired_access,
-				       uint32_t share_access,
-				       uint32_t create_disposition,
-				       uint32_t create_options,
-				       uint32_t num_blobs,
-				       bool mxac)
+static bool smbd_smb2_create_is_lookup(
+	const struct smbd_smb2_create_state *state,
+	uint32_t desired_access,
+	uint32_t share_access,
+	uint32_t num_blobs)
 {
+	struct smbd_smb2_request *smb2req = state->smb2req;
 	uint16_t next_opcodes[] = { 0, SMB2_OP_CLOSE };
 	const uint32_t lookup_access =
 		SEC_FILE_READ_ATTRIBUTE | SEC_DIR_LIST | SEC_STD_SYNCHRONIZE;
@@ -912,24 +910,29 @@ static bool smbd_smb2_create_is_lookup(struct smbd_smb2_request *smb2req,
 	size_t i;
 
 	if (!smb2req->sconn->aapl_negotiated ||
-	    (oplock_level != SMB2_OPLOCK_LEVEL_NONE) ||
+	    (state->requested_oplock_level != SMB2_OPLOCK_LEVEL_NONE) ||
 	    (share_access !=
 	     (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)) ||
-	    (create_disposition != FILE_OPEN) ||
-	    (create_options & FILE_DELETE_ON_CLOSE)) {
+	    (state->in_create_disposition != FILE_OPEN) ||
+	    (state->in_create_options & FILE_DELETE_ON_CLOSE)) {
 		return false;
 	}
 
 	if ((desired_access & SEC_DIR_LIST) &&
 	    !(desired_access & ~lookup_access) &&
-	    (create_options & FILE_DIRECTORY_FILE) &&
+	    (state->in_create_options & FILE_DIRECTORY_FILE) &&
 	    (num_blobs == 0)) {
 		next_opcodes[0] = SMB2_OP_QUERY_DIRECTORY;
 	} else if (is_oplock_stat_open(desired_access) &&
 		   !(desired_access & SEC_FILE_WRITE_ATTRIBUTE) &&
-		   (num_blobs == (mxac ? 1 : 0))) {
+		   (num_blobs == ((state->mxac != NULL) ? 1 : 0))) {
 		next_opcodes[0] = SMB2_OP_GETINFO;
 	} else {
+		return false;
+	}
+
+	/* The compound is this CREATE and the next two, ending with the CLOSE */
+	if (smb2req->in.vector_count != idx + 3 * SMBD_SMB2_NUM_IOV_PER_REQ) {
 		return false;
 	}
 
@@ -937,17 +940,13 @@ static bool smbd_smb2_create_is_lookup(struct smbd_smb2_request *smb2req,
 		const uint8_t *hdr = NULL;
 
 		idx += SMBD_SMB2_NUM_IOV_PER_REQ;
-		if (idx + SMBD_SMB2_NUM_IOV_PER_REQ > smb2req->in.vector_count) {
-			return false;
-		}
 		hdr = SMBD_SMB2_IDX_HDR_IOV(smb2req, in, idx)->iov_base;
 		if ((SVAL(hdr, SMB2_HDR_OPCODE) != next_opcodes[i]) ||
 		    !(IVAL(hdr, SMB2_HDR_FLAGS) & SMB2_HDR_FLAG_CHAINED)) {
 			return false;
 		}
 	}
-	/* The compound ends with the CLOSE */
-	return (idx + SMBD_SMB2_NUM_IOV_PER_REQ == smb2req->in.vector_count);
+	return true;
 }
 
 static struct tevent_req *smbd_smb2_create_send(TALLOC_CTX *mem_ctx,
@@ -1355,14 +1354,10 @@ static struct tevent_req *smbd_smb2_create_send(TALLOC_CTX *mem_ctx,
 	}
 
 	smb2req->compound_lookup = smbd_smb2_create_is_lookup(
-		smb2req,
-		state->requested_oplock_level,
+		state,
 		in_desired_access,
 		in_share_access,
-		state->in_create_disposition,
-		state->in_create_options,
-		in_context_blobs.num_blobs,
-		state->mxac != NULL);
+		in_context_blobs.num_blobs);
 	status = SMB_VFS_CREATE_FILE(smb1req->conn,
 				     smb1req,
 				     dirfsp,

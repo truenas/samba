@@ -3905,15 +3905,21 @@ static void possibly_set_archive(struct connection_struct *conn,
  * closed before the reply goes out. It only has to fit the existing opens
  * and needs no share-mode entry: later opens don't see it, as if they had
  * come after the compound. Attribute-only opens never break leases, see
- * delay_for_oplock().
+ * delay_for_oplock(). Marks fsp if it goes without the entry.
  */
-static bool open_lookup_shareable(struct files_struct *fsp,
-				  uint32_t access_mask,
-				  uint32_t share_access)
+static bool open_skip_share_mode_entry(struct smb_request *req,
+				       struct files_struct *fsp,
+				       uint32_t access_mask,
+				       uint32_t share_access)
 {
 	uint32_t e_access_mask, e_share_access, e_lease_type;
 	bool delete_on_close;
 	NTSTATUS status;
+	bool ok;
+
+	if (!smb2_req_compound_lookup(req) || fsp_is_alternate_stream(fsp)) {
+		return false;
+	}
 
 	status = share_mode_peek_unlocked(fsp->file_id,
 					  fsp->name_hash,
@@ -3921,13 +3927,15 @@ static bool open_lookup_shareable(struct files_struct *fsp,
 					  &e_share_access,
 					  &e_lease_type,
 					  &delete_on_close);
-	if (NT_STATUS_EQUAL(status, NT_STATUS_NOT_FOUND)) {
-		return true;
+	ok = NT_STATUS_EQUAL(status, NT_STATUS_NOT_FOUND) ||
+	     (NT_STATUS_IS_OK(status) && !delete_on_close &&
+	      (is_oplock_stat_open(access_mask) || (e_lease_type == 0)) &&
+	      !share_conflict(e_access_mask, e_share_access,
+			      access_mask, share_access));
+	if (ok) {
+		fsp->fsp_flags.no_share_mode_entry = true;
 	}
-	return NT_STATUS_IS_OK(status) && !delete_on_close &&
-	       (is_oplock_stat_open(access_mask) || (e_lease_type == 0)) &&
-	       !share_conflict(e_access_mask, e_share_access,
-			       access_mask, share_access);
+	return ok;
 }
 
 /****************************************************************************
@@ -4481,13 +4489,12 @@ static NTSTATUS open_file_ntcreate(
 		keep_locked = true;
 	}
 
-	if (smb2_req_compound_lookup(req) && !fsp_is_alternate_stream(fsp) &&
-	    open_lookup_shareable(fsp, open_access_mask, share_access)) {
+	if (open_skip_share_mode_entry(req, fsp, open_access_mask,
+				       share_access)) {
 		/*
 		 * No step below needs the lock for an attribute-only FILE_OPEN,
 		 * and the untouched lck_state makes the unlock a no-op.
 		 */
-		fsp->fsp_flags.no_share_mode_entry = true;
 		goto share_mode_added;
 	}
 
@@ -5524,9 +5531,7 @@ static NTSTATUS open_directory(connection_struct *conn,
 		}
 	}
 
-	if (smb2_req_compound_lookup(req) &&
-	    open_lookup_shareable(fsp, access_mask, share_access)) {
-		fsp->fsp_flags.no_share_mode_entry = true;
+	if (open_skip_share_mode_entry(req, fsp, access_mask, share_access)) {
 		if (pinfo) {
 			*pinfo = info;
 		}

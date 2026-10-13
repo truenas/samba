@@ -1339,7 +1339,8 @@ static uint64_t ixnas_sd_variant(struct files_struct *fsp)
 
 	/*
 	 * Linux allocates and zeroes a buffer of the requested size on
-	 * every getxattr, so try a typical ACL size first.
+	 * every getxattr, so try a typical ACL size first. Larger ACLs are
+	 * rare and get read twice.
 	 */
 	len = SMB_VFS_FGETXATTR(fsp, ACL4_XATTR, buf + sizeof(hdr),
 				ACL4_XDR_SMALL);

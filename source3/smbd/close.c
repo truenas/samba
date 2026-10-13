@@ -1218,9 +1218,7 @@ static NTSTATUS close_directory(struct smb_request *req, files_struct *fsp,
 
 	if (fsp->fsp_flags.no_share_mode_entry) {
 		/* Lookup compound open, see open_directory() */
-		remove_pending_change_notify_requests_by_fid(fsp,
-							     notify_status);
-		goto close_fd;
+		goto done;
 	}
 
 	/*

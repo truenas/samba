@@ -1220,7 +1220,10 @@ static int smb_Dir_destructor(struct smb_Dir *dir_hnd)
 	if (dir_hnd->dir != NULL) {
 		SMB_VFS_CLOSEDIR(dir_hnd->conn, dir_hnd->dir);
 	} else if (fsp_get_pathref_fd(fsp) != -1) {
-		/* Own the fd as if fdopendir() had taken it over */
+		/*
+		 * Close the fd as closedir() would have. SMB_VFS_CLOSE() would
+		 * log an audit CLOSE that searches with a stream don't get.
+		 */
 		close(fsp_get_pathref_fd(fsp));
 	}
 	fsp_set_fd(fsp, -1);
