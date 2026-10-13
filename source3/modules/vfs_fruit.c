@@ -981,6 +981,7 @@ static NTSTATUS check_aapl(vfs_handle_struct *handle,
 	if (NT_STATUS_IS_OK(status)) {
 		global_fruit_config.nego_aapl = true;
 		global_fruit_config.readdir_attr_v2 = readdir_attr_v2;
+		handle->conn->sconn->aapl_negotiated = true;
 	}
 
 	return status;

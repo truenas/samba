@@ -889,6 +889,67 @@ static void smbd_smb2_create_before_exec(struct tevent_req *req);
 static void smbd_smb2_create_after_exec(struct tevent_req *req);
 static void smbd_smb2_create_finish(struct tevent_req *req);
 
+/*
+ * macOS looks a name up with CREATE(folder) + QUERY_DIRECTORY + CLOSE and
+ * reads stream lists, file and volume info with an attribute-only CREATE
+ * (plus MxAc) + GETINFO + CLOSE, each in one related compound that ends
+ * with the CLOSE. If smbd rejects that CLOSE, smbd_smb2_request_reply()
+ * closes the handle, so it can't outlive the compound.
+ */
+static bool smbd_smb2_create_is_lookup(struct smbd_smb2_request *smb2req,
+				       uint8_t oplock_level,
+				       uint32_t desired_access,
+				       uint32_t share_access,
+				       uint32_t create_disposition,
+				       uint32_t create_options,
+				       uint32_t num_blobs,
+				       bool mxac)
+{
+	uint16_t next_opcodes[] = { 0, SMB2_OP_CLOSE };
+	const uint32_t lookup_access =
+		SEC_FILE_READ_ATTRIBUTE | SEC_DIR_LIST | SEC_STD_SYNCHRONIZE;
+	int idx = smb2req->current_idx;
+	size_t i;
+
+	if (!smb2req->sconn->aapl_negotiated ||
+	    (oplock_level != SMB2_OPLOCK_LEVEL_NONE) ||
+	    (share_access !=
+	     (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)) ||
+	    (create_disposition != FILE_OPEN) ||
+	    (create_options & FILE_DELETE_ON_CLOSE)) {
+		return false;
+	}
+
+	if ((desired_access & SEC_DIR_LIST) &&
+	    !(desired_access & ~lookup_access) &&
+	    (create_options & FILE_DIRECTORY_FILE) &&
+	    (num_blobs == 0)) {
+		next_opcodes[0] = SMB2_OP_QUERY_DIRECTORY;
+	} else if (is_oplock_stat_open(desired_access) &&
+		   !(desired_access & SEC_FILE_WRITE_ATTRIBUTE) &&
+		   (num_blobs == (mxac ? 1 : 0))) {
+		next_opcodes[0] = SMB2_OP_GETINFO;
+	} else {
+		return false;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(next_opcodes); i++) {
+		const uint8_t *hdr = NULL;
+
+		idx += SMBD_SMB2_NUM_IOV_PER_REQ;
+		if (idx + SMBD_SMB2_NUM_IOV_PER_REQ > smb2req->in.vector_count) {
+			return false;
+		}
+		hdr = SMBD_SMB2_IDX_HDR_IOV(smb2req, in, idx)->iov_base;
+		if ((SVAL(hdr, SMB2_HDR_OPCODE) != next_opcodes[i]) ||
+		    !(IVAL(hdr, SMB2_HDR_FLAGS) & SMB2_HDR_FLAG_CHAINED)) {
+			return false;
+		}
+	}
+	/* The compound ends with the CLOSE */
+	return (idx + SMBD_SMB2_NUM_IOV_PER_REQ == smb2req->in.vector_count);
+}
+
 static struct tevent_req *smbd_smb2_create_send(TALLOC_CTX *mem_ctx,
 			struct tevent_context *ev,
 			struct smbd_smb2_request *smb2req,
@@ -1293,6 +1354,15 @@ static struct tevent_req *smbd_smb2_create_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 
+	smb2req->compound_lookup = smbd_smb2_create_is_lookup(
+		smb2req,
+		state->requested_oplock_level,
+		in_desired_access,
+		in_share_access,
+		state->in_create_disposition,
+		state->in_create_options,
+		in_context_blobs.num_blobs,
+		state->mxac != NULL);
 	status = SMB_VFS_CREATE_FILE(smb1req->conn,
 				     smb1req,
 				     dirfsp,
@@ -1313,6 +1383,7 @@ static struct tevent_req *smbd_smb2_create_send(TALLOC_CTX *mem_ctx,
 				     &state->info,
 				     &in_context_blobs,
 				     state->out_context_blobs);
+	smb2req->compound_lookup = false;
 	if (NT_STATUS_IS_OK(status) &&
 	    !(state->in_create_options & FILE_OPEN_REPARSE_POINT))
 	{

@@ -1021,9 +1021,7 @@ static NTSTATUS reopen_from_fsp_pathref_based(
 	NTSTATUS status;
 	struct sys_proc_fd_path_buf buf;
 	int pathref_fd = fsp_get_pathref_fd(fsp);
-	struct smb_filename proc_fname = {
-		.base_name = sys_proc_fd_path(pathref_fd, &buf),
-	};
+	struct smb_filename proc_fname = {};
 	mode_t mode = fsp->fsp_name->st.st_ex_mode;
 	int new_fd;
 	struct vfs_open_how pathref_how = *how;
@@ -1043,6 +1041,8 @@ static NTSTATUS reopen_from_fsp_pathref_based(
 		// (desired effect is changing is_pathref to false)
 		return NT_STATUS_OK;
 	}
+
+	proc_fname.base_name = sys_proc_fd_path(pathref_fd, &buf);
 
 #if defined(HAVE_FSTATFS) && defined(HAVE_LINUX_MAGIC_H)
 	/*
@@ -3900,6 +3900,36 @@ static void possibly_set_archive(struct connection_struct *conn,
 	*unx_mode = smb_fname->st.st_ex_mode;
 }
 
+/*
+ * smb2_create.c flags the open of a lookup or query compound, which gets
+ * closed before the reply goes out. It only has to fit the existing opens
+ * and needs no share-mode entry: later opens don't see it, as if they had
+ * come after the compound. Attribute-only opens never break leases, see
+ * delay_for_oplock().
+ */
+static bool open_lookup_shareable(struct files_struct *fsp,
+				  uint32_t access_mask,
+				  uint32_t share_access)
+{
+	uint32_t e_access_mask, e_share_access, e_lease_type;
+	bool delete_on_close;
+	NTSTATUS status;
+
+	status = share_mode_peek_unlocked(fsp->file_id,
+					  fsp->name_hash,
+					  &e_access_mask,
+					  &e_share_access,
+					  &e_lease_type,
+					  &delete_on_close);
+	if (NT_STATUS_EQUAL(status, NT_STATUS_NOT_FOUND)) {
+		return true;
+	}
+	return NT_STATUS_IS_OK(status) && !delete_on_close &&
+	       (is_oplock_stat_open(access_mask) || (e_lease_type == 0)) &&
+	       !share_conflict(e_access_mask, e_share_access,
+			       access_mask, share_access);
+}
+
 /****************************************************************************
  Open a file with a share mode. Passed in an already created files_struct *.
 ****************************************************************************/
@@ -4451,6 +4481,16 @@ static NTSTATUS open_file_ntcreate(
 		keep_locked = true;
 	}
 
+	if (smb2_req_compound_lookup(req) && !fsp_is_alternate_stream(fsp) &&
+	    open_lookup_shareable(fsp, open_access_mask, share_access)) {
+		/*
+		 * No step below needs the lock for an attribute-only FILE_OPEN,
+		 * and the untouched lck_state makes the unlock a no-op.
+		 */
+		fsp->fsp_flags.no_share_mode_entry = true;
+		goto share_mode_added;
+	}
+
 	lck_state = (struct open_ntcreate_lock_state) {
 		.fsp			= fsp,
 		.object_type		= "file",
@@ -4485,6 +4525,7 @@ static NTSTATUS open_file_ntcreate(
 		return status;
 	}
 
+share_mode_added:
 	/*
 	 * From here we need to use 'goto unlock;' instead of return !!!
 	 */
@@ -5481,6 +5522,15 @@ static NTSTATUS open_directory(connection_struct *conn,
 			fd_close(fsp);
 			return status;
 		}
+	}
+
+	if (smb2_req_compound_lookup(req) &&
+	    open_lookup_shareable(fsp, access_mask, share_access)) {
+		fsp->fsp_flags.no_share_mode_entry = true;
+		if (pinfo) {
+			*pinfo = info;
+		}
+		return NT_STATUS_OK;
 	}
 
 	/*

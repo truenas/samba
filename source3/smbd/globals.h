@@ -664,6 +664,9 @@ struct smbd_smb2_request {
 	struct smb_request *smb1req;
 	struct files_struct *compat_chain_fsp;
 
+	/* Set while smb2_create opens a lookup or query compound's handle */
+	bool compound_lookup;
+
 	/*
 	 * Keep track of whether the outstanding request counters
 	 * had been updated in dispatch, so that they need to be
@@ -774,6 +777,12 @@ struct smbd_smb2_request {
 	} out;
 };
 
+static inline bool smb2_req_compound_lookup(const struct smb_request *req)
+{
+	return (req != NULL) && (req->smb2req != NULL) &&
+	       req->smb2req->compound_lookup;
+}
+
 struct smbd_server_connection;
 
 struct pending_message_list;
@@ -784,6 +793,7 @@ struct dcesrv_context;
 
 struct smbd_server_connection {
 	uint64_t mdcache_epoch; /* TrueNAS: see truenas_mdcache.c */
+	bool aapl_negotiated; /* TrueNAS: set by vfs_fruit */
 	const struct tsocket_address *local_address;
 	const struct tsocket_address *remote_address;
 	const char *remote_hostname;

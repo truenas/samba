@@ -53,6 +53,7 @@ enum ixnas_dacl_type {
 
 #define ACL4_XATTR "system.nfs4_acl_xdr"
 #define ACL4_XDR_MAX 20488	/* what libzfsacl reads, 1024 entries */
+#define ACL4_XDR_SMALL 1008	/* 50 entries */
 #define ACL_XATTR "system.posix_acl_access"
 
 #define ZFS_IOC_GETDOSFLAGS     _IOR(0x83, 1, uint64_t)
@@ -1331,23 +1332,34 @@ static uint64_t ixnas_sd_variant(struct files_struct *fsp)
 		.gid = st->st_ex_gid,
 		.mode = st->st_ex_mode,
 	};
-	uint8_t *buf = NULL;
+	uint8_t small[sizeof(hdr) + ACL4_XDR_SMALL];
+	uint8_t *buf = small;
 	ssize_t len;
 	uint64_t seq = 0;
 
-	buf = talloc_array(talloc_tos(), uint8_t, sizeof(hdr) + ACL4_XDR_MAX);
-	if (buf == NULL) {
-		return 0;
-	}
-
+	/*
+	 * Linux allocates and zeroes a buffer of the requested size on
+	 * every getxattr, so try a typical ACL size first.
+	 */
 	len = SMB_VFS_FGETXATTR(fsp, ACL4_XATTR, buf + sizeof(hdr),
-				ACL4_XDR_MAX);
+				ACL4_XDR_SMALL);
+	if ((len == -1) && (errno == ERANGE)) {
+		buf = talloc_array(talloc_tos(), uint8_t,
+				   sizeof(hdr) + ACL4_XDR_MAX);
+		if (buf == NULL) {
+			return 0;
+		}
+		len = SMB_VFS_FGETXATTR(fsp, ACL4_XATTR, buf + sizeof(hdr),
+					ACL4_XDR_MAX);
+	}
 	if (len > 0) {
 		memcpy(buf, &hdr, sizeof(hdr));
 		seq = mdcache_sd_variant(data_blob_const(buf,
 							 sizeof(hdr) + len));
 	}
-	TALLOC_FREE(buf);
+	if (buf != small) {
+		TALLOC_FREE(buf);
+	}
 	return seq;
 }
 
