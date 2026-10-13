@@ -494,6 +494,7 @@ static NTSTATUS smbXsrv_open_global_allocate(
 		} else {
 			generate_nonce_buffer(
 				(uint8_t *)&state.id, sizeof(state.id));
+			state.id &= ~SMBXSRV_OPEN_GLOBAL_ID_NO_RECORD;
 			state.id = MAX(state.id, 1);
 			state.id = MIN(state.id, UINT32_MAX-1);
 		}
@@ -568,6 +569,7 @@ NTSTATUS smbXsrv_open_create(struct smbXsrv_connection *conn,
 			     struct smbXsrv_session *session,
 			     struct smbXsrv_tcon *tcon,
 			     NTTIME now,
+			     bool no_global_record,
 			     struct smbXsrv_open **_open)
 {
 	struct smbXsrv_open_table *table = conn->client->open_table;
@@ -641,8 +643,22 @@ NTSTATUS smbXsrv_open_create(struct smbXsrv_connection *conn,
 		global->client_guid = conn->smb2.client.guid;
 	}
 
-	status = smbXsrv_open_global_allocate(table->global.db_ctx,
-					      global);
+	if (no_global_record && !lp_clustering()) {
+		/*
+		 * Only durable reconnects and create replays look for the
+		 * global record, so skip it. Allocated global ids never
+		 * have SMBXSRV_OPEN_GLOBAL_ID_NO_RECORD set, so with the
+		 * local id it gives a unique id for this process that
+		 * marks the open as record-less. Clusters keep the record.
+		 */
+		global->open_global_id =
+			SMBXSRV_OPEN_GLOBAL_ID_NO_RECORD | op->local_id;
+		global->open_persistent_id = global->open_global_id;
+		status = NT_STATUS_OK;
+	} else {
+		status = smbXsrv_open_global_allocate(table->global.db_ctx,
+						      global);
+	}
 	if (!NT_STATUS_IS_OK(status)) {
 		int ret = idr_remove(table->local.idr, local_id);
 		SMB_ASSERT(ret == 0);
@@ -833,6 +849,15 @@ NTSTATUS smbXsrv_open_update(struct smbXsrv_open *op)
 		op->global->open_global_id, &key_buf);
 	NTSTATUS status;
 
+	if (op->global->open_global_id & SMBXSRV_OPEN_GLOBAL_ID_NO_RECORD) {
+		/* No global record, see smbXsrv_open_create() */
+		if (op->global->durable ||
+		    (op->flags & SMBXSRV_OPEN_NEED_REPLAY_CACHE)) {
+			return NT_STATUS_INTERNAL_ERROR;
+		}
+		return NT_STATUS_OK;
+	}
+
 	status = dbwrap_do_locked(
 		table->global.db_ctx, key, smbXsrv_open_update_fn, &state);
 	if (!NT_STATUS_IS_OK(status)) {
@@ -943,8 +968,12 @@ NTSTATUS smbXsrv_open_close(struct smbXsrv_open *op, NTTIME now)
 	global->tcon_global_id = 0;
 	server_id_set_disconnected(&global->server_id);
 
-	status = dbwrap_do_locked(
-		table->global.db_ctx, key, smbXsrv_open_close_fn, &state);
+	status = NT_STATUS_OK;
+	if (!(global->open_global_id & SMBXSRV_OPEN_GLOBAL_ID_NO_RECORD)) {
+		/* Else no global record, see smbXsrv_open_create() */
+		status = dbwrap_do_locked(
+			table->global.db_ctx, key, smbXsrv_open_close_fn, &state);
+	}
 	if (!NT_STATUS_IS_OK(status)) {
 		DBG_WARNING("dbwrap_do_locked() for %s failed: %s\n",
 			    tdb_data_dbg(key),

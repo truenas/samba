@@ -503,6 +503,8 @@ typedef struct files_struct {
 		bool ntcreatex_deny_dos : 1;
 		bool ntcreatex_deny_fcb : 1;
 		bool ntcreatex_stream_baseopen : 1;
+		/* TrueNAS: lookup or query compound open, see open.c */
+		bool no_share_mode_entry : 1;
 	} fsp_flags;
 
 	/* Only used for SMB1 close with explicit time */
@@ -735,6 +737,8 @@ typedef struct files_struct {
 #define TCON_FLAG_CASE_INSENSTIVE_FS	0x08
 #define TCON_FLAG_TRUENAS_ABE		0x10
 #define TCON_FLAG_NOXDEV		0x20
+#define TCON_FLAG_DONT_DESCEND		0x40
+#define TCON_FLAG_FIND_ASYNC_DELAY	0x80
 
 struct vuid_cache_entry {
 	struct auth_session_info *session_info;

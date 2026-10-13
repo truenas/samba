@@ -477,6 +477,12 @@ static NTSTATUS close_remove_share_mode(files_struct *fsp,
 	struct smb_filename *base_fname = NULL;
 	int ret;
 
+	if (fsp->fsp_flags.no_share_mode_entry) {
+		/* Query compound open, see open_file_ntcreate() */
+		locking_close_file(fsp, close_type);
+		return NT_STATUS_OK;
+	}
+
 	/*
 	 * Lock the share entries, and determine if we should delete
 	 * on close. If so delete whilst the lock is still in effect.
@@ -1209,6 +1215,11 @@ static NTSTATUS close_directory(struct smb_request *req, files_struct *fsp,
 	}
 
 	assert_no_pending_aio(fsp, close_type);
+
+	if (fsp->fsp_flags.no_share_mode_entry) {
+		/* Lookup compound open, see open_directory() */
+		goto done;
+	}
 
 	/*
 	 * NT can set delete_on_close of the last open

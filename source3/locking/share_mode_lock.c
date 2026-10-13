@@ -1527,6 +1527,107 @@ struct share_mode_lock *fetch_share_mode_unlocked(TALLOC_CTX *mem_ctx,
 	return state.lck;
 }
 
+struct share_mode_peek_unlocked_state {
+	struct file_id id;
+	uint32_t name_hash;
+	uint32_t *access_mask;
+	uint32_t *share_mode;
+	uint32_t *lease_type;
+	bool *delete_on_close;
+	NTSTATUS status;
+};
+
+static void share_mode_peek_unlocked_fn(
+	struct server_id exclusive,
+	size_t num_shared,
+	const struct server_id *shared,
+	const uint8_t *data,
+	size_t datalen,
+	void *private_data)
+{
+	struct share_mode_peek_unlocked_state *state = private_data;
+	struct locking_tdb_data ltdb = { 0 };
+	struct share_mode_lock lck = { .id = state->id };
+	const DATA_BLOB key = memcache_key(&state->id);
+	struct share_mode_data *d = NULL;
+	enum ndr_err_code ndr_err;
+	uint64_t epoch;
+	uint16_t flags;
+
+	if ((datalen != 0) && !locking_tdb_data_parse(&ltdb, data, datalen)) {
+		state->status = NT_STATUS_INTERNAL_DB_CORRUPTION;
+		return;
+	}
+	if (ltdb.share_mode_data_len == 0) {
+		/* Likely a ctdb tombstone record, ignore it */
+		state->status = NT_STATUS_NOT_FOUND;
+		return;
+	}
+
+	ndr_err = get_share_mode_blob_header(ltdb.share_mode_data_buf,
+					     ltdb.share_mode_data_len,
+					     &epoch,
+					     &flags);
+	if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
+		state->status = ndr_map_error2ntstatus(ndr_err);
+		return;
+	}
+
+	/* Read a current cached copy in place, unlike parse_share_mode_data() */
+	d = memcache_lookup_talloc(NULL, SHARE_MODE_LOCK_CACHE, key);
+	if ((d == NULL) || (d->unique_content_epoch != epoch)) {
+		d = parse_share_mode_data(talloc_tos(),
+					  state->id,
+					  ltdb.share_mode_data_buf,
+					  ltdb.share_mode_data_len);
+		if (d == NULL) {
+			state->status = NT_STATUS_INTERNAL_DB_CORRUPTION;
+			return;
+		}
+		d->id = state->id;
+		share_mode_memcache_store(d);
+	}
+
+	lck.cached_data = d;
+	share_mode_flags_get(&lck,
+			     state->access_mask,
+			     state->share_mode,
+			     state->lease_type);
+	*state->delete_on_close = is_delete_on_close_set(&lck, state->name_hash);
+	state->status = NT_STATUS_OK;
+}
+
+/*
+ * The summary flags of id's record and whether name_hash is delete-pending,
+ * NT_STATUS_NOT_FOUND without a record. Takes no lock and leaves the
+ * record in the cache for the next locked access.
+ */
+NTSTATUS share_mode_peek_unlocked(struct file_id id,
+				  uint32_t name_hash,
+				  uint32_t *access_mask,
+				  uint32_t *share_mode,
+				  uint32_t *lease_type,
+				  bool *delete_on_close)
+{
+	struct share_mode_peek_unlocked_state state = {
+		.id = id,
+		.name_hash = name_hash,
+		.access_mask = access_mask,
+		.share_mode = share_mode,
+		.lease_type = lease_type,
+		.delete_on_close = delete_on_close,
+		.status = NT_STATUS_INTERNAL_ERROR,
+	};
+	NTSTATUS status;
+
+	status = g_lock_dump(
+		lock_ctx, locking_key(&id), share_mode_peek_unlocked_fn, &state);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+	return state.status;
+}
+
 struct fetch_share_mode_state {
 	struct file_id id;
 	struct share_mode_lock *lck;

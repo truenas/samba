@@ -573,6 +573,14 @@ NTSTATUS make_connection_snum(struct smbXsrv_connection *xconn,
 
 	conn->read_only = lp_read_only(SNUM(conn));
 
+	/* Spares QUERY_DIRECTORY these lookups while they're unset */
+	if (*lp_dont_descend(talloc_tos(), lp_sub, snum)) {
+		conn->internal_tcon_flags |= TCON_FLAG_DONT_DESCEND;
+	}
+	if (lp_parm_ulong(snum, "smbd", "find async delay usec", 0) != 0) {
+		conn->internal_tcon_flags |= TCON_FLAG_FIND_ASYNC_DELAY;
+	}
+
 	status = set_conn_force_user_group(conn, snum);
 	if (!NT_STATUS_IS_OK(status)) {
 		goto err_root_exit;
