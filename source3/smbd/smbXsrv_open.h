@@ -33,11 +33,18 @@ struct smbXsrv_open;
 struct smbXsrv_open_global0;
 struct smbXsrv_client;
 
+/*
+ * TrueNAS: global ids of opens without a global record have this bit set,
+ * see smbXsrv_open_create()
+ */
+#define SMBXSRV_OPEN_GLOBAL_ID_NO_RECORD 0x80000000U
+
 NTSTATUS smbXsrv_open_global_init(void);
 NTSTATUS smbXsrv_open_create(struct smbXsrv_connection *conn,
 			     struct smbXsrv_session *session,
 			     struct smbXsrv_tcon *tcon,
 			     NTTIME now,
+			     bool no_global_record,
 			     struct smbXsrv_open **_open);
 NTSTATUS smbXsrv_open_update(struct smbXsrv_open *_open);
 NTSTATUS smbXsrv_open_close(struct smbXsrv_open *op, NTTIME now);
