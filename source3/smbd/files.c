@@ -127,6 +127,7 @@ NTSTATUS fsp_bind_smb(struct files_struct *fsp, struct smb_request *req)
 				     req->session,
 				     fsp->conn->tcon,
 				     now,
+				     smb2_req_compound_lookup(req),
 				     &op);
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;

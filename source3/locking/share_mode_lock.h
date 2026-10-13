@@ -71,6 +71,12 @@ bool mark_share_mode_disconnected(
 struct share_mode_lock *fetch_share_mode_unlocked(
 	TALLOC_CTX *mem_ctx,
 	struct file_id id);
+NTSTATUS share_mode_peek_unlocked(struct file_id id,
+				  uint32_t name_hash,
+				  uint32_t *access_mask,
+				  uint32_t *share_mode,
+				  uint32_t *lease_type,
+				  bool *delete_on_close);
 
 struct tevent_req *fetch_share_mode_send(
 	TALLOC_CTX *mem_ctx,

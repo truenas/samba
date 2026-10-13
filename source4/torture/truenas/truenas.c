@@ -1066,10 +1066,11 @@ done:
 }
 
 /*
- * AAPL READ_DIR_ATTR_V2. A client offering V2 gets only the V2 bit back, and
- * each entry's flags say whether it has no stream besides its data, which
- * lets macOS skip asking for its xattrs. The entries live in the share root,
- * as fruit:resource = file can't create resource forks in subdirectories.
+ * AAPL READ_DIR_ATTR_V2. A client offering V2 gets the V1 and V2 bits back,
+ * as from macOS, and each entry's flags say whether it has no stream besides
+ * its data, which lets macOS skip asking for its xattrs. The entries live in
+ * the share root, as fruit:resource = file can't create resource forks in
+ * subdirectories.
  * Skipped without vfs_fruit or with fruit:readdir_attr_version = 1.
  */
 static bool test_truenas_fruit_readdir_attr_v2(struct torture_context *tctx,
@@ -1119,8 +1120,8 @@ static bool test_truenas_fruit_readdir_attr_v2(struct torture_context *tctx,
 		torture_skip(tctx, "fruit:readdir_attr_version = 1\n");
 	}
 	torture_assert(tctx,
-		       !(server_caps & SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR),
-		       "a V2 server answers with only the V2 bit");
+		       server_caps & SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR,
+		       "a V2 server also sets the V1 bit");
 
 	/* AfpInfo with a FinderInfo type and creator */
 	RSIVAL(data, 0, AFP_Signature);

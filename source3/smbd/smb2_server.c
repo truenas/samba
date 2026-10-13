@@ -3699,6 +3699,39 @@ static void smbd_smb2_request_reply_update_counts(struct smbd_smb2_request *req)
 	}
 }
 
+/*
+ * TrueNAS: a lookup or query compound's handle may have no share mode
+ * entry or global record (see smbd_smb2_create_is_lookup()), so other
+ * clients can't see it. If it's still the chain handle when the compound
+ * ends, smbd rejected the compound's CLOSE (bad size, flags or
+ * signature): close it now instead of at disconnect.
+ */
+static void smbd_smb2_close_untracked_chain_fsp(struct smbd_smb2_request *req)
+{
+	struct files_struct *fsp = req->compat_chain_fsp;
+	NTSTATUS status;
+
+	if ((fsp == NULL) || (fsp->op == NULL)) {
+		return;
+	}
+	if (!fsp->fsp_flags.no_share_mode_entry &&
+	    !(fsp->op->global->open_global_id &
+	      SMBXSRV_OPEN_GLOBAL_ID_NO_RECORD)) {
+		/* A normal open */
+		return;
+	}
+
+	DBG_NOTICE("%s: the compound's CLOSE did not run\n", fsp_str_dbg(fsp));
+
+	if (!change_to_user_and_service_by_fsp(fsp)) {
+		change_to_root_user();
+	}
+	status = close_file_free(NULL, &fsp, NORMAL_CLOSE);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_WARNING("close_file_free() failed: %s\n", nt_errstr(status));
+	}
+}
+
 static NTSTATUS smbd_smb2_request_reply(struct smbd_smb2_request *req)
 {
 	struct smbXsrv_connection *xconn = req->xconn;
@@ -3842,6 +3875,8 @@ static NTSTATUS smbd_smb2_request_reply(struct smbd_smb2_request *req)
 					req);
 		return NT_STATUS_OK;
 	}
+
+	smbd_smb2_close_untracked_chain_fsp(req);
 
 	if (req->compound_related) {
 		req->compound_related = false;

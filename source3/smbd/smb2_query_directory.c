@@ -455,10 +455,12 @@ static struct tevent_req *smbd_smb2_query_directory_send(TALLOC_CTX *mem_ctx,
 		 fsp_str_dbg(fsp), lp_dont_descend(talloc_tos(), lp_sub, SNUM(conn)),
 		(unsigned int)in_output_buffer_length ));
 
-	state->dont_descend = in_list(
-		fsp->fsp_name->base_name,
-		lp_dont_descend(talloc_tos(), lp_sub, SNUM(conn)),
-		posix_dir_handle ? true : conn->case_sensitive);
+	if (conn->internal_tcon_flags & TCON_FLAG_DONT_DESCEND) {
+		state->dont_descend = in_list(
+			fsp->fsp_name->base_name,
+			lp_dont_descend(talloc_tos(), lp_sub, SNUM(conn)),
+			posix_dir_handle ? true : conn->case_sensitive);
+	}
 
 	/*
 	 * SMB_FIND_FILE_NAMES_INFO doesn't need stat information
@@ -497,9 +499,10 @@ static struct tevent_req *smbd_smb2_query_directory_send(TALLOC_CTX *mem_ctx,
 	/*
 	 * This gets set in autobuild for some tests
 	 */
-	state->find_async_delay_usec = lp_parm_ulong(SNUM(conn), "smbd",
-						     "find async delay usec",
-						     0);
+	if (conn->internal_tcon_flags & TCON_FLAG_FIND_ASYNC_DELAY) {
+		state->find_async_delay_usec = lp_parm_ulong(
+			SNUM(conn), "smbd", "find async delay usec", 0);
+	}
 
 	while (!stop) {
 		stop = smb2_query_directory_next_entry(req);

@@ -82,6 +82,7 @@ static NTSTATUS OpenDir_fsp(
 	files_struct *fsp,
 	const char *mask,
 	uint32_t attr,
+	bool open_stream,
 	struct smb_Dir **_dir_hnd);
 
 static int smb_Dir_destructor(struct smb_Dir *dir_hnd);
@@ -209,6 +210,7 @@ NTSTATUS dptr_create(connection_struct *conn,
 	struct smbd_server_connection *sconn = conn->sconn;
 	struct dptr_struct *dptr = NULL;
 	struct smb_Dir *dir_hnd = NULL;
+	bool has_wild;
 	NTSTATUS status;
 
 	DBG_INFO("dir=%s\n", fsp_str_dbg(fsp));
@@ -228,7 +230,15 @@ NTSTATUS dptr_create(connection_struct *conn,
 			 fsp_str_dbg(fsp));
 		return status;
 	}
-	status = OpenDir_fsp(NULL, conn, fsp, wcard, attr, &dir_hnd);
+
+	if ((req != NULL && req->posix_pathnames) || ISDOT(wcard)) {
+		has_wild = true;
+	} else {
+		has_wild = ms_has_wild(wcard);
+	}
+
+	/* A search without wildcards stats the name and never reads */
+	status = OpenDir_fsp(NULL, conn, fsp, wcard, attr, has_wild, &dir_hnd);
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
@@ -247,11 +257,7 @@ NTSTATUS dptr_create(connection_struct *conn,
 		TALLOC_FREE(dir_hnd);
 		return NT_STATUS_NO_MEMORY;
 	}
-	if ((req != NULL && req->posix_pathnames) || ISDOT(wcard)) {
-		dptr->has_wild = True;
-	} else {
-		dptr->has_wild = ms_has_wild(dptr->wcard);
-	}
+	dptr->has_wild = has_wild;
 
 	dptr->attr = attr;
 
@@ -1211,7 +1217,15 @@ static int smb_Dir_destructor(struct smb_Dir *dir_hnd)
 {
 	files_struct *fsp = dir_hnd->fsp;
 
-	SMB_VFS_CLOSEDIR(dir_hnd->conn, dir_hnd->dir);
+	if (dir_hnd->dir != NULL) {
+		SMB_VFS_CLOSEDIR(dir_hnd->conn, dir_hnd->dir);
+	} else if (fsp_get_pathref_fd(fsp) != -1) {
+		/*
+		 * Close the fd as closedir() would have. SMB_VFS_CLOSE() would
+		 * log an audit CLOSE that searches with a stream don't get.
+		 */
+		close(fsp_get_pathref_fd(fsp));
+	}
 	fsp_set_fd(fsp, -1);
 	if (fsp->dptr != NULL) {
 		SMB_ASSERT(fsp->dptr->dir_hnd == dir_hnd);
@@ -1253,7 +1267,7 @@ NTSTATUS OpenDir(TALLOC_CTX *mem_ctx,
 		return status;
 	}
 
-	status = OpenDir_fsp(mem_ctx, conn, fsp, mask, attr, &dir_hnd);
+	status = OpenDir_fsp(mem_ctx, conn, fsp, mask, attr, true, &dir_hnd);
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
@@ -1320,7 +1334,7 @@ NTSTATUS OpenDir_from_pathref(TALLOC_CTX *mem_ctx,
 		}
 	}
 
-	status = OpenDir_fsp(mem_ctx, conn, new_fsp, mask, attr, &dir_hnd);
+	status = OpenDir_fsp(mem_ctx, conn, new_fsp, mask, attr, true, &dir_hnd);
 	if (!NT_STATUS_IS_OK(status)) {
 		fd_close(new_fsp);
 		file_free(NULL, new_fsp);
@@ -1348,6 +1362,7 @@ static NTSTATUS OpenDir_fsp(
 	files_struct *fsp,
 	const char *mask,
 	uint32_t attr,
+	bool open_stream,
 	struct smb_Dir **_dir_hnd)
 {
 	struct smb_Dir *dir_hnd = talloc_zero(mem_ctx, struct smb_Dir);
@@ -1375,10 +1390,12 @@ static NTSTATUS OpenDir_fsp(
 		goto fail;
 	}
 
-	dir_hnd->dir = SMB_VFS_FDOPENDIR(fsp, mask, attr);
-	if (dir_hnd->dir == NULL) {
-		status = map_nt_error_from_unix(errno);
-		goto fail;
+	if (open_stream) {
+		dir_hnd->dir = SMB_VFS_FDOPENDIR(fsp, mask, attr);
+		if (dir_hnd->dir == NULL) {
+			status = map_nt_error_from_unix(errno);
+			goto fail;
+		}
 	}
 	dir_hnd->fsp = fsp;
 	if (fsp->fsp_name->flags & SMB_FILENAME_POSIX_PATH) {
@@ -1493,7 +1510,9 @@ const char *ReadDirName(struct smb_Dir *dir_hnd, char **ptalloced)
 
 void RewindDir(struct smb_Dir *dir_hnd)
 {
-	SMB_VFS_REWINDDIR(dir_hnd->conn, dir_hnd->dir);
+	if (dir_hnd->dir != NULL) {
+		SMB_VFS_REWINDDIR(dir_hnd->conn, dir_hnd->dir);
+	}
 	dir_hnd->file_number = 0;
 }
 
