@@ -521,6 +521,49 @@ class ReconnectTest(ClusterTestCase):
         self.assertEqual(db.fetch(b'key'), b'value')
 
 
+class DisconnectNodeTest(ClusterTestCase):
+    """disconnect_node() drops a node without waiting for its keepalives."""
+
+    def setUp(self):
+        super().setUp()
+        if NUM_NODES < 2:
+            self.skipTest('needs a second node')
+        if os.geteuid() != 0:
+            self.skipTest('needs CAP_NET_ADMIN')
+
+    @staticmethod
+    def flags(client, pnn):
+        return next(n['flags'] for n in client.nodemap(refresh=True)
+                    if n['pnn'] == pnn)
+
+    def test_node_is_dropped_at_once_and_comes_back(self):
+        client = cluster.client(0)
+        db = client.get_db('pyctdb_disconnect_node.tdb', create_ok=True)
+        db.store(b'key', b'value')
+        self.assertNotIn('DISCONNECTED', self.flags(client, 1))
+
+        # Two links, but ctdbd may close the second on seeing the first go
+        self.assertIn(client.disconnect_node(1), (1, 2))
+        # Well within one keepalive interval, which is 5 seconds
+        cluster.wait_until(
+            lambda: 'DISCONNECTED' in self.flags(client, 1), timeout=3,
+        )
+
+        # The daemons connect again on their own, and nothing is lost
+        cluster.wait_until(
+            lambda: 'DISCONNECTED' not in self.flags(client, 1), timeout=30,
+        )
+        cluster.wait_ready()
+        self.assertEqual(db.fetch(b'key'), b'value')
+
+    def test_this_node_and_an_unknown_one_are_refused(self):
+        client = cluster.client(0)
+        with self.assertRaises(ValueError):
+            client.disconnect_node(client.pnn)
+        with self.assertRaises(ValueError):
+            client.disconnect_node(42)
+
+
 class GlobalLockingTest(ClusterTestCase):
     """The lock that all clients of a process share, if it is turned on.
 

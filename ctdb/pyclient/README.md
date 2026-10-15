@@ -125,6 +125,17 @@ If a recovery is already in progress then that one is waited for first and anoth
 - `ValueError`: `timeout` is out of range
 - `CTDBError`: Operation failed. `errno` is `ETIMEDOUT` if the recovery did not complete in time, in which case it may still be pending or in progress and the node may still be in recovery mode.
 
+##### `disconnect_node(pnn) -> int`
+Make this node's ctdbd treat node `pnn` as disconnected now, instead of when that node's keepalives time out (30 seconds with the default tunables). For a node that is known to be gone, for example one that has been fenced out of the storage.
+
+It destroys this host's TCP connections with the node, the way `ss -K` does, through the kernel's socket diagnostics interface. ctdbd finds its sockets gone, marks the node `DISCONNECTED` and recovers without it. It reconnects by itself, so a node that is in fact alive costs a reconnect and two recoveries, nothing more. Returns the number of connections destroyed, normally two: one in each direction.
+
+Requires `CAP_NET_ADMIN`. Linux only.
+
+**Raises:**
+- `ValueError`: `pnn` is this node, or there is no such node
+- `CTDBError`: The node map could not be read, or the connections could not be destroyed. `errno` is `EPERM` without `CAP_NET_ADMIN`.
+
 ### CtdbDB Class
 
 Represents an open CTDB database handle.
