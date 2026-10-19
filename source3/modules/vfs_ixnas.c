@@ -51,9 +51,6 @@ enum ixnas_dacl_type {
 #define	UF_OFFLINE		0x0000100000000000ull
 #define	UF_SPARSE		0x0000200000000000ull
 
-#define ACL4_XATTR "system.nfs4_acl_xdr"
-#define ACL4_XDR_MAX 20488	/* what libzfsacl reads, 1024 entries */
-#define ACL4_XDR_SMALL 1008	/* 50 entries */
 #define ACL_XATTR "system.posix_acl_access"
 
 #define ZFS_IOC_GETDOSFLAGS     _IOR(0x83, 1, uint64_t)
@@ -1314,56 +1311,6 @@ static NTSTATUS ixnas_fget_nt_acl_uncached(struct vfs_handle_struct *handle,
 	return status;
 }
 
-/*
- * A converted security descriptor depends only on the raw NFSv4 ACL and
- * the owner, group and mode, so files with the same ones share a
- * variant.
- */
-static uint64_t ixnas_sd_variant(struct files_struct *fsp)
-{
-	const SMB_STRUCT_STAT *st = &fsp->fsp_name->st;
-	struct {
-		uint32_t uid;
-		uint32_t gid;
-		uint32_t mode;
-		uint32_t pad;
-	} hdr = {
-		.uid = st->st_ex_uid,
-		.gid = st->st_ex_gid,
-		.mode = st->st_ex_mode,
-	};
-	uint8_t small[sizeof(hdr) + ACL4_XDR_SMALL];
-	uint8_t *buf = small;
-	ssize_t len;
-	uint64_t seq = 0;
-
-	/*
-	 * Linux allocates and zeroes a buffer of the requested size on
-	 * every getxattr, so try a typical ACL size first. Larger ACLs are
-	 * rare and get read twice.
-	 */
-	len = SMB_VFS_FGETXATTR(fsp, ACL4_XATTR, buf + sizeof(hdr),
-				ACL4_XDR_SMALL);
-	if ((len == -1) && (errno == ERANGE)) {
-		buf = talloc_array(talloc_tos(), uint8_t,
-				   sizeof(hdr) + ACL4_XDR_MAX);
-		if (buf == NULL) {
-			return 0;
-		}
-		len = SMB_VFS_FGETXATTR(fsp, ACL4_XATTR, buf + sizeof(hdr),
-					ACL4_XDR_MAX);
-	}
-	if (len > 0) {
-		memcpy(buf, &hdr, sizeof(hdr));
-		seq = mdcache_sd_variant(data_blob_const(buf,
-							 sizeof(hdr) + len));
-	}
-	if (buf != small) {
-		TALLOC_FREE(buf);
-	}
-	return seq;
-}
-
 static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 				  struct files_struct *fsp,
 				  uint32_t security_info,
@@ -1377,14 +1324,7 @@ static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 	slot = mdcache_inode_fetch(fsp);
 	if (slot != NULL) {
 		cookie = slot->cookie;
-		seq = slot->sd_seq;
-		if (seq == 0) {
-			seq = ixnas_sd_variant(fsp);
-			slot = mdcache_inode_peek(&fsp->file_id, cookie);
-			if (slot != NULL) {
-				slot->sd_seq = seq;
-			}
-		}
+		seq = mdcache_sd_seq(fsp, &slot);
 		if ((seq != 0) &&
 		    mdcache_sd_get(seq, security_info, mem_ctx, ppdesc)) {
 			return NT_STATUS_OK;
@@ -1957,6 +1897,8 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 	SMB_VFS_HANDLE_SET_DATA(handle, config,
 				NULL, struct ixnas_config_data,
 				return -1);
+
+	handle->conn->internal_tcon_flags |= TCON_FLAG_MDCACHE_SD;
 
 	if (lp_parm_bool(SNUM(handle->conn), "ixnas", "truenas_abe", true)) {
 		/*

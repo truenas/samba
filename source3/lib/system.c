@@ -301,11 +301,7 @@ int sys_stat(const char *fname, SMB_STRUCT_STAT *sbuf,
 	struct statx statbuf;
 	ret = statx(AT_FDCWD, fname, 0, TNSTATX_FLAGS, &statbuf);
 	if (ret == 0) {
-		/* we always want directories to appear zero size */
-		if (S_ISDIR(statbuf.stx_mode)) {
-			statbuf.stx_size = 0;
-		}
-		init_stat_ex_from_stat(sbuf, &statbuf, fake_dir_create_times);
+		sys_stat_ex_from_statx(sbuf, &statbuf, fake_dir_create_times);
 	}
 	return ret;
 }
@@ -320,11 +316,7 @@ int sys_fstat(int fd, SMB_STRUCT_STAT *sbuf, bool fake_dir_create_times)
 	struct statx statbuf;
 	ret = statx(fd, "", AT_EMPTY_PATH, TNSTATX_FLAGS, &statbuf);
 	if (ret == 0) {
-		/* we always want directories to appear zero size */
-		if (S_ISDIR(statbuf.stx_mode)) {
-			statbuf.stx_size = 0;
-		}
-		init_stat_ex_from_stat(sbuf, &statbuf, fake_dir_create_times);
+		sys_stat_ex_from_statx(sbuf, &statbuf, fake_dir_create_times);
 	}
 	return ret;
 }
@@ -340,11 +332,7 @@ int sys_lstat(const char *fname,SMB_STRUCT_STAT *sbuf,
 	struct statx statbuf;
 	ret = statx(AT_FDCWD, fname, AT_SYMLINK_NOFOLLOW, TNSTATX_FLAGS, &statbuf);
 	if (ret == 0) {
-		/* we always want directories to appear zero size */
-		if (S_ISDIR(statbuf.stx_mode)) {
-			statbuf.stx_size = 0;
-		}
-		init_stat_ex_from_stat(sbuf, &statbuf, fake_dir_create_times);
+		sys_stat_ex_from_statx(sbuf, &statbuf, fake_dir_create_times);
 	}
 	return ret;
 }
@@ -366,13 +354,24 @@ int sys_fstatat(int fd,
 	if (ret != 0) {
 		return -1;
 	}
-
-	/* we always want directories to appear zero size */
-	if (S_ISDIR(statbuf.stx_mode)) {
-		statbuf.stx_size = 0;
-	}
-	init_stat_ex_from_stat(sbuf, &statbuf, fake_dir_create_times);
+	sys_stat_ex_from_statx(sbuf, &statbuf, fake_dir_create_times);
 	return 0;
+}
+
+unsigned int sys_statx_mask(void)
+{
+	return TNSTATX_FLAGS;
+}
+
+void sys_stat_ex_from_statx(SMB_STRUCT_STAT *sbuf,
+			    const struct statx *src,
+			    bool fake_dir_create_times)
+{
+	init_stat_ex_from_stat(sbuf, src, fake_dir_create_times);
+	/* we always want directories to appear zero size */
+	if (S_ISDIR(sbuf->st_ex_mode)) {
+		sbuf->st_ex_size = 0;
+	}
 }
 
 /*******************************************************************

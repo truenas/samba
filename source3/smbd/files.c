@@ -1596,8 +1596,8 @@ fail:
 
 /*
  * A pathref fsp without an fd for dirfsp's entry smb_fname_rel, the file
- * smb_fname_rel->st describes. VFS modules answer for it from what they
- * cached, or fail with NT_STATUS_RETRY.
+ * smb_fname_rel->st describes; fsp->dirfsp is the directory. VFS modules
+ * answer for it from what they cached, or fail with NT_STATUS_RETRY.
  */
 struct files_struct *fsp_new_fdless(struct files_struct *dirfsp,
 				    const struct smb_filename *smb_fname_rel)
@@ -1611,6 +1611,7 @@ struct files_struct *fsp_new_fdless(struct files_struct *dirfsp,
 		return NULL;
 	}
 	fsp->fsp_flags.is_pathref = true;
+	fsp->dirfsp = dirfsp;
 
 	full_fname = full_path_from_dirfsp_atname(conn, dirfsp, smb_fname_rel);
 	if ((full_fname == NULL) || !fsp_attach_smb_fname(fsp, &full_fname)) {
@@ -1757,6 +1758,16 @@ NTSTATUS openat_pathref_fsp_lcomp(struct files_struct *dirfsp,
 		fd_close(fsp);
 		file_free(NULL, fsp);
 		return status;
+	}
+
+	if (!VALID_STAT(fsp->fsp_name->st)) {
+		/* unlinked between the open and the stat */
+		DBG_DEBUG("%s/%s vanished after the open\n",
+			  fsp_str_dbg(dirfsp),
+			  smb_fname_rel->base_name);
+		fd_close(fsp);
+		file_free(NULL, fsp);
+		return NT_STATUS_OBJECT_NAME_NOT_FOUND;
 	}
 
 	fsp->fsp_flags.is_directory = S_ISDIR(fsp->fsp_name->st.st_ex_mode);

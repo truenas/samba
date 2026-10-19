@@ -163,6 +163,58 @@ static NTSTATUS smbd_check_access_rights_fname(
 	return NT_STATUS_MORE_PROCESSING_REQUIRED;
 }
 
+/*
+ * The share's settings and the parent directory may grant what the
+ * descriptor rejected
+ */
+static NTSTATUS smbd_check_access_rights_denied(
+				struct connection_struct *conn,
+				struct files_struct *dirfsp,
+				const struct smb_filename *smb_fname,
+				uint32_t access_mask,
+				uint32_t rejected_mask)
+{
+	if ((access_mask & FILE_WRITE_ATTRIBUTES) &&
+	    (rejected_mask & FILE_WRITE_ATTRIBUTES) &&
+	    !lp_store_dos_attributes(SNUM(conn)) &&
+	    !lp_kernel_dosmodes(SNUM(conn)) &&
+	    (lp_map_readonly(SNUM(conn)) ||
+	     lp_map_archive(SNUM(conn)) ||
+	     lp_map_hidden(SNUM(conn)) ||
+	     lp_map_system(SNUM(conn))))
+	{
+		rejected_mask &= ~FILE_WRITE_ATTRIBUTES;
+
+		DBG_DEBUG("overrode FILE_WRITE_ATTRIBUTES on file %s\n",
+			  smb_fname_str_dbg(smb_fname));
+	}
+
+	if (parent_override_delete(conn,
+				   dirfsp,
+				   smb_fname,
+				   access_mask,
+				   rejected_mask))
+	{
+		/*
+		 * Were we trying to do an open for delete and didn't get DELETE
+		 * access. Check if the directory allows DELETE_CHILD.
+		 * See here:
+		 * http://blogs.msdn.com/oldnewthing/archive/2004/06/04/148426.aspx
+		 * for details.
+		 */
+
+		rejected_mask &= ~DELETE_ACCESS;
+
+		DBG_DEBUG("Overrode DELETE_ACCESS on file %s\n",
+			  smb_fname_str_dbg(smb_fname));
+	}
+
+	if (rejected_mask != 0) {
+		return NT_STATUS_ACCESS_DENIED;
+	}
+	return NT_STATUS_OK;
+}
+
 static NTSTATUS smbd_check_access_rights_sd(
 				struct connection_struct *conn,
 				struct files_struct *dirfsp,
@@ -220,46 +272,188 @@ static NTSTATUS smbd_check_access_rights_sd(
 	/* Here we know status == NT_STATUS_ACCESS_DENIED. */
 
 access_denied:
+	return smbd_check_access_rights_denied(conn,
+					      dirfsp,
+					      smb_fname,
+					      access_mask,
+					      rejected_mask);
+}
 
-	if ((access_mask & FILE_WRITE_ATTRIBUTES) &&
-	    (rejected_mask & FILE_WRITE_ATTRIBUTES) &&
-	    !lp_store_dos_attributes(SNUM(conn)) &&
-	    !lp_kernel_dosmodes(SNUM(conn)) &&
-	    (lp_map_readonly(SNUM(conn)) ||
-	     lp_map_archive(SNUM(conn)) ||
-	     lp_map_hidden(SNUM(conn)) ||
-	     lp_map_system(SNUM(conn))))
-	{
-		rejected_mask &= ~FILE_WRITE_ATTRIBUTES;
-
-		DBG_DEBUG("overrode FILE_WRITE_ATTRIBUTES on file %s\n",
-			  smb_fname_str_dbg(smb_fname));
+/*
+ * A specific access check needs only the DACL's maximum for the token:
+ * the ACE walk of se_access_check() grants a bit when an allow ACE for
+ * the token carries it and no earlier deny ACE does, which is how
+ * access_check_max_allowed() builds the maximum, and applies the
+ * privilege rules after the walk. The maximum is cached per SD variant
+ * and token, so a check is a lookup instead of a descriptor fetch,
+ * unpack and walk.
+ */
+static bool dacl_max_key(struct files_struct *fsp,
+			 const struct mdcache_inode *slot,
+			 struct mdcache_access_key *key)
+{
+	if (slot->sd_seq == 0) {
+		return false;
 	}
+	*key = (struct mdcache_access_key) {
+		.sd_seq = slot->sd_seq,
+		.vuid = get_current_vuid(fsp->conn),
+		.cnum = fsp->conn->cnum,
+		.uid = get_current_uid(fsp->conn),
+		.access_mask = SEC_FLAG_MAXIMUM_ALLOWED,
+		.flags = MDCACHE_ACCESS_DACL_MAX,
+	};
+	return true;
+}
 
-	if (parent_override_delete(conn,
-				   dirfsp,
-				   smb_fname,
-				   access_mask,
-				   rejected_mask))
-	{
-		/*
-		 * Were we trying to do an open for delete and didn't get DELETE
-		 * access. Check if the directory allows DELETE_CHILD.
-		 * See here:
-		 * http://blogs.msdn.com/oldnewthing/archive/2004/06/04/148426.aspx
-		 * for details.
-		 */
+/*
+ * The cached maximum of fsp's DACL for the current token. *pcookie is
+ * the slot's change cookie, 0 if the file can't be cached or the share
+ * does not identify SD variants.
+ */
+static bool dacl_max_get(struct files_struct *fsp,
+			 uint64_t *pcookie,
+			 uint32_t *max)
+{
+	struct mdcache_inode *slot = NULL;
+	struct mdcache_access_key key;
 
-		rejected_mask &= ~DELETE_ACCESS;
-
-		DBG_DEBUG("Overrode DELETE_ACCESS on file %s\n",
-			  smb_fname_str_dbg(smb_fname));
+	*pcookie = 0;
+	if (!(fsp->conn->internal_tcon_flags & TCON_FLAG_MDCACHE_SD)) {
+		return false;
 	}
+	slot = mdcache_inode_fetch(fsp);
+	if (slot == NULL) {
+		return false;
+	}
+	*pcookie = slot->cookie;
+	mdcache_sd_seq(fsp, &slot);
+	if (slot == NULL) {
+		return false;
+	}
+	return dacl_max_key(fsp, slot, &key) && mdcache_access_get(&key, max);
+}
 
-	if (rejected_mask != 0) {
-		return NT_STATUS_ACCESS_DENIED;
+/*
+ * The maximum of sd's DACL for the token. se_access_check() grants a
+ * present NULL DACL everything, while access_check_max_allowed() gives
+ * it only the owner's rights; an absent DACL is left to the walk.
+ */
+static bool dacl_max_from_sd(const struct security_descriptor *sd,
+			     const struct security_token *token,
+			     uint32_t *max)
+{
+	NTSTATUS status;
+
+	*max = 0;
+	status = se_file_access_check(sd,
+				      token,
+				      false,
+				      SEC_FLAG_MAXIMUM_ALLOWED,
+				      max);
+	if (!NT_STATUS_IS_OK(status)) {
+		return false;
+	}
+	if (sd->dacl == NULL) {
+		if (!(sd->type & SEC_DESC_DACL_PRESENT)) {
+			return false;
+		}
+		*max = UINT32_MAX;
+	}
+	return true;
+}
+
+/* Cache max for fsp's SD variant, unless the file changed meanwhile */
+static void dacl_max_put(struct files_struct *fsp,
+			 uint64_t cookie,
+			 uint32_t max)
+{
+	struct mdcache_inode *slot = NULL;
+	struct mdcache_access_key key;
+
+	if ((cookie == 0) || !mdcache_inode_unchanged(fsp, cookie)) {
+		return;
+	}
+	slot = mdcache_inode_peek(&fsp->file_id, cookie);
+	if ((slot != NULL) && dacl_max_key(fsp, slot, &key)) {
+		mdcache_access_put(&key, max);
+	}
+}
+
+/*
+ * fsp's DACL maximum for the current token in *max, from the cache or
+ * from the descriptor, which is then cached. When the file can't be
+ * cached or no maximum stands for the descriptor, *have_max is false
+ * and *psd holds it for the caller to walk.
+ */
+static NTSTATUS dacl_max_fetch(struct files_struct *fsp,
+			       TALLOC_CTX *mem_ctx,
+			       uint32_t *max,
+			       bool *have_max,
+			       struct security_descriptor **psd)
+{
+	uint64_t cookie = 0;
+	NTSTATUS status;
+
+	*psd = NULL;
+	*have_max = dacl_max_get(fsp, &cookie, max);
+	if (*have_max) {
+		return NT_STATUS_OK;
+	}
+	status = SMB_VFS_FGET_NT_ACL(metadata_fsp(fsp),
+				     (SECINFO_OWNER |
+				      SECINFO_GROUP |
+				      SECINFO_DACL),
+				     mem_ctx,
+				     psd);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+	if ((cookie != 0) && (*psd != NULL) &&
+	    dacl_max_from_sd(*psd, get_current_nttok(fsp->conn), max)) {
+		dacl_max_put(fsp, cookie, *max);
+		TALLOC_FREE(*psd);
+		*have_max = true;
 	}
 	return NT_STATUS_OK;
+}
+
+/*
+ * se_file_access_check() against the DACL's maximum: the bits of
+ * desired the ACEs don't grant, minus what the token's privileges
+ * grant, are rejected.
+ */
+static NTSTATUS access_check_dacl_max(uint32_t max,
+				      const struct security_token *token,
+				      bool use_privs,
+				      uint32_t desired,
+				      uint32_t *rejected)
+{
+	uint32_t remaining = desired & ~max;
+
+	if (remaining & SEC_FLAG_SYSTEM_SECURITY) {
+		if (!security_token_has_privilege(token, SEC_PRIV_SECURITY)) {
+			*rejected = remaining;
+			return NT_STATUS_PRIVILEGE_NOT_HELD;
+		}
+		remaining &= ~SEC_FLAG_SYSTEM_SECURITY;
+	}
+	if ((remaining & SEC_STD_WRITE_OWNER) &&
+	    security_token_has_privilege(token, SEC_PRIV_TAKE_OWNERSHIP)) {
+		remaining &= ~SEC_STD_WRITE_OWNER;
+	}
+	if (use_privs) {
+		if ((remaining & SEC_RIGHTS_PRIV_BACKUP) &&
+		    security_token_has_privilege(token, SEC_PRIV_BACKUP)) {
+			remaining &= ~SEC_RIGHTS_PRIV_BACKUP;
+		}
+		if ((remaining & SEC_RIGHTS_PRIV_RESTORE) &&
+		    security_token_has_privilege(token, SEC_PRIV_RESTORE)) {
+			remaining &= ~SEC_RIGHTS_PRIV_RESTORE;
+		}
+	}
+	*rejected = remaining;
+	return (remaining != 0) ? NT_STATUS_ACCESS_DENIED : NT_STATUS_OK;
 }
 
 NTSTATUS smbd_check_access_rights_fsp(struct files_struct *dirfsp,
@@ -269,6 +463,9 @@ NTSTATUS smbd_check_access_rights_fsp(struct files_struct *dirfsp,
 {
 	struct security_descriptor *sd = NULL;
 	uint32_t do_not_check_mask = 0;
+	uint32_t max = 0;
+	uint32_t rejected = 0;
+	bool have_max = false;
 	NTSTATUS status;
 
 	/* Cope with fake/printer fsp's. */
@@ -326,28 +523,48 @@ NTSTATUS smbd_check_access_rights_fsp(struct files_struct *dirfsp,
 		return status;
 	}
 
-	status = SMB_VFS_FGET_NT_ACL(metadata_fsp(fsp),
-				     (SECINFO_OWNER |
-				      SECINFO_GROUP |
-				      SECINFO_DACL),
-				     talloc_tos(),
-				     &sd);
+	status = dacl_max_fetch(fsp, talloc_tos(), &max, &have_max, &sd);
 	if (!NT_STATUS_IS_OK(status)) {
 		DBG_DEBUG("Could not get acl on %s: %s\n",
 			  fsp_str_dbg(fsp),
 			  nt_errstr(status));
 		return status;
 	}
+	if (!have_max) {
+		status = smbd_check_access_rights_sd(fsp->conn,
+						     dirfsp,
+						     fsp->fsp_name,
+						     sd,
+						     use_privs,
+						     access_mask,
+						     do_not_check_mask);
+		TALLOC_FREE(sd);
+		return status;
+	}
 
-	status = smbd_check_access_rights_sd(fsp->conn,
-					     dirfsp,
-					     fsp->fsp_name,
-					     sd,
-					     use_privs,
-					     access_mask,
-					     do_not_check_mask);
-	TALLOC_FREE(sd);
-	return status;
+	status = access_check_dacl_max(max,
+				       get_current_nttok(fsp->conn),
+				       use_privs,
+				       (access_mask & ~do_not_check_mask),
+				       &rejected);
+
+	DBG_DEBUG("File [%s] requesting [0x%"PRIx32"] "
+		  "returning [0x%"PRIx32"] (%s)\n",
+		  fsp_str_dbg(fsp),
+		  access_mask,
+		  rejected,
+		  nt_errstr(status));
+
+	if (NT_STATUS_IS_OK(status) ||
+	    !NT_STATUS_EQUAL(status, NT_STATUS_ACCESS_DENIED))
+	{
+		return status;
+	}
+	return smbd_check_access_rights_denied(fsp->conn,
+					      dirfsp,
+					      fsp->fsp_name,
+					      access_mask,
+					      rejected);
 }
 
 /*
@@ -360,6 +577,8 @@ NTSTATUS check_parent_access_fsp(struct files_struct *fsp,
 	NTSTATUS status;
 	struct security_descriptor *parent_sd = NULL;
 	uint32_t access_granted = 0;
+	uint32_t max = 0;
+	bool have_max = false;
 	bool delete_on_close_set;
 	TALLOC_CTX *frame = talloc_stackframe();
 
@@ -372,11 +591,7 @@ NTSTATUS check_parent_access_fsp(struct files_struct *fsp,
 		goto out;
 	}
 
-	status = SMB_VFS_FGET_NT_ACL(fsp,
-				(SECINFO_OWNER | SECINFO_GROUP | SECINFO_DACL),
-				frame,
-				&parent_sd);
-
+	status = dacl_max_fetch(fsp, frame, &max, &have_max, &parent_sd);
 	if (!NT_STATUS_IS_OK(status)) {
 		DBG_INFO("SMB_VFS_FGET_NT_ACL failed for "
 			"%s with error %s\n",
@@ -395,11 +610,19 @@ NTSTATUS check_parent_access_fsp(struct files_struct *fsp,
 	 * se_file_access_check() also takes care of
 	 * owner WRITE_DAC and READ_CONTROL.
 	 */
-	status = se_file_access_check(parent_sd,
-				get_current_nttok(fsp->conn),
-				false,
-				(access_mask & ~FILE_READ_ATTRIBUTES),
-				&access_granted);
+	if (have_max) {
+		status = access_check_dacl_max(max,
+					get_current_nttok(fsp->conn),
+					false,
+					(access_mask & ~FILE_READ_ATTRIBUTES),
+					&access_granted);
+	} else {
+		status = se_file_access_check(parent_sd,
+					get_current_nttok(fsp->conn),
+					false,
+					(access_mask & ~FILE_READ_ATTRIBUTES),
+					&access_granted);
+	}
 	if(!NT_STATUS_IS_OK(status)) {
 		DBG_INFO("access check "
 			"on directory %s for mask 0x%x returned (0x%x) %s\n",
@@ -3398,7 +3621,7 @@ static NTSTATUS check_and_store_share_mode(
 /*
  * Maximum access is a function of the security descriptor variant, the
  * read-only attribute, the user and the share, so files with the same
- * ACL share it.
+ * ACL share it. DELETE granted by the parent directory is not part of it.
  */
 static bool max_access_key(struct files_struct *fsp,
 			   const struct mdcache_inode *slot,
@@ -3430,6 +3653,18 @@ static bool max_access_key(struct files_struct *fsp,
 			 (readonly ? 4 : 0),
 	};
 	return true;
+}
+
+/* The cached maximum plus DELETE through the parent's FILE_DELETE_CHILD */
+static uint32_t with_parent_delete(struct files_struct *dirfsp,
+				   struct files_struct *fsp,
+				   uint32_t access_mask)
+{
+	if (!(access_mask & DELETE_ACCESS) &&
+	    can_delete_file_in_directory(fsp->conn, dirfsp, fsp->fsp_name)) {
+		access_mask |= DELETE_ACCESS;
+	}
+	return access_mask;
 }
 
 static NTSTATUS smbd_calculate_maximum_allowed_access_fsp(
@@ -3470,9 +3705,14 @@ static NTSTATUS smbd_calculate_maximum_allowed_access_fsp(
 	if (slot != NULL) {
 		cookie = slot->cookie;
 		cacheable = true;
-		if (max_access_key(fsp, slot, use_privs, ignore_readonly,
+		mdcache_sd_seq(fsp, &slot);
+		if ((slot != NULL) &&
+		    max_access_key(fsp, slot, use_privs, ignore_readonly,
 				   orig_access_mask, &key) &&
 		    mdcache_access_get(&key, p_access_mask)) {
+			*p_access_mask = with_parent_delete(dirfsp,
+							    fsp,
+							    *p_access_mask);
 			return NT_STATUS_OK;
 		}
 	}
@@ -3526,16 +3766,6 @@ static NTSTATUS smbd_calculate_maximum_allowed_access_fsp(
 
 	*p_access_mask = (access_granted | FILE_READ_ATTRIBUTES);
 
-	if (!(access_granted & DELETE_ACCESS)) {
-		// depends on the parent, which changes with every entry
-		cacheable = false;
-		if (can_delete_file_in_directory(fsp->conn,
-				dirfsp,
-				fsp->fsp_name)) {
-			*p_access_mask |= DELETE_ACCESS;
-		}
-	}
-
 	if (!CAN_WRITE(fsp->conn)) {
 		*p_access_mask &= ~(FILE_GENERIC_WRITE | DELETE_ACCESS);
 	}
@@ -3575,13 +3805,14 @@ done:
 			mdcache_access_put(&key, *p_access_mask);
 		}
 	}
+	*p_access_mask = with_parent_delete(dirfsp, fsp, *p_access_mask);
 	return NT_STATUS_OK;
 }
 
 /*
  * smbd_calculate_access_mask_fsp(dirfsp, fsp, false, false,
  * SEC_FLAG_MAXIMUM_ALLOWED, ...) answered from the metadata cache alone,
- * for a file that wasn't opened
+ * for an fsp_new_fdless() entry of a listing
  */
 bool smbd_cached_maximum_access(struct files_struct *fsp,
 				const struct mdcache_inode *slot,
@@ -3596,6 +3827,10 @@ bool smbd_cached_maximum_access(struct files_struct *fsp,
 				   SEC_FLAG_MAXIMUM_ALLOWED, &key) ||
 		   !mdcache_access_get(&key, &access_mask)) {
 		return false;
+	} else if (!(access_mask & DELETE_ACCESS) && (fsp->dirfsp == NULL)) {
+		return false;
+	} else {
+		access_mask = with_parent_delete(fsp->dirfsp, fsp, access_mask);
 	}
 
 	*access_mask_out = access_mask & fsp->conn->share_access;

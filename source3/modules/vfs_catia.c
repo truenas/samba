@@ -617,6 +617,7 @@ static int catia_fstatat(struct vfs_handle_struct *handle,
 			 int flags)
 {
 	struct smb_filename *tmp = NULL;
+	int saved_errno;
 	int ret;
 
 	tmp = cp_smb_filename(talloc_tos(), smb_fname);
@@ -636,13 +637,124 @@ static int catia_fstatat(struct vfs_handle_struct *handle,
 	}
 
 	ret = SMB_VFS_NEXT_FSTATAT(handle, dirfsp, tmp, sbuf, flags);
+	saved_errno = errno;
+	TALLOC_FREE(tmp);
+	errno = saved_errno;
+	return ret;
+}
 
-	{
-		int err = errno;
-		TALLOC_FREE(tmp);
-		errno = err;
+/* The names of the batch in flight, put back at the wait */
+struct catia_batch_names {
+	struct vfs_attr_entry *ents;
+	size_t count;
+	const char **names;
+};
+
+static struct catia_batch_names catia_batch_inflight;
+
+static void catia_batch_restore(struct vfs_attr_entry *ents,
+				size_t count,
+				const char **names)
+{
+	size_t i;
+
+	for (i = 0; i < count; i++) {
+		ents[i].name = names[i];
 	}
+	TALLOC_FREE(names);
+}
 
+/* *pnames gets the originals and owns the translations */
+static int catia_batch_translate(struct vfs_handle_struct *handle,
+				 struct share_mapping_entry *selected,
+				 struct vfs_attr_entry *ents,
+				 size_t count,
+				 const char ***pnames)
+{
+	const char **names = NULL;
+	size_t i;
+	int ret;
+
+	names = talloc_array(handle, const char *, count);
+	if (names == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	for (i = 0; i < count; i++) {
+		char *mapped = NULL;
+
+		names[i] = ents[i].name;
+		ret = string_replace_allocate(handle->conn,
+					      names[i],
+					      selected->mappings,
+					      names,
+					      &mapped,
+					      vfs_translate_to_unix);
+		if (ret != 0) {
+			catia_batch_restore(ents, i, names);
+			errno = ret;
+			return -1;
+		}
+		ents[i].name = mapped;
+	}
+	*pnames = names;
+	return 0;
+}
+
+static int catia_batch_attr_submit(struct vfs_handle_struct *handle,
+				   const struct files_struct *dirfsp,
+				   struct vfs_attr_entry *ents,
+				   size_t count,
+				   uint32_t want)
+{
+	const char **names = NULL;
+	struct share_mapping_entry *selected = NULL;
+	int saved_errno;
+	int ret;
+
+	if ((count == 0) || !init_mappings(handle->conn, &selected)) {
+		return SMB_VFS_NEXT_BATCH_ATTR_SUBMIT(
+			handle, dirfsp, ents, count, want);
+	}
+	if (catia_batch_inflight.names != NULL) {
+		errno = EBUSY;
+		return -1;
+	}
+	ret = catia_batch_translate(handle, selected, ents, count, &names);
+	if (ret != 0) {
+		return -1;
+	}
+	ret = SMB_VFS_NEXT_BATCH_ATTR_SUBMIT(handle, dirfsp, ents, count, want);
+	if (ret != 0) {
+		saved_errno = errno;
+		catia_batch_restore(ents, count, names);
+		errno = saved_errno;
+		return ret;
+	}
+	catia_batch_inflight = (struct catia_batch_names) {
+		.ents = ents,
+		.count = count,
+		.names = names,
+	};
+	return 0;
+}
+
+static int catia_batch_attr_wait(struct vfs_handle_struct *handle,
+				 const struct files_struct *dirfsp,
+				 struct vfs_attr_entry *ents,
+				 size_t count)
+{
+	int saved_errno;
+	int ret;
+
+	ret = SMB_VFS_NEXT_BATCH_ATTR_WAIT(handle, dirfsp, ents, count);
+	saved_errno = errno;
+	if ((catia_batch_inflight.ents == ents) &&
+	    (catia_batch_inflight.count == count)) {
+		catia_batch_restore(ents, count, catia_batch_inflight.names);
+		ZERO_STRUCT(catia_batch_inflight);
+	}
+	errno = saved_errno;
 	return ret;
 }
 
@@ -1972,6 +2084,8 @@ static struct vfs_fn_pointers vfs_catia_fns = {
 	.flistxattr_fn = catia_flistxattr,
 	.fremovexattr_fn = catia_fremovexattr,
 	.fsetxattr_fn = catia_fsetxattr,
+	.batch_attr_submit_fn = catia_batch_attr_submit,
+	.batch_attr_wait_fn = catia_batch_attr_wait,
 };
 
 static_decl_vfs;

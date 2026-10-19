@@ -608,4 +608,17 @@
 #define SMB_VFS_NEXT_FREADDIR_ATTR(handle, fsp, mem_ctx, attr_data) \
 	smb_vfs_call_freaddir_attr((handle)->next, (fsp), (mem_ctx), (attr_data))
 
+#define SMB_VFS_BATCH_ATTR_SUBMIT(conn, dirfsp, ents, count, want) \
+	smb_vfs_call_batch_attr_submit((conn)->vfs_handles, (dirfsp), (ents), \
+				       (count), (want))
+#define SMB_VFS_NEXT_BATCH_ATTR_SUBMIT(handle, dirfsp, ents, count, want) \
+	smb_vfs_call_batch_attr_submit((handle)->next, (dirfsp), (ents), \
+				       (count), (want))
+#define SMB_VFS_BATCH_ATTR_WAIT(conn, dirfsp, ents, count) \
+	smb_vfs_call_batch_attr_wait((conn)->vfs_handles, (dirfsp), (ents), \
+					(count))
+#define SMB_VFS_NEXT_BATCH_ATTR_WAIT(handle, dirfsp, ents, count) \
+	smb_vfs_call_batch_attr_wait((handle)->next, (dirfsp), (ents), \
+					(count))
+
 #endif /* _VFS_MACROS_H */
