@@ -391,6 +391,27 @@ int vfs_not_implemented_fstatat(
 }
 
 _PUBLIC_
+int vfs_not_implemented_batch_attr_submit(struct vfs_handle_struct *handle,
+					  const struct files_struct *dirfsp,
+					  struct vfs_attr_entry *ents,
+					  size_t count,
+					  uint32_t want)
+{
+	errno = ENOSYS;
+	return -1;
+}
+
+_PUBLIC_
+int vfs_not_implemented_batch_attr_wait(struct vfs_handle_struct *handle,
+					   const struct files_struct *dirfsp,
+					   struct vfs_attr_entry *ents,
+					   size_t count)
+{
+	errno = ENOSYS;
+	return -1;
+}
+
+_PUBLIC_
 uint64_t vfs_not_implemented_get_alloc_size(struct vfs_handle_struct *handle,
 					    struct files_struct *fsp,
 					    const SMB_STRUCT_STAT *sbuf)
@@ -1168,6 +1189,8 @@ static struct vfs_fn_pointers vfs_not_implemented_fns = {
 	.durable_cookie_fn = vfs_not_implemented_durable_cookie,
 	.durable_disconnect_fn = vfs_not_implemented_durable_disconnect,
 	.durable_reconnect_fn = vfs_not_implemented_durable_reconnect,
+	.batch_attr_submit_fn = vfs_not_implemented_batch_attr_submit,
+	.batch_attr_wait_fn = vfs_not_implemented_batch_attr_wait,
 };
 
 static_decl_vfs;

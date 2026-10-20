@@ -20,11 +20,16 @@
 #define __SMBD_TRUENAS_MDCACHE_H__
 
 struct smbd_server_connection;
+struct connection_struct;
+
+#define ACL4_XATTR "system.nfs4_acl_xdr"
 
 #define MDCACHE_HAVE_DOSMODE	0x1
 #define MDCACHE_HAVE_STREAMS	0x2	/* MDCACHE_STREAMS and MDCACHE_MACMETA */
 #define MDCACHE_STREAMS		0x4	/* has named streams */
 #define MDCACHE_MACMETA		0x8	/* has an AfpInfo or resource fork */
+#define MDCACHE_ABE_VISIBLE	0x10	/* the ABE context could open it */
+#define MDCACHE_ABE_CTX_SHIFT	16	/* flags >> 16: ABE context, 0 none */
 
 /*
  * What smbd derived from one version of a file, keyed by its file_id
@@ -38,12 +43,14 @@ struct mdcache_inode {
 	int64_t btime_sec;	/* create time from DOSATTRIB */
 	uint32_t btime_nsec;	/* UTIME_OMIT if DOSATTRIB has none */
 	uint32_t dosmode;
-	uint32_t flags;
+	uint32_t flags;		/* MDCACHE_* and the ABE context */
 	uint32_t tick;
 };
 
 /* mdcache_access_key flag: whether a TrueNAS ABE read-only open succeeded */
 #define MDCACHE_ACCESS_ABE	0x8
+/* mdcache_access_key flag: the DACL's maximum for the token, see open.c */
+#define MDCACHE_ACCESS_DACL_MAX	0x10
 
 struct mdcache_access_key {
 	uint64_t sd_seq;
@@ -57,10 +64,13 @@ struct mdcache_access_key {
 void mdcache_bump_epoch(struct smbd_server_connection *sconn);
 void mdcache_stat_taken(struct files_struct *fsp, const SMB_STRUCT_STAT *sbuf);
 struct mdcache_inode *mdcache_inode_fetch(struct files_struct *fsp);
+void mdcache_inode_prefetch(const struct file_id *id);
 struct mdcache_inode *mdcache_inode_peek(const struct file_id *id,
 					 uint64_t cookie);
 bool mdcache_inode_unchanged(struct files_struct *fsp, uint64_t cookie);
 uint64_t mdcache_sd_variant(DATA_BLOB content);
+uint64_t mdcache_sd_seq(struct files_struct *fsp,
+			struct mdcache_inode **pslot);
 bool mdcache_sd_get(uint64_t seq, uint32_t security_info,
 		    TALLOC_CTX *mem_ctx, struct security_descriptor **ppdesc);
 void mdcache_sd_put(uint64_t seq, uint32_t security_info,
@@ -70,6 +80,10 @@ bool mdcache_access_get(const struct mdcache_access_key *key,
 void mdcache_access_put(const struct mdcache_access_key *key,
 			uint32_t access_mask);
 void mdcache_flush_access(void);
+uint32_t mdcache_abe_ctx(struct connection_struct *conn);
+bool mdcache_abe_get(const struct mdcache_inode *slot, uint32_t ctx,
+		     bool *visible);
+void mdcache_abe_put(struct mdcache_inode *slot, uint32_t ctx, bool visible);
 void mdcache_smbtorture(struct files_struct *fsp, uint32_t idle_timeout,
 			uint32_t *slots, uint32_t *count);
 
