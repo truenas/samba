@@ -535,6 +535,8 @@ typedef struct files_struct {
 
 	struct files_struct *base_fsp; /* placeholder for delete on close */
 	struct files_struct *stream_fsp; /* backlink from base_fsp */
+	/* TrueNAS: the directory an fsp_new_fdless() entry was listed from */
+	struct files_struct *dirfsp;
 
 	/*
 	 * Cache of share_mode_data->flags
@@ -739,6 +741,8 @@ typedef struct files_struct {
 #define TCON_FLAG_NOXDEV		0x20
 #define TCON_FLAG_DONT_DESCEND		0x40
 #define TCON_FLAG_FIND_ASYNC_DELAY	0x80
+/* SDs are a function of the raw NFSv4 ACL, owner, group and mode */
+#define TCON_FLAG_MDCACHE_SD		0x100
 
 struct vuid_cache_entry {
 	struct auth_session_info *session_info;
@@ -979,6 +983,15 @@ struct vfs_open_how {
 	int flags;
 	mode_t mode;
 	uint64_t resolve;
+};
+
+/* SMB_VFS_BATCH_ATTR_SUBMIT() want bits */
+#define VFS_ATTR_STAT	0x01	/* ents[i].st of ents[i].name */
+
+struct vfs_attr_entry {
+	const char *name;	/* relative to dirfsp */
+	uint32_t got;		/* the wants answered for this entry */
+	SMB_STRUCT_STAT st;
 };
 
 #define VFS_RENAME_HOW_NO_REPLACE 1
@@ -1390,6 +1403,25 @@ struct vfs_fn_pointers {
 				     struct files_struct *fsp,
 				     TALLOC_CTX *mem_ctx,
 				     struct readdir_attr_data **attr_data);
+
+	/*
+	 * Stat several entries of dirfsp in one batch, without following
+	 * symlinks, possibly with privilege: dirfsp must have passed the
+	 * listing access check. _submit starts the batch, _wait waits for
+	 * it and fills the entries, which must not move in between; one
+	 * batch at a time per connection. ENOSYS when no module in the
+	 * chain can. A module that rewrites names in fstatat_fn must
+	 * implement these too.
+	 */
+	int (*batch_attr_submit_fn)(struct vfs_handle_struct *handle,
+				    const struct files_struct *dirfsp,
+				    struct vfs_attr_entry *ents,
+				    size_t count,
+				    uint32_t want);
+	int (*batch_attr_wait_fn)(struct vfs_handle_struct *handle,
+				     const struct files_struct *dirfsp,
+				     struct vfs_attr_entry *ents,
+				     size_t count);
 };
 
 /*
@@ -1914,6 +1946,15 @@ NTSTATUS smb_vfs_call_freaddir_attr(struct vfs_handle_struct *handle,
 				    struct files_struct *fsp,
 				    TALLOC_CTX *mem_ctx,
 				    struct readdir_attr_data **attr_data);
+int smb_vfs_call_batch_attr_submit(struct vfs_handle_struct *handle,
+				   const struct files_struct *dirfsp,
+				   struct vfs_attr_entry *ents,
+				   size_t count,
+				   uint32_t want);
+int smb_vfs_call_batch_attr_wait(struct vfs_handle_struct *handle,
+				    const struct files_struct *dirfsp,
+				    struct vfs_attr_entry *ents,
+				    size_t count);
 
 NTSTATUS smb_register_vfs(int version, const char *name,
 			  const struct vfs_fn_pointers *fns);
@@ -2239,6 +2280,15 @@ NTSTATUS vfs_not_implemented_freaddir_attr(struct vfs_handle_struct *handle,
 					   struct files_struct *dirfsp,
 					   TALLOC_CTX *mem_ctx,
 					   struct readdir_attr_data **pattr_data);
+int vfs_not_implemented_batch_attr_submit(struct vfs_handle_struct *handle,
+					  const struct files_struct *dirfsp,
+					  struct vfs_attr_entry *ents,
+					  size_t count,
+					  uint32_t want);
+int vfs_not_implemented_batch_attr_wait(struct vfs_handle_struct *handle,
+					   const struct files_struct *dirfsp,
+					   struct vfs_attr_entry *ents,
+					   size_t count);
 struct tevent_req *vfs_not_implemented_get_dos_attributes_send(
 			TALLOC_CTX *mem_ctx,
 			struct tevent_context *ev,

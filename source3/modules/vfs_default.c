@@ -1412,6 +1412,25 @@ static int vfswrap_fstatat(
 	return result;
 }
 
+static int vfswrap_batch_attr_submit(struct vfs_handle_struct *handle,
+				     const struct files_struct *dirfsp,
+				     struct vfs_attr_entry *ents,
+				     size_t count,
+				     uint32_t want)
+{
+	errno = ENOSYS;
+	return -1;
+}
+
+static int vfswrap_batch_attr_wait(struct vfs_handle_struct *handle,
+				      const struct files_struct *dirfsp,
+				      struct vfs_attr_entry *ents,
+				      size_t count)
+{
+	errno = EINVAL;
+	return -1;
+}
+
 static NTSTATUS vfswrap_translate_name(struct vfs_handle_struct *handle,
 				       const char *name,
 				       enum vfs_translate_direction direction,
@@ -4153,6 +4172,8 @@ static struct vfs_fn_pointers vfs_default_fns = {
 	.durable_cookie_fn = vfswrap_durable_cookie,
 	.durable_disconnect_fn = vfswrap_durable_disconnect,
 	.durable_reconnect_fn = vfswrap_durable_reconnect,
+	.batch_attr_submit_fn = vfswrap_batch_attr_submit,
+	.batch_attr_wait_fn = vfswrap_batch_attr_wait,
 };
 
 static_decl_vfs;

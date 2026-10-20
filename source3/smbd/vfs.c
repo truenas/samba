@@ -2093,6 +2093,32 @@ int smb_vfs_call_fstatat(
 	return handle->fns->fstatat_fn(handle, dirfsp, smb_fname, sbuf, flags);
 }
 
+int smb_vfs_call_batch_attr_submit(struct vfs_handle_struct *handle,
+				   const struct files_struct *dirfsp,
+				   struct vfs_attr_entry *ents,
+				   size_t count,
+				   uint32_t want)
+{
+	VFS_FIND(batch_attr_submit);
+	return handle->fns->batch_attr_submit_fn(handle,
+						 dirfsp,
+						 ents,
+						 count,
+						 want);
+}
+
+int smb_vfs_call_batch_attr_wait(struct vfs_handle_struct *handle,
+				    const struct files_struct *dirfsp,
+				    struct vfs_attr_entry *ents,
+				    size_t count)
+{
+	VFS_FIND(batch_attr_wait);
+	return handle->fns->batch_attr_wait_fn(handle,
+						  dirfsp,
+						  ents,
+						  count);
+}
+
 uint64_t smb_vfs_call_get_alloc_size(struct vfs_handle_struct *handle,
 				     struct files_struct *fsp,
 				     const SMB_STRUCT_STAT *sbuf)

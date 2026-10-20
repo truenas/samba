@@ -215,6 +215,10 @@ struct statx;
 void init_stat_ex_from_stat (struct stat_ex *dst,
 			    const struct statx *src,
 			    bool fake_dir_create_times);
+unsigned int sys_statx_mask(void);
+void sys_stat_ex_from_statx(SMB_STRUCT_STAT *sbuf,
+			    const struct statx *src,
+			    bool fake_dir_create_times);
 
 /* The following definitions come from lib/system_smbd.c  */
 
