@@ -278,6 +278,9 @@ void init_stat_ex_from_stat (struct stat_ex *dst,
 	dst->st_ex_change_cookie = src->stx_change_cookie;
 #endif
 	dst->st_ex_gen = src->stx_gen;
+	if (src->stx_mask & STATX_GEN) {
+		dst->st_ex_iflags |= ST_EX_IFLAG_HAS_GEN;
+	}
 	dst->st_ex_mnt_id = src->stx_mnt_id;
 	dst->st_ex_attributes = src->stx_attributes;
 }

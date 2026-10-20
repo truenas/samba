@@ -810,6 +810,30 @@ disconnect_out:
 	return -1;
 }
 
+#define ZC_FILE_ID_OBJ_BITS 48	/* ZFS object numbers are below 2^48 */
+
+/*
+ * Off the share's dataset: device minor above the object number. Minors
+ * are unique among mounted filesystems and never 0.
+ */
+static uint64_t zfs_core_fs_file_id(struct vfs_handle_struct *handle,
+				    const SMB_STRUCT_STAT *psbuf)
+{
+	unsigned int dev_minor = minor(psbuf->st_ex_dev);
+
+	if ((psbuf->st_ex_dev == handle->conn->base_share_dev) ||
+	    !(psbuf->st_ex_iflags & ST_EX_IFLAG_HAS_GEN) ||
+	    (major(psbuf->st_ex_dev) != 0) ||
+	    (dev_minor == 0) ||
+	    (dev_minor > UINT16_MAX) ||
+	    ((psbuf->st_ex_ino >> ZC_FILE_ID_OBJ_BITS) != 0)) {
+		return SMB_VFS_NEXT_FS_FILE_ID(handle, psbuf);
+	}
+
+	return ((uint64_t)dev_minor << ZC_FILE_ID_OBJ_BITS) |
+	       psbuf->st_ex_ino;
+}
+
 static struct vfs_fn_pointers zfs_core_fns = {
 	.fs_capabilities_fn = zfs_core_fs_capabilities,
 	.chdir_fn = zfs_core_chdir,
@@ -822,7 +846,8 @@ static struct vfs_fn_pointers zfs_core_fns = {
 	.offload_write_recv_fn = zfs_core_offload_write_recv,
 	.get_quota_fn = zfs_core_get_quota,
 	.set_quota_fn = zfs_core_set_quota,
-	.disk_free_fn = zfs_core_disk_free
+	.disk_free_fn = zfs_core_disk_free,
+	.fs_file_id_fn = zfs_core_fs_file_id
 };
 
 static_decl_vfs
