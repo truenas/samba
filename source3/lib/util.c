@@ -1397,6 +1397,8 @@ bool mask_match(const char *string, const char *pattern, bool is_case_sensitive)
 		string = ".";
 	if (ISDOT(pattern))
 		return False;
+	if ((pattern[0] == '*') && (pattern[1] == '\0'))
+		return True;
 
 	return ms_fnmatch_protocol(pattern, string, Protocol, is_case_sensitive) == 0;
 }

@@ -69,6 +69,12 @@ struct vfs_io_uring_queue_config {
 	uint async_cnt;
 };
 
+struct vfs_io_uring_batch {
+	struct vfs_attr_entry *ents;	/* the caller's, filled at the wait */
+	size_t count;
+	size_t done;
+};
+
 struct vfs_io_uring_config {
 	struct io_uring uring;
 	struct tevent_fd *fde;
@@ -81,7 +87,19 @@ struct vfs_io_uring_config {
 	struct vfs_io_uring_request *pending;
 	struct vfs_io_uring_queue_config writeq;
 	struct vfs_io_uring_queue_config readq;
+
+	/* the batch ops' ring; their completions stay out of fde's */
+	struct io_uring batch;
+	bool batch_ready;
+	bool batch_failed;
+	bool fake_dctime;
+	struct vfs_io_uring_batch inflight;
+	uint16_t batch_personality;	/* root's, 0 if unregistered */
+	struct statx *batch_bufs;
 };
+
+static int vfs_io_uring_batch_reap(struct vfs_io_uring_config *config,
+				   struct vfs_attr_entry *ents);
 
 struct vfs_io_uring_request {
 	struct vfs_io_uring_request *prev, *next;
@@ -139,6 +157,16 @@ static void vfs_io_uring_config_destroy(struct vfs_io_uring_config *config,
 	};
 
 	PROFILE_TIMESTAMP(&start_time);
+
+	if (config->batch_ready) {
+		if (config->inflight.count != 0) {
+			/* the kernel still writes batch_bufs */
+			(void)vfs_io_uring_batch_reap(config, NULL);
+		}
+		io_uring_queue_exit(&config->batch);
+		config->batch_ready = false;
+	}
+	config->batch_failed = true;
 
 	if (config->uring.ring_fd != -1) {
 		/* TODO: cancel queued and pending requests */
@@ -278,6 +306,9 @@ static int vfs_io_uring_connect(vfs_handle_struct *handle, const char *service,
 			VFS_URING_READQ_DEFAULT);
 		config->readq.queue_sz = VFS_URING_READQ_DEFAULT;
 	}
+
+	config->fake_dctime =
+		lp_fake_directory_create_times(SNUM(handle->conn));
 
 	ret = io_uring_queue_init(num_entries, &config->uring, flags);
 	if (ret < 0) {
@@ -1060,6 +1091,254 @@ static void vfs_io_uring_disconnect(vfs_handle_struct *handle)
 	}
 }
 
+#define VFS_IO_URING_BATCH_ENTRIES 256
+/* Stats a worker runs in a row without going back to the queue lock */
+#define VFS_IO_URING_BATCH_LINK 16
+
+static int vfs_io_uring_batch_init(struct vfs_io_uring_config *config,
+				   size_t count)
+{
+	unsigned entries = MIN(MAX(count, 8), VFS_IO_URING_BATCH_ENTRIES);
+	int ret;
+
+	if (config->batch_failed) {
+		errno = ENOSYS;
+		return -1;
+	}
+	if (config->batch_ready) {
+		return 0;
+	}
+
+	/*
+	 * No DEFER_TASKRUN: a worker would hand each link back to this
+	 * task instead of running it. COOP_TASKRUN: completions run their
+	 * task work at this task's next kernel entry instead of
+	 * interrupting it. Older kernels: no flags.
+	 */
+	ret = io_uring_queue_init(entries,
+				  &config->batch,
+				  IORING_SETUP_COOP_TASKRUN);
+	if (ret == -EINVAL) {
+		ret = io_uring_queue_init(entries, &config->batch, 0);
+	}
+	if (ret < 0) {
+		DBG_NOTICE("io_uring_queue_init() for the batch ring failed: "
+			   "%s\n", strerror(-ret));
+		config->batch_failed = true;
+		errno = ENOSYS;
+		return -1;
+	}
+#ifdef HAVE_IO_URING_RING_DONTFORK
+	ret = io_uring_ring_dontfork(&config->batch);
+	if (ret < 0) {
+		DBG_NOTICE("io_uring_ring_dontfork() failed: %s\n",
+			   strerror(-ret));
+		io_uring_queue_exit(&config->batch);
+		config->batch_failed = true;
+		errno = ENOSYS;
+		return -1;
+	}
+#endif /* HAVE_IO_URING_RING_DONTFORK */
+	config->batch_ready = true;
+
+	/*
+	 * Stat as root: the client holds dirfsp with FILE_LIST_DIRECTORY
+	 * and a stat by name needs only traverse on it; root skips the
+	 * directory's ACL walk and keeps the lookup in RCU mode. The
+	 * personality snapshots the credentials, hence become_root().
+	 */
+	become_root();
+	ret = io_uring_register_personality(&config->batch);
+	unbecome_root();
+	if (ret < 0) {
+		DBG_NOTICE("io_uring_register_personality() failed: %s; "
+			   "batch stats run as the user\n",
+			   strerror(-ret));
+	} else {
+		config->batch_personality = ret;
+	}
+	return 0;
+}
+
+/* ents NULL: discard the results */
+static int vfs_io_uring_batch_reap(struct vfs_io_uring_config *config,
+				   struct vfs_attr_entry *ents)
+{
+	struct vfs_io_uring_batch *b = &config->inflight;
+	int retries = 0;
+
+	while (b->done < b->count) {
+		struct io_uring_cqe *cqe = NULL;
+		unsigned head;
+		unsigned nr = 0;
+		int ret;
+
+		ret = io_uring_wait_cqe_nr(&config->batch,
+					   &cqe,
+					   b->count - b->done);
+		if (ret == -EINTR) {
+			continue;
+		}
+		if (((ret == -EAGAIN) || (ret == -EBUSY)) && (retries++ < 10)) {
+			continue;
+		}
+		if (ret < 0) {
+			/* requests may be in flight: keep the ring */
+			DBG_WARNING("io_uring_wait_cqe_nr() failed: %s; "
+				    "%zu of %zu entries stat'ed, batch stats "
+				    "off for this connection\n",
+				    strerror(-ret), b->done, b->count);
+			config->batch_failed = true;
+			ZERO_STRUCTP(b);
+			errno = -ret;
+			return -1;
+		}
+
+		io_uring_for_each_cqe(&config->batch, head, cqe) {
+			size_t i = io_uring_cqe_get_data64(cqe);
+
+			nr++;
+			if (i >= b->count) {
+				continue;
+			}
+			b->done++;
+			if ((ents != NULL) && (cqe->res >= 0)) {
+				sys_stat_ex_from_statx(&ents[i].st,
+						       &config->batch_bufs[i],
+						       config->fake_dctime);
+				ents[i].got |= VFS_ATTR_STAT;
+			}
+		}
+		io_uring_cq_advance(&config->batch, nr);
+	}
+	ZERO_STRUCTP(b);
+	return 0;
+}
+
+static int vfs_io_uring_batch_start(struct vfs_io_uring_config *config,
+				    int dirfd,
+				    struct vfs_attr_entry *ents,
+				    size_t count)
+{
+	struct vfs_io_uring_batch *b = &config->inflight;
+	struct statx *bufs = NULL;
+	unsigned int mask = sys_statx_mask();
+	size_t submitted = 0;
+	int retries = 0;
+
+	if (vfs_io_uring_batch_init(config, count) != 0) {
+		return -1;
+	}
+	if (talloc_array_length(config->batch_bufs) < count) {
+		bufs = talloc_realloc(config, config->batch_bufs,
+				      struct statx, count);
+		if (bufs == NULL) {
+			errno = ENOMEM;
+			return -1;
+		}
+		config->batch_bufs = bufs;
+	}
+	bufs = config->batch_bufs;
+	/* zeroed for memcheck, which cannot see the kernel fill them */
+	memset(bufs, 0, count * sizeof(struct statx));
+
+	*b = (struct vfs_io_uring_batch) {
+		.ents = ents,
+		.count = count,
+	};
+
+	while (submitted < count) {
+		int ret;
+
+		while (submitted < count) {
+			struct io_uring_sqe *sqe =
+				io_uring_get_sqe(&config->batch);
+
+			if (sqe == NULL) {
+				break;
+			}
+			io_uring_prep_statx(sqe,
+					    dirfd,
+					    ents[submitted].name,
+					    AT_SYMLINK_NOFOLLOW,
+					    mask,
+					    &bufs[submitted]);
+			io_uring_sqe_set_data64(sqe, submitted);
+			sqe->personality = config->batch_personality;
+			/* a hard link: a stat that fails does not sever it */
+			if (((submitted + 1) % VFS_IO_URING_BATCH_LINK != 0) &&
+			    (submitted + 1 < count)) {
+				sqe->flags |= IOSQE_IO_HARDLINK;
+			}
+			submitted++;
+		}
+		SMB_ASSERT(submitted > 0);
+
+		do {
+			ret = io_uring_submit(&config->batch);
+		} while ((ret == -EINTR) ||
+			 (((ret == -EAGAIN) || (ret == -EBUSY)) &&
+			  (retries++ < 10)));
+		if (ret < 0) {
+			/* requests may be in flight: keep the ring */
+			DBG_WARNING("io_uring_submit() failed: %s; batch stats "
+				    "off for this connection\n",
+				    strerror(-ret));
+			config->batch_failed = true;
+			ZERO_STRUCTP(b);
+			errno = -ret;
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static int vfs_io_uring_batch_attr_submit(struct vfs_handle_struct *handle,
+					  const struct files_struct *dirfsp,
+					  struct vfs_attr_entry *ents,
+					  size_t count,
+					  uint32_t want)
+{
+	struct vfs_io_uring_config *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct vfs_io_uring_config,
+				smb_panic(__location__));
+
+	if ((count == 0) || !(want & VFS_ATTR_STAT)) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (config->inflight.count != 0) {
+		errno = EBUSY;
+		return -1;
+	}
+	return vfs_io_uring_batch_start(config,
+					fsp_get_pathref_fd(dirfsp),
+					ents,
+					count);
+}
+
+static int vfs_io_uring_batch_attr_wait(struct vfs_handle_struct *handle,
+					const struct files_struct *dirfsp,
+					struct vfs_attr_entry *ents,
+					size_t count)
+{
+	struct vfs_io_uring_config *config = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct vfs_io_uring_config,
+				smb_panic(__location__));
+
+	if ((config->inflight.count == 0) ||
+	    (config->inflight.ents != ents) ||
+	    (config->inflight.count != count)) {
+		errno = EINVAL;
+		return -1;
+	}
+	return vfs_io_uring_batch_reap(config, ents);
+}
+
 static struct vfs_fn_pointers vfs_io_uring_fns = {
 	.connect_fn = vfs_io_uring_connect,
 	.openat_fn = vfs_io_uring_openat,
@@ -1070,6 +1349,8 @@ static struct vfs_fn_pointers vfs_io_uring_fns = {
 	.pwrite_recv_fn = vfs_io_uring_pwrite_recv,
 	.fsync_send_fn = vfs_io_uring_fsync_send,
 	.fsync_recv_fn = vfs_io_uring_fsync_recv,
+	.batch_attr_submit_fn = vfs_io_uring_batch_attr_submit,
+	.batch_attr_wait_fn = vfs_io_uring_batch_attr_wait,
 };
 
 static_decl_vfs;

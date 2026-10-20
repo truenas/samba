@@ -44,6 +44,28 @@
 
 /* Make directory handle internals available. */
 
+/*
+ * A window of names read ahead of a listing and stat'ed in one batch
+ * for dirent_from_cache(); the next window's batch runs while this one
+ * goes out.
+ */
+struct dir_prefetch_window {
+	char **names;
+	struct vfs_attr_entry *ents;	/* names[i] and its stat */
+	struct file_id *ids;		/* of the stat'ed entries */
+	size_t count;
+	size_t next;
+};
+
+struct dir_stat_prefetch {
+	size_t batch;		/* window size, 0 off */
+	bool enabled;		/* the listing is on the cache path */
+	struct dir_prefetch_window win[2];
+	uint8_t cur;		/* win[cur] goes out, win[!cur] is read ahead */
+	const SMB_STRUCT_STAT *cur_st;	/* of the last name returned */
+	const struct file_id *cur_id;
+};
+
 struct smb_Dir {
 	connection_struct *conn;
 	DIR *dir;
@@ -52,7 +74,18 @@ struct smb_Dir {
 	bool case_sensitive;
 	files_struct *fsp; /* Back pointer to containing fsp, only
 			      set from OpenDir_fsp(). */
+	struct dir_stat_prefetch prefetch;
+	struct files_struct *entry_fsp;	/* dir_entry_fsp() */
+	size_t entry_name_at;		/* name's offset in its path */
 };
+
+static void dir_prefetch_reset(struct smb_Dir *dir_hnd);
+
+/* the batch in flight, one per smbd */
+static struct {
+	struct smb_Dir *hnd;
+	struct dir_prefetch_window *win;
+} dir_prefetch_inflight;
 
 struct dptr_struct {
 	struct dptr_struct *next, *prev;
@@ -258,6 +291,12 @@ NTSTATUS dptr_create(connection_struct *conn,
 		return NT_STATUS_NO_MEMORY;
 	}
 	dptr->has_wild = has_wild;
+	if (has_wild) {
+		/* a window is stat'ed before the one before it has gone out */
+		int batch = lp_parm_int(SNUM(conn), "smbd", "dir prefetch", 32);
+
+		dir_hnd->prefetch.batch = (batch > 0) ? batch : 0;
+	}
 
 	dptr->attr = attr;
 
@@ -555,23 +594,75 @@ static bool dirent_abe_key(connection_struct *conn,
 	return true;
 }
 
+/* The open's answer, for the file and, once known, its SD variant */
 static void dirent_abe_remember(struct files_struct *fsp)
 {
 	const SMB_STRUCT_STAT *st = &fsp->fsp_name->st;
 	struct mdcache_inode *slot = NULL;
 	struct mdcache_access_key key;
+	bool visible;
 
 	if (!S_ISREG(st->st_ex_mode) && !S_ISDIR(st->st_ex_mode)) {
 		return;
 	}
 
-	/* A slot matching the stat taken after the open predates the open */
-	slot = mdcache_inode_peek(&fsp->file_id, st->st_ex_change_cookie);
-	if ((slot != NULL) && dirent_abe_key(fsp->conn, slot, &key)) {
-		mdcache_access_put(&key,
-				   (fsp_get_status_flags(fsp) & O_PATH) ?
-				   0 : FILE_READ_DATA);
+	/* fetch, not peek: a hidden entry gets no later chance at a slot */
+	slot = mdcache_inode_fetch(fsp);
+	if ((slot == NULL) || (slot->cookie != st->st_ex_change_cookie)) {
+		return;
 	}
+	visible = !(fsp_get_status_flags(fsp) & O_PATH);
+	mdcache_abe_put(slot, mdcache_abe_ctx(fsp->conn), visible);
+	if (dirent_abe_key(fsp->conn, slot, &key)) {
+		mdcache_access_put(&key, visible ? FILE_READ_DATA : 0);
+	}
+}
+
+/*
+ * The handle's fd-less fsp, re-pointed at an entry: the directory's
+ * path with the entry's name after it. A module's fsp extensions are
+ * dropped first.
+ */
+static struct files_struct *dir_entry_fsp(struct smb_Dir *dir_hnd,
+					  const struct smb_filename *smb_fname,
+					  const struct file_id *id)
+{
+	struct files_struct *fsp = dir_hnd->entry_fsp;
+	struct smb_filename *name = NULL;
+	size_t len = strlen(smb_fname->base_name);
+	size_t need;
+
+	if (fsp == NULL) {
+		fsp = fsp_new_fdless(dir_hnd->fsp, smb_fname);
+		if (fsp == NULL) {
+			return NULL;
+		}
+		dir_hnd->entry_fsp = fsp;
+		dir_hnd->entry_name_at =
+			strlen(fsp->fsp_name->base_name) - len;
+		return fsp;
+	}
+	vfs_remove_all_fsp_extensions(fsp);
+	name = fsp->fsp_name;
+	need = dir_hnd->entry_name_at + len + 1;
+	if (talloc_get_size(name->base_name) < need) {
+		char *grown = talloc_realloc(name, name->base_name, char, need);
+
+		if (grown == NULL) {
+			return NULL;
+		}
+		name->base_name = grown;
+	}
+	memcpy(name->base_name + dir_hnd->entry_name_at,
+	       smb_fname->base_name,
+	       len + 1);
+	name->twrp = smb_fname->twrp;
+	name->flags = smb_fname->flags;
+	name->st = smb_fname->st;
+	name->st.cached_dos_attributes = FILE_ATTRIBUTE_INVALID;
+	fsp->fsp_flags.is_directory = S_ISDIR(name->st.st_ex_mode);
+	fsp->file_id = *id;
+	return fsp;
 }
 
 enum dirent_cached { DIRENT_OPEN, DIRENT_HIDDEN, DIRENT_LISTED };
@@ -602,11 +693,15 @@ static enum dirent_cached dirent_from_cache(TALLOC_CTX *ctx,
 	NTSTATUS status;
 	int rc;
 
-	rc = SMB_VFS_FSTATAT(conn,
-			     dir_hnd->fsp,
-			     smb_fname,
-			     &smb_fname->st,
-			     AT_SYMLINK_NOFOLLOW);
+	if (VALID_STAT(smb_fname->st)) {
+		rc = 0;
+	} else {
+		rc = SMB_VFS_FSTATAT(conn,
+				     dir_hnd->fsp,
+				     smb_fname,
+				     &smb_fname->st,
+				     AT_SYMLINK_NOFOLLOW);
+	}
 	if ((rc != 0) ||
 	    (!S_ISREG(st->st_ex_mode) && !S_ISDIR(st->st_ex_mode)) ||
 	    ((conn->internal_tcon_flags & TCON_FLAG_NOXDEV) &&
@@ -614,16 +709,25 @@ static enum dirent_cached dirent_from_cache(TALLOC_CTX *ctx,
 		return DIRENT_OPEN;
 	}
 
-	id = vfs_file_id_from_sbuf(conn, st);
+	if (dir_hnd->prefetch.cur_id != NULL) {
+		id = *dir_hnd->prefetch.cur_id;
+	} else {
+		id = vfs_file_id_from_sbuf(conn, st);
+	}
 	slot = mdcache_inode_peek(&id, st->st_ex_change_cookie);
-	if ((slot == NULL) || !(slot->flags & MDCACHE_HAVE_DOSMODE)) {
+	if (slot == NULL) {
 		return DIRENT_OPEN;
 	}
 
+	/* ABE first: a hidden entry needs nothing else */
 	if ((conn->internal_tcon_flags & TCON_FLAG_TRUENAS_ABE) &&
 	    !ISDOT(smb_fname->base_name) && !ISDOTDOT(smb_fname->base_name)) {
-		if (!dirent_abe_key(conn, slot, &key) ||
-		    !mdcache_access_get(&key, &read_access)) {
+		bool visible;
+
+		if (mdcache_abe_get(slot, mdcache_abe_ctx(conn), &visible)) {
+			read_access = visible ? FILE_READ_DATA : 0;
+		} else if (!dirent_abe_key(conn, slot, &key) ||
+			   !mdcache_access_get(&key, &read_access)) {
 			return DIRENT_OPEN;
 		}
 		if (read_access == 0) {
@@ -631,7 +735,11 @@ static enum dirent_cached dirent_from_cache(TALLOC_CTX *ctx,
 		}
 	}
 
-	fsp = fsp_new_fdless(dir_hnd->fsp, smb_fname);
+	if (!(slot->flags & MDCACHE_HAVE_DOSMODE)) {
+		return DIRENT_OPEN;
+	}
+
+	fsp = dir_entry_fsp(dir_hnd, smb_fname, &id);
 	if (fsp == NULL) {
 		return DIRENT_OPEN;
 	}
@@ -655,7 +763,6 @@ static enum dirent_cached dirent_from_cache(TALLOC_CTX *ctx,
 	*_mode = mode;
 	ret = DIRENT_LISTED;
 out:
-	file_free(NULL, fsp);
 	return ret;
 }
 
@@ -721,6 +828,12 @@ bool smbd_dirptr_get_entry(TALLOC_CTX *ctx,
 		bool toplevel_dotdot;
 		bool visible;
 		bool ok;
+		const bool use_cache =
+			try_cache &&
+			(dirptr->cache_misses < DIRENT_CACHE_MISSES);
+
+		dir_hnd->prefetch.enabled =
+			use_cache && (dir_hnd->prefetch.batch != 0);
 
 		dname = dptr_ReadDirName(ctx, dirptr);
 
@@ -757,7 +870,7 @@ bool smbd_dirptr_get_entry(TALLOC_CTX *ctx,
 		smb_fname = synthetic_smb_fname(talloc_tos(),
 						toplevel_dotdot ? "." : dname,
 						NULL,
-						NULL,
+						dir_hnd->prefetch.cur_st,
 						dir_fname->twrp,
 						dir_fname->flags);
 		if (smb_fname == NULL) {
@@ -765,7 +878,7 @@ bool smbd_dirptr_get_entry(TALLOC_CTX *ctx,
 			return false;
 		}
 
-		if (try_cache && (dirptr->cache_misses < DIRENT_CACHE_MISSES)) {
+		if (use_cache) {
 			switch (dirent_from_cache(ctx,
 						  dir_hnd,
 						  smb_fname,
@@ -1217,6 +1330,11 @@ static int smb_Dir_destructor(struct smb_Dir *dir_hnd)
 {
 	files_struct *fsp = dir_hnd->fsp;
 
+	if (dir_hnd->entry_fsp != NULL) {
+		file_free(NULL, dir_hnd->entry_fsp);
+		dir_hnd->entry_fsp = NULL;
+	}
+	dir_prefetch_reset(dir_hnd);
 	if (dir_hnd->dir != NULL) {
 		SMB_VFS_CLOSEDIR(dir_hnd->conn, dir_hnd->dir);
 	} else if (fsp_get_pathref_fd(fsp) != -1) {
@@ -1415,28 +1533,12 @@ static NTSTATUS OpenDir_fsp(
 }
 
 
-/*******************************************************************
- Read from a directory.
- Return directory entry, current offset, and optional stat information.
- Don't check for veto or invisible files.
-********************************************************************/
-
-const char *ReadDirName(struct smb_Dir *dir_hnd, char **ptalloced)
+/* The next name from the VFS; "." and ".." come from ReadDirName() */
+static const char *dir_read_next(struct smb_Dir *dir_hnd, char **ptalloced)
 {
 	const char *n;
 	char *talloced = NULL;
 	connection_struct *conn = dir_hnd->conn;
-
-	if (dir_hnd->file_number < 2) {
-		if (dir_hnd->file_number == 0) {
-			n = ".";
-		} else {
-			n = "..";
-		}
-		dir_hnd->file_number++;
-		*ptalloced = NULL;
-		return n;
-	}
 
 	while ((n = vfs_readdirname(conn,
 				    dir_hnd->fsp,
@@ -1497,11 +1599,238 @@ const char *ReadDirName(struct smb_Dir *dir_hnd, char **ptalloced)
 			continue;
 		}
 		*ptalloced = talloced;
-		dir_hnd->file_number++;
 		return n;
 	}
 	*ptalloced = NULL;
 	return NULL;
+}
+
+/* The window's batch; its entries' cache slots are pulled in meanwhile */
+static void dir_prefetch_wait(struct smb_Dir *dir_hnd,
+			      struct dir_prefetch_window *w)
+{
+	size_t i;
+	int ret;
+
+	if (dir_prefetch_inflight.win != w) {
+		return;
+	}
+	ZERO_STRUCT(dir_prefetch_inflight);
+	ret = SMB_VFS_BATCH_ATTR_WAIT(dir_hnd->conn,
+				      dir_hnd->fsp,
+				      w->ents,
+				      w->count);
+	if (ret == -1) {
+		DBG_NOTICE("waiting for %zu stats of %s failed: %s\n",
+			   w->count,
+			   fsp_str_dbg(dir_hnd->fsp),
+			   strerror(errno));
+	}
+	for (i = 0; i < w->count; i++) {
+		if (!(w->ents[i].got & VFS_ATTR_STAT)) {
+			continue;
+		}
+		w->ids[i] = vfs_file_id_from_sbuf(dir_hnd->conn,
+						  &w->ents[i].st);
+		mdcache_inode_prefetch(&w->ids[i]);
+	}
+}
+
+static void dir_prefetch_drain(struct smb_Dir *dir_hnd,
+			       struct dir_prefetch_window *w)
+{
+	size_t i;
+
+	dir_prefetch_wait(dir_hnd, w);
+	for (i = w->next; i < w->count; i++) {
+		TALLOC_FREE(w->names[i]);
+	}
+	w->count = 0;
+	w->next = 0;
+}
+
+static void dir_prefetch_reset(struct smb_Dir *dir_hnd)
+{
+	struct dir_stat_prefetch *p = &dir_hnd->prefetch;
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(p->win); i++) {
+		dir_prefetch_drain(dir_hnd, &p->win[i]);
+		TALLOC_FREE(p->win[i].names);
+		TALLOC_FREE(p->win[i].ents);
+		TALLOC_FREE(p->win[i].ids);
+	}
+	p->cur_st = NULL;
+	p->cur_id = NULL;
+}
+
+static bool dir_prefetch_fill(struct smb_Dir *dir_hnd,
+			      struct dir_prefetch_window *w)
+{
+	struct dir_stat_prefetch *p = &dir_hnd->prefetch;
+	size_t n = 0;
+
+	if (p->batch == 0) {
+		return false;
+	}
+	if (w->names == NULL) {
+		w->names = talloc_zero_array(dir_hnd, char *, p->batch);
+		w->ents = talloc_zero_array(dir_hnd,
+					    struct vfs_attr_entry,
+					    p->batch);
+		w->ids = talloc_zero_array(dir_hnd, struct file_id, p->batch);
+		if ((w->names == NULL) || (w->ents == NULL) ||
+		    (w->ids == NULL)) {
+			dir_prefetch_reset(dir_hnd);
+			return false;
+		}
+	}
+
+	while (n < p->batch) {
+		char *talloced = NULL;
+		const char *name = dir_read_next(dir_hnd, &talloced);
+
+		if (name == NULL) {
+			break;
+		}
+		if (talloced != NULL) {
+			w->names[n] = talloc_steal(w->names, talloced);
+		} else {
+			w->names[n] = talloc_strdup(w->names, name);
+		}
+		if (w->names[n] == NULL) {
+			DBG_ERR("out of memory reading %s ahead\n",
+				fsp_str_dbg(dir_hnd->fsp));
+			break;
+		}
+		w->ents[n] = (struct vfs_attr_entry) { .name = w->names[n] };
+		n++;
+	}
+	w->count = n;
+	w->next = 0;
+	return true;
+}
+
+/* One batch in flight per smbd: another handle's is waited for first */
+static void dir_prefetch_stat(struct smb_Dir *dir_hnd,
+			      struct dir_prefetch_window *w)
+{
+	int ret;
+
+	if (w->count == 0) {
+		return;
+	}
+	if (dir_prefetch_inflight.win != NULL) {
+		dir_prefetch_wait(dir_prefetch_inflight.hnd,
+				  dir_prefetch_inflight.win);
+	}
+	ret = SMB_VFS_BATCH_ATTR_SUBMIT(dir_hnd->conn,
+					dir_hnd->fsp,
+					w->ents,
+					w->count,
+					VFS_ATTR_STAT);
+	if (ret == -1) {
+		dir_hnd->prefetch.batch = 0;
+		return;
+	}
+	dir_prefetch_inflight.hnd = dir_hnd;
+	dir_prefetch_inflight.win = w;
+}
+
+/*
+ * Make the window read ahead current, or fill and stat one now; then
+ * read ahead and submit the next. False when this handle gets none.
+ */
+static bool dir_prefetch_advance(struct smb_Dir *dir_hnd)
+{
+	struct dir_stat_prefetch *p = &dir_hnd->prefetch;
+	struct dir_prefetch_window *cur = &p->win[p->cur];
+	struct dir_prefetch_window *nxt = &p->win[!p->cur];
+
+	dir_prefetch_drain(dir_hnd, cur);
+
+	if (nxt->count > 0) {
+		dir_prefetch_wait(dir_hnd, nxt);
+		p->cur = !p->cur;
+		cur = nxt;
+		nxt = &p->win[!p->cur];
+	} else if (p->enabled && dir_prefetch_fill(dir_hnd, cur)) {
+		if (cur->count == 0) {
+			dir_prefetch_reset(dir_hnd);
+			return false;
+		}
+		if (cur->count < p->batch) {
+			/* the directory ends within a window: no batch */
+			p->batch = 0;
+			return true;
+		}
+		dir_prefetch_stat(dir_hnd, cur);
+		dir_prefetch_wait(dir_hnd, cur);
+	} else {
+		return false;
+	}
+	if (p->enabled && dir_prefetch_fill(dir_hnd, nxt)) {
+		dir_prefetch_stat(dir_hnd, nxt);
+	}
+	return true;
+}
+
+static const char *dir_prefetch_pop(struct smb_Dir *dir_hnd,
+				    char **ptalloced)
+{
+	struct dir_stat_prefetch *p = &dir_hnd->prefetch;
+	struct dir_prefetch_window *w = &p->win[p->cur];
+	size_t i = w->next++;
+
+	p->cur_st = (w->ents[i].got & VFS_ATTR_STAT) ? &w->ents[i].st : NULL;
+	p->cur_id = (w->ents[i].got & VFS_ATTR_STAT) ? &w->ids[i] : NULL;
+	*ptalloced = w->names[i];
+	w->names[i] = NULL;
+	return *ptalloced;
+}
+
+/*******************************************************************
+ Read from a directory.
+ Return directory entry, current offset, and optional stat information.
+ Don't check for veto or invisible files.
+********************************************************************/
+
+const char *ReadDirName(struct smb_Dir *dir_hnd, char **ptalloced)
+{
+	struct dir_stat_prefetch *p = &dir_hnd->prefetch;
+	struct dir_prefetch_window *cur = &p->win[p->cur];
+	const char *n;
+	char *talloced = NULL;
+
+	p->cur_st = NULL;
+	p->cur_id = NULL;
+
+	if (dir_hnd->file_number < 2) {
+		if (dir_hnd->file_number == 0) {
+			n = ".";
+		} else {
+			n = "..";
+		}
+		dir_hnd->file_number++;
+		*ptalloced = NULL;
+		return n;
+	}
+
+	if (cur->next < cur->count) {
+		n = dir_prefetch_pop(dir_hnd, &talloced);
+	} else if ((p->enabled || (p->win[!p->cur].count > 0)) &&
+		   dir_prefetch_advance(dir_hnd)) {
+		n = dir_prefetch_pop(dir_hnd, &talloced);
+	} else {
+		n = dir_read_next(dir_hnd, &talloced);
+	}
+	if (n == NULL) {
+		*ptalloced = NULL;
+		return NULL;
+	}
+	*ptalloced = talloced;
+	dir_hnd->file_number++;
+	return n;
 }
 
 /*******************************************************************
@@ -1514,6 +1843,7 @@ void RewindDir(struct smb_Dir *dir_hnd)
 		SMB_VFS_REWINDDIR(dir_hnd->conn, dir_hnd->dir);
 	}
 	dir_hnd->file_number = 0;
+	dir_prefetch_reset(dir_hnd);
 }
 
 struct have_file_open_below_state {

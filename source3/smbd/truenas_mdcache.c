@@ -28,7 +28,8 @@
  * converted SD is a function of the raw NFSv4 ACL, owner, group and mode,
  * so those are the key of a variant, and files in a large folder usually
  * share a handful of them. Shared entries are only stored after checking
- * that the file did not change while they were computed.
+ * that the file did not change while they were computed. TrueNAS ABE's
+ * answer for a file, taken from the open a listing did, stays in its slot.
  *
  * Both are freed once the process goes MDCACHE_IDLE_TIMEOUT seconds
  * without using them.
@@ -182,6 +183,45 @@ static struct mdcache_inode *mdcache_insert(const struct file_id *id)
 	return slot;
 }
 
+/*
+ * ABE's answer for a file is kept in its slot under a number standing
+ * for the session, share and user. A number is not reused while slots
+ * may hold it: a token change drops the contexts, the numbering goes on.
+ */
+struct mdcache_abe_ctx {
+	uint64_t vuid;
+	uint32_t cnum;
+	uint32_t uid;
+	uint32_t num;
+};
+
+static struct {
+	struct mdcache_abe_ctx *ctxs;
+	uint32_t count;
+	uint32_t next;		/* number for the next context */
+} abe;
+
+#define MDCACHE_ABE_BITS	(MDCACHE_ABE_VISIBLE | \
+				 (UINT32_MAX << MDCACHE_ABE_CTX_SHIFT))
+
+static void mdcache_abe_drop_ctxs(void)
+{
+	TALLOC_FREE(abe.ctxs);
+	abe.count = 0;
+}
+
+static void mdcache_abe_forget(void)
+{
+	uint32_t i;
+
+	if (mdc.slots == NULL) {
+		return;
+	}
+	for (i = 0; i <= mdc.mask; i++) {
+		mdc.slots[i].flags &= ~MDCACHE_ABE_BITS;
+	}
+}
+
 static void mdcache_idle(struct tevent_context *ev,
 			 struct tevent_timer *te,
 			 struct timeval now,
@@ -219,6 +259,8 @@ static void mdcache_idle(struct tevent_context *ev,
 	mdc.mask = 0;
 	mdc.count = 0;
 	TALLOC_FREE(mdc.mc);
+	mdcache_abe_drop_ctxs();
+	abe.next = 0;
 }
 
 void mdcache_bump_epoch(struct smbd_server_connection *sconn)
@@ -355,6 +397,13 @@ struct mdcache_inode *mdcache_inode_fetch(struct files_struct *fsp)
 #endif
 }
 
+void mdcache_inode_prefetch(const struct file_id *id)
+{
+	if (mdc.slots != NULL) {
+		__builtin_prefetch(&mdc.slots[mdcache_home(id) & mdc.mask]);
+	}
+}
+
 struct mdcache_inode *mdcache_inode_peek(const struct file_id *id,
 					 uint64_t cookie)
 {
@@ -411,6 +460,79 @@ uint64_t mdcache_sd_variant(DATA_BLOB content)
 	seq = ++mdc.seq;
 	memcache_add(mc, MDCACHE_SD_VARIANT, content,
 		     data_blob_const(&seq, sizeof(seq)));
+	return seq;
+}
+
+#define ACL4_XDR_MAX 20488	/* what libzfsacl reads, 1024 entries */
+#define ACL4_XDR_SMALL 1008	/* 50 entries */
+
+/* The variant of a file's SD: its raw NFSv4 ACL, owner, group and mode */
+static uint64_t mdcache_sd_variant_fsp(struct files_struct *fsp)
+{
+	const SMB_STRUCT_STAT *st = &fsp->fsp_name->st;
+	struct {
+		uint32_t uid;
+		uint32_t gid;
+		uint32_t mode;
+		uint32_t pad;
+	} hdr = {
+		.uid = st->st_ex_uid,
+		.gid = st->st_ex_gid,
+		.mode = st->st_ex_mode,
+	};
+	uint8_t small[sizeof(hdr) + ACL4_XDR_SMALL];
+	uint8_t *buf = small;
+	ssize_t len;
+	uint64_t seq = 0;
+
+	/*
+	 * Linux allocates and zeroes a buffer of the requested size on
+	 * every getxattr, so try a typical ACL size first. Larger ACLs are
+	 * rare and get read twice.
+	 */
+	len = SMB_VFS_FGETXATTR(fsp, ACL4_XATTR, buf + sizeof(hdr),
+				ACL4_XDR_SMALL);
+	if ((len == -1) && (errno == ERANGE)) {
+		buf = talloc_array(talloc_tos(), uint8_t,
+				   sizeof(hdr) + ACL4_XDR_MAX);
+		if (buf == NULL) {
+			return 0;
+		}
+		len = SMB_VFS_FGETXATTR(fsp, ACL4_XATTR, buf + sizeof(hdr),
+					ACL4_XDR_MAX);
+	}
+	if (len > 0) {
+		memcpy(buf, &hdr, sizeof(hdr));
+		seq = mdcache_sd_variant(data_blob_const(buf,
+							 sizeof(hdr) + len));
+	}
+	if (buf != small) {
+		TALLOC_FREE(buf);
+	}
+	return seq;
+}
+
+/*
+ * The slot's SD variant, read from the file if it has none. The read
+ * may move the slot: *pslot is looked up again, NULL if it is gone.
+ */
+uint64_t mdcache_sd_seq(struct files_struct *fsp,
+			struct mdcache_inode **pslot)
+{
+	struct mdcache_inode *slot = *pslot;
+	uint64_t cookie = slot->cookie;
+	uint64_t seq = slot->sd_seq;
+
+	if ((seq != 0) ||
+	    !(fsp->conn->internal_tcon_flags & TCON_FLAG_MDCACHE_SD)) {
+		return seq;
+	}
+	seq = mdcache_sd_variant_fsp(fsp);
+	slot = mdcache_inode_peek(&fsp->file_id, cookie);
+	if (slot != NULL) {
+		slot->sd_seq = seq;
+	}
+	*pslot = slot;
 	return seq;
 }
 
@@ -492,11 +614,71 @@ void mdcache_access_put(const struct mdcache_access_key *key,
 		     data_blob_const(&access_mask, sizeof(access_mask)));
 }
 
-/* Maximum access depends on share settings such as "read only" */
+/* Maximum access and ABE answers depend on share settings and the token */
 void mdcache_flush_access(void)
 {
 	if (mdc.mc != NULL) {
 		memcache_flush(mdc.mc, MDCACHE_ACCESS);
+	}
+	mdcache_abe_drop_ctxs();
+}
+
+uint32_t mdcache_abe_ctx(struct connection_struct *conn)
+{
+	uint64_t vuid = get_current_vuid(conn);
+	uint32_t uid = get_current_uid(conn);
+	struct mdcache_abe_ctx *c = NULL;
+	uint32_t i;
+
+	for (i = 0; i < abe.count; i++) {
+		c = &abe.ctxs[i];
+		if ((c->vuid == vuid) && (c->cnum == conn->cnum) &&
+		    (c->uid == uid)) {
+			return c->num;
+		}
+	}
+
+	if ((abe.next == 0) || (abe.next > UINT16_MAX)) {
+		/* wrapped: no slot may keep an old number */
+		mdcache_abe_forget();
+		abe.next = 1;
+	}
+
+	c = talloc_realloc(NULL, abe.ctxs, struct mdcache_abe_ctx,
+			   abe.count + 1);
+	if (c == NULL) {
+		return 0;
+	}
+	abe.ctxs = c;
+	c = &abe.ctxs[abe.count++];
+	*c = (struct mdcache_abe_ctx) {
+		.vuid = vuid,
+		.cnum = conn->cnum,
+		.uid = uid,
+		.num = abe.next++,
+	};
+	return c->num;
+}
+
+bool mdcache_abe_get(const struct mdcache_inode *slot, uint32_t ctx,
+		     bool *visible)
+{
+	if ((ctx == 0) || ((slot->flags >> MDCACHE_ABE_CTX_SHIFT) != ctx)) {
+		return false;
+	}
+	*visible = (slot->flags & MDCACHE_ABE_VISIBLE) != 0;
+	return true;
+}
+
+void mdcache_abe_put(struct mdcache_inode *slot, uint32_t ctx, bool visible)
+{
+	if (ctx == 0) {
+		return;
+	}
+	slot->flags &= ~MDCACHE_ABE_BITS;
+	slot->flags |= ctx << MDCACHE_ABE_CTX_SHIFT;
+	if (visible) {
+		slot->flags |= MDCACHE_ABE_VISIBLE;
 	}
 }
 
