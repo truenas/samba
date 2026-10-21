@@ -18,6 +18,24 @@
 
 enum zc_offload_map_t {ZC_OFFLOAD_GENERIC = 1, ZC_OFFLOAD_CLONE};
 
+/* vfs_zfs_core_durable.c */
+NTSTATUS zfs_core_durable_cookie(struct vfs_handle_struct *handle,
+				 struct files_struct *fsp,
+				 TALLOC_CTX *mem_ctx,
+				 DATA_BLOB *cookie);
+NTSTATUS zfs_core_durable_disconnect(struct vfs_handle_struct *handle,
+				     struct files_struct *fsp,
+				     const DATA_BLOB old_cookie,
+				     TALLOC_CTX *mem_ctx,
+				     DATA_BLOB *new_cookie);
+NTSTATUS zfs_core_durable_reconnect(struct vfs_handle_struct *handle,
+				    struct smb_request *smb1req,
+				    struct smbXsrv_open *op,
+				    const DATA_BLOB old_cookie,
+				    TALLOC_CTX *mem_ctx,
+				    struct files_struct **fsp,
+				    DATA_BLOB *new_cookie);
+
 typedef struct zfs_core_offload_ops {
 	enum zc_offload_map_t opmap_type;
 	struct tevent_req *(*read_send)(TALLOC_CTX *mem_ctx,
@@ -56,6 +74,9 @@ struct zfs_core_config_data {
 	const char *dataset_auto_quota;
 	uint64_t base_user_quota;
 	const zc_offload_ops_t *offload_ops;
+	/* TrueNAS: the last dataset of zfs_core_fs_file_id() */
+	uint64_t fid_mnt_id;
+	uint64_t fid_objsetid;
 };
 
 /* vfs_zfs_core_fsctl.c */

@@ -32,6 +32,7 @@
 #include "lib/util/util_process.h"
 #include "lib/util/sys_rw_data.h"
 #include "source3/lib/substitute.h"
+#include "truenas_hastate/truenas_hastate.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_SCAVENGER
@@ -283,6 +284,9 @@ static bool smbd_scavenger_start(struct smbd_scavenger_state *state)
 		}
 		tevent_fd_set_auto_close(fde);
 
+		/* TrueNAS: resend disconnected handles to truenas_smbhad */
+		truenas_hastate_scavenger_start();
+
 		ret = smbd_scavenger_main(state);
 
 		DEBUG(10, ("scavenger ended: %d\n", ret));
@@ -514,7 +518,7 @@ static bool cleanup_disconnected_share_mode_entry_fn(
 	return true;
 }
 
-static bool share_mode_cleanup_disconnected(
+bool share_mode_cleanup_disconnected(
 	struct file_id fid, uint64_t open_persistent_id)
 {
 	struct cleanup_disconnected_state state = {
@@ -616,6 +620,11 @@ static void scavenger_timer(struct tevent_context *ev,
 		  timeval_string(talloc_tos(), &t, true));
 
 	status = smbXsrv_open_cleanup(ctx->msg.open_persistent_id);
+	if (NT_STATUS_IS_OK(status) ||
+	    NT_STATUS_EQUAL(status, NT_STATUS_NOT_FOUND)) {
+		/* a client cannot reconnect the open */
+		truenas_hastate_forget(ctx->msg.open_persistent_id);
+	}
 	if (!NT_STATUS_IS_OK(status)) {
 		DBG_WARNING("Failed to cleanup open global for file %s open "
 			    "%"PRIu64": %s\n",
@@ -633,7 +642,35 @@ static void scavenger_timer(struct tevent_context *ev,
 			    file_id_str_buf(ctx->msg.file_id, &idbuf),
 			    ctx->msg.open_persistent_id);
 	}
+}
 
+/*
+ * TrueNAS: schedule the cleanup of a durable open that the parent smbd
+ * restored, see truenas_hastate/restore.c
+ */
+void scavenger_schedule_restored(struct messaging_context *msg_ctx,
+				 struct file_id fid,
+				 uint64_t open_persistent_id,
+				 NTTIME until)
+{
+	struct scavenger_message msg = {
+		.file_id = fid,
+		.open_persistent_id = open_persistent_id,
+		.until = until,
+	};
+	DATA_BLOB msg_blob = data_blob_const(&msg, sizeof(msg));
+	NTSTATUS status;
+
+	status = messaging_send(msg_ctx,
+				messaging_server_id(msg_ctx),
+				MSG_SMB_SCAVENGER,
+				&msg_blob);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_WARNING("scheduling cleanup of open %"PRIu64" failed: "
+			    "%s\n",
+			    open_persistent_id,
+			    nt_errstr(status));
+	}
 }
 
 static void scavenger_add_timer(struct smbd_scavenger_state *state,

@@ -6,6 +6,7 @@ Homepage: http://www.samba.org
 Standards-Version: 4.4.1
 Build-Depends: bison,
                ca-certificates,
+               curl,
                debhelper-compat (= 12),
                dh-exec,
                dh-python,

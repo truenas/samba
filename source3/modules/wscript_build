@@ -291,11 +291,12 @@ bld.SAMBA3_MODULE('vfs_zfs_core',
                  subsystem='vfs',
                  source='''
                      vfs_zfs_core.c
+                     vfs_zfs_core_durable.c
                      vfs_zfs_core_fsctl.c
                      vfs_zfs_core_rw.c
                      vfs_zfs_core_util.c
                  ''',
-                 deps='smb_libzfs',
+                 deps='smb_libzfs NDR_OPEN_FILES truenas_mount',
                  init_function='',
                  internal_module=bld.SAMBA3_IS_STATIC_MODULE('vfs_zfs_core'),
                  enabled=bld.SAMBA3_IS_ENABLED_MODULE('vfs_zfs_core'))

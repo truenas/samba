@@ -28,6 +28,11 @@ ssh debian@$VM_IP "sudo dmesg"                            > "$LOG_DIR/dmesg.log"
 ssh debian@$VM_IP "zpool status; zfs list"               > "$LOG_DIR/zfs-status.txt" 2>/dev/null || true
 # ctdbd logs of the pyctdb test cluster, one node after the other.
 ssh debian@$VM_IP "sudo sh -c 'tail -n +1 /var/tmp/pyctdb-test/node.*/log.ctdb'" > "$LOG_DIR/ctdb.log" 2>/dev/null || true
+# Durable handle tests (qemu-4.6-durable.sh): smbd, daemon and client
+# output, configurations and state files, without the link secret.
+ssh debian@$VM_IP "sudo sh -c 'cd /var/tmp && tar czf - --exclude=secret durable'" \
+  > "$LOG_DIR/durable.tar.gz" 2>/dev/null || true
+ssh debian@$VM_IP "sudo journalctl -u truenas-smbhad --no-pager" > "$LOG_DIR/truenas-smbhad.log" 2>/dev/null || true
 # Listing of the built debs (handy when a build/packaging step failed).
 ssh debian@$VM_IP "ls -l ~/*.deb /tmp/*.deb 2>/dev/null" > "$LOG_DIR/built-debs.txt" 2>/dev/null || true
 
