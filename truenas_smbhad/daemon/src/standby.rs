@@ -123,7 +123,8 @@ impl Standby {
                 if !auth::verify(&self.key, Side::Primary, &t, &c.proof) {
                     return Err("the primary failed authentication".to_owned());
                 }
-                let proof = auth::proof(&self.key, Side::Standby, &t);
+                let proof = auth::proof(&self.key, Side::Standby, &t)
+                    .map_err(|e| format!("computing the link proof: {e}"))?;
                 self.stage = Stage::Prove;
                 Ok(ReplRequest::Prove(proof))
             }
@@ -450,7 +451,7 @@ mod tests {
         let mut header = Header::empty(PNODE, SB);
         header.tag = 7;
         Standby::new(
-            LinkKey::derive(b"k"),
+            LinkKey::derive(b"k").unwrap(),
             SNODE,
             SB,
             fill,
@@ -466,14 +467,14 @@ mod tests {
             panic!()
         };
         let nonce = FixedOpaque([5; 32]);
-        let key = LinkKey::derive(b"k");
+        let key = LinkKey::derive(b"k").unwrap();
         let t = Transcript {
             standby_node: h.node,
             standby_nonce: &h.nonce,
             primary_node: PNODE,
             primary_nonce: &nonce,
         };
-        let proof = auth::proof(&key, Side::Primary, &t);
+        let proof = auth::proof(&key, Side::Primary, &t).unwrap();
         let ReplRequest::Prove(p) = sb
             .on_reply(ReplReply::Challenge(Challenge {
                 version: VERSION,
@@ -593,7 +594,7 @@ mod tests {
             };
             let nonce = FixedOpaque([5; 32]);
             let proof = auth::proof(
-                &LinkKey::derive(key),
+                &LinkKey::derive(key).unwrap(),
                 Side::Primary,
                 &Transcript {
                     standby_node: h.node,
@@ -601,7 +602,8 @@ mod tests {
                     primary_node: PNODE,
                     primary_nonce: &nonce,
                 },
-            );
+            )
+            .unwrap();
             let r = sb.on_reply(ReplReply::Challenge(Challenge {
                 version,
                 node: PNODE,
@@ -620,7 +622,7 @@ mod tests {
         };
         let nonce = FixedOpaque([5; 32]);
         let proof = auth::proof(
-            &LinkKey::derive(b"k"),
+            &LinkKey::derive(b"k").unwrap(),
             Side::Primary,
             &Transcript {
                 standby_node: h.node,
@@ -628,7 +630,8 @@ mod tests {
                 primary_node: h.node,
                 primary_nonce: &nonce,
             },
-        );
+        )
+        .unwrap();
         let err = sb
             .on_reply(ReplReply::Challenge(Challenge {
                 version: VERSION,

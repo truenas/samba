@@ -4,7 +4,7 @@
 //! The boot id, and random values for nonces and instance ids.
 
 use crate::proto::BootId;
-use std::io::{self, Read};
+use std::io;
 use std::path::Path;
 use truenas_xdr::FixedOpaque;
 
@@ -38,15 +38,13 @@ fn parse_hex16(text: &str, path: &Path) -> io::Result<FixedOpaque<16>> {
     Ok(FixedOpaque(out))
 }
 
-/// Fills `buf` with random bytes from `/dev/urandom`.
+/// Fills `buf` with random bytes from OpenSSL (`RAND_bytes`).
 ///
 /// # Panics
 ///
-/// `/dev/urandom` is not readable.
+/// OpenSSL has no random bytes.
 pub fn random_fill(buf: &mut [u8]) {
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(buf))
-        .expect("/dev/urandom is readable");
+    openssl::rand::rand_bytes(buf).expect("OpenSSL gives random bytes");
 }
 
 /// Returns a random 64-bit value.

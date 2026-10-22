@@ -27,11 +27,10 @@ truenas_smbhad_proto = { path = "proto" }
 truenas_smbhad_client = { path = "client" }
 serde = { version = "1", features = ["derive"] }
 libc = "0.2"
-# HMAC and HKDF for the link handshake. These crates are pure Rust. The
-# package build does not need libssl-dev. Samba builds with GnuTLS.
-hkdf = "0.12"
-hmac = "0.12"
-sha2 = "0.10"
+# OpenSSL (libcrypto) for the link handshake: HKDF, HMAC and the random
+# nonces, as in truenas_ros. The package build needs libssl-dev. In FIPS
+# mode, the FIPS provider of OpenSSL does this work.
+openssl = "0.10"
 
 # proto and daemon forbid unsafe code at their crate roots. Only the C
 # interface of the client allows it.

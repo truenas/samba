@@ -279,7 +279,6 @@ pub fn run(
         instance: ids::random_u64(),
         random: crate::ids::random_fill,
     };
-    let key = key.unwrap_or_else(|| LinkKey::derive(&[]));
     let core: Core = Rc::new(RefCell::new(Primary::new(
         settings,
         key,

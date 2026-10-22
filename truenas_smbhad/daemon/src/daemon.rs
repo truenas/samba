@@ -161,7 +161,17 @@ pub const THREAD_STACK: usize = 2 << 20;
 
 fn read_key(cfg: &Config, log: &Logger) -> Option<LinkKey> {
     match std::fs::read(&cfg.secret_file) {
-        Ok(secret) if !secret.is_empty() => Some(LinkKey::derive(&secret)),
+        Ok(secret) if !secret.is_empty() => match LinkKey::derive(&secret) {
+            Ok(key) => Some(key),
+            Err(e) => {
+                truenas_ros::log!(
+                    log,
+                    Level::Warning,
+                    "deriving the link key: {e}"
+                );
+                None
+            }
+        },
         Ok(_) => {
             truenas_ros::log!(
                 log,

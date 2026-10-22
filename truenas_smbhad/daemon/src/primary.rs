@@ -8,7 +8,7 @@
 //! replication connection. Replies that must wait are kept as `Waiter`s. The
 //! core runs on the server thread. It uses no locks.
 
-use crate::auth::{self, LinkKey, Nonce, Side, Transcript};
+use crate::auth::{self, LinkKey, Nonce, Proof, Side, Transcript};
 use crate::epoch::{self, Bumped};
 use crate::proto::encode;
 use crate::proto::local::{HelloOk, Origin, RehydratePage, Reply, Synced};
@@ -155,7 +155,8 @@ struct Session<W> {
 pub struct Primary<W> {
     s: Settings,
     log: Logger,
-    key: LinkKey,
+    /// None: no link, see `serve::run`.
+    key: Option<LinkKey>,
     store: Store,
     header: Header,
     origin: Origin,
@@ -212,7 +213,7 @@ impl<W: Waiter> Primary<W> {
     /// written `epoch` with `EpochFile::bump`. No replica is restorable.
     pub fn new(
         s: Settings,
-        key: LinkKey,
+        key: Option<LinkKey>,
         store: Store,
         header: Header,
         origin: Origin,
@@ -664,6 +665,32 @@ impl<W: Waiter> Primary<W> {
         }
     }
 
+    /// The proof of this primary for a standby's hello. None without a link
+    /// key, or if OpenSSL fails.
+    fn link_proof(
+        &self,
+        standby_node: Node,
+        standby_nonce: &Nonce,
+        nonce: &Nonce,
+    ) -> Option<Proof> {
+        let key = self.key.as_ref()?;
+        let t = Transcript {
+            standby_node,
+            standby_nonce,
+            primary_node: self.s.node,
+            primary_nonce: nonce,
+        };
+        auth::proof(key, Side::Primary, &t)
+            .inspect_err(|e| {
+                truenas_ros::log!(
+                    self.log,
+                    Level::Warning,
+                    "computing the link proof: {e}"
+                );
+            })
+            .ok()
+    }
+
     /// Handles a request of a connection that has not authenticated yet.
     fn handshake(&mut self, req: ReplRequest, w: W, now: Instant) {
         let link_timeout = self.s.link_timeout;
@@ -690,16 +717,12 @@ impl<W: Waiter> Primary<W> {
                 let mut nonce = [0u8; 32];
                 (self.s.random)(&mut nonce);
                 let nonce = FixedOpaque(nonce);
-                let proof = auth::proof(
-                    &self.key,
-                    Side::Primary,
-                    &Transcript {
-                        standby_node: h.node,
-                        standby_nonce: &h.nonce,
-                        primary_node: self.s.node,
-                        primary_nonce: &nonce,
-                    },
-                );
+                let Some(proof) = self.link_proof(h.node, &h.nonce, &nonce)
+                else {
+                    w.close();
+                    self.drop_pending(p);
+                    return;
+                };
                 p.stage = Stage::Prove {
                     standby_node: h.node,
                     standby_nonce: h.nonce,
@@ -725,17 +748,19 @@ impl<W: Waiter> Primary<W> {
                 },
                 ReplRequest::Prove(proof),
             ) => {
-                let ok = auth::verify(
-                    &self.key,
-                    Side::Standby,
-                    &Transcript {
-                        standby_node,
-                        standby_nonce: &standby_nonce,
-                        primary_node: self.s.node,
-                        primary_nonce: &nonce,
-                    },
-                    &proof,
-                );
+                let ok = self.key.as_ref().is_some_and(|key| {
+                    auth::verify(
+                        key,
+                        Side::Standby,
+                        &Transcript {
+                            standby_node,
+                            standby_nonce: &standby_nonce,
+                            primary_node: self.s.node,
+                            primary_nonce: &nonce,
+                        },
+                        &proof,
+                    )
+                });
                 if !ok {
                     truenas_ros::log!(
                         self.log,
@@ -1203,7 +1228,7 @@ mod tests {
             let file = 2;
             let p = Primary::new(
                 settings(),
-                LinkKey::derive(b"secret"),
+                Some(LinkKey::derive(b"secret").unwrap()),
                 store,
                 Header::empty(PNODE, PB),
                 Origin::Own,
@@ -1211,7 +1236,7 @@ mod tests {
                 Logger::silent(),
             );
             let sb = Standby::new(
-                LinkKey::derive(key_s),
+                LinkKey::derive(key_s).unwrap(),
                 SNODE,
                 SB,
                 zero,
@@ -1240,7 +1265,7 @@ mod tests {
                 &mut self.p,
                 Primary::new(
                     settings(),
-                    LinkKey::derive(b"secret"),
+                    Some(LinkKey::derive(b"secret").unwrap()),
                     Store::default(),
                     Header::empty(PNODE, PB),
                     Origin::Own,
@@ -1258,7 +1283,7 @@ mod tests {
             self.fenced_last = true;
             self.p = Primary::new(
                 settings(),
-                LinkKey::derive(b"secret"),
+                Some(LinkKey::derive(b"secret").unwrap()),
                 store,
                 header,
                 origin,
@@ -2084,7 +2109,7 @@ mod tests {
         pair.p.repl_connect(intruder, pair.now);
         let (w, slot) = waiter();
         let mut other = Standby::new(
-            LinkKey::derive(b"guess"),
+            LinkKey::derive(b"guess").unwrap(),
             SNODE,
             SB,
             zero,
@@ -2220,7 +2245,7 @@ mod tests {
         assert_eq!(seen, (1..=50).collect::<Vec<_>>());
         let mut none: Primary<TestWaiter> = Primary::new(
             settings(),
-            LinkKey::derive(b"secret"),
+            Some(LinkKey::derive(b"secret").unwrap()),
             Store::default(),
             Header::empty(PNODE, PB),
             Origin::None,
@@ -2635,7 +2660,7 @@ mod tests {
             let (store, header) = std::mem::replace(
                 &mut pair.sb,
                 Standby::new(
-                    LinkKey::derive(b"x"),
+                    LinkKey::derive(b"x").unwrap(),
                     SNODE,
                     SB,
                     zero,

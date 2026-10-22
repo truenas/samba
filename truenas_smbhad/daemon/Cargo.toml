@@ -19,9 +19,7 @@ truenas_smbhad_proto.workspace = true
 truenas_ros = { workspace = true, features = ["sync-fs", "configfile", "mount", "net-server", "net-client", "signal", "secrets", "log"] }
 truenas_xdr.workspace = true
 serde.workspace = true
-hkdf.workspace = true
-hmac.workspace = true
-sha2.workspace = true
+openssl.workspace = true
 
 # The tests of the client against the daemon
 [dev-dependencies]
