@@ -35,6 +35,7 @@ void tn_this_process(void)
 	TALLOC_FREE(tn_c.idle_te);
 	TALLOC_FREE(tn_c.fde);
 	TALLOC_FREE(tn_c.reconnect_te);
+	TALLOC_FREE(tn_c.marker_te);
 	tn_c = (struct tn_client) { .pid = tevent_cached_getpid() };
 }
 

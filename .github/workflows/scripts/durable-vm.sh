@@ -42,7 +42,7 @@ HD="$WORK/hd"
 SUITES="smb2.durable-open smb2.durable-v2-open smb2.durable-open-disconnect
 	smb2.durable-v2-delay smb2.lease smb2.oplock smb2.lock smb2.replay"
 NOHA_SUITES="smb2.durable-open smb2.durable-v2-open"
-ALL=ABCDEFGHIJKLMN
+ALL=ABCDEFGHIJKLMNOP
 CASE=setup
 LOG="$OUT/setup.smbd.log"
 STATE="$WORK/state.txt"
@@ -307,8 +307,8 @@ verify() {
 	echo "$CASE: PASSED (gone '${1}')"
 	grep -h 'durable handles after' "$LOG" | tail -1 |
 		sed 's/^.*durable handles/  durable handles/'
-	grep '^[A-N]: reconnect' "$out" | sort |
-		sed -E -e 's/^([A-N]): reconnect [^:]*: NT_STATUS_/\1 /' \
+	grep '^[A-P]: reconnect' "$out" | sort |
+		sed -E -e 's/^([A-P]): reconnect [^:]*: NT_STATUS_/\1 /' \
 			-e 's/ OK$/ ok/' -e 's/ OBJECT_NAME_NOT_FOUND$/ gone/' |
 		tr '\n' ' ' | sed 's/^/  /'
 	echo

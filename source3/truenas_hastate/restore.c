@@ -60,6 +60,7 @@ enum tn_restore_result {
 	TN_DROP_EXPIRED,
 	TN_DROP_CHANGED,
 	TN_DROP_FAILED,
+	TN_DROP_DELETE_PENDING,
 	TN_NUM_RESULTS
 };
 
@@ -72,6 +73,7 @@ static const char *tn_result_str[TN_NUM_RESULTS] = {
 	[TN_DROP_EXPIRED] = "expired",
 	[TN_DROP_CHANGED] = "changed",
 	[TN_DROP_FAILED] = "failed",
+	[TN_DROP_DELETE_PENDING] = "delete on close",
 };
 
 struct tn_restore_ctx {
@@ -178,6 +180,7 @@ static enum tn_restore_result tn_restore_open(
 	struct file_id file_id;
 	struct statfs sfs;
 	NTTIME now_nt, disconnected, until;
+	uint32_t timeout_msec;
 	enum ndr_err_code ndr_err;
 	NTSTATUS status;
 	uint32_t lease_type, i;
@@ -206,7 +209,9 @@ static enum tn_restore_result tn_restore_open(
 	    (rec->disconnect_time < now_nt)) {
 		disconnected = rec->disconnect_time;
 	}
-	until = disconnected + (NTTIME)rec->durable_timeout_msec * 10000;
+	/* Not longer than smbd grants: 16 minutes, for durable v1. */
+	timeout_msec = MIN(rec->durable_timeout_msec, 16 * 60 * 1000);
+	until = disconnected + (NTTIME)timeout_msec * 10000;
 	if (until < now_nt) {
 		return TN_DROP_EXPIRED;
 	}
@@ -287,7 +292,7 @@ static enum tn_restore_result tn_restore_open(
 		.app_instance_id = rec->app_instance_id,
 		.create_action = rec->create_action,
 		.disconnect_time = disconnected,
-		.durable_timeout_msec = rec->durable_timeout_msec,
+		.durable_timeout_msec = timeout_msec,
 		.durable = true,
 		.channel_sequence = rec->channel_sequence,
 		.channel_generation = rec->channel_generation,
@@ -475,7 +480,9 @@ static void tn_entry_parse(TALLOC_CTX *mem_ctx, struct tn_entry *e)
 	if (r == NULL) {
 		return;
 	}
-	if (!tn_record_valid(r)) {
+	/* A marker has no handle, see tn_check_file(). */
+	if (!(r->flags & TRUENAS_DURABLE_DELETE_PENDING) &&
+	    !tn_record_valid(r)) {
 		DBG_WARNING("%s: the record has an unknown value\n",
 			    r->base_name);
 		smbhad_record_free(r);
@@ -539,6 +546,7 @@ static bool tn_same_lease(const struct tn_entry *a, const struct tn_entry *b)
 /*
  * Check the records e[0..n-1] of one file. A record can be one tick older
  * than the records of other handles.
+ * - A marker: the file has delete on close. Drop all records.
  * - A lease gets the states of its records with the highest epoch.
  * - After a reboot or a failover, the file can lack a change that a client
  *   cached. Drop the records of the client of a dirty record.
@@ -553,6 +561,18 @@ static void tn_check_file(struct tn_restore_ctx *ctx,
 {
 	size_t i, j, owners = 0, locked = 0;
 	bool write = false;
+
+	for (i = 0; i < n; i++) {
+		if (e[i].flags & TRUENAS_DURABLE_DELETE_PENDING) {
+			break;
+		}
+	}
+	if (i < n) {
+		for (i = 0; i < n; i++) {
+			e[i].result = TN_DROP_DELETE_PENDING;
+		}
+		return;
+	}
 
 	for (i = 0; i < n; i++) {
 		uint16_t epoch = e[i].lease_epoch;
@@ -639,6 +659,11 @@ static void tn_restore_entry(struct tn_restore_ctx *ctx,
 	const char *share = e->share;
 	int snum = -1;
 
+	if (e->flags & TRUENAS_DURABLE_DELETE_PENDING) {
+		/* a marker, not a handle */
+		TALLOC_FREE(frame);
+		return;
+	}
 	if (res == TN_RESTORED) {
 		/* The sort by connection groups the entries of a share. */
 		if ((rc->share == NULL) || (strcmp(rc->share, share) != 0)) {
@@ -688,7 +713,7 @@ static void tn_restore_entry(struct tn_restore_ctx *ctx,
 		res = tn_restore_open(ctx, rc->c->conn, frame, r);
 	}
 
-	DBG_NOTICE("[%s] %s: %s\n",
+	DBG_NOTICE("[%s] %s: %s%s\n",
 		   share,
 		   (e->base_name != NULL) ? e->base_name : "?",
 		   (res == TN_RESTORED) ? "" : "dropped, ",
@@ -770,7 +795,7 @@ void truenas_hastate_restore(struct messaging_context *msg_ctx)
 	struct tn_restore_conn rc = { .snum = -1 };
 	struct tn_entry *entries = NULL;
 	struct smbhad_page **pages = NULL;
-	size_t i, j, n = 0, alloc = 0, num_pages = 0;
+	size_t i, j, n = 0, alloc = 0, num_pages = 0, unreadable = 0;
 	struct smbhad_batch *base = NULL;
 	struct timespec t0, t1, alive;
 	uint64_t cursor = 0;
@@ -881,6 +906,9 @@ void truenas_hastate_restore(struct messaging_context *msg_ctx)
 							put->body_len),
 			};
 			tn_entry_parse(entries, &entries[n]);
+			if (entries[n].result == TN_DROP_FAILED) {
+				unreadable += 1;
+			}
 			n += 1;
 		}
 		if (failed) {
@@ -893,6 +921,13 @@ void truenas_hastate_restore(struct messaging_context *msg_ctx)
 		/* A missing record can change the checks of its file. */
 		DBG_ERR("the copy is not complete: no durable handles "
 			"restored\n");
+		n = 0;
+	}
+	if (unreadable != 0) {
+		/* An unreadable record has no file: it is a missing record. */
+		DBG_ERR("%zu records of the copy are not readable: no durable "
+			"handles restored\n",
+			unreadable);
 		n = 0;
 	}
 
@@ -939,7 +974,8 @@ void truenas_hastate_restore(struct messaging_context *msg_ctx)
 	} else {
 		DBG_WARNING("durable handles after %s: restored %u, dropped %u "
 		    "(unflushed %u, locks %u, caching conflict %u, "
-		    "expired %u, changed %u, failed %u) in %" PRIi64 " ms\n",
+		    "expired %u, changed %u, failed %u, delete on close %u) "
+		    "in %" PRIi64 " ms\n",
 		    tn_case_str(ctx.how),
 		    ctx.counts[TN_RESTORED],
 		    dropped,
@@ -949,6 +985,7 @@ void truenas_hastate_restore(struct messaging_context *msg_ctx)
 		    ctx.counts[TN_DROP_EXPIRED],
 		    ctx.counts[TN_DROP_CHANGED],
 		    ctx.counts[TN_DROP_FAILED],
+		    ctx.counts[TN_DROP_DELETE_PENDING],
 		    nsec_time_diff(&t1, &t0) / 1000000);
 	}
 	/* Each child makes its own connection. */

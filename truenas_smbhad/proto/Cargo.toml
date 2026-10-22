@@ -11,6 +11,7 @@ publish.workspace = true
 truenas_ros = { workspace = true, features = ["sync-fs"] }
 truenas_xdr.workspace = true
 serde.workspace = true
+libc.workspace = true
 
 [lints]
 workspace = true

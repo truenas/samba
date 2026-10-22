@@ -9,25 +9,43 @@
 //! The file is on the pool's system dataset. Only the controller that has
 //! imported the pool can write it. The epoch never decreases. Each writer
 //! holds an exclusive `flock` on `<file>.lock` while it reads and replaces
-//! the file. smbd's fallback fence must use the same lock and the same
-//! 12-byte XDR layout (`EpochRecord`).
+//! the file. smbd's fallback fence uses this code too.
 //!
-//! A later layout version keeps the first 12 bytes and their meaning, and
+//! The file is a 24-byte XDR record (`EpochRecord`): a magic number, the
+//! layout version, the epoch and the `f_fsid` of the file system of the
+//! file. A file of another file system, for example a copy from another
+//! pool, reads as a fence above its epoch: no copy is restorable with it,
+//! and the next write continues above it. A file without the magic is an
+//! error.
+//!
+//! A later layout version keeps the first 24 bytes and their meaning, and
 //! can add bytes after them. A reader accepts any version from 1 and reads
-//! the first 12 bytes. Writers write version 1, so an older writer drops
+//! the first 24 bytes. Writers write version 1, so an older writer drops
 //! the added bytes: they must be optional.
 
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{self, Read};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use truenas_ros::sync_fs::{AtomicWriteOptions, atomic_replace};
+use truenas_ros::sync_fs::{AtomicWriteOptions, atomic_replace, fstatfs};
+
+/// The first 4 bytes of the file: "SMBE".
+pub const MAGIC: u32 = 0x534d_4245;
 
 /// Layout version of the file.
 pub const FORMAT_VERSION: u32 = 1;
 
 /// The length of the version 1 record. Later versions start with it.
-pub const RECORD_LEN: usize = 12;
+pub const RECORD_LEN: usize = 24;
+
+/// The highest version that a read accepts. A version counts revisions of
+/// the layout; a larger value means that the file is not an epoch file.
+pub const MAX_FORMAT_VERSION: u32 = 256;
+
+/// The highest epoch that a read accepts. Fences cannot count this high, so
+/// the arithmetic of `next_tag` and `next_fence` cannot overflow.
+pub const MAX_EPOCH: u64 = 1 << 48;
 
 /// Returns the smallest even epoch above `x`. Fences write even epochs.
 pub fn next_fence(x: u64) -> Option<u64> {
@@ -52,10 +70,22 @@ pub struct Bumped {
 /// The file's contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EpochRecord {
+    /// `MAGIC`.
+    pub magic: u32,
     /// `FORMAT_VERSION`.
     pub version: u32,
     /// The epoch.
     pub epoch: u64,
+    /// `f_fsid` of the file system of the file.
+    pub fsid: u64,
+}
+
+/// Returns `f_fsid` of the file system of `file`, as smbd's `tn_fsid()`.
+/// ZFS keeps it in the dataset: an import on the other controller keeps
+/// it.
+fn fsid_of(file: &File) -> io::Result<u64> {
+    let id = fstatfs(file)?.fsid();
+    Ok((u64::from(id[1]) << 32) | u64::from(id[0]))
 }
 
 /// Why a read or a change of the epoch file failed.
@@ -114,17 +144,26 @@ impl EpochFile {
         }
     }
 
-    /// Returns the current epoch, or 0 if the file does not exist.
+    /// Returns the current epoch, or 0 if the file does not exist. A file of
+    /// another file system reads as the smallest fence above its epoch.
     ///
     /// # Errors
     ///
     /// The read fails, or the file does not contain a valid epoch record.
     pub fn read(&self) -> Result<u64, EpochError> {
-        let mut file = match File::open(&self.path) {
+        // Not through a symlink, and no wait for the writer of a FIFO.
+        let mut file = match File::options()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&self.path)
+        {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(e.into()),
         };
+        if !file.metadata()?.is_file() {
+            return Err(EpochError::Format("not a regular file".to_owned()));
+        }
         let mut bytes = Vec::with_capacity(64);
         file.by_ref().take(4096).read_to_end(&mut bytes)?;
         let Some(prefix) = bytes.get(..RECORD_LEN) else {
@@ -135,11 +174,23 @@ impl EpochFile {
         };
         let record: EpochRecord = truenas_xdr::from_bytes(prefix)
             .map_err(|e| EpochError::Format(e.to_string()))?;
-        if record.version < FORMAT_VERSION {
+        if record.magic != MAGIC {
+            return Err(EpochError::Format("not an epoch file".to_owned()));
+        }
+        if !(FORMAT_VERSION..=MAX_FORMAT_VERSION).contains(&record.version)
+            || record.epoch > MAX_EPOCH
+        {
             return Err(EpochError::Format(format!(
-                "version {} is below {FORMAT_VERSION}",
-                record.version
+                "version {} or epoch {} is out of range",
+                record.version, record.epoch
             )));
+        }
+        if record.fsid != fsid_of(&file)? {
+            // A copy from another file system. Its epoch can be of another
+            // pool: no copy is restorable with it.
+            return next_fence(record.epoch).ok_or_else(|| {
+                EpochError::Format("epoch overflow".to_owned())
+            });
         }
         Ok(record.epoch)
     }
@@ -154,11 +205,11 @@ impl EpochFile {
     /// A lock, read or replacement of the file failed. The caller must then
     /// not send any `Protection::Unprotected` reply.
     pub fn bump(&self, floor: u64) -> Result<Bumped, EpochError> {
-        let _lock = self.lock()?;
+        let lock = self.lock()?;
         let previous = self.read()?;
         let epoch = next_fence(previous.max(floor))
             .ok_or_else(|| EpochError::Format("epoch overflow".to_owned()))?;
-        self.write(epoch)?;
+        self.write(&lock, epoch)?;
         Ok(Bumped { previous, epoch })
     }
 
@@ -172,12 +223,12 @@ impl EpochFile {
     /// fence happened during the resync. The resync must start again with a
     /// new tag.
     pub fn advance_to(&self, tag: u64, from: u64) -> Result<(), EpochError> {
-        let _lock = self.lock()?;
+        let lock = self.lock()?;
         let current = self.read()?;
         if current != from || tag <= current {
             return Err(EpochError::Stale { current });
         }
-        self.write(tag)
+        self.write(&lock, tag)
     }
 
     /// The fence of smbd when it cannot reach the daemon. Writes the
@@ -197,14 +248,20 @@ impl EpochFile {
         {
             return Ok(None);
         }
-        let _lock = self.lock()?;
+        // First without the lock: while the daemon is down, every smbd
+        // process fences on each promise. A write replaces the whole file,
+        // so a read sees the old or the new epoch.
+        if fenced_to != 0 && self.read()? == fenced_to {
+            return Ok(None);
+        }
+        let lock = self.lock()?;
         let current = self.read()?;
         if fenced_to != 0 && current == fenced_to {
             return Ok(None);
         }
         let epoch = next_fence(current)
             .ok_or_else(|| EpochError::Format("epoch overflow".to_owned()))?;
-        self.write(epoch)?;
+        self.write(&lock, epoch)?;
         Ok(Some(epoch))
     }
 
@@ -218,10 +275,13 @@ impl EpochFile {
         Ok(file)
     }
 
-    fn write(&self, epoch: u64) -> Result<(), EpochError> {
+    /// Replaces the file. `lock` is the lock file, in the same directory.
+    fn write(&self, lock: &File, epoch: u64) -> Result<(), EpochError> {
         let bytes = truenas_xdr::to_bytes(&EpochRecord {
+            magic: MAGIC,
             version: FORMAT_VERSION,
             epoch,
+            fsid: fsid_of(lock)?,
         })
         .map_err(|e| EpochError::Format(e.to_string()))?;
         let opts = AtomicWriteOptions {
@@ -283,13 +343,45 @@ mod tests {
         assert_eq!(ef.read().unwrap(), 7);
     }
 
+    fn dir_fsid(dir: &Path) -> u64 {
+        fsid_of(&File::open(dir).unwrap()).unwrap()
+    }
+
+    fn record(version: u32, epoch: u64, fsid: u64) -> Vec<u8> {
+        truenas_xdr::to_bytes(&EpochRecord {
+            magic: MAGIC,
+            version,
+            epoch,
+            fsid,
+        })
+        .unwrap()
+    }
+
     #[test]
-    fn the_file_is_the_12_byte_layout_smbd_reads() {
+    fn the_file_is_the_24_byte_layout() {
         let dir = truenas_ros::tempdir().unwrap();
         let path = dir.path().join("smbhad.epoch");
         EpochFile::new(&path).bump(0x0102).unwrap();
-        let want = [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0x01, 0x04];
+        let mut want = vec![b'S', b'M', b'B', b'E', 0, 0, 0, 1];
+        want.extend_from_slice(&0x0104u64.to_be_bytes());
+        want.extend_from_slice(&dir_fsid(dir.path()).to_be_bytes());
         assert_eq!(std::fs::read(&path).unwrap(), want);
+    }
+
+    #[test]
+    fn a_file_of_another_file_system_reads_as_a_fence() {
+        let dir = truenas_ros::tempdir().unwrap();
+        let path = dir.path().join("smbhad.epoch");
+        let other = dir_fsid(dir.path()) ^ 1;
+        std::fs::write(&path, record(FORMAT_VERSION, 7, other)).unwrap();
+        let ef = EpochFile::new(&path);
+        assert_eq!(ef.read().unwrap(), 8, "no tag matches it");
+        assert!(matches!(
+            ef.advance_to(9, 7),
+            Err(EpochError::Stale { current: 8 })
+        ));
+        assert_eq!(ef.fence(0).unwrap(), Some(10));
+        assert_eq!(ef.read().unwrap(), 10, "written for this file system");
     }
 
     #[test]
@@ -323,13 +415,29 @@ mod tests {
         // No file: nothing to fence, and no file is made.
         assert_eq!(file.fence(0).unwrap(), None);
         assert!(!dir.path().join("smbhad.epoch").exists());
-        file.write(5).unwrap();
+        file.write(&file.lock().unwrap(), 5).unwrap();
         assert_eq!(file.fence(0).unwrap(), Some(6));
         assert_eq!(file.fence(6).unwrap(), None);
         assert_eq!(file.read().unwrap(), 6);
         // The daemon advanced: the next fence writes again.
-        file.write(7).unwrap();
+        file.write(&file.lock().unwrap(), 7).unwrap();
         assert_eq!(file.fence(6).unwrap(), Some(8));
+    }
+
+    #[test]
+    fn a_fence_to_the_current_epoch_does_not_wait_for_the_lock() {
+        let dir = truenas_ros::tempdir().unwrap();
+        let path = dir.path().join("smbhad.epoch");
+        let file = EpochFile::new(&path);
+        file.write(&file.lock().unwrap(), 6).unwrap();
+        let held = file.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(EpochFile::new(&path).fence(6).unwrap());
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(held);
+        assert_eq!(got.expect("the fence waited for the lock"), None);
     }
 
     #[test]
@@ -347,12 +455,12 @@ mod tests {
     fn a_later_version_with_more_bytes_is_read_from_its_prefix() {
         let dir = truenas_ros::tempdir().unwrap();
         let path = dir.path().join("smbhad.epoch");
-        let mut bytes = vec![0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0x01, 0x05];
+        let mut bytes = record(2, 0x0105, dir_fsid(dir.path()));
         bytes.extend_from_slice(&[0xcd; 12]);
         std::fs::write(&path, &bytes).unwrap();
         let ef = EpochFile::new(&path);
         assert_eq!(ef.read().unwrap(), 0x0105);
-        // A version 1 writer replaces it with the 12-byte layout.
+        // A version 1 writer replaces it with the 24-byte layout.
         assert_eq!(ef.bump(0).unwrap().epoch, 0x0106);
         assert_eq!(std::fs::read(&path).unwrap().len(), RECORD_LEN);
     }
@@ -362,12 +470,12 @@ mod tests {
         let dir = truenas_ros::tempdir().unwrap();
         let path = dir.path().join("smbhad.epoch");
         let ef = EpochFile::new(&path);
-        let mut bytes = vec![0u8; 12];
-        std::fs::write(&path, &bytes).unwrap();
+        let fsid = dir_fsid(dir.path());
+        std::fs::write(&path, record(0, 6, fsid)).unwrap();
         assert!(ef.read().is_err(), "version 0");
-        bytes[3] = 1;
+        let bytes = record(FORMAT_VERSION, 6, fsid);
         std::fs::write(&path, &bytes[..RECORD_LEN - 1]).unwrap();
-        assert!(ef.read().is_err(), "11 bytes");
+        assert!(ef.read().is_err(), "23 bytes");
     }
 
     #[test]
@@ -378,5 +486,48 @@ mod tests {
         let ef = EpochFile::new(&path);
         assert!(ef.read().is_err());
         assert!(ef.bump(0).is_err(), "never fence from a guess");
+        let mut bytes = record(FORMAT_VERSION, 6, dir_fsid(dir.path()));
+        bytes[0] = b's';
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(ef.read().is_err(), "no magic");
+        assert!(ef.bump(0).is_err(), "no magic, no fence");
+    }
+
+    #[test]
+    fn a_symlink_a_fifo_and_values_out_of_range_are_errors() {
+        let dir = truenas_ros::tempdir().unwrap();
+        let path = dir.path().join("smbhad.epoch");
+        let ef = EpochFile::new(&path);
+        let target = dir.path().join("target");
+        EpochFile::new(&target).bump(5).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(ef.read().is_err(), "a symlink to a valid file");
+        std::fs::remove_file(&path).unwrap();
+
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fifo = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(EpochFile::new(&fifo).read().is_err());
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(got.expect("the read waited on the FIFO"), "a FIFO");
+        std::fs::remove_file(&path).unwrap();
+
+        let fsid = dir_fsid(dir.path());
+        let over = record(MAX_FORMAT_VERSION + 1, 6, fsid);
+        std::fs::write(&path, over).unwrap();
+        assert!(ef.read().is_err(), "version out of range");
+        let over = record(FORMAT_VERSION, MAX_EPOCH + 1, fsid);
+        std::fs::write(&path, over).unwrap();
+        assert!(ef.read().is_err(), "epoch out of range");
+        std::fs::write(&path, b"root:x:0:0:root:/root:/bin/sh\n").unwrap();
+        assert!(ef.read().is_err(), "the start of /etc/passwd");
+        std::fs::write(&path, record(FORMAT_VERSION, MAX_EPOCH, fsid)).unwrap();
+        assert_eq!(ef.read().unwrap(), MAX_EPOCH);
     }
 }

@@ -12,7 +12,9 @@ use crate::auth::{self, LinkKey, Nonce, Proof, Side, Transcript};
 use crate::epoch::{self, Bumped};
 use crate::proto::encode;
 use crate::proto::local::{HelloOk, Origin, RehydratePage, Reply, Synced};
-use crate::proto::repl::{Batch, Challenge, ReplReply, ReplRequest, Snapshot};
+use crate::proto::repl::{
+    Batch, Challenge, ReplHello, ReplReply, ReplRequest, Snapshot,
+};
 use crate::proto::{self, BootId, Node, Op, Owner, Protection, VERSION};
 use crate::store::{self, Header, Store};
 use serde::Serialize;
@@ -125,11 +127,7 @@ pub enum State {
 
 enum Stage {
     Hello,
-    Prove {
-        standby_node: Node,
-        standby_nonce: Nonce,
-        nonce: Nonce,
-    },
+    Prove(Challenged),
     Ready,
     Snapshot {
         cursor: u64,
@@ -137,6 +135,14 @@ enum Stage {
         sent_last: bool,
     },
     Stream,
+}
+
+/// A standby's hello and the challenge of this primary: the values of the
+/// proofs.
+struct Challenged {
+    hello: ReplHello,
+    version: u32,
+    nonce: Nonce,
 }
 
 struct Session<W> {
@@ -665,22 +671,23 @@ impl<W: Waiter> Primary<W> {
         }
     }
 
-    /// The proof of this primary for a standby's hello. None without a link
-    /// key, or if OpenSSL fails.
-    fn link_proof(
-        &self,
-        standby_node: Node,
-        standby_nonce: &Nonce,
-        nonce: &Nonce,
-    ) -> Option<Proof> {
-        let key = self.key.as_ref()?;
-        let t = Transcript {
-            standby_node,
-            standby_nonce,
+    /// The values of the proofs of a handshake with this primary.
+    fn transcript<'a>(&self, c: &'a Challenged) -> Transcript<'a> {
+        Transcript {
+            standby_version: c.hello.version,
+            standby_node: c.hello.node,
+            standby_nonce: &c.hello.nonce,
+            version: c.version,
             primary_node: self.s.node,
-            primary_nonce: nonce,
-        };
-        auth::proof(key, Side::Primary, &t)
+            primary_nonce: &c.nonce,
+        }
+    }
+
+    /// The proof of this primary. None without a link key, or if OpenSSL
+    /// fails.
+    fn link_proof(&self, c: &Challenged) -> Option<Proof> {
+        let key = self.key.as_ref()?;
+        auth::proof(key, Side::Primary, &self.transcript(c))
             .inspect_err(|e| {
                 truenas_ros::log!(
                     self.log,
@@ -716,48 +723,33 @@ impl<W: Waiter> Primary<W> {
             {
                 let mut nonce = [0u8; 32];
                 (self.s.random)(&mut nonce);
-                let nonce = FixedOpaque(nonce);
-                let Some(proof) = self.link_proof(h.node, &h.nonce, &nonce)
-                else {
+                let c = Challenged {
+                    version: VERSION.min(h.version),
+                    hello: h,
+                    nonce: FixedOpaque(nonce),
+                };
+                let Some(proof) = self.link_proof(&c) else {
                     w.close();
                     self.drop_pending(p);
                     return;
                 };
-                p.stage = Stage::Prove {
-                    standby_node: h.node,
-                    standby_nonce: h.nonce,
-                    nonce,
+                let challenge = Challenge {
+                    version: c.version,
+                    node: self.s.node,
+                    nonce: c.nonce,
+                    proof,
                 };
+                p.stage = Stage::Prove(c);
                 p.deadline = Some(now + link_timeout);
                 self.pending = Some(p);
-                send(
-                    w,
-                    &ReplReply::Challenge(Challenge {
-                        version: VERSION.min(h.version),
-                        node: self.s.node,
-                        nonce,
-                        proof,
-                    }),
-                );
+                send(w, &ReplReply::Challenge(challenge));
             }
-            (
-                Stage::Prove {
-                    standby_node,
-                    standby_nonce,
-                    nonce,
-                },
-                ReplRequest::Prove(proof),
-            ) => {
+            (Stage::Prove(c), ReplRequest::Prove(proof)) => {
                 let ok = self.key.as_ref().is_some_and(|key| {
                     auth::verify(
                         key,
                         Side::Standby,
-                        &Transcript {
-                            standby_node,
-                            standby_nonce: &standby_nonce,
-                            primary_node: self.s.node,
-                            primary_nonce: &nonce,
-                        },
+                        &self.transcript(&c),
                         &proof,
                     )
                 });
@@ -1615,6 +1607,22 @@ mod tests {
         });
         pair.p.repl_request(pair.conn, hello, w, pair.now);
         assert!(matches!(slot.borrow_mut().take(), Some(Outcome::Closed)));
+    }
+
+    #[test]
+    fn a_version_changed_on_the_link_fails_authentication() {
+        let mut pair = Pair::new(&[], b"secret");
+        pair.conn += 1;
+        pair.open = true;
+        pair.p.repl_connect(pair.conn, pair.now);
+        let ReplRequest::Hello(mut h) = pair.sb.start() else {
+            panic!("no hello")
+        };
+        h.version += 1;
+        pair.send(ReplRequest::Hello(h));
+        let err = pair.pump().unwrap_err();
+        assert!(err.contains("authentication"), "{err}");
+        assert_eq!(pair.p.state(), State::Unprotected);
     }
 
     #[test]

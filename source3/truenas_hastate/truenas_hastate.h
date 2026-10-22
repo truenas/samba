@@ -22,6 +22,7 @@ void truenas_hastate_flushed(struct files_struct *fsp);
 void truenas_hastate_update(struct files_struct *fsp);
 void truenas_hastate_lease(struct files_struct *fsp,
 			   uint32_t old_state);
+void truenas_hastate_created(struct files_struct *fsp);
 NTSTATUS truenas_hastate_locked(struct files_struct *fsp);
 void truenas_hastate_delete_on_close(struct files_struct *fsp,
 				     bool delete_on_close);

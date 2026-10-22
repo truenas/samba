@@ -15,23 +15,28 @@
  * connects to the local daemon on "truenas smbhad socket".
  *
  * A changed handle goes on the pending list of the process. The tick is a
- * timer that runs once a second. At each tick, smbd sends the pending
- * records and deletes. smbd does not wait for a reply. smbd sends nothing
- * for a handle that it opens and closes between two ticks. A process with
- * durable handles keeps its connection. When the daemon restarts, the
- * process sends all its handles again.
+ * timer that runs every 100 ms ("truenas smbhad:tick ms") while changes
+ * are pending. At each tick, smbd sends the pending records and deletes.
+ * smbd does not wait for a reply. smbd sends nothing for a handle that it
+ * opens and closes between two ticks. A process with durable handles keeps
+ * its connection. When the daemon restarts, the process sends all its
+ * handles again.
  *
  * Some changes wait for the standby. smbd replies to the client only after
  * the standby has the change or after the standby's copy is fenced. These
  * changes are:
  * - the dirty flag, before the first change of the file after the open or
- *   a flush, and before the reply if a flush cleared the flag. The client
- *   can cache a change for all its handles of the file. smbd marks all
- *   handles of the file in the process.
+ *   a flush. The client can cache a change for all its handles of the
+ *   file. smbd marks all handles of the file in the process. A flush
+ *   clears the flag at the next tick: a failover before it drops the
+ *   handle as unflushed.
  * - byte range lock changes, see tn_every_lock_promised()
- * - a lease change that adds write caching
+ * - a lease change that adds write caching. An open makes this change
+ *   under the share mode lock: the wait comes before the reply to the
+ *   create, see truenas_hastate_created().
  * - the delete of the record of a handle that holds byte range locks, and
- *   of the handles of a file that gets delete on close
+ *   of the handles of a file that gets delete on close, and the marker of
+ *   the file, see tn_delete_pending()
  * This applies only to a handle whose record smbd sent before. If the wait
  * fails, smbd fences the standby's copy through the epoch file.
  *
@@ -60,8 +65,14 @@
 
 #include "includes.h"
 #include "smbd/smbd.h"
+#include "smbd/globals.h"
 #include "truenas_hastate/truenas_hastate.h"
+#include "locking/share_mode_lock.h"
+#include "librpc/gen_ndr/ndr_open_files.h"
 #include "librpc/gen_ndr/ndr_smbXsrv.h"
+#include "lib/util/server_id.h"
+#include "lib/global_contexts.h"
+#include "messages.h"
 #include "truenas_hastate/private.h"
 
 static bool tn_durable_enabled(void)
@@ -196,9 +207,163 @@ void truenas_hastate_disconnect(struct files_struct *fsp)
 }
 
 /*
- * Delete on close is set on the file of fsp. smbd does not replicate the
- * delete token. smbd must not restore the handles of the file in this
- * process. The deletes wait for the standby.
+ * Markers. smbd does not replicate the delete token of a file. Before smbd
+ * sets the token, it breaks the handle caching of the other clients. Their
+ * processes then delete the records of their handles at their next tick.
+ * A failover before that tick can restore these handles. So the process
+ * that sets the token also sends a marker of the file and waits for the
+ * standby. The restore drops all records of a file with a marker. Each
+ * second, the process deletes its markers whose file has no delete token
+ * for their name. A marker has no owner: it stays when the process exits,
+ * until the copy is cleared.
+ */
+
+struct tn_others_state {
+	struct server_id self;
+	bool found;
+};
+
+static bool tn_others_fn(struct share_mode_entry *e,
+			 bool *modified,
+			 void *private_data)
+{
+	struct tn_others_state *state = private_data;
+
+	state->found = !server_id_equal(&e->pid, &state->self);
+	return state->found;
+}
+
+/* True if another process has the file of fsp open, also disconnected */
+static bool tn_others_open(struct files_struct *fsp)
+{
+	struct tn_others_state state = {
+		.self = messaging_server_id(fsp->conn->sconn->msg_ctx),
+	};
+	size_t own = fsp->fsp_flags.no_share_mode_entry ? 0 : 1;
+	struct share_mode_lock *lck = NULL;
+	size_t n = 0;
+	NTSTATUS status;
+	bool ok;
+
+	/* Most often fsp is the only open. That needs no lock. */
+	status = share_mode_count_entries(fsp->file_id, &n);
+	if (NT_STATUS_EQUAL(status, NT_STATUS_NOT_FOUND) ||
+	    (NT_STATUS_IS_OK(status) && (n <= own))) {
+		return false;
+	}
+	lck = get_existing_share_mode_lock(talloc_tos(), fsp->file_id);
+	if (lck == NULL) {
+		return false;
+	}
+	ok = share_mode_forall_entries(lck, tn_others_fn, &state);
+	TALLOC_FREE(lck);
+	return !ok || state.found;
+}
+
+static void tn_marker_fn(struct tevent_context *ev,
+			 struct tevent_timer *te,
+			 struct timeval current_time,
+			 void *private_data);
+
+static void tn_arm_marker_check(void)
+{
+	if (tn_c.marker_te != NULL) {
+		return;
+	}
+	tn_c.marker_te = tevent_add_timer(global_event_context(),
+					  NULL,
+					  timeval_current_ofs(1, 0),
+					  tn_marker_fn,
+					  NULL);
+}
+
+static void tn_marker_fn(struct tevent_context *ev,
+			 struct tevent_timer *te,
+			 struct timeval current_time,
+			 void *private_data)
+{
+	struct tn_marker *m = NULL, *next = NULL;
+
+	tn_c.marker_te = NULL;
+	for (m = tn_c.markers; m != NULL; m = next) {
+		uint32_t access_mask, share_mode, lease_type;
+		bool delete_on_close = false;
+		NTSTATUS status;
+
+		next = m->next;
+		status = share_mode_peek_unlocked(m->file_id,
+						  m->name_hash,
+						  &access_mask,
+						  &share_mode,
+						  &lease_type,
+						  &delete_on_close);
+		if (NT_STATUS_IS_OK(status) && !delete_on_close) {
+			tn_drop_marker(m);
+		} else if (NT_STATUS_EQUAL(status, NT_STATUS_NOT_FOUND)) {
+			/* The file has no open handle. */
+			tn_drop_marker(m);
+		}
+	}
+	if (tn_c.markers != NULL) {
+		tn_arm_marker_check();
+	}
+}
+
+/*
+ * If another process has the file of fsp open, make a marker of the file
+ * and the name of fsp. True if smbd must wait for the standby.
+ */
+static bool tn_add_marker(struct files_struct *fsp)
+{
+	const struct loadparm_substitution *lp_sub =
+		loadparm_s3_global_substitution();
+	struct tn_marker *m = NULL;
+	struct statfs sfs;
+
+	tn_this_process();
+	if ((fsp->op == NULL) || !tn_others_open(fsp)) {
+		return false;
+	}
+	for (m = tn_c.markers; m != NULL; m = m->next) {
+		if (file_id_equal(&m->file_id, &fsp->file_id) &&
+		    (m->name_hash == fsp->name_hash)) {
+			return false;
+		}
+	}
+	if (fstatfs(fsp_get_pathref_fd(fsp), &sfs) != 0) {
+		DBG_WARNING("%s: no marker: %s\n",
+			    fsp_str_dbg(fsp),
+			    strerror(errno));
+		return false;
+	}
+	m = talloc_zero(NULL, struct tn_marker);
+	if (m == NULL) {
+		return false;
+	}
+	*m = (struct tn_marker) {
+		.id = TN_MARKER_ID | fsp->op->global->open_persistent_id,
+		.file_id = fsp->file_id,
+		.name_hash = fsp->name_hash,
+		.fsid = tn_fsid(&sfs),
+		.share = lp_servicename(m, lp_sub, SNUM(fsp->conn)),
+		.servicepath = talloc_strdup(m, fsp->conn->connectpath),
+		.base_name = talloc_strdup(m, fsp->fsp_name->base_name),
+	};
+	if ((m->share == NULL) || (m->servicepath == NULL) ||
+	    (m->base_name == NULL)) {
+		TALLOC_FREE(m);
+		return false;
+	}
+	DLIST_ADD(tn_c.markers, m);
+	tn_mark_marker(m);
+	tn_arm_marker_check();
+	return true;
+}
+
+/*
+ * Delete on close is set on the file of fsp, or the close of fsp sets it.
+ * smbd must not restore the handles of the file. The deletes and the
+ * marker wait for the standby.
  */
 static void tn_delete_pending(struct files_struct *fsp)
 {
@@ -213,6 +378,7 @@ static void tn_delete_pending(struct files_struct *fsp)
 			promise |= tn_unrecord(s);
 		}
 	}
+	promise |= tn_add_marker(fsp);
 	if (promise && !NT_STATUS_IS_OK(tn_promise(NULL))) {
 		DBG_ERR("%s: delete not replicated and not fenced\n",
 			fsp_str_dbg(fsp));
@@ -247,9 +413,8 @@ void truenas_hastate_fsp_freed(struct files_struct *fsp)
 		return;
 	}
 	if (tn_is(fsp, TRUENAS_FSP_HA_SENT) && (fsp->op != NULL)) {
-		/* The close hook did not run. Change the entry to a delete. */
-		p->fsp = NULL;
-		fsp->hastate_pending = NULL;
+		/* The close hook did not run. */
+		tn_pending_to_delete(p);
 		return;
 	}
 	tn_unlink_pending(p);
@@ -387,6 +552,16 @@ done:
 	return status;
 }
 
+/*
+ * Delete the record of fsp, which no longer survives a disconnect. Returns
+ * true if the delete must wait for the standby: fsp holds byte range locks
+ * that the standby has.
+ */
+static bool tn_unrecord_locks(struct files_struct *fsp)
+{
+	return tn_unrecord(fsp) && (fsp->current_lock_count != 0);
+}
+
 /* The oplock of fsp changed. */
 void truenas_hastate_update(struct files_struct *fsp)
 {
@@ -394,7 +569,11 @@ void truenas_hastate_update(struct files_struct *fsp)
 		return;
 	}
 	if (!tn_fsp_survives(fsp)) {
-		(void)tn_unrecord(fsp);
+		if (tn_unrecord_locks(fsp) &&
+		    !NT_STATUS_IS_OK(tn_promise(NULL))) {
+			DBG_ERR("%s: delete not replicated and not fenced\n",
+				fsp_str_dbg(fsp));
+		}
 		return;
 	}
 	tn_mark(fsp);
@@ -404,7 +583,9 @@ void truenas_hastate_update(struct files_struct *fsp)
  * The lease of fsp changed from old_state. The handles of a lease in this
  * process share fsp->lease. A restored lease with less caching than the
  * client has is not safe. A change that adds write caching waits for the
- * standby. The restore merges the records of a lease, see tn_check_file().
+ * standby. An open makes this change under the share mode lock, so the
+ * reply to the create waits, see truenas_hastate_created(). The restore
+ * merges the records of a lease, see tn_check_file().
  */
 void truenas_hastate_lease(struct files_struct *fsp,
 			   uint32_t old_state)
@@ -412,6 +593,7 @@ void truenas_hastate_lease(struct files_struct *fsp,
 	struct files_struct *s = NULL;
 	uint32_t new_state = fsp->lease->lease.lease_state;
 	bool promise = false;
+	bool upgrade = false;
 
 	if (!tn_durable_enabled()) {
 		return;
@@ -423,13 +605,16 @@ void truenas_hastate_lease(struct files_struct *fsp,
 			continue;
 		}
 		if (!tn_fsp_survives(s)) {
-			(void)tn_unrecord(s);
+			promise |= tn_unrecord_locks(s);
 			continue;
 		}
-		promise |= tn_is(s, TRUENAS_FSP_HA_SENT) &&
+		upgrade |= tn_is(s, TRUENAS_FSP_HA_SENT) &&
 			   (new_state & SMB2_LEASE_WRITE) &&
 			   !(old_state & SMB2_LEASE_WRITE);
 		tn_mark(s);
+	}
+	if (upgrade) {
+		tn_set(fsp, TRUENAS_FSP_HA_LEASE_PROMISE, true);
 	}
 	if (promise && !NT_STATUS_IS_OK(tn_promise(NULL))) {
 		DBG_ERR("%s: lease change not replicated and not fenced\n",
@@ -437,14 +622,63 @@ void truenas_hastate_lease(struct files_struct *fsp,
 	}
 }
 
+/*
+ * smbd opened fsp and does not hold the share mode lock. If the open added
+ * write caching to a lease that the standby has, wait before the reply.
+ */
+void truenas_hastate_created(struct files_struct *fsp)
+{
+	if (!tn_is(fsp, TRUENAS_FSP_HA_LEASE_PROMISE)) {
+		return;
+	}
+	tn_set(fsp, TRUENAS_FSP_HA_LEASE_PROMISE, false);
+	if (!NT_STATUS_IS_OK(tn_promise(NULL))) {
+		DBG_ERR("%s: lease change not replicated and not fenced\n",
+			fsp_str_dbg(fsp));
+	}
+}
+
+/*
+ * Delete on close of a name of the file was cancelled. A handle of a name
+ * without a delete token survives a disconnect again: it gets a record at
+ * the next tick.
+ */
+static void tn_delete_cancelled(struct files_struct *fsp)
+{
+	struct share_mode_lock *lck = NULL;
+	struct files_struct *s = NULL;
+
+	lck = get_existing_share_mode_lock(talloc_tos(), fsp->file_id);
+	if (lck == NULL) {
+		return;
+	}
+	for (s = file_find_di_first(fsp->conn->sconn, fsp->file_id, true);
+	     s != NULL;
+	     s = file_find_di_next(s, true)) {
+		if (!tn_is(s, TRUENAS_FSP_HA_DELETE_PENDING) ||
+		    is_delete_on_close_set(lck, s->name_hash)) {
+			continue;
+		}
+		tn_set(s, TRUENAS_FSP_HA_DELETE_PENDING, false);
+		if (s != fsp) {
+			truenas_hastate_update(s);
+		}
+	}
+	TALLOC_FREE(lck);
+}
+
 /* Delete on close of fsp changed, see smb_set_file_disposition_info(). */
 void truenas_hastate_delete_on_close(struct files_struct *fsp,
 				     bool delete_on_close)
 {
-	if (delete_on_close && tn_durable_enabled()) {
+	if (!tn_durable_enabled()) {
+		return;
+	}
+	if (delete_on_close) {
 		tn_delete_pending(fsp);
 		return;
 	}
+	tn_delete_cancelled(fsp);
 	truenas_hastate_update(fsp);
 }
 

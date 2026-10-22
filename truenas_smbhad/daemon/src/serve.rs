@@ -134,6 +134,34 @@ fn refuse(code: i32, message: &str) -> Response {
     }))
 }
 
+/// Returns the copy that stays after the fence at the start of a primary.
+/// `previous` is the epoch that the fence found. If it is not `file_epoch`,
+/// another fence came after `classify` read the file, for example a fence
+/// of smbd while this role started: that fence made the copy stale.
+fn after_start_fence(
+    kept: (Store, Header, Origin),
+    file_epoch: u64,
+    previous: u64,
+    me: &Identity,
+    log: &Logger,
+) -> (Store, Header, Origin) {
+    if previous == file_epoch {
+        return kept;
+    }
+    truenas_ros::log!(
+        log,
+        Level::Warning,
+        "the epoch file moved from {file_epoch} to {previous} during the \
+         start; dropping {} records",
+        kept.0.len()
+    );
+    (
+        Store::default(),
+        Header::empty(me.node, me.boot),
+        Origin::None,
+    )
+}
+
 /// Returns the copy to serve and the origin that a rehydration reports.
 /// `file_epoch` is the epoch in the epoch file before this primary fences.
 /// The copy of an earlier primary of this process stays only if no other
@@ -203,6 +231,7 @@ pub struct Identity {
 }
 
 /// Runs the primary role until `interrupt` is raised. Returns the copy.
+#[allow(clippy::too_many_lines)]
 pub fn run(
     cfg: &Config,
     copy: Copy,
@@ -212,15 +241,28 @@ pub fn run(
     log: &Logger,
 ) -> Copy {
     let ef = EpochFile::new(&cfg.epoch_file);
+    let mut failures = 0u32;
     let file_epoch = loop {
         match ef.read() {
             Ok(e) => break e,
             Err(e) => {
-                truenas_ros::log!(
-                    log,
-                    Level::Warning,
-                    "reading the epoch file: {e}"
-                );
+                // A damaged file holds the primary, and smbd waits for it at
+                // each start: an error after 10 s, then once a minute.
+                failures += 1;
+                if failures == 1 {
+                    truenas_ros::log!(
+                        log,
+                        Level::Warning,
+                        "reading the epoch file: {e}"
+                    );
+                } else if failures == 10 || failures.is_multiple_of(60) {
+                    truenas_ros::log!(
+                        log,
+                        Level::Error,
+                        "the epoch file is not readable for {failures} s, \
+                         so there is no primary: {e}"
+                    );
+                }
                 if interrupt.wait(Duration::from_secs(1)) {
                     return copy;
                 }
@@ -229,9 +271,9 @@ pub fn run(
     };
     let (store, header, origin) =
         classify(copy, file_epoch, me.node, me.boot, log);
-    let epoch = loop {
+    let (epoch, previous) = loop {
         match ef.bump(file_epoch.max(header.tag)) {
-            Ok(b) => break b.epoch,
+            Ok(b) => break (b.epoch, b.previous),
             Err(e) => {
                 truenas_ros::log!(log, Level::Warning, "fencing at start: {e}");
                 if interrupt.wait(Duration::from_secs(1)) {
@@ -245,6 +287,13 @@ pub fn run(
             }
         }
     };
+    let (store, header, origin) = after_start_fence(
+        (store, header, origin),
+        file_epoch,
+        previous,
+        me,
+        log,
+    );
     truenas_ros::log!(
         log,
         Level::Notice,
@@ -376,6 +425,7 @@ fn serve(
     let next_id = Rc::new(Cell::new(0u64));
     let allowed_uid = cfg.allowed_uid;
 
+    let repl_conns = Rc::new(Cell::new(0usize));
     let accept = {
         let log = log.clone();
         let core = Rc::clone(core);
@@ -383,6 +433,7 @@ fn serve(
         let jobs = jobs_tx.clone();
         let interrupt = Arc::clone(interrupt);
         let next_id = Rc::clone(&next_id);
+        let repl_conns = Rc::clone(&repl_conns);
         move |inc: Incoming<'_>| -> Option<Conn> {
             match inc.peer {
                 ClientAddr::Unix { cred: Some(c) } if c.uid == allowed_uid => {
@@ -399,7 +450,18 @@ fn serve(
                     None
                 }
                 ClientAddr::Inet(sa) => {
-                    if peer.is_some_and(|p| sa.ip() == IpAddr::V4(p)) {
+                    if peer.is_some_and(|p| sa.ip() == IpAddr::V4(p))
+                        && repl_conns.get() >= MAX_REPL_CONNS
+                    {
+                        truenas_ros::log!(
+                            log,
+                            Level::Warning,
+                            "refused {sa}: {MAX_REPL_CONNS} replication \
+                             connections are open"
+                        );
+                        None
+                    } else if peer.is_some_and(|p| sa.ip() == IpAddr::V4(p)) {
+                        repl_conns.set(repl_conns.get() + 1);
                         let id = next_id.get() + 1;
                         next_id.set(id);
                         let mut c = core.borrow_mut();
@@ -480,6 +542,9 @@ fn serve(
         unix_peercred: true,
         unlink_unix: true,
         backlog: cfg.backlog,
+        // TCP only: the link to the peer. Reaps half-open connections.
+        keepalive: Some(LINK_KEEPALIVE),
+        tcp_user_timeout: Some(LINK_KEEPALIVE),
         ..ServerConfig::default()
     };
     let mut server = Server::with_config(addrs, scfg, protocol)
@@ -495,6 +560,7 @@ fn serve(
             let mut c = core.borrow_mut();
             match state {
                 Conn::Repl { id } => {
+                    repl_conns.set(repl_conns.get().saturating_sub(1));
                     pushes.borrow_mut().remove(id);
                     c.repl_closed(*id);
                 }
@@ -590,6 +656,15 @@ const LINK_BIND_WAIT: Duration = Duration::from_millis(100);
 
 /// The time between two tries of a link port that was not free.
 const LINK_RETRY: Duration = Duration::from_secs(5);
+
+/// The most replication connections that the primary keeps open. One
+/// session and one handshake are in use. A connection that sends nothing
+/// cannot be closed here, and the server pool also serves smbd.
+const MAX_REPL_CONNS: usize = 4;
+
+/// The keepalive idle time and the TCP user timeout of the link. A
+/// connection from a peer that rebooted then closes.
+const LINK_KEEPALIVE: Duration = Duration::from_secs(30);
 
 /// Tries the link port every `LINK_RETRY` while the primary serves smbd
 /// without the link. When the port is free, starts the role again.
@@ -818,6 +893,26 @@ mod tests {
         let mut header = Header::empty(writer, boot);
         header.tag = tag;
         Copy::Replica { store, header }
+    }
+
+    #[test]
+    fn a_fence_during_the_start_drops_the_copy() {
+        let me = Identity {
+            node: ME,
+            boot: BOOT,
+        };
+        let kept = || {
+            let Copy::Replica { store, header } = replica(9, PEER, BOOT) else {
+                unreachable!()
+            };
+            (store, header, Origin::Replica)
+        };
+        let log = Logger::silent();
+        let (s, _, origin) = after_start_fence(kept(), 9, 9, &me, &log);
+        assert_eq!((origin, s.len()), (Origin::Replica, 1));
+        // smbd fenced after classify read the file.
+        let (s, _, origin) = after_start_fence(kept(), 9, 10, &me, &log);
+        assert_eq!((origin, s.len()), (Origin::None, 0));
     }
 
     #[test]

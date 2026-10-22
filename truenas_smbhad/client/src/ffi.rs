@@ -24,6 +24,12 @@ use truenas_smbhad_proto::local::{Client as Role, Origin, RehydratePage};
 use truenas_smbhad_proto::{MAX_RECORD_BYTES, Node, Owner, Record, SyncLevel};
 use truenas_xdr::{Bounded, FixedOpaque, VarOpaque, VarOpaqueRef};
 
+/// The bytes of one lock in a record: start, size, type and flavour.
+const LOCK_XDR_BYTES: usize = 24;
+
+/// The most locks that a record of `MAX_RECORD_BYTES` can hold.
+const MAX_RECORD_LOCKS: usize = MAX_RECORD_BYTES / LOCK_XDR_BYTES;
+
 /// The kinds of smbd process: `role` of `smbhad_connect()`.
 pub const TN_WORKER: u32 = 1;
 /// The parent: rehydrate and done.
@@ -598,6 +604,12 @@ pub unsafe extern "C" fn smbhad_batch_put(
     guard(TN_PUT_FAILED, || {
         // SAFETY: the caller guarantees valid pointers.
         let (b, share, r) = unsafe { (&mut *b, bytes(share), &*r) };
+        // More locks than a record can hold: a delete. The locks are not
+        // read.
+        if usize::try_from(r.num_locks).map_or(true, |n| n > MAX_RECORD_LOCKS) {
+            b.del(r.persistent_id);
+            return TN_PUT_DELETED;
+        }
         // SAFETY: the caller guarantees the pointers of `r`.
         let Some(rec) = (unsafe { record_of(r) }) else {
             set_error("the record has a value out of range");
@@ -818,7 +830,8 @@ pub unsafe extern "C" fn smbhad_record_decode(
     len: usize,
 ) -> *mut DurableRecord {
     guard(std::ptr::null_mut(), || {
-        if buf.is_null() {
+        if buf.is_null() || len > MAX_RECORD_BYTES {
+            set_error("not a record that this version can restore");
             return std::ptr::null_mut();
         }
         // SAFETY: the caller guarantees `len` bytes at `buf`.
@@ -1089,6 +1102,24 @@ mod tests {
             assert_eq!(smbhad_batch_len(b), 1);
             smbhad_batch_free(b);
         }
+    }
+
+    #[test]
+    fn a_lock_count_above_the_limit_is_a_delete_without_a_read() {
+        let mut r = c_sample(c"/s", c"f", &[]);
+        r.num_locks = u32::MAX;
+        r.locks = std::ptr::NonNull::dangling().as_ptr();
+        let b = smbhad_batch_new();
+        // SAFETY: valid pointers, except `locks`, which must not be read.
+        let put = unsafe {
+            smbhad_batch_put(b, c"data".as_ptr(), 1, 2, &raw const r)
+        };
+        assert_eq!(put, TN_PUT_DELETED);
+        // SAFETY: `b` is a batch.
+        unsafe { smbhad_batch_free(b) };
+        // SAFETY: the length is checked before the bytes.
+        let d = unsafe { smbhad_record_decode(b"x".as_ptr(), usize::MAX) };
+        assert!(d.is_null());
     }
 
     #[test]

@@ -66,6 +66,11 @@ static NTSTATUS zc_durable_wrap(struct vfs_handle_struct *handle,
 	};
 	bool ok;
 
+	/* The change cookie is the only check of a reconnect. */
+	if (!(st->st_ex_iflags & ST_EX_IFLAG_HAS_CHANGE_COOKIE)) {
+		TALLOC_FREE(share);
+		return NT_STATUS_NOT_SUPPORTED;
+	}
 	ok = truenas_zfs_durable_cookie_push(mem_ctx, &zc, cookie);
 	TALLOC_FREE(share);
 	return ok ? NT_STATUS_OK : NT_STATUS_NO_MEMORY;
@@ -222,6 +227,10 @@ static NTSTATUS zc_durable_refresh(struct vfs_handle_struct *handle,
 		return NT_STATUS_OBJECT_NAME_NOT_FOUND;
 	}
 	st = &smb_fname->fsp->fsp_name->st;
+	if (!(st->st_ex_iflags & ST_EX_IFLAG_HAS_CHANGE_COOKIE)) {
+		DBG_NOTICE("%s has no change cookie\n", cookie.base_name);
+		return NT_STATUS_OBJECT_NAME_NOT_FOUND;
+	}
 	if (st->st_ex_change_cookie != zc->change_cookie) {
 		DBG_NOTICE("%s changed while disconnected, "
 			   "change cookie %"PRIu64" != %"PRIu64"\n",

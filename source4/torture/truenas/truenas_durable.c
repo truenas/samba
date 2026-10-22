@@ -27,10 +27,10 @@
  *
  *  --option=torture:durable_phase=prepare --option=torture:durable_state=FILE
  *	Opens the durable handles in the list below. Waits 2 s, one tick
- *	after the records are sent. Then locks C and changes J, K, M and N.
- *	Waits until torture:durable_late_lock_secs seconds after the opens,
- *	default 0. Then locks I. Writes the client state to FILE. Keeps the
- *	connection open for torture:durable_hold seconds.
+ *	after the records are sent. Then locks C and changes J, K, M, N and
+ *	P. Waits until torture:durable_late_lock_secs seconds after the
+ *	opens, default 0. Then locks I and changes O. Writes the client state
+ *	to FILE. Keeps the connection open for torture:durable_hold seconds.
  *  --option=torture:durable_phase=reconnect --option=torture:durable_state=FILE
  *	--option=torture:durable_state_out=FILE2
  *	Reconnects the handles that verify expects to be restored, except E.
@@ -69,6 +69,13 @@
  *     close and closes. Never restored.
  *  N  v2, RWH lease, flushed. A second handle of the lease opens it with
  *     overwrite (truncates it) and closes. Never restored, as B.
+ *  O  v2, RWH lease, flushed. A second client opens it with delete on
+ *     close, closes and disconnects. The close breaks the handle caching
+ *     of O, and O keeps the file open. Never restored. If the failure
+ *     comes before the next tick, the marker of the second client drops
+ *     it.
+ *  P  v2, RH lease, flushed. A second handle of the lease asks for RWH
+ *     and closes: the lease gets write caching. Restored with RWH.
  *
  * torture:durable_gone lists the letters of the handles that the caller
  * changed on disk while they were disconnected. These handles must not be
@@ -109,6 +116,8 @@ struct td_handle {
 	bool exit_close;	/* a second client opens and closes it */
 	bool sibling_delete;	/* delete on close through a second handle */
 	bool sibling_truncate;	/* overwritten through a second handle */
+	bool other_delete;	/* delete on close through a second client */
+	bool sibling_upgrade;	/* write caching through a second handle */
 	/* client state, saved in the state file */
 	struct smb2_handle h;
 	struct GUID create_guid;
@@ -147,6 +156,11 @@ static struct td_handle td_handles[] = {
 	  .lease = true, .flush = true, .sibling_delete = true },
 	{ .tag = 'N', .name = TD_DIR "\\durable_n.dat", .version = 2,
 	  .lease = true, .flush = true, .sibling_truncate = true },
+	{ .tag = 'O', .name = TD_DIR "\\durable_o.dat", .version = 2,
+	  .lease = true, .flush = true, .other_delete = true },
+	{ .tag = 'P', .name = TD_DIR "\\durable_p.dat", .version = 2,
+	  .lease = true, .no_write = true, .flush = true,
+	  .sibling_upgrade = true },
 };
 
 static void td_pattern(uint8_t *buf, size_t len, char tag)
@@ -442,6 +456,42 @@ done:
 	return ret;
 }
 
+/*
+ * A second client opens t with delete on close, closes its handle and
+ * disconnects. t keeps the file open, so the file keeps the delete token.
+ */
+static bool td_other_delete(struct torture_context *tctx,
+			    struct smb2_tree *tree0,
+			    struct td_handle *t)
+{
+	struct smbcli_options options = tree0->session->transport->options;
+	struct smb2_tree *tree = NULL;
+	struct smb2_create io;
+	NTSTATUS status;
+	bool ret = true;
+
+	options.client_guid = GUID_random();
+	torture_assert(tctx,
+		       torture_smb2_connection_ext(tctx, 0, &options, &tree),
+		       "connecting the second client");
+	ZERO_STRUCT(io);
+	io.in.fname = td_final_name(t);
+	io.in.desired_access = SEC_STD_DELETE | SEC_FILE_READ_ATTRIBUTE;
+	io.in.share_access = NTCREATEX_SHARE_ACCESS_MASK;
+	io.in.create_disposition = NTCREATEX_DISP_OPEN;
+	io.in.create_options = NTCREATEX_OPTIONS_DELETE_ON_CLOSE;
+	io.in.file_attributes = FILE_ATTRIBUTE_NORMAL;
+	status = smb2_create(tree, tctx, &io);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"open of the second client");
+	status = smb2_util_close(tree, io.out.file.handle);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "close");
+done:
+	/* The server process of the client exits. */
+	talloc_free(tree);
+	return ret;
+}
+
 static bool td_prepare(struct torture_context *tctx,
 		       struct smb2_tree *tree,
 		       const char *state_path)
@@ -562,7 +612,7 @@ static bool td_prepare(struct torture_context *tctx,
 							done, "lock");
 		}
 		if (t->break_write || t->sibling_write || t->sibling_delete ||
-		    t->sibling_truncate) {
+		    t->sibling_truncate || t->sibling_upgrade) {
 			torture_assert_goto(tctx,
 					    td_second(tctx, tree, t, key,
 						      t->sibling_write,
@@ -576,13 +626,19 @@ static bool td_prepare(struct torture_context *tctx,
 	for (i = 0; i < ARRAY_SIZE(td_handles); i++) {
 		struct td_handle *t = &td_handles[i];
 
-		if (!t->late_lock) {
-			continue;
+		if (t->late_lock) {
+			status = td_lock(tree, t);
+			torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+							"late lock");
+			torture_comment(tctx, "%c: locked\n", t->tag);
 		}
-		status = td_lock(tree, t);
-		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
-						"late lock");
-		torture_comment(tctx, "%c: locked\n", t->tag);
+		if (t->other_delete) {
+			torture_assert_goto(tctx,
+					    td_other_delete(tctx, tree, t),
+					    ret, done, "second client");
+			torture_comment(tctx, "%c: delete on close by a second "
+					"client\n", t->tag);
+		}
 	}
 
 	client_guid = &tree->session->transport->options.client_guid;
@@ -654,7 +710,7 @@ static bool td_wanted(const struct td_handle *t, const char *gone)
 	if ((t->tag == 'B') || t->sibling_write || t->sibling_truncate) {
 		return false;	/* unflushed writes */
 	}
-	if (t->exit_close || t->sibling_delete) {
+	if (t->exit_close || t->sibling_delete || t->other_delete) {
 		return false;	/* closed, or delete on close */
 	}
 	if (strchr(gone, t->tag) != NULL) {

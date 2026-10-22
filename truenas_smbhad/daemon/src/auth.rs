@@ -6,9 +6,11 @@
 //! Both controllers have the same pwenc secret. The secret also encrypts the
 //! passwords that middleware stores. The daemons derive the link key from
 //! the secret. Each side proves that it has the link key. The proof is an
-//! HMAC over a label for the side, both nodes and both nonces. A proof
-//! from one side does not verify for the other side. The link has no
-//! encryption and no per-message MAC. The link does not leave the chassis.
+//! HMAC over a label for the side and the values of the hello and the
+//! challenge: both versions, both nodes and both nonces. A proof from one
+//! side does not verify for the other side. A version that changes on the
+//! link makes the proofs fail. The link has no encryption and no
+//! per-message MAC. The link does not leave the chassis.
 //!
 //! OpenSSL (libcrypto) does the HKDF, the HMAC and the comparison. In FIPS
 //! mode, the FIPS provider of OpenSSL does this work.
@@ -79,10 +81,14 @@ impl Side {
 /// The handshake values in the HMAC input of both proofs.
 #[derive(Clone, Copy, Debug)]
 pub struct Transcript<'a> {
+    /// From the standby's hello: the highest version that it speaks.
+    pub standby_version: u32,
     /// From the standby's hello.
     pub standby_node: Node,
     /// From the standby's hello.
     pub standby_nonce: &'a Nonce,
+    /// From the primary's challenge: the version of the session.
+    pub version: u32,
     /// From the primary's challenge.
     pub primary_node: Node,
     /// From the primary's challenge.
@@ -97,8 +103,10 @@ fn mac(
     let pkey = PKey::hmac(&key.0)?;
     let mut m = Signer::new(MessageDigest::sha256(), &pkey)?;
     m.update(side.label())?;
+    m.update(&t.standby_version.to_be_bytes())?;
     m.update(&(t.standby_node as i32).to_be_bytes())?;
     m.update(&t.standby_nonce.0)?;
+    m.update(&t.version.to_be_bytes())?;
     m.update(&(t.primary_node as i32).to_be_bytes())?;
     m.update(&t.primary_nonce.0)?;
     let mut out = [0u8; 32];
@@ -154,10 +162,13 @@ mod tests {
     const PNODE: Node = Node::A;
     const PN: Nonce = FixedOpaque([4; 32]);
 
+    // A newer standby and a session of version 1: the two versions differ.
     fn transcript() -> Transcript<'static> {
         Transcript {
+            standby_version: 3,
             standby_node: SNODE,
             standby_nonce: &SN,
+            version: 1,
             primary_node: PNODE,
             primary_nonce: &PN,
         }
@@ -179,11 +190,11 @@ mod tests {
         );
         assert_eq!(
             hex(&proof(&key, Side::Primary, &transcript()).unwrap().0),
-            "e0aa788334de8cf5342c83d2bf7828b8673bb27b05d767e7c687aa725af15761"
+            "7e94ccdfc89316137ddc97c126151e5ad4d188e6f64a538fac39d6a5cead2bed"
         );
         assert_eq!(
             hex(&proof(&key, Side::Standby, &transcript()).unwrap().0),
-            "0a7d9150cf118ee557939b7ccc17c524a70222745a2d846a8729669aaea2d59c"
+            "4488012ca3f1fa49629aed7d617343aa104fd1949f436d5a114e4897d133abef"
         );
     }
 
@@ -205,5 +216,19 @@ mod tests {
             !verify(&key, Side::Standby, &t2, &p),
             "replayed into a new handshake"
         );
+    }
+
+    #[test]
+    fn a_proof_does_not_verify_for_other_versions() {
+        let key = LinkKey::derive(&secret()).unwrap();
+        let t = transcript();
+        let p = proof(&key, Side::Primary, &t).unwrap();
+        let hello = Transcript {
+            standby_version: 2,
+            ..t
+        };
+        assert!(!verify(&key, Side::Primary, &hello, &p), "hello version");
+        let session = Transcript { version: 2, ..t };
+        assert!(!verify(&key, Side::Primary, &session, &p), "session");
     }
 }

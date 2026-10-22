@@ -126,6 +126,12 @@
 #define TRUENAS_DURABLE_LOCKS_UNSTABLE 4
 
 /**
+ * Not a handle: a marker. The file has delete on close. The restore drops
+ * all records of the file.
+ */
+#define TRUENAS_DURABLE_DELETE_PENDING 16
+
+/**
  * The operations of one or more submits.
  */
 struct smbhad_batch;

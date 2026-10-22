@@ -19,13 +19,15 @@
 
 static int tn_tick_ms(void)
 {
-	return lp_parm_int(-1, "truenas smbhad", "tick ms", 1000);
+	return lp_parm_int(-1, "truenas smbhad", "tick ms", 100);
 }
 
 void tn_unlink_pending(struct tn_pending *p)
 {
 	DLIST_REMOVE(tn_c.pending, p);
-	if ((p->fsp != NULL) && (p->fsp->hastate_pending == p)) {
+	if ((p->fsp == NULL) && (p->marker == NULL)) {
+		tn_c.num_deletes -= 1;
+	} else if ((p->fsp != NULL) && (p->fsp->hastate_pending == p)) {
 		p->fsp->hastate_pending = NULL;
 	}
 	TALLOC_FREE(p);
@@ -78,6 +80,28 @@ void tn_mark(struct files_struct *fsp)
 	tn_arm_tick();
 }
 
+/*
+ * The daemon is unreachable and the deletes grow, mostly in the scavenger.
+ * Fence the standby's copy and drop the deletes. The daemon drops a fenced
+ * copy, and each process sends its handles again.
+ */
+static void tn_drop_deletes(void)
+{
+	struct tn_pending *p = NULL, *next = NULL;
+
+	if (!tn_fallback_fence()) {
+		return;
+	}
+	DBG_WARNING("%zu deletes not sent: dropped, the copy is fenced\n",
+		    tn_c.num_deletes);
+	for (p = tn_c.pending; p != NULL; p = next) {
+		next = p->next;
+		if ((p->fsp == NULL) && (p->marker == NULL)) {
+			tn_unlink_pending(p);
+		}
+	}
+}
+
 /* smbd sends a delete of the record of id at the next tick. */
 void tn_mark_delete(uint64_t id)
 {
@@ -90,7 +114,56 @@ void tn_mark_delete(uint64_t id)
 	}
 	p->id = id;
 	DLIST_ADD_END(tn_c.pending, p);
+	tn_c.num_deletes += 1;
+	if ((tn_c.conn == NULL) && (tn_c.num_deletes % TN_MAX_DELETES == 0)) {
+		tn_drop_deletes();
+	}
 	tn_arm_tick();
+}
+
+/* smbd frees the fsp of p. p becomes a delete. */
+void tn_pending_to_delete(struct tn_pending *p)
+{
+	p->fsp->hastate_pending = NULL;
+	p->fsp = NULL;
+	tn_c.num_deletes += 1;
+}
+
+/* smbd sends marker m at the next tick. */
+void tn_mark_marker(struct tn_marker *m)
+{
+	struct tn_pending *p = NULL;
+
+	tn_this_process();
+	for (p = tn_c.pending; p != NULL; p = p->next) {
+		if (p->marker == m) {
+			return;
+		}
+	}
+	p = talloc_zero(NULL, struct tn_pending);
+	if (p == NULL) {
+		return;
+	}
+	p->id = m->id;
+	p->marker = m;
+	DLIST_ADD_END(tn_c.pending, p);
+	tn_arm_tick();
+}
+
+/* The file of marker m has no delete token for its name. Delete m. */
+void tn_drop_marker(struct tn_marker *m)
+{
+	struct tn_pending *p = NULL, *next = NULL;
+
+	for (p = tn_c.pending; p != NULL; p = next) {
+		next = p->next;
+		if (p->marker == m) {
+			tn_unlink_pending(p);
+		}
+	}
+	tn_mark_delete(m->id);
+	DLIST_REMOVE(tn_c.markers, m);
+	TALLOC_FREE(m);
 }
 
 /*
@@ -121,6 +194,10 @@ bool tn_submit(uint32_t sync,
 			p->deleted = false;
 			if ((fsp != NULL) && (p->fsp == fsp)) {
 				/* sent at the end */
+				continue;
+			}
+			if (p->marker != NULL) {
+				(void)tn_put_marker(b, p->marker);
 				continue;
 			}
 			if (p->fsp == NULL) {
@@ -268,7 +345,11 @@ static struct files_struct *tn_resubmit_fn(struct files_struct *fsp,
 void tn_resubmit_all(void)
 {
 	struct tn_resubmit_state state = { .count = 0 };
+	struct tn_marker *m = NULL;
 
+	for (m = tn_c.markers; m != NULL; m = m->next) {
+		tn_mark_marker(m);
+	}
 	if (tn_c.sconn == NULL) {
 		return;
 	}

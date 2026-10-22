@@ -115,8 +115,10 @@ impl Standby {
                     ));
                 }
                 let t = Transcript {
+                    standby_version: VERSION,
                     standby_node: self.node,
                     standby_nonce: &nonce,
+                    version: c.version,
                     primary_node: c.node,
                     primary_nonce: &c.nonce,
                 };
@@ -469,8 +471,10 @@ mod tests {
         let nonce = FixedOpaque([5; 32]);
         let key = LinkKey::derive(b"k").unwrap();
         let t = Transcript {
+            standby_version: h.version,
             standby_node: h.node,
             standby_nonce: &h.nonce,
+            version: VERSION,
             primary_node: PNODE,
             primary_nonce: &nonce,
         };
@@ -597,8 +601,10 @@ mod tests {
                 &LinkKey::derive(key).unwrap(),
                 Side::Primary,
                 &Transcript {
+                    standby_version: h.version,
                     standby_node: h.node,
                     standby_nonce: &h.nonce,
+                    version,
                     primary_node: PNODE,
                     primary_nonce: &nonce,
                 },
@@ -625,8 +631,10 @@ mod tests {
             &LinkKey::derive(b"k").unwrap(),
             Side::Primary,
             &Transcript {
+                standby_version: h.version,
                 standby_node: h.node,
                 standby_nonce: &h.nonce,
+                version: VERSION,
                 primary_node: h.node,
                 primary_nonce: &nonce,
             },

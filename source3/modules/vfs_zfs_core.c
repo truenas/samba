@@ -810,13 +810,25 @@ disconnect_out:
 	return -1;
 }
 
-#define ZC_FILE_ID_OBJ_BITS 48	/* ZFS object numbers are below 2^48 */
-
 /*
- * Off the share's dataset: the objsetid of the dataset above the object
- * number. An objsetid is unique in the pool and never 0. A device minor
- * can change at a failover. An objsetid does not change.
+ * Off the share's dataset, the file id is the objsetid of the dataset above
+ * the object number of the file. An objsetid is unique in the pool, never
+ * 0, and does not change. A device minor can change at a failover.
+ *
+ * In ZFS both numbers can use 48 bits (DN_MAX_OBJECT_SHIFT), so no split of
+ * 64 bits holds every pair. The split is 24 bits for the objsetid and 40
+ * bits for the object number:
+ * - An objsetid is an object number in the MOS of the pool. It grows with
+ *   the history of dataset and snapshot creation. Real pools have
+ *   objsetids above 2^16, for example 138,892. 2^24 is 16.7 million.
+ * - The object number of a file follows the peak file count of its
+ *   dataset, times the dnode slots of a file. 2^40 is 1.1 trillion.
+ * Above these limits, the file id is the default of vfs_default, which can
+ * change at a failover. smbd logs a warning for such a dataset.
  */
+#define ZC_FILE_ID_OBJ_BITS 40
+#define ZC_FILE_ID_SET_BITS (64 - ZC_FILE_ID_OBJ_BITS)
+
 static uint64_t zfs_core_fs_file_id(struct vfs_handle_struct *handle,
 				    const SMB_STRUCT_STAT *psbuf)
 {
@@ -834,17 +846,31 @@ static uint64_t zfs_core_fs_file_id(struct vfs_handle_struct *handle,
 				config,
 				struct zfs_core_config_data,
 				return SMB_VFS_NEXT_FS_FILE_ID(handle, psbuf));
-	/* The entries of a directory are mostly in one dataset. */
+	/*
+	 * The entries of a directory are mostly in one dataset. A failed
+	 * lookup is not kept: the next stat looks up again.
+	 */
 	if (psbuf->st_ex_mnt_id != config->fid_mnt_id) {
 		ds = smb_zfs_lookup_dataset(psbuf->st_ex_mnt_id);
 		if (ds != NULL) {
 			props = smb_zfs_dataset_props(ds);
 		}
+		if (props == NULL) {
+			return SMB_VFS_NEXT_FS_FILE_ID(handle, psbuf);
+		}
 		config->fid_mnt_id = psbuf->st_ex_mnt_id;
-		config->fid_objsetid = (props != NULL) ? props->objsetid : 0;
+		config->fid_objsetid = props->objsetid;
+		if ((config->fid_objsetid >> ZC_FILE_ID_SET_BITS) != 0) {
+			DBG_WARNING("%s: objsetid %" PRIu64 " is above 2^%d: "
+				    "default file ids, which can change at a "
+				    "failover\n",
+				    ds->dataset_name,
+				    config->fid_objsetid,
+				    ZC_FILE_ID_SET_BITS);
+		}
 	}
 	if ((config->fid_objsetid == 0) ||
-	    (config->fid_objsetid > UINT16_MAX)) {
+	    ((config->fid_objsetid >> ZC_FILE_ID_SET_BITS) != 0)) {
 		return SMB_VFS_NEXT_FS_FILE_ID(handle, psbuf);
 	}
 

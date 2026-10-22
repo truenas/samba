@@ -471,6 +471,11 @@ static zfs_handle_t *entry_get_zhandle(dataset_t *entry)
 	zfs_handle_t *zfsp = NULL;
 
 	if (entry->zhandle != NULL) {
+		if (!entry->props_loaded) {
+			/* A failed read is not kept: read again. */
+			entry->props_loaded = (zhandle_get_props(
+				entry->zhandle, entry->ds->properties) == 0);
+		}
 		return entry->zhandle;
 	}
 

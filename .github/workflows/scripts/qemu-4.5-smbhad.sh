@@ -40,6 +40,8 @@ echo "=========================================="
 # output of cbindgen.
 cargo install --locked cbindgen --version 0.29.4
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
-cargo test --locked
+# Each HA test starts daemons with io_uring rings, which take locked
+# memory. More test threads than RLIMIT_MEMLOCK allows fail with ENOMEM.
+cargo test --locked -- --test-threads=8
 echo "truenas_smbhad tests PASSED"
 REMOTE_SCRIPT

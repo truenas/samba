@@ -32,6 +32,9 @@ pub const TRUENAS_DURABLE_DISCONNECTED: u32 = 0x1;
 pub const TRUENAS_DURABLE_DIRTY: u32 = 0x2;
 /// Later lock changes can be missing from the record.
 pub const TRUENAS_DURABLE_LOCKS_UNSTABLE: u32 = 0x4;
+/// Not a handle: a marker. The file has delete on close. The restore drops
+/// all records of the file.
+pub const TRUENAS_DURABLE_DELETE_PENDING: u32 = 0x10;
 /// A persistent handle. Reserved: no reader restores it yet, and a reader
 /// that does not know it must not restore it as a durable handle.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -41,7 +44,8 @@ pub(crate) const CRITICAL_FLAGS: u32 = 0x0000_ffff;
 /// The critical flags that this version knows.
 pub(crate) const KNOWN_FLAGS: u32 = TRUENAS_DURABLE_DISCONNECTED
     | TRUENAS_DURABLE_DIRTY
-    | TRUENAS_DURABLE_LOCKS_UNSTABLE;
+    | TRUENAS_DURABLE_LOCKS_UNSTABLE
+    | TRUENAS_DURABLE_DELETE_PENDING;
 /// An unknown extension with this bit makes a reader drop the record.
 pub(crate) const EXT_CRITICAL: u32 = 0x8000_0000;
 
@@ -306,6 +310,10 @@ pub(crate) mod tests {
         let mut bad = pinned.clone();
         set_u32(&mut bad, 4, TRUENAS_DURABLE_DISCONNECTED | PERSISTENT);
         assert_eq!(decode(&bad), None, "a persistent handle");
+        set_u32(&mut bad, 4, 0x20);
+        assert_eq!(decode(&bad), None, "an unknown critical flag");
+        set_u32(&mut bad, 4, TRUENAS_DURABLE_DELETE_PENDING);
+        assert_eq!(decode(&bad).unwrap().flags, TRUENAS_DURABLE_DELETE_PENDING);
         set_u32(&mut bad, 4, TRUENAS_DURABLE_DISCONNECTED | 0x0001_0000);
         assert_eq!(
             decode(&bad).unwrap().flags,

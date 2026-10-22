@@ -287,6 +287,31 @@ int tn_put_record(struct smbhad_batch *b,
 	return ret;
 }
 
+/* Add the put of marker m to b. The marker has no owner. */
+int tn_put_marker(struct smbhad_batch *b, const struct tn_marker *m)
+{
+	struct truenas_durable_record r = {
+		.flags = TRUENAS_DURABLE_DELETE_PENDING,
+		.servicepath = m->servicepath,
+		.base_name = m->base_name,
+		.fsid = m->fsid,
+		.inode = m->file_id.inode,
+		.extid = m->file_id.extid,
+		.name_hash = m->name_hash,
+		.persistent_id = m->id,
+	};
+	int ret;
+
+	unix_to_nt_time(&r.updated, time(NULL));
+	ret = smbhad_batch_put(b, m->share, 0, 0, &r);
+	if (ret != TN_PUT_OK) {
+		DBG_WARNING("no marker for %s: %s\n",
+			    m->base_name,
+			    smbhad_last_error());
+	}
+	return ret;
+}
+
 bool truenas_zfs_durable_cookie_push(
 	TALLOC_CTX *mem_ctx,
 	const struct truenas_zfs_durable_cookie *zc,

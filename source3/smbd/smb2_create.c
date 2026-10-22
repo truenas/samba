@@ -2085,6 +2085,8 @@ static void smbd_smb2_create_after_exec(struct tevent_req *req)
 		}
 	}
 
+	/* TrueNAS: a lease change of the open waits for the standby here. */
+	truenas_hastate_created(state->result);
 	return;
 
 fail:
