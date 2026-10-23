@@ -80,15 +80,59 @@ enum Job {
 type Core = Rc<RefCell<Primary<Deferred>>>;
 type Pushes = Rc<RefCell<HashMap<u64, PushHandle>>>;
 
-/// The local connections after their hello, by connection id.
+/// The local connections after their hello, by connection id, and the
+/// processes that said hello.
 #[derive(Default)]
 struct Locals {
-    /// The process of each connection, and its start time.
-    owners: HashMap<u64, (Owner, Option<u64>)>,
+    /// The process of each connection.
+    owners: HashMap<u64, Owner>,
+    /// The start time of each process, from its hello. It stays when the
+    /// connection closes: the daemon closes idle connections of processes
+    /// that are alive. cleanupd reports each process that exits.
+    starts: HashMap<Owner, Option<u64>>,
     /// The connections of processes that exited. cleanupd reported them.
     /// Their submits can arrive after the `ForgetOwner`. The daemon drops
     /// such submits.
     gone: HashSet<u64>,
+}
+
+impl Locals {
+    /// Process `owner`, which started at `start`, said hello on connection
+    /// `id`.
+    fn hello(&mut self, id: u64, owner: Owner, start: Option<u64>) {
+        self.owners.insert(id, owner);
+        self.starts.insert(owner, start);
+    }
+
+    fn closed(&mut self, id: u64) {
+        self.owners.remove(&id);
+        self.gone.remove(&id);
+    }
+
+    /// cleanupd reports that the processes of `owner` exited. The kernel
+    /// can give the pid to a new process before the report arrives:
+    /// `current` is the start time of the process that has the pid now.
+    /// Returns the processes with the pid that are alive.
+    fn forget(&mut self, owner: Owner, current: Option<u64>) -> Vec<Owner> {
+        let live: Vec<Owner> = self
+            .starts
+            .iter()
+            .filter(|(o, start)| {
+                o.pid == owner.pid && current.is_some() && **start == current
+            })
+            .map(|(o, _)| *o)
+            .collect();
+        let gone: Vec<u64> = self
+            .owners
+            .iter()
+            .filter(|(_, o)| owner.matches(**o) && !live.contains(o))
+            .map(|(&id, _)| id)
+            .collect();
+        self.gone.extend(gone);
+        self.starts
+            .retain(|o, _| !owner.matches(*o) || live.contains(o));
+        live
+    }
 }
 
 type LocalsRc = Rc<RefCell<Locals>>;
@@ -243,8 +287,18 @@ pub fn run(
     let ef = EpochFile::new(&cfg.epoch_file);
     let mut failures = 0u32;
     let file_epoch = loop {
-        match ef.read() {
-            Ok(e) => break e,
+        match ef.read_foreign() {
+            Ok((e, foreign)) => {
+                if foreign {
+                    truenas_ros::log!(
+                        log,
+                        Level::Warning,
+                        "the epoch file is of another file system: no copy \
+                         is restorable with it"
+                    );
+                }
+                break e;
+            }
             Err(e) => {
                 // A damaged file holds the primary, and smbd waits for it at
                 // each start: an error after 10 s, then once a minute.
@@ -271,11 +325,28 @@ pub fn run(
     };
     let (store, header, origin) =
         classify(copy, file_epoch, me.node, me.boot, log);
+    let mut failures = 0u32;
     let (epoch, previous) = loop {
         match ef.bump(file_epoch.max(header.tag)) {
             Ok(b) => break (b.epoch, b.previous),
             Err(e) => {
-                truenas_ros::log!(log, Level::Warning, "fencing at start: {e}");
+                // As the read above: an error after 10 s, then once a
+                // minute.
+                failures += 1;
+                if failures == 1 {
+                    truenas_ros::log!(
+                        log,
+                        Level::Warning,
+                        "fencing at start: {e}"
+                    );
+                } else if failures == 10 || failures.is_multiple_of(60) {
+                    truenas_ros::log!(
+                        log,
+                        Level::Error,
+                        "fencing at start fails for {failures} s, so there \
+                         is no primary: {e}"
+                    );
+                }
                 if interrupt.wait(Duration::from_secs(1)) {
                     return Copy::Own {
                         store,
@@ -425,7 +496,6 @@ fn serve(
     let next_id = Rc::new(Cell::new(0u64));
     let allowed_uid = cfg.allowed_uid;
 
-    let repl_conns = Rc::new(Cell::new(0usize));
     let accept = {
         let log = log.clone();
         let core = Rc::clone(core);
@@ -433,7 +503,6 @@ fn serve(
         let jobs = jobs_tx.clone();
         let interrupt = Arc::clone(interrupt);
         let next_id = Rc::clone(&next_id);
-        let repl_conns = Rc::clone(&repl_conns);
         move |inc: Incoming<'_>| -> Option<Conn> {
             match inc.peer {
                 ClientAddr::Unix { cred: Some(c) } if c.uid == allowed_uid => {
@@ -450,18 +519,7 @@ fn serve(
                     None
                 }
                 ClientAddr::Inet(sa) => {
-                    if peer.is_some_and(|p| sa.ip() == IpAddr::V4(p))
-                        && repl_conns.get() >= MAX_REPL_CONNS
-                    {
-                        truenas_ros::log!(
-                            log,
-                            Level::Warning,
-                            "refused {sa}: {MAX_REPL_CONNS} replication \
-                             connections are open"
-                        );
-                        None
-                    } else if peer.is_some_and(|p| sa.ip() == IpAddr::V4(p)) {
-                        repl_conns.set(repl_conns.get() + 1);
+                    if peer.is_some_and(|p| sa.ip() == IpAddr::V4(p)) {
                         let id = next_id.get() + 1;
                         next_id.set(id);
                         let mut c = core.borrow_mut();
@@ -545,6 +603,9 @@ fn serve(
         // TCP only: the link to the peer. Reaps half-open connections.
         keepalive: Some(LINK_KEEPALIVE),
         tcp_user_timeout: Some(LINK_KEEPALIVE),
+        // All connections: closes one that sends nothing for this time, for
+        // example a connection from the peer that never sends a request.
+        idle_timeout: Some(cfg.idle_timeout),
         ..ServerConfig::default()
     };
     let mut server = Server::with_config(addrs, scfg, protocol)
@@ -560,14 +621,11 @@ fn serve(
             let mut c = core.borrow_mut();
             match state {
                 Conn::Repl { id } => {
-                    repl_conns.set(repl_conns.get().saturating_sub(1));
                     pushes.borrow_mut().remove(id);
                     c.repl_closed(*id);
                 }
                 Conn::Local { id, .. } => {
-                    let mut l = locals.borrow_mut();
-                    l.owners.remove(id);
-                    l.gone.remove(id);
+                    locals.borrow_mut().closed(*id);
                     c.local_closed(*id);
                 }
             }
@@ -657,11 +715,6 @@ const LINK_BIND_WAIT: Duration = Duration::from_millis(100);
 /// The time between two tries of a link port that was not free.
 const LINK_RETRY: Duration = Duration::from_secs(5);
 
-/// The most replication connections that the primary keeps open. One
-/// session and one handshake are in use. A connection that sends nothing
-/// cannot be closed here, and the server pool also serves smbd.
-const MAX_REPL_CONNS: usize = 4;
-
 /// The keepalive idle time and the TCP user timeout of the link. A
 /// connection from a peer that rebooted then closes.
 const LINK_KEEPALIVE: Duration = Duration::from_secs(30);
@@ -688,22 +741,6 @@ fn link_probe(
             return;
         }
     }
-}
-
-/// The processes of `conns` with pid `pid` that are alive: they started at
-/// `current`, the start time of the process that has the pid now.
-fn live(
-    conns: &HashMap<u64, (Owner, Option<u64>)>,
-    pid: u32,
-    current: Option<u64>,
-) -> Vec<Owner> {
-    conns
-        .values()
-        .filter(|(o, start)| {
-            o.pid == pid && current.is_some() && *start == current
-        })
-        .map(|(o, _)| *o)
-        .collect()
 }
 
 /// The start time of process `pid`, in clock ticks after the boot: field 22
@@ -774,8 +811,7 @@ fn local(
                 let ok = c.hello();
                 locals
                     .borrow_mut()
-                    .owners
-                    .insert(id, (h.owner, start_time(h.owner.pid)));
+                    .hello(id, h.owner, start_time(h.owner.pid));
                 *hello = Some(h);
                 reply(&Reply::HelloOk(ok))
             } else {
@@ -821,17 +857,8 @@ fn local(
             }
         }
         (Some(_), Request::ForgetOwner(owner)) => {
-            let mut l = locals.borrow_mut();
-            // cleanupd knows only the pid. The kernel can give the pid to
-            // a new process before the forget arrives.
-            let live = live(&l.owners, owner.pid, start_time(owner.pid));
-            let gone: Vec<u64> = l
-                .owners
-                .iter()
-                .filter(|(_, (o, _))| owner.matches(*o) && !live.contains(o))
-                .map(|(&cid, _)| cid)
-                .collect();
-            l.gone.extend(gone);
+            // cleanupd knows only the pid.
+            let live = locals.borrow_mut().forget(owner, start_time(owner.pid));
             c.forget_owner(owner, &live, now);
             Response::Reply(Vec::new())
         }
@@ -915,17 +942,35 @@ mod tests {
         assert_eq!((origin, s.len()), (Origin::None, 0));
     }
 
+    fn owner(pid: u32, unique_id: u64) -> Owner {
+        Owner { pid, unique_id }
+    }
+
     #[test]
     fn a_forget_keeps_only_the_process_that_has_the_pid_now() {
-        let owner = |pid, unique_id| Owner { pid, unique_id };
-        let conns = HashMap::from([
-            (1, (owner(7, 1), Some(100))),
-            (2, (owner(7, 2), Some(200))),
-            (3, (owner(8, 3), Some(200))),
-            (4, (owner(7, 4), None)),
-        ]);
-        assert_eq!(live(&conns, 7, Some(200)), vec![owner(7, 2)]);
-        assert!(live(&conns, 7, None).is_empty());
+        let mut l = Locals::default();
+        l.hello(1, owner(7, 1), Some(100));
+        l.hello(2, owner(7, 2), Some(200));
+        l.hello(3, owner(8, 3), Some(200));
+        l.hello(4, owner(7, 4), None);
+        assert_eq!(l.forget(owner(7, 0), Some(200)), vec![owner(7, 2)]);
+        assert_eq!(l.gone, HashSet::from([1, 4]));
+        assert!(!l.starts.contains_key(&owner(7, 1)), "an exited process");
+        assert!(l.starts.contains_key(&owner(8, 3)), "another pid");
+        assert!(l.forget(owner(7, 0), None).is_empty(), "no process now");
+        assert!(!l.starts.contains_key(&owner(7, 2)));
+    }
+
+    #[test]
+    fn a_forget_keeps_a_live_process_whose_connection_closed() {
+        let mut l = Locals::default();
+        l.hello(1, owner(7, 2), Some(200));
+        // The daemon closed the idle connection. The process is alive.
+        l.closed(1);
+        assert_eq!(l.forget(owner(7, 0), Some(200)), vec![owner(7, 2)]);
+        assert!(l.gone.is_empty());
+        l.hello(5, owner(7, 2), Some(200));
+        assert_eq!(l.owners.get(&5), Some(&owner(7, 2)));
     }
 
     #[test]

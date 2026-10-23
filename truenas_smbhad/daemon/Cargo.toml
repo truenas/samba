@@ -15,6 +15,7 @@ name = "truenas_smbhad"
 path = "src/main.rs"
 
 [dependencies]
+libc.workspace = true
 truenas_smbhad_proto.workspace = true
 truenas_ros = { workspace = true, features = ["sync-fs", "configfile", "mount", "net-server", "net-client", "signal", "secrets", "log"] }
 truenas_xdr.workspace = true

@@ -81,8 +81,10 @@ bool tn_recorded(const struct files_struct *fsp)
 
 /*
  * The record identifies the file system of a file by f_fsid. ZFS keeps it
- * in the dataset: an import of the pool on the other controller keeps it.
- * The device number in a file id can change at the import.
+ * in the dataset, so an import of the pool on the other controller normally
+ * keeps it. ZFS changes it when it collides with a dataset that is open in
+ * that kernel. The restore then drops the records as changed. The device
+ * number in a file id can change at the import.
  */
 uint64_t tn_fsid(const struct statfs *sfs)
 {

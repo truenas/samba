@@ -391,6 +391,41 @@ fn only_the_configured_peer_may_connect_to_the_link() {
     assert_eq!(a.protection(), Some(Protection::Protected));
 }
 
+/// A process on the other controller that connects and sends nothing does
+/// not keep the standby out, also before `idle_timeout_ms` (60 s) closes
+/// its connections.
+#[test]
+fn silent_connections_from_the_peer_do_not_keep_the_standby_out() {
+    let lab = Lab::new();
+    let _proxy = Proxy::new(
+        SocketAddrV4::new(PROXY, lab.port),
+        SocketAddrV4::new(A, lab.port),
+    );
+    // A's peer is its own address, as in proxied_pair(): these connections
+    // and the proxy's come from the peer.
+    let mut a = lab.node("a", 0xa, A, A);
+    a.start("primary");
+    let silent: Vec<TcpStream> = (0..8)
+        .map(|_| TcpStream::connect(SocketAddrV4::new(A, lab.port)).unwrap())
+        .collect();
+    let mut b = lab.node("b", 0xb, B, PROXY);
+    b.start("standby");
+    a.wait_protected();
+    drop(silent);
+}
+
+#[test]
+fn the_primary_closes_a_peer_connection_that_sends_nothing() {
+    let lab = Lab::new();
+    let mut a = lab.node("a", 0xa, A, A);
+    a.extra = "idle_timeout_ms = 1000\n".to_owned();
+    a.start("primary");
+    let mut s = TcpStream::connect(SocketAddrV4::new(A, lab.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut buf = [0u8; 1];
+    assert_eq!(s.read(&mut buf).unwrap_or(1), 0, "closed when idle");
+}
+
 #[test]
 fn protocol_abuse_on_the_local_socket_is_contained() {
     let lab = Lab::new();
@@ -542,6 +577,35 @@ fn a_submit_that_arrives_after_its_process_was_forgotten_is_dropped() {
     let mut parent = a.smbd(Client::Parent, 1);
     let (_, records) = parent.rehydrate_all(1 << 20);
     assert!(records.is_empty(), "{records:?}");
+    parent.done();
+}
+
+/// The primary closes the idle connection of a live process. A forget of
+/// an exited process with the same pid keeps the records of the live one.
+#[test]
+fn a_forget_keeps_the_handles_of_a_live_process_after_an_idle_close() {
+    let lab = Lab::new();
+    let mut a = lab.node("a", 0xa, A, B);
+    a.extra = "idle_timeout_ms = 1000\n".to_owned();
+    let mut b = lab.node("b", 0xb, B, A);
+    a.start("primary");
+    b.start("standby");
+    a.wait_protected();
+    let pid = std::process::id();
+    let mut live = a.smbd(Client::Worker, pid);
+    live.put(vec![record(1, live.owner, 10)], SyncLevel::Local);
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        live.stream.read(&mut buf).unwrap_or(1),
+        0,
+        "closed when idle"
+    );
+    let mut cleanupd = a.smbd(Client::Cleanupd, 300);
+    cleanupd.forget(truenas_smbhad::proto::Owner { pid, unique_id: 0 });
+    cleanupd.barrier();
+    let mut parent = a.smbd(Client::Parent, 1);
+    let (_, records) = parent.rehydrate_all(1 << 20);
+    assert_eq!(records, vec![record(1, live.owner, 10)]);
     parent.done();
 }
 

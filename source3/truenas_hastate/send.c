@@ -83,13 +83,21 @@ void tn_mark(struct files_struct *fsp)
 /*
  * The daemon is unreachable and the deletes grow, mostly in the scavenger.
  * Fence the standby's copy and drop the deletes. The daemon drops a fenced
- * copy, and each process sends its handles again.
+ * copy, and each process sends its handles again. If the fence fails, try
+ * again after TN_MAX_DELETES more deletes.
  */
-static void tn_drop_deletes(void)
+static void tn_check_deletes(void)
 {
 	struct tn_pending *p = NULL, *next = NULL;
 
+	if (tn_c.drop_at == 0) {
+		tn_c.drop_at = TN_MAX_DELETES;
+	}
+	if ((tn_c.conn != NULL) || (tn_c.num_deletes < tn_c.drop_at)) {
+		return;
+	}
 	if (!tn_fallback_fence()) {
+		tn_c.drop_at = tn_c.num_deletes + TN_MAX_DELETES;
 		return;
 	}
 	DBG_WARNING("%zu deletes not sent: dropped, the copy is fenced\n",
@@ -100,6 +108,7 @@ static void tn_drop_deletes(void)
 			tn_unlink_pending(p);
 		}
 	}
+	tn_c.drop_at = TN_MAX_DELETES;
 }
 
 /* smbd sends a delete of the record of id at the next tick. */
@@ -115,9 +124,7 @@ void tn_mark_delete(uint64_t id)
 	p->id = id;
 	DLIST_ADD_END(tn_c.pending, p);
 	tn_c.num_deletes += 1;
-	if ((tn_c.conn == NULL) && (tn_c.num_deletes % TN_MAX_DELETES == 0)) {
-		tn_drop_deletes();
-	}
+	tn_check_deletes();
 	tn_arm_tick();
 }
 
@@ -127,6 +134,7 @@ void tn_pending_to_delete(struct tn_pending *p)
 	p->fsp->hastate_pending = NULL;
 	p->fsp = NULL;
 	tn_c.num_deletes += 1;
+	tn_check_deletes();
 }
 
 /* smbd sends marker m at the next tick. */
@@ -272,6 +280,8 @@ static void tn_tick_fn(struct tevent_context *ev,
 
 	tn_c.tick_te = NULL;
 	tn_c.tick += 1;
+	/* A wait that a path without truenas_hastate_settle() left */
+	truenas_hastate_settle();
 	if (tn_c.pending == NULL) {
 		return;
 	}

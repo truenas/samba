@@ -200,6 +200,8 @@ static void tn_closed_fn(struct tevent_context *ev,
  * A process with durable handles keeps its connection. The daemon closes
  * all connections when it restarts. The process then connects again. The
  * hello has the new instance, and the process sends its handles again.
+ * The daemon also closes a connection that is idle for its idle_timeout_ms.
+ * Then the instance is the same, and the process sends nothing again.
  */
 void tn_watch(void)
 {

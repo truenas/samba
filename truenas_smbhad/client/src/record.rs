@@ -96,7 +96,8 @@ pub struct RecordV1 {
     /// The path of the file in the share. An XDR string.
     pub base_name: VarOpaque,
     /// The file system of the file: statfs `f_fsid`. ZFS keeps it in the
-    /// dataset, so an import of the pool on the other controller keeps it.
+    /// dataset, so an import on the other controller normally keeps it.
+    /// See `fsid_of()` in `truenas_smbhad_proto::epoch`.
     pub fsid: u64,
     pub inode: u64,
     pub extid: u64,

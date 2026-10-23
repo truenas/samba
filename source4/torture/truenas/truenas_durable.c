@@ -76,6 +76,9 @@
  *     it.
  *  P  v2, RH lease, flushed. A second handle of the lease asks for RWH
  *     and closes: the lease gets write caching. Restored with RWH.
+ *  Q  v2, RWH lease, flushed, holds a byte range lock. A second lease of
+ *     the client breaks it to RH. Never restored: a disconnect closes it,
+ *     as H.
  *
  * torture:durable_gone lists the letters of the handles that the caller
  * changed on disk while they were disconnected. These handles must not be
@@ -161,6 +164,8 @@ static struct td_handle td_handles[] = {
 	{ .tag = 'P', .name = TD_DIR "\\durable_p.dat", .version = 2,
 	  .lease = true, .no_write = true, .flush = true,
 	  .sibling_upgrade = true },
+	{ .tag = 'Q', .name = TD_DIR "\\durable_q.dat", .version = 2,
+	  .lease = true, .flush = true, .lock = true, .break_write = true },
 };
 
 static void td_pattern(uint8_t *buf, size_t len, char tag)
@@ -716,7 +721,7 @@ static bool td_wanted(const struct td_handle *t, const char *gone)
 	if (strchr(gone, t->tag) != NULL) {
 		return false;	/* changed on disk while disconnected */
 	}
-	if (t->no_write && t->lock) {
+	if ((t->no_write || t->break_write) && t->lock) {
 		return false;	/* a disconnect closes it */
 	}
 	return true;

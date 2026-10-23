@@ -28,7 +28,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use truenas_ros::sync_fs::{AtomicWriteOptions, atomic_replace, fstatfs};
+use truenas_ros::sync_fs::{AtomicWriteOptions, atomic_write, fstatfs};
 
 /// The first 4 bytes of the file: "SMBE".
 pub const MAGIC: u32 = 0x534d_4245;
@@ -43,8 +43,8 @@ pub const RECORD_LEN: usize = 24;
 /// the layout; a larger value means that the file is not an epoch file.
 pub const MAX_FORMAT_VERSION: u32 = 256;
 
-/// The highest epoch that a read accepts. Fences cannot count this high, so
-/// the arithmetic of `next_tag` and `next_fence` cannot overflow.
+/// The highest epoch that a read accepts and a write writes. `next_tag` and
+/// `next_fence` of an epoch from the file cannot overflow.
 pub const MAX_EPOCH: u64 = 1 << 48;
 
 /// Returns the smallest even epoch above `x`. Fences write even epochs.
@@ -81,8 +81,11 @@ pub struct EpochRecord {
 }
 
 /// Returns `f_fsid` of the file system of `file`, as smbd's `tn_fsid()`.
-/// ZFS keeps it in the dataset: an import on the other controller keeps
-/// it.
+/// ZFS keeps it in the dataset, so an import on the other controller
+/// normally keeps it. ZFS changes it when it collides with a dataset that
+/// is open in that kernel (`unique_insert()`). A remount of the same
+/// dataset does not collide: `dsl_dataset_evict_sync()` releases it at
+/// once. A changed fsid makes the file read as foreign: a fence.
 fn fsid_of(file: &File) -> io::Result<u64> {
     let id = fstatfs(file)?.fsid();
     Ok((u64::from(id[1]) << 32) | u64::from(id[0]))
@@ -97,6 +100,12 @@ pub enum EpochError {
     Write(truenas_ros::Error),
     /// The file does not contain a valid epoch record of this version.
     Format(String),
+    /// The caller asked for an epoch above `MAX_EPOCH`. The file is not
+    /// changed.
+    Ceiling {
+        /// The refused epoch.
+        epoch: u64,
+    },
     /// For `advance_to`, the file does not contain the expected epoch or
     /// the tag is not larger than the epoch in the file.
     Stale {
@@ -111,6 +120,9 @@ impl std::fmt::Display for EpochError {
             EpochError::Io(e) => write!(f, "epoch file: {e}"),
             EpochError::Write(e) => write!(f, "replacing the epoch file: {e}"),
             EpochError::Format(m) => write!(f, "epoch file: {m}"),
+            EpochError::Ceiling { epoch } => {
+                write!(f, "epoch {epoch} is above {MAX_EPOCH}")
+            }
             EpochError::Stale { current } => {
                 write!(f, "epoch file already at {current}")
             }
@@ -151,6 +163,22 @@ impl EpochFile {
     ///
     /// The read fails, or the file does not contain a valid epoch record.
     pub fn read(&self) -> Result<u64, EpochError> {
+        Ok(self.read_opt()?.map_or(0, |(epoch, _)| epoch))
+    }
+
+    /// As `read`. Also returns true if the file is of another file system.
+    ///
+    /// # Errors
+    ///
+    /// As `read`.
+    pub fn read_foreign(&self) -> Result<(u64, bool), EpochError> {
+        Ok(self.read_opt()?.unwrap_or((0, false)))
+    }
+
+    /// The epoch and whether the file is foreign, or `None` if the file
+    /// does not exist. One open decides both: every caller agrees about a
+    /// symlink, a FIFO and a file removed during the call.
+    fn read_opt(&self) -> Result<Option<(u64, bool)>, EpochError> {
         // Not through a symlink, and no wait for the writer of a FIFO.
         let mut file = match File::options()
             .read(true)
@@ -158,7 +186,7 @@ impl EpochFile {
             .open(&self.path)
         {
             Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         if !file.metadata()?.is_file() {
@@ -188,11 +216,12 @@ impl EpochFile {
         if record.fsid != fsid_of(&file)? {
             // A copy from another file system. Its epoch can be of another
             // pool: no copy is restorable with it.
-            return next_fence(record.epoch).ok_or_else(|| {
+            let fence = next_fence(record.epoch).ok_or_else(|| {
                 EpochError::Format("epoch overflow".to_owned())
-            });
+            })?;
+            return Ok(Some((fence, true)));
         }
-        Ok(record.epoch)
+        Ok(Some((record.epoch, false)))
     }
 
     /// Fences every copy. Sets the epoch to the smallest even value above
@@ -205,11 +234,11 @@ impl EpochFile {
     /// A lock, read or replacement of the file failed. The caller must then
     /// not send any `Protection::Unprotected` reply.
     pub fn bump(&self, floor: u64) -> Result<Bumped, EpochError> {
-        let lock = self.lock()?;
+        let _lock = self.lock()?;
         let previous = self.read()?;
         let epoch = next_fence(previous.max(floor))
             .ok_or_else(|| EpochError::Format("epoch overflow".to_owned()))?;
-        self.write(&lock, epoch)?;
+        self.write(epoch)?;
         Ok(Bumped { previous, epoch })
     }
 
@@ -223,12 +252,12 @@ impl EpochFile {
     /// fence happened during the resync. The resync must start again with a
     /// new tag.
     pub fn advance_to(&self, tag: u64, from: u64) -> Result<(), EpochError> {
-        let lock = self.lock()?;
+        let _lock = self.lock()?;
         let current = self.read()?;
         if current != from || tag <= current {
             return Err(EpochError::Stale { current });
         }
-        self.write(&lock, tag)
+        self.write(tag)
     }
 
     /// The fence of smbd when it cannot reach the daemon. Writes the
@@ -243,52 +272,71 @@ impl EpochFile {
     /// A lock, read or replacement of the file failed, or the file does not
     /// contain a valid epoch record.
     pub fn fence(&self, fenced_to: u64) -> Result<Option<u64>, EpochError> {
-        if let Err(e) = std::fs::metadata(&self.path)
-            && e.kind() == io::ErrorKind::NotFound
-        {
-            return Ok(None);
-        }
         // First without the lock: while the daemon is down, every smbd
         // process fences on each promise. A write replaces the whole file,
         // so a read sees the old or the new epoch.
-        if fenced_to != 0 && self.read()? == fenced_to {
+        let Some((current, _)) = self.read_opt()? else {
+            return Ok(None);
+        };
+        if fenced_to != 0 && current == fenced_to {
             return Ok(None);
         }
-        let lock = self.lock()?;
-        let current = self.read()?;
+        let _lock = self.lock()?;
+        // Again under the lock. A file removed meanwhile stays removed: a
+        // fence from 0 would lower the epoch.
+        let Some((current, _)) = self.read_opt()? else {
+            return Ok(None);
+        };
         if fenced_to != 0 && current == fenced_to {
             return Ok(None);
         }
         let epoch = next_fence(current)
             .ok_or_else(|| EpochError::Format("epoch overflow".to_owned()))?;
-        self.write(&lock, epoch)?;
+        self.write(epoch)?;
         Ok(Some(epoch))
     }
 
+    /// Takes the lock file. Not through a symlink, and no wait for the
+    /// writer of a FIFO: a FIFO would block every bump and fence. The lock
+    /// itself still waits.
     fn lock(&self) -> Result<File, EpochError> {
         let file = File::options()
             .create(true)
             .truncate(false)
             .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&self.lock_path)?;
         file.lock()?;
         Ok(file)
     }
 
-    /// Replaces the file. `lock` is the lock file, in the same directory.
-    fn write(&self, lock: &File, epoch: u64) -> Result<(), EpochError> {
-        let bytes = truenas_xdr::to_bytes(&EpochRecord {
-            magic: MAGIC,
-            version: FORMAT_VERSION,
-            epoch,
-            fsid: fsid_of(lock)?,
-        })
-        .map_err(|e| EpochError::Format(e.to_string()))?;
+    /// Replaces the file. The fsid in the record is that of the new file.
+    ///
+    /// # Errors
+    ///
+    /// `Ceiling` for an epoch that a read would refuse, or the replacement
+    /// failed.
+    fn write(&self, epoch: u64) -> Result<(), EpochError> {
+        use std::io::Write as _;
+
+        if epoch > MAX_EPOCH {
+            return Err(EpochError::Ceiling { epoch });
+        }
         let opts = AtomicWriteOptions {
             mode: 0o600,
             ..AtomicWriteOptions::default()
         };
-        atomic_replace(&self.path, &bytes, opts).map_err(EpochError::Write)
+        atomic_write(&self.path, opts, |f| {
+            let bytes = truenas_xdr::to_bytes(&EpochRecord {
+                magic: MAGIC,
+                version: FORMAT_VERSION,
+                epoch,
+                fsid: fsid_of(f)?,
+            })
+            .map_err(|e| io::Error::other(e.to_string()))?;
+            f.write_all(&bytes)
+        })
+        .map_err(EpochError::Write)
     }
 }
 
@@ -376,12 +424,94 @@ mod tests {
         std::fs::write(&path, record(FORMAT_VERSION, 7, other)).unwrap();
         let ef = EpochFile::new(&path);
         assert_eq!(ef.read().unwrap(), 8, "no tag matches it");
+        assert_eq!(ef.read_foreign().unwrap(), (8, true));
         assert!(matches!(
             ef.advance_to(9, 7),
             Err(EpochError::Stale { current: 8 })
         ));
         assert_eq!(ef.fence(0).unwrap(), Some(10));
         assert_eq!(ef.read().unwrap(), 10, "written for this file system");
+        assert_eq!(ef.read_foreign().unwrap(), (10, false));
+    }
+
+    #[test]
+    fn a_fence_takes_existence_and_epoch_from_one_read() {
+        let d = truenas_ros::tempdir().unwrap();
+        let path = d.path().join("smbhad.epoch");
+        let ef = EpochFile::new(&path);
+        assert_eq!(ef.fence(0).unwrap(), None, "no file");
+        assert!(!path.exists());
+        ef.bump(0).unwrap();
+        assert_eq!(ef.fence(0).unwrap(), Some(4));
+        // A dangling symlink is not a missing file.
+        let link = d.path().join("dangling.epoch");
+        std::os::unix::fs::symlink(d.path().join("absent"), &link).unwrap();
+        assert!(EpochFile::new(&link).fence(0).is_err());
+    }
+
+    #[test]
+    fn a_file_removed_during_a_fence_stays_removed() {
+        let run = |remove: bool| {
+            let d = truenas_ros::tempdir().unwrap();
+            let path = d.path().join("smbhad.epoch");
+            EpochFile::new(&path).bump(98).unwrap();
+            // The lock makes the fence wait after its first read.
+            let held = EpochFile::new(&path).lock().unwrap();
+            let p = path.clone();
+            let t = std::thread::spawn(move || EpochFile::new(&p).fence(0));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if remove {
+                std::fs::remove_file(&path).unwrap();
+            }
+            drop(held);
+            (t.join().unwrap().unwrap(), path.exists())
+        };
+        assert_eq!(run(false), (Some(102), true));
+        assert_eq!(run(true), (None, false), "a fence from 0 lowers the epoch");
+    }
+
+    #[test]
+    fn no_write_goes_above_the_ceiling() {
+        let d = truenas_ros::tempdir().unwrap();
+        let ef = EpochFile::new(&d.path().join("smbhad.epoch"));
+        ef.bump(0).unwrap();
+        assert!(matches!(
+            ef.bump(MAX_EPOCH + 1),
+            Err(EpochError::Ceiling { .. })
+        ));
+        assert!(matches!(
+            ef.advance_to(u64::MAX, 2),
+            Err(EpochError::Ceiling { .. })
+        ));
+        assert_eq!(ef.read().unwrap(), 2, "the file is intact");
+        assert_eq!(ef.bump(MAX_EPOCH - 2).unwrap().epoch, MAX_EPOCH);
+        assert_eq!(ef.read().unwrap(), MAX_EPOCH);
+    }
+
+    #[test]
+    fn a_fifo_or_a_symlink_at_the_lock_path_is_refused() {
+        let d = truenas_ros::tempdir().unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(d.path().join("fifo.epoch.lock"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let ef = EpochFile::new(&d.path().join("fifo.epoch"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ef.bump(0).is_err());
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(got.expect("the bump waited on the FIFO"), "a FIFO lock");
+        std::fs::write(d.path().join("target"), b"").unwrap();
+        std::os::unix::fs::symlink(
+            d.path().join("target"),
+            d.path().join("link.epoch.lock"),
+        )
+        .unwrap();
+        let path = d.path().join("link.epoch");
+        assert!(EpochFile::new(&path).bump(0).is_err(), "a symlinked lock");
+        assert!(!path.exists());
     }
 
     #[test]
@@ -415,12 +545,12 @@ mod tests {
         // No file: nothing to fence, and no file is made.
         assert_eq!(file.fence(0).unwrap(), None);
         assert!(!dir.path().join("smbhad.epoch").exists());
-        file.write(&file.lock().unwrap(), 5).unwrap();
+        file.write(5).unwrap();
         assert_eq!(file.fence(0).unwrap(), Some(6));
         assert_eq!(file.fence(6).unwrap(), None);
         assert_eq!(file.read().unwrap(), 6);
         // The daemon advanced: the next fence writes again.
-        file.write(&file.lock().unwrap(), 7).unwrap();
+        file.write(7).unwrap();
         assert_eq!(file.fence(6).unwrap(), Some(8));
     }
 
@@ -429,7 +559,7 @@ mod tests {
         let dir = truenas_ros::tempdir().unwrap();
         let path = dir.path().join("smbhad.epoch");
         let file = EpochFile::new(&path);
-        file.write(&file.lock().unwrap(), 6).unwrap();
+        file.write(6).unwrap();
         let held = file.lock().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {

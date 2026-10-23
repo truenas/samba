@@ -31,9 +31,9 @@
  *   clears the flag at the next tick: a failover before it drops the
  *   handle as unflushed.
  * - byte range lock changes, see tn_every_lock_promised()
- * - a lease change that adds write caching. An open makes this change
- *   under the share mode lock: the wait comes before the reply to the
- *   create, see truenas_hastate_created().
+ * - a lease change that adds write caching. smbd makes lease changes
+ *   under the share mode lock: the wait comes after it, see
+ *   truenas_hastate_settle().
  * - the delete of the record of a handle that holds byte range locks, and
  *   of the handles of a file that gets delete on close, and the marker of
  *   the file, see tn_delete_pending()
@@ -582,22 +582,22 @@ void truenas_hastate_update(struct files_struct *fsp)
 /*
  * The lease of fsp changed from old_state. The handles of a lease in this
  * process share fsp->lease. A restored lease with less caching than the
- * client has is not safe. A change that adds write caching waits for the
- * standby. An open makes this change under the share mode lock, so the
- * reply to the create waits, see truenas_hastate_created(). The restore
- * merges the records of a lease, see tn_check_file().
+ * client has is not safe: a change that adds write caching waits for the
+ * standby. So does the delete of the record of a handle with byte range
+ * locks that no longer survives. smbd holds the share mode lock here: the
+ * wait comes after it, see truenas_hastate_settle(). The restore merges the
+ * records of a lease, see tn_check_file().
  */
 void truenas_hastate_lease(struct files_struct *fsp,
 			   uint32_t old_state)
 {
 	struct files_struct *s = NULL;
 	uint32_t new_state = fsp->lease->lease.lease_state;
-	bool promise = false;
-	bool upgrade = false;
 
 	if (!tn_durable_enabled()) {
 		return;
 	}
+	tn_this_process();
 	for (s = file_find_di_first(fsp->conn->sconn, fsp->file_id, true);
 	     s != NULL;
 	     s = file_find_di_next(s, true)) {
@@ -605,36 +605,31 @@ void truenas_hastate_lease(struct files_struct *fsp,
 			continue;
 		}
 		if (!tn_fsp_survives(s)) {
-			promise |= tn_unrecord_locks(s);
+			tn_c.owed |= tn_unrecord_locks(s);
 			continue;
 		}
-		upgrade |= tn_is(s, TRUENAS_FSP_HA_SENT) &&
-			   (new_state & SMB2_LEASE_WRITE) &&
-			   !(old_state & SMB2_LEASE_WRITE);
+		tn_c.owed |= tn_is(s, TRUENAS_FSP_HA_SENT) &&
+			     (new_state & SMB2_LEASE_WRITE) &&
+			     !(old_state & SMB2_LEASE_WRITE);
 		tn_mark(s);
-	}
-	if (upgrade) {
-		tn_set(fsp, TRUENAS_FSP_HA_LEASE_PROMISE, true);
-	}
-	if (promise && !NT_STATUS_IS_OK(tn_promise(NULL))) {
-		DBG_ERR("%s: lease change not replicated and not fenced\n",
-			fsp_str_dbg(fsp));
 	}
 }
 
 /*
- * smbd opened fsp and does not hold the share mode lock. If the open added
- * write caching to a lease that the standby has, wait before the reply.
+ * smbd released the share mode lock after a lease change: before the reply
+ * to a create or to a lease break, after a break timeout or a break
+ * message. If the change needs it, wait for the standby. The tick also
+ * calls this.
  */
-void truenas_hastate_created(struct files_struct *fsp)
+void truenas_hastate_settle(void)
 {
-	if (!tn_is(fsp, TRUENAS_FSP_HA_LEASE_PROMISE)) {
+	tn_this_process();
+	if (!tn_c.owed) {
 		return;
 	}
-	tn_set(fsp, TRUENAS_FSP_HA_LEASE_PROMISE, false);
+	tn_c.owed = false;
 	if (!NT_STATUS_IS_OK(tn_promise(NULL))) {
-		DBG_ERR("%s: lease change not replicated and not fenced\n",
-			fsp_str_dbg(fsp));
+		DBG_ERR("lease change not replicated and not fenced\n");
 	}
 }
 
@@ -647,6 +642,8 @@ static void tn_delete_cancelled(struct files_struct *fsp)
 {
 	struct share_mode_lock *lck = NULL;
 	struct files_struct *s = NULL;
+	struct files_struct **update = NULL;
+	size_t i, n = 0;
 
 	lck = get_existing_share_mode_lock(talloc_tos(), fsp->file_id);
 	if (lck == NULL) {
@@ -655,16 +652,33 @@ static void tn_delete_cancelled(struct files_struct *fsp)
 	for (s = file_find_di_first(fsp->conn->sconn, fsp->file_id, true);
 	     s != NULL;
 	     s = file_find_di_next(s, true)) {
+		struct files_struct **tmp = NULL;
+
 		if (!tn_is(s, TRUENAS_FSP_HA_DELETE_PENDING) ||
 		    is_delete_on_close_set(lck, s->name_hash)) {
 			continue;
 		}
 		tn_set(s, TRUENAS_FSP_HA_DELETE_PENDING, false);
-		if (s != fsp) {
-			truenas_hastate_update(s);
+		if (s == fsp) {
+			continue;
 		}
+		tmp = talloc_realloc(talloc_tos(),
+				     update,
+				     struct files_struct *,
+				     n + 1);
+		if (tmp == NULL) {
+			/* recorded again at their next change */
+			continue;
+		}
+		update = tmp;
+		update[n++] = s;
 	}
 	TALLOC_FREE(lck);
+	/* An update can wait for the standby: not under the lock. */
+	for (i = 0; i < n; i++) {
+		truenas_hastate_update(update[i]);
+	}
+	TALLOC_FREE(update);
 }
 
 /* Delete on close of fsp changed, see smb_set_file_disposition_info(). */

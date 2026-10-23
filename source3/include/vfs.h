@@ -605,8 +605,6 @@ typedef struct files_struct {
 #define TRUENAS_FSP_HA_NO_SYNC		0x0020
 /* delete on close is set on the file */
 #define TRUENAS_FSP_HA_DELETE_PENDING	0x0040
-/* the reply to the create of fsp waits for the standby */
-#define TRUENAS_FSP_HA_LEASE_PROMISE	0x0080
 
 /*
  * The fsp flags "is_pathref" and "is_fsa"

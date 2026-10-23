@@ -786,6 +786,19 @@ static void tn_restore_alive(struct timespec *last,
 		snprintf(msg, sizeof(msg), "durable handles: %s", what);
 	}
 	daemon_extend_timeout("smbd", 30 * 1000 * 1000, msg);
+	/*
+	 * The daemon closes a connection that sends nothing for a time, and a
+	 * close of the parent's connection ends the rehydration.
+	 */
+	if (tn_c.conn != NULL) {
+		struct smbhad_batch *b = smbhad_batch_new();
+		int ret = smbhad_submit(tn_c.conn, b, TN_SYNC_NONE);
+
+		smbhad_batch_free(b);
+		if (ret != 0) {
+			tn_failed("keeping the connection", ret);
+		}
+	}
 }
 
 void truenas_hastate_restore(struct messaging_context *msg_ctx)

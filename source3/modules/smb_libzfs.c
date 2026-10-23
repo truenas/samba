@@ -94,10 +94,14 @@ char *hasmntopt (const struct mntent *__mnt,
 #define ZFS_CACHE_TAG_MNT 'M'
 #define ZFS_CACHE_TAG_ALIAS 'A'
 
+/* A failed read of the properties of a dataset is read again after this. */
+#define ZFS_PROPS_RETRY_SECS 60
+
 typedef struct dataset_entry_internal {
 	struct zfs_dataset *ds;		/* published, as a const pointer */
 	zfs_handle_t *zhandle;		/* never leaves this library */
 	bool props_loaded;		/* snapdir, checksum, record size */
+	time_t props_retry;		/* no read of the properties before */
 } dataset_t;
 
 /*
@@ -471,10 +475,19 @@ static zfs_handle_t *entry_get_zhandle(dataset_t *entry)
 	zfs_handle_t *zfsp = NULL;
 
 	if (entry->zhandle != NULL) {
-		if (!entry->props_loaded) {
-			/* A failed read is not kept: read again. */
+		if (!entry->props_loaded &&
+		    (time(NULL) >= entry->props_retry)) {
+			/*
+			 * A failed read is not kept, but is not read again on
+			 * each stat: zfs_core gets the file id of each entry
+			 * of a listing.
+			 */
 			entry->props_loaded = (zhandle_get_props(
 				entry->zhandle, entry->ds->properties) == 0);
+			if (!entry->props_loaded) {
+				entry->props_retry =
+					time(NULL) + ZFS_PROPS_RETRY_SECS;
+			}
 		}
 		return entry->zhandle;
 	}
@@ -500,6 +513,9 @@ static zfs_handle_t *entry_get_zhandle(dataset_t *entry)
 	entry->zhandle = zfsp;
 	entry->props_loaded =
 		(zhandle_get_props(zfsp, entry->ds->properties) == 0);
+	if (!entry->props_loaded) {
+		entry->props_retry = time(NULL) + ZFS_PROPS_RETRY_SECS;
+	}
 	return entry->zhandle;
 }
 

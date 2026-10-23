@@ -63,7 +63,7 @@ impl std::str::FromStr for Node {
 pub type BootId = FixedOpaque<16>;
 
 /// The smbd process that holds a handle. A disconnected handle has pid 0.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Owner {
     /// Process id.
     pub pid: u32,

@@ -42,11 +42,13 @@ impl fmt::Debug for LinkKey {
 
 impl LinkKey {
     /// Derives the key from `secret` with HKDF-SHA256, salt `truenas_smbhad`
-    /// and info `replication key v1`.
+    /// and info `replication key v1`. The bytes are used as read: a newline
+    /// at the end is part of the key. An empty secret also gives a key;
+    /// `read_key()` refuses an empty file.
     ///
     /// # Errors
     ///
-    /// OpenSSL fails, for example for an empty `secret`.
+    /// OpenSSL fails.
     pub fn derive(secret: &[u8]) -> Result<LinkKey, ErrorStack> {
         let mut ctx = PkeyCtx::new_id(Id::HKDF)?;
         ctx.derive_init()?;
@@ -216,6 +218,16 @@ mod tests {
             !verify(&key, Side::Standby, &t2, &p),
             "replayed into a new handshake"
         );
+    }
+
+    // A change that trims the secret would change the key of every system.
+    #[test]
+    fn the_secret_bytes_are_used_as_read() {
+        assert_eq!(
+            hex(&LinkKey::derive(b"\n").unwrap().0),
+            "65688b58f6f52107433d2af3f64ee314b0ea281c8ba9fe0eb2c8207297911b1d"
+        );
+        assert!(LinkKey::derive(b"").is_ok());
     }
 
     #[test]

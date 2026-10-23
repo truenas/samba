@@ -14,7 +14,7 @@
 
 /*
  * A process that cannot reach the daemon fences the standby's copy when
- * this many deletes are pending, and drops them, see tn_mark_delete().
+ * this many deletes are pending, and drops them, see tn_check_deletes().
  */
 #define TN_MAX_DELETES 65536
 
@@ -63,7 +63,11 @@ struct tn_client {
 	uint32_t node;
 	uint64_t fenced_to;
 	struct tn_pending *pending;
+	/* a wait after the share mode lock, see truenas_hastate_settle() */
+	bool owed;
 	size_t num_deletes;
+	/* tn_check_deletes() drops at this count. 0: TN_MAX_DELETES */
+	size_t drop_at;
 	struct tn_marker *markers;
 	struct tevent_timer *marker_te;
 	struct tevent_timer *tick_te;

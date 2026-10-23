@@ -159,8 +159,36 @@ struct Watched {
 /// it.
 pub const THREAD_STACK: usize = 2 << 20;
 
+/// The most bytes of the secret file. The pwenc secret has 32.
+const MAX_SECRET: usize = 4096;
+
+/// Reads the secret file. Not through a symlink, no wait for the writer of
+/// a FIFO, a regular file of at most `MAX_SECRET` bytes.
+fn read_secret(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let mut secret = Vec::new();
+    file.by_ref()
+        .take(MAX_SECRET as u64 + 1)
+        .read_to_end(&mut secret)?;
+    if secret.len() > MAX_SECRET {
+        return Err(std::io::Error::other(format!(
+            "more than {MAX_SECRET} bytes"
+        )));
+    }
+    Ok(secret)
+}
+
 fn read_key(cfg: &Config, log: &Logger) -> Option<LinkKey> {
-    match std::fs::read(&cfg.secret_file) {
+    match read_secret(&cfg.secret_file) {
         Ok(secret) if !secret.is_empty() => match LinkKey::derive(&secret) {
             Ok(key) => Some(key),
             Err(e) => {
@@ -352,5 +380,35 @@ fn role_watcher(interrupt: &Interrupt, watched: &Mutex<Watched>) {
             differ = 0;
             interrupt.raise(Reason::Role);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_secret_file_is_a_regular_file_of_bounded_size() {
+        let d = truenas_ros::tempdir().unwrap();
+        let secret = d.path().join("secret");
+        std::fs::write(&secret, [7u8; 32]).unwrap();
+        assert_eq!(read_secret(&secret).unwrap(), vec![7u8; 32]);
+        std::fs::write(&secret, vec![7u8; MAX_SECRET + 1]).unwrap();
+        assert!(read_secret(&secret).is_err(), "too large");
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        assert!(read_secret(&link).is_err(), "a symlink");
+        let fifo = d.path().join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_secret(&fifo).is_err());
+        });
+        let got = rx.recv_timeout(Duration::from_secs(5));
+        assert!(got.expect("the read waited on the FIFO"), "a FIFO");
     }
 }

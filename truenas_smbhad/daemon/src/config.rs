@@ -88,6 +88,11 @@ pub struct Config {
     /// `link_timeout_ms`: after this time without a message from the other
     /// controller, the daemon closes the connection.
     pub link_timeout: Duration,
+    /// `idle_timeout_ms`: the daemon closes a connection that sends nothing
+    /// for this time. A standby always has a poll waiting, and smbd connects
+    /// again. This closes a connection from the peer that never sends a
+    /// request.
+    pub idle_timeout: Duration,
     /// `max_lag_bytes`: maximum size of the operations that the standby has
     /// not acknowledged. Above it, the primary disconnects the standby.
     pub max_lag_bytes: usize,
@@ -116,6 +121,7 @@ impl Default for Config {
             allowed_uid: 0,
             heartbeat: Duration::from_millis(100),
             link_timeout: Duration::from_millis(500),
+            idle_timeout: Duration::from_secs(60),
             max_lag_bytes: 256 << 20,
             snapshot_chunk_bytes: 4 << 20,
             pool_size: 65536,
@@ -186,6 +192,7 @@ impl Config {
             allowed_uid: opt(cf, "allowed_uid")?.unwrap_or(d.allowed_uid),
             heartbeat: ms("heartbeat_ms")?.unwrap_or(d.heartbeat),
             link_timeout: ms("link_timeout_ms")?.unwrap_or(d.link_timeout),
+            idle_timeout: ms("idle_timeout_ms")?.unwrap_or(d.idle_timeout),
             max_lag_bytes: opt(cf, "max_lag_bytes")?.unwrap_or(d.max_lag_bytes),
             snapshot_chunk_bytes: opt(cf, "snapshot_chunk_bytes")?
                 .unwrap_or(d.snapshot_chunk_bytes),
@@ -202,6 +209,41 @@ impl Config {
                 "link_timeout_ms must be above heartbeat_ms, both nonzero"
                     .to_owned(),
             ));
+        }
+        if self.idle_timeout <= self.link_timeout {
+            return Err(ConfigError(
+                "idle_timeout_ms must be above link_timeout_ms".to_owned(),
+            ));
+        }
+        // A relative path depends on the working directory. smbd works in
+        // its share: it would fence another epoch file than the daemon.
+        for (name, path) in [
+            ("sysdataset_path", &self.sysdataset_path),
+            ("socket_dir", &self.socket_dir),
+            ("epoch_file", &self.epoch_file),
+            ("secret_file", &self.secret_file),
+            ("boot_id_file", &self.boot_id_file),
+        ] {
+            if !path.is_absolute() {
+                return Err(ConfigError(format!(
+                    "{name} must be an absolute path, not {}",
+                    path.display()
+                )));
+            }
+        }
+        // The lock file is "<epoch_file>.lock": a final "/" puts it in the
+        // directory.
+        for (name, path) in [
+            ("epoch_file", &self.epoch_file),
+            ("secret_file", &self.secret_file),
+            ("boot_id_file", &self.boot_id_file),
+        ] {
+            if path.as_os_str().as_encoded_bytes().ends_with(b"/") {
+                return Err(ConfigError(format!(
+                    "{name} must name a file, not {}",
+                    path.display()
+                )));
+            }
         }
         if self.snapshot_chunk_bytes < crate::proto::MAX_RECORD_BYTES + 1024
             || self.snapshot_chunk_bytes > crate::proto::MAX_FRAME / 2
@@ -251,6 +293,25 @@ fn is_not_found(e: &truenas_ros::Error) -> bool {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paths_must_be_absolute_and_name_files() {
+        assert!(Config::default().check().is_ok());
+        for (key, value) in [
+            ("epoch_file", "smbhad.epoch"),
+            ("secret_file", "pwenc_secret"),
+            ("socket_dir", "run/truenas_smbhad"),
+            ("boot_id_file", "boot_id"),
+            ("sysdataset_path", "var/db/system"),
+        ] {
+            let e = Config::parse(&format!("[smbhad]\n{key} = {value}\n"))
+                .expect_err("a relative path");
+            assert!(e.to_string().contains("absolute"), "{key}: {e}");
+        }
+        let e = Config::parse("[smbhad]\nepoch_file = /var/db/system/\n")
+            .expect_err("a directory");
+        assert!(e.to_string().contains("name a file"), "{e}");
+    }
 
     #[test]
     fn a_missing_file_is_the_defaults() {

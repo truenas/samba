@@ -346,6 +346,7 @@ static void lease_timeout_handler(struct tevent_context *ctx,
 		DEBUG(10, ("lease break timeout race (epoch) for file %s - ignoring\n",
 			   fsp_str_dbg(fsp)));
 		TALLOC_FREE(lck);
+		truenas_hastate_settle();
 		return;
 	}
 
@@ -357,6 +358,7 @@ static void lease_timeout_handler(struct tevent_context *ctx,
 		DEBUG(10, ("lease break timeout race (flags) for file %s - ignoring\n",
 			   fsp_str_dbg(fsp)));
 		TALLOC_FREE(lck);
+		truenas_hastate_settle();
 		return;
 	}
 
@@ -369,6 +371,7 @@ static void lease_timeout_handler(struct tevent_context *ctx,
 			SMB2_LEASE_NONE);
 
 	TALLOC_FREE(lck);
+	truenas_hastate_settle();
 }
 
 bool fsp_lease_update(struct files_struct *fsp)
@@ -1016,6 +1019,7 @@ static void process_oplock_break_message(struct messaging_context *msg_ctx,
 		fsp_lease_update(fsp);
 
 		TALLOC_FREE(lck);
+		truenas_hastate_settle();
 	}
 
 	if (!break_needed) {
