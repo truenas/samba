@@ -81,8 +81,8 @@
  * changed on disk while they were disconnected. These handles must not be
  * restored.
  *
- * The test is skipped if torture:durable_phase or torture:durable_state
- * is not set.
+ * The test fails if torture:durable_phase or torture:durable_state is not
+ * set.
  */
 
 #include "includes.h"
@@ -910,7 +910,7 @@ static bool test_truenas_durable_restore(struct torture_context *tctx,
 						   NULL);
 
 	if ((phase == NULL) || (state == NULL)) {
-		torture_skip(tctx, "needs torture:durable_phase and "
+		torture_fail(tctx, "needs torture:durable_phase and "
 			     "torture:durable_state\n");
 	}
 	if (strcmp(phase, "prepare") == 0) {
@@ -1107,7 +1107,7 @@ static bool test_truenas_durable_bench(struct torture_context *tctx,
 	FILE *f = NULL;
 
 	if ((workload == NULL) || (out == NULL)) {
-		torture_skip(tctx, "needs torture:durable_bench and "
+		torture_fail(tctx, "needs torture:durable_bench and "
 			     "torture:durable_bench_out\n");
 	}
 
@@ -1201,16 +1201,15 @@ static bool test_truenas_durable_bench(struct torture_context *tctx,
 }
 
 /*
- * Print the file id (FileInternalInformation) of torture:fileid_path,
- * default nested\fileid.dat. The CI checks that the file id of a file in
- * a nested dataset does not change when the dataset gets another device
- * number.
+ * Print the file id (FileInternalInformation) of torture:fileid_path. The
+ * CI checks that the file id of a file in a nested dataset does not change
+ * when the dataset gets another device number. The test fails if
+ * torture:fileid_path is not set.
  */
 static bool test_truenas_durable_fileid(struct torture_context *tctx,
 					struct smb2_tree *tree)
 {
-	const char *path = torture_setting_string(tctx, "fileid_path",
-						  "nested\\fileid.dat");
+	const char *path = torture_setting_string(tctx, "fileid_path", NULL);
 	struct smb2_create io = {
 		.in.desired_access = SEC_FILE_READ_ATTRIBUTE,
 		.in.share_access = NTCREATEX_SHARE_ACCESS_MASK,
@@ -1223,6 +1222,9 @@ static bool test_truenas_durable_fileid(struct torture_context *tctx,
 	};
 	NTSTATUS status;
 
+	if (path == NULL) {
+		torture_fail(tctx, "needs torture:fileid_path\n");
+	}
 	status = smb2_create(tree, tctx, &io);
 	torture_assert_ntstatus_ok(tctx, status, "open");
 	info.generic.in.file.handle = io.out.file.handle;

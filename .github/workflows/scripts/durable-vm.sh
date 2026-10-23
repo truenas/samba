@@ -361,7 +361,8 @@ devmove() {
 nested_fileid() {
 	local out="$OUT/$CASE.fileid.txt"
 
-	torture "$out" truenas.durable.fileid || true
+	torture "$out" --option='torture:fileid_path=nested\fileid.dat' \
+		truenas.durable.fileid || true
 	sed -n 's/^fileid //p' "$out"
 }
 
