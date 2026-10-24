@@ -198,7 +198,10 @@ hd_wait() {
 hd_lines() { cat "$(hd_log "$1")" 2> /dev/null | wc -l; }
 
 hd_up() { # $1: a or b
-	(setsid "$SMBHAD" --config "$HD/$1.conf" >> "$(hd_log "$1")" 2>&1 \
+	# LimitNOFILE of truenas-smbhad.service: a primary registers
+	# pool_size (65536) files, more than the soft limit of a login.
+	(ulimit -n 1048576
+	setsid "$SMBHAD" --config "$HD/$1.conf" >> "$(hd_log "$1")" 2>&1 \
 		< /dev/null & echo $! > "$HD/$1.pid")
 }
 
