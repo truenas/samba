@@ -24,6 +24,7 @@
 #include "../libcli/smb/smb_common.h"
 #include "../lib/util/tevent_ntstatus.h"
 #include "libcli/security/security.h"
+#include "truenas_hastate/truenas_hastate.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_SMB2
@@ -226,6 +227,8 @@ static void smbd_smb2_flush_done(struct tevent_req *subreq)
 {
 	struct tevent_req *req = tevent_req_callback_data(
 		subreq, struct tevent_req);
+	struct smbd_smb2_flush_state *state = tevent_req_data(
+		req, struct smbd_smb2_flush_state);
 	int ret;
 	struct vfs_aio_state vfs_aio_state;
 
@@ -235,6 +238,8 @@ static void smbd_smb2_flush_done(struct tevent_req *subreq)
 		tevent_req_nterror(req, map_nt_error_from_unix(vfs_aio_state.error));
 		return;
 	}
+	/* the changes of the handle are on stable storage now */
+	truenas_hastate_flushed(state->fsp);
 	tevent_req_done(req);
 }
 

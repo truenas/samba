@@ -537,6 +537,15 @@ typedef struct files_struct {
 	struct files_struct *stream_fsp; /* backlink from base_fsp */
 	/* TrueNAS: the directory an fsp_new_fdless() entry was listed from */
 	struct files_struct *dirfsp;
+	/* TrueNAS: TRUENAS_FSP_* */
+	uint64_t truenas_fsp_flags;
+	/* TrueNAS: change cookie of the file as the client knows it */
+	uint64_t hastate_change_cookie;
+	/* TrueNAS: statfs f_fsid of the file */
+	uint64_t hastate_fsid;
+	/* TrueNAS: truenas_smbhad state, see truenas_hastate/send.c */
+	struct tn_pending *hastate_pending;
+	uint64_t hastate_lock_tick;
 
 	/*
 	 * Cache of share_mode_data->flags
@@ -580,6 +589,22 @@ typedef struct files_struct {
 
 	struct mdcache_stat mdcache_stat; /* TrueNAS */
 } files_struct;
+
+/* TrueNAS: files_struct.truenas_fsp_flags, see truenas_hastate/ */
+/* truenas_smbhad has a record of the handle */
+#define TRUENAS_FSP_HA_RECORDED		0x0001
+/* the record has unflushed changes */
+#define TRUENAS_FSP_HA_DIRTY		0x0002
+/* smbd sent the record to truenas_smbhad */
+#define TRUENAS_FSP_HA_SENT		0x0004
+/* the record on the standby can lack the last lock changes */
+#define TRUENAS_FSP_HA_LOCKS_UNSTABLE	0x0008
+/* the recorded handles of the file are dirty */
+#define TRUENAS_FSP_HA_FILE_DIRTY	0x0010
+/* the dataset of the file has sync=disabled */
+#define TRUENAS_FSP_HA_NO_SYNC		0x0020
+/* delete on close is set on the file */
+#define TRUENAS_FSP_HA_DELETE_PENDING	0x0040
 
 /*
  * The fsp flags "is_pathref" and "is_fsa"

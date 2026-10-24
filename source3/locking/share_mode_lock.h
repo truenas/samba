@@ -58,6 +58,14 @@ bool set_share_mode(
 	const struct smb2_lease_key *lease_key,
 	uint32_t share_access,
 	uint32_t access_mask);
+void share_mode_set_purged_fn(void (*fn)(uint64_t share_file_id));
+bool share_mode_entry_lookup(struct file_id id,
+			     struct server_id pid,
+			     uint64_t share_file_id,
+			     struct share_mode_entry *e);
+bool share_mode_restore_entry(struct share_mode_lock *lck,
+			      const struct share_mode_entry *e,
+			      uint32_t lease_type);
 bool reset_share_mode_entry(
 	struct share_mode_lock *lck,
 	struct server_id old_pid,

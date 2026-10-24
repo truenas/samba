@@ -52,6 +52,7 @@
 #include "source3/printing/rap_jobid.h"
 #include "source3/lib/substitute.h"
 #include "source3/smbd/dir.h"
+#include "truenas_hastate/truenas_hastate.h"
 
 /****************************************************************************
  Ensure we check the path in *exactly* the same way as W2K for a findfirst/findnext
@@ -1228,6 +1229,7 @@ static void rename_open_files(connection_struct *conn,
 			new_name_hash = fsp->name_hash;
 			/* Restore existing stat. */
 			fsp->fsp_name->st = fsp_orig_sbuf;
+			truenas_hastate_renamed(fsp);
 		}
 	}
 

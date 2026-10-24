@@ -658,6 +658,11 @@ bld.SAMBA3_LIBRARY('smbd_base',
                           smbd/server_reload.c
                           smbd/files.c
                           smbd/truenas_mdcache.c
+                          truenas_hastate/conn.c
+                          truenas_hastate/hooks.c
+                          truenas_hastate/record.c
+                          truenas_hastate/restore.c
+                          truenas_hastate/send.c
                           smbd/connection.c
                           smbd/utmp.c
                           smbd/session.c
@@ -780,6 +785,7 @@ bld.SAMBA3_LIBRARY('smbd_base',
                         samba3-namearray
                         LIBTLS
                         TRUENAS_MEMPOOL
+                        truenas_smbhad_client
                    ''' +
                    bld.env['dmapi_lib'] +
                    bld.env['legacy_quota_libs'] +

@@ -35,6 +35,7 @@
 #include "librpc/gen_ndr/ndr_open_files.h"
 #include "lib/util/tevent_ntstatus.h"
 #include "source3/smbd/dir.h"
+#include "truenas_hastate/truenas_hastate.h"
 
 /****************************************************************************
  Run a file if it is a magic script.
@@ -923,11 +924,13 @@ static NTSTATUS close_normal_file(struct smb_request *req, files_struct *fsp,
 		DEBUG(10, ("%s disconnected durable handle for file %s\n",
 			   conn->session_info->unix_info->unix_name,
 			   fsp_str_dbg(fsp)));
+		truenas_hastate_disconnect(fsp);
 		scavenger_schedule_disconnected(fsp);
 		return NT_STATUS_OK;
 	}
 
 	if (fsp->op != NULL) {
+		truenas_hastate_close(fsp);
 		/*
 		 * Make sure the handle is not marked as durable anymore
 		 */

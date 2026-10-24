@@ -2,6 +2,7 @@
 [linux-any] lib/systemd/system/ctdb.service
 [linux-any] lib/systemd/system/samba-bgqd.service
 [linux-any] lib/systemd/system/smbd.service
+[linux-any] lib/systemd/system/truenas-smbhad.service
 [linux-any] lib/systemd/system/winbind.service
 usr/bin/mdsearch
 usr/bin/oLschema2ldif
@@ -57,6 +58,7 @@ usr/bin/pdbedit
 usr/bin/nmblookup
 usr/bin/wspsearch
 usr/sbin/smbd
+usr/sbin/truenas_smbhad
 usr/sbin/ctdbd
 usr/sbin/winbindd
 usr/sbin/eventlogadm

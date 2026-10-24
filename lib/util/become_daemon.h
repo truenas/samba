@@ -86,4 +86,17 @@ void daemon_ready(const char *daemon);
 **/
 void daemon_status(const char *daemon, const char *msg);
 
+/**
+ * @brief Ask systemd for more time to start, and log the status
+ *
+ * TrueNAS: for a long step of the start before daemon_ready(). systemd
+ * extends the start timeout of the service to usec from now.
+ *
+ * @param[in] daemon Name of daemon to include it message
+ * @param[in] usec The time that the step can still take
+ * @param[in] msg Message to log
+**/
+void daemon_extend_timeout(const char *daemon, uint64_t usec,
+			   const char *msg);
+
 #endif /* _BECOME_DAEMON_H */

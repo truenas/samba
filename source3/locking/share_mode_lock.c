@@ -2277,6 +2277,134 @@ done:
 	return NT_STATUS_IS_OK(status);
 }
 
+/*
+ * TrueNAS: read the share mode entry of (pid, share_file_id) without the
+ * share mode lock, for truenas_hastate/
+ */
+bool share_mode_entry_lookup(struct file_id id,
+			     struct server_id pid,
+			     uint64_t share_file_id,
+			     struct share_mode_entry *e)
+{
+	TDB_DATA key = locking_key(&id);
+	struct locking_tdb_data *ltdb = NULL;
+	NTSTATUS status;
+	bool found = false;
+
+	status = locking_tdb_data_fetch(key, talloc_tos(), &ltdb);
+	if (!NT_STATUS_IS_OK(status)) {
+		return false;
+	}
+	share_mode_entry_find(ltdb->share_entries,
+			      ltdb->num_share_entries,
+			      pid,
+			      share_file_id,
+			      e,
+			      &found);
+	TALLOC_FREE(ltdb);
+	return found;
+}
+
+/*
+ * TrueNAS: add the share mode entry of a restored durable open, see
+ * truenas_hastate/restore.c. e->pid is the disconnected server id.
+ */
+bool share_mode_restore_entry(struct share_mode_lock *lck,
+			      const struct share_mode_entry *e,
+			      uint32_t lease_type)
+{
+	struct share_mode_data *d = share_mode_lock_assert_private_data(lck);
+	TDB_DATA key = locking_key(&d->id);
+	struct locking_tdb_data *ltdb = NULL;
+	struct share_mode_entry existing = { .pid.pid = 0 };
+	struct share_mode_entry_buf e_buf;
+	uint32_t access_mask, share_access, lease_types;
+	TDB_DATA dbufs[3];
+	size_t num_dbufs = 0;
+	size_t idx;
+	NTSTATUS status;
+	bool ok, found;
+
+	status = locking_tdb_data_fetch(key, talloc_tos(), &ltdb);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("locking_tdb_data_fetch failed: %s\n",
+			nt_errstr(status));
+		return false;
+	}
+
+	idx = share_mode_entry_find(ltdb->share_entries,
+				    ltdb->num_share_entries,
+				    e->pid,
+				    e->share_file_id,
+				    &existing,
+				    &found);
+	if (found) {
+		DBG_WARNING("share mode entry %"PRIu64" already present\n",
+			    e->share_file_id);
+		TALLOC_FREE(ltdb);
+		return false;
+	}
+
+	ok = share_mode_entry_put(e, &e_buf);
+	if (!ok) {
+		TALLOC_FREE(ltdb);
+		return false;
+	}
+
+	/* The same update as share_mode_flags_restrict() in open.c */
+	share_mode_flags_get(lck, &access_mask, &share_access, &lease_types);
+	access_mask |= e->access_mask;
+	if (e->access_mask & (FILE_WRITE_DATA | FILE_APPEND_DATA |
+			      FILE_READ_DATA | FILE_EXECUTE |
+			      DELETE_ACCESS)) {
+		share_access &= e->share_access;
+	}
+	lease_types |= lease_type;
+	share_mode_flags_set(lck, access_mask, share_access, lease_types,
+			     NULL);
+
+	if (idx > 0) {
+		dbufs[num_dbufs++] = (TDB_DATA) {
+			.dptr = discard_const_p(uint8_t, ltdb->share_entries),
+			.dsize = idx * SHARE_MODE_ENTRY_SIZE,
+		};
+	}
+	dbufs[num_dbufs++] = (TDB_DATA) {
+		.dptr = e_buf.buf, .dsize = SHARE_MODE_ENTRY_SIZE,
+	};
+	if (idx < ltdb->num_share_entries) {
+		dbufs[num_dbufs++] = (TDB_DATA) {
+			.dptr = discard_const_p(uint8_t, ltdb->share_entries) +
+				idx * SHARE_MODE_ENTRY_SIZE,
+			.dsize = (ltdb->num_share_entries - idx) *
+				 SHARE_MODE_ENTRY_SIZE,
+		};
+	}
+	if (num_dbufs == 1) {
+		d->modified = true;
+	}
+	/* dbufs holds all entries, as in set_share_mode() */
+	ltdb->share_entries = NULL;
+	ltdb->num_share_entries = 0;
+
+	status = share_mode_data_ltdb_store(d, key, ltdb, dbufs, num_dbufs);
+	TALLOC_FREE(ltdb);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_ERR("share_mode_data_ltdb_store failed: %s\n",
+			nt_errstr(status));
+		return false;
+	}
+	return true;
+}
+
+/* TrueNAS: called when the entry of a disconnected durable open is removed */
+static void (*share_mode_purged_fn)(uint64_t share_file_id);
+
+void share_mode_set_purged_fn(void (*fn)(uint64_t share_file_id))
+{
+	share_mode_purged_fn = fn;
+}
+
 static bool share_mode_for_one_entry(
 	bool (*fn)(struct share_mode_entry *e,
 		   bool *modified,
@@ -2326,6 +2454,11 @@ static bool share_mode_for_one_entry(
 		if (DEBUGLEVEL>=10) {
 			DBG_DEBUG("share_mode_entry:\n");
 			NDR_PRINT_DEBUG(share_mode_entry, &e);
+		}
+
+		if ((share_mode_purged_fn != NULL) &&
+		    server_id_is_disconnected(&e.pid)) {
+			share_mode_purged_fn(e.share_file_id);
 		}
 
 		if (*i < *num_share_modes) {

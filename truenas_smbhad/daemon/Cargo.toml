@@ -1,0 +1,30 @@
+[package]
+name = "truenas_smbhad"
+description = "Replicates durable SMB handle state to the standby controller of a TrueNAS HA pair"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "truenas_smbhad"
+path = "src/main.rs"
+
+[dependencies]
+libc.workspace = true
+truenas_smbhad_proto.workspace = true
+truenas_ros = { workspace = true, features = ["sync-fs", "configfile", "mount", "net-server", "net-client", "signal", "secrets", "log"] }
+truenas_xdr.workspace = true
+serde.workspace = true
+openssl.workspace = true
+
+# The tests of the client against the daemon
+[dev-dependencies]
+truenas_smbhad_client.workspace = true
+
+[lints]
+workspace = true

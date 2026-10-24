@@ -34,6 +34,7 @@
 #include "source3/passdb/lookup_sid.h"
 #include "source3/modules/util_reparse.h"
 #include "libcli/smb/reparse.h"
+#include "truenas_hastate/truenas_hastate.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_SMB2
@@ -1210,6 +1211,9 @@ static struct tevent_req *smbd_smb2_create_send(TALLOC_CTX *mem_ctx,
 				   nt_errstr(status),
 				   nt_errstr(return_status));
 
+			/* the next restore must not restore this open */
+			truenas_hastate_forget(
+				state->op->global->open_persistent_id);
 			TALLOC_FREE(state->op);
 			tevent_req_nterror(req, return_status);
 			return tevent_req_post(req, state->ev);
@@ -1409,6 +1413,19 @@ static struct tevent_req *smbd_smb2_create_send(TALLOC_CTX *mem_ctx,
 	    (state->info == FILE_WAS_OVERWRITTEN))
 	{
 		state->info = FILE_WAS_SUPERSEDED;
+	}
+
+	if ((state->info == FILE_WAS_OVERWRITTEN) ||
+	    (state->info == FILE_WAS_SUPERSEDED)) {
+		/*
+		 * TrueNAS: the open truncated the file. The recorded handles
+		 * of the file are dirty before the reply.
+		 */
+		status = truenas_hastate_dirty(state->result);
+		if (!NT_STATUS_IS_OK(status)) {
+			DBG_ERR("%s: truncate not replicated and not fenced\n",
+				fsp_str_dbg(state->result));
+		}
 	}
 
 	smbd_smb2_create_after_exec(req);
@@ -1899,9 +1916,25 @@ static void smbd_smb2_create_after_exec(struct tevent_req *req)
 	}
 
 	if (state->update_open) {
+		bool reconnect = state->do_durable_reconnect ||
+				 state->replay_reconnect;
+
 		state->op->global->create_guid = state->_create_guid;
 		if (state->need_replay_cache) {
 			state->op->flags |= SMBXSRV_OPEN_NEED_REPLAY_CACHE;
+		}
+
+		if (state->op->global->durable) {
+			status = truenas_hastate_open(state->result,
+						      reconnect);
+			if (!NT_STATUS_IS_OK(status) && !reconnect) {
+				DBG_WARNING("not durable, recording failed: "
+					    "%s\n",
+					    nt_errstr(status));
+				data_blob_free(
+					&state->op->global->backend_cookie);
+				state->op->global->durable = false;
+			}
 		}
 
 		status = smbXsrv_open_update(state->op);
@@ -2052,6 +2085,8 @@ static void smbd_smb2_create_after_exec(struct tevent_req *req)
 		}
 	}
 
+	/* TrueNAS: a lease change of the open waits for the standby here. */
+	truenas_hastate_settle();
 	return;
 
 fail:
