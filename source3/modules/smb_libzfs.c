@@ -1372,7 +1372,11 @@ snapshot_list *smb_zfs_list_snapshots(TALLOC_CTX *mem_ctx,
 	if (dsentry == NULL) {
 		return NULL;
 	}
-	zfs = dsentry->zhandle;
+	/* The cache opens the dataset on its first use. */
+	zfs = entry_get_zhandle(dsentry);
+	if (zfs == NULL) {
+		return NULL;
+	}
 
 	tmp_ctx = talloc_new(mem_ctx);
 	if (tmp_ctx == NULL) {
