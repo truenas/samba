@@ -73,6 +73,8 @@ struct tn_audit_create_acl {
  * `conn_info` - static connection info for audit message
  * `op_cnt` - operation counters that are printed on TDIS.
  * `depth` - audited VFS operations in progress, see tn_audit_nested().
+ * `disabled` - watch_list / ignore_list exclude this session's user, so no
+ *     operation is audited, see tn_audit_nested().
  * `create_acl` - security descriptor of the CREATE in progress, logged as
  *     SET_ACL after the CREATE if smbd applied it.
  */
@@ -92,6 +94,7 @@ typedef struct truenas_audit_config {
 		size_t close;
 	} op_cnt;
 	unsigned int depth;
+	bool disabled;
 	struct tn_audit_create_acl create_acl;
 } tn_audit_conf_t;
 
@@ -163,10 +166,14 @@ static inline tn_audit_conf_t *tn_audit_config(vfs_handle_struct *handle)
 	return (tn_audit_conf_t *)handle->data;
 }
 
-/* A connection without configuration is never audited. */
+/*
+ * A connection without configuration, or whose user is excluded from
+ * auditing, is never audited: its operations take the same pass-through
+ * path as nested ones instead of building messages for the noop backend.
+ */
 static inline bool tn_audit_nested(const tn_audit_conf_t *conf)
 {
-	return (conf == NULL) || (conf->depth > 0);
+	return (conf == NULL) || conf->disabled || (conf->depth > 0);
 }
 
 static inline void tn_audit_enter(tn_audit_conf_t *conf)
