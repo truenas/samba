@@ -149,3 +149,21 @@ void daemon_status(const char *daemon, const char *msg)
 #endif
 	DBG_STARTUP_NOTICE("daemon '%s' : %s\n", daemon, msg);
 }
+
+void daemon_extend_timeout(const char *daemon, uint64_t usec,
+			   const char *msg)
+{
+	if (daemon == NULL) {
+		daemon = "Samba";
+	}
+#if defined(HAVE_LIBSYSTEMD_DAEMON) || defined(HAVE_LIBSYSTEMD)
+	if (sd_notifications) {
+		sd_notifyf(0,
+			   "EXTEND_TIMEOUT_USEC=%" PRIu64 "\nSTATUS=%s: %s",
+			   usec,
+			   daemon,
+			   msg);
+	}
+#endif
+	DBG_STARTUP_NOTICE("daemon '%s' : %s\n", daemon, msg);
+}

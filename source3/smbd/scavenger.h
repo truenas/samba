@@ -27,5 +27,12 @@ bool smbd_scavenger_init(TALLOC_CTX *mem_ctx,
 			 struct tevent_context *ev);
 
 void scavenger_schedule_disconnected(struct files_struct *fsp);
+/* TrueNAS: for a failed restore, see truenas_hastate/restore.c */
+bool share_mode_cleanup_disconnected(struct file_id fid,
+				     uint64_t open_persistent_id);
+void scavenger_schedule_restored(struct messaging_context *msg_ctx,
+				 struct file_id fid,
+				 uint64_t open_persistent_id,
+				 NTTIME until);
 
 #endif

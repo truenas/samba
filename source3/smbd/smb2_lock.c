@@ -28,6 +28,7 @@
 #include "lib/dbwrap/dbwrap_watch.h"
 #include "librpc/gen_ndr/open_files.h"
 #include "messages.h"
+#include "truenas_hastate/truenas_hastate.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_SMB2
@@ -50,6 +51,8 @@ struct smbd_smb2_lock_state {
 	struct smbd_lock_element *locks;
 	uint8_t lock_sequence_value;
 	uint8_t *lock_sequence_element;
+	/* TrueNAS: smbd_do_locks_try_fn() granted the locks */
+	bool granted;
 };
 
 static struct tevent_req *smbd_smb2_lock_send(TALLOC_CTX *mem_ctx,
@@ -491,10 +494,14 @@ static struct tevent_req *smbd_smb2_lock_send(TALLOC_CTX *mem_ctx,
 		status = smbd_do_unlocking(
 			state->smb1req, fsp, in_lock_count, locks);
 
-		if (tevent_req_nterror(req, status)) {
-			return tevent_req_post(req, ev);
+		if (!tevent_req_nterror(req, status)) {
+			tevent_req_done(req);
 		}
-		tevent_req_done(req);
+		/*
+		 * TrueNAS: after smbd_smb2_lock_cleanup() stored the lock
+		 * sequence. A failed unlock can release some locks.
+		 */
+		(void)truenas_hastate_locked(fsp);
 		return tevent_req_post(req, ev);
 	}
 
@@ -608,7 +615,8 @@ static void smbd_do_locks_try_fn(struct share_mode_lock *lck,
 
 	status = smbd_do_locks_try(br_lck, &brl_state);
 	if (NT_STATUS_IS_OK(status)) {
-		tevent_req_done(req);
+		/* TrueNAS: smbd_smb2_lock_granted() after the store */
+		state->granted = true;
 		return;
 	}
 	if (NT_STATUS_EQUAL(status, NT_STATUS_RETRY)) {
@@ -717,6 +725,39 @@ setup_retry:
 	}
 }
 
+/*
+ * TrueNAS: the standby gets the locks before the reply. If that fails,
+ * release the locks and fail the request.
+ */
+static void smbd_smb2_lock_granted(struct tevent_req *req)
+{
+	struct smbd_smb2_lock_state *state = tevent_req_data(
+		req, struct smbd_smb2_lock_state);
+	NTSTATUS status;
+	uint16_t i;
+
+	if (state->lock_sequence_element != NULL) {
+		/* as smbd_smb2_lock_cleanup(), for the record of the handle */
+		*state->lock_sequence_element = state->lock_sequence_value;
+	}
+	status = truenas_hastate_locked(state->fsp);
+	if (NT_STATUS_IS_OK(status)) {
+		tevent_req_done(req);
+		return;
+	}
+	if (state->lock_sequence_element != NULL) {
+		*state->lock_sequence_element = 0xFF;
+	}
+	for (i = 0; i < state->lock_count; i++) {
+		state->locks[i].brltype = UNLOCK_LOCK;
+	}
+	(void)smbd_do_unlocking(state->smb1req,
+				state->fsp,
+				state->lock_count,
+				state->locks);
+	tevent_req_nterror(req, status);
+}
+
 static void smbd_smb2_lock_try(struct tevent_req *req)
 {
 	struct smbd_smb2_lock_state *state = tevent_req_data(
@@ -743,6 +784,9 @@ static void smbd_smb2_lock_try(struct tevent_req *req)
 	if (!NT_STATUS_IS_OK(status)) {
 		tevent_req_nterror(req, status);
 		return;
+	}
+	if (state->granted) {
+		smbd_smb2_lock_granted(req);
 	}
 }
 

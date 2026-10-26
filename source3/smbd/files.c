@@ -20,6 +20,7 @@
 #include "includes.h"
 #include "smbd/smbd.h"
 #include "smbd/globals.h"
+#include "truenas_hastate/truenas_hastate.h"
 #include "smbd/smbXsrv_open.h"
 #include "libcli/security/security.h"
 #include "util_tdb.h"
@@ -2511,6 +2512,8 @@ void file_free(struct smb_request *req, files_struct *fsp)
 {
 	struct smbd_server_connection *sconn = fsp->conn->sconn;
 	uint64_t fnum = fsp->fnum;
+
+	truenas_hastate_fsp_freed(fsp);
 
 	fsp_unbind_smb(req, fsp);
 

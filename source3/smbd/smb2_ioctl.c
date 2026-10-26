@@ -26,6 +26,7 @@
 #include "include/ntioctl.h"
 #include "smb2_ioctl_private.h"
 #include "librpc/gen_ndr/ioctl.h"
+#include "truenas_hastate/truenas_hastate.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_SMB2
@@ -45,6 +46,7 @@ static NTSTATUS smbd_smb2_ioctl_recv(struct tevent_req *req,
 				     bool *disconnect);
 
 static void smbd_smb2_request_ioctl_done(struct tevent_req *subreq);
+static bool smbd_smb2_ioctl_modifies(uint32_t ctl_code);
 NTSTATUS smbd_smb2_request_process_ioctl(struct smbd_smb2_request *req)
 {
 	NTSTATUS status;
@@ -337,6 +339,20 @@ static void smbd_smb2_request_ioctl_done(struct tevent_req *subreq)
 	in_file_id_volatile	= BVAL(inbody, 0x10);
 	in_max_output_length	= IVAL(inbody, 0x2C);
 
+	if (smbd_smb2_ioctl_modifies(in_ctl_code)) {
+		/* TrueNAS: a flush during the request can clear the flag */
+		struct files_struct *fsp = file_fsp_smb2(
+			req, in_file_id_persistent, in_file_id_volatile);
+		NTSTATUS tn_status = NT_STATUS_OK;
+
+		if (fsp != NULL) {
+			tn_status = truenas_hastate_dirty(fsp);
+		}
+		if (NT_STATUS_IS_OK(status) && !NT_STATUS_IS_OK(tn_status)) {
+			status = tn_status;
+		}
+	}
+
 	if (out_output_buffer.length > in_max_output_length) {
 		/*
 		 * Return NT_STATUS_BUFFER_TOO_SMALL by
@@ -422,6 +438,21 @@ static void smbd_smb2_request_ioctl_done(struct tevent_req *subreq)
 	}
 }
 
+/* TrueNAS: control codes that change the file the handle refers to */
+static bool smbd_smb2_ioctl_modifies(uint32_t ctl_code)
+{
+	switch (ctl_code) {
+	case FSCTL_SRV_COPYCHUNK:
+	case FSCTL_SET_SPARSE:
+	case FSCTL_SET_REPARSE_POINT:
+	case FSCTL_DELETE_REPARSE_POINT:
+		return true;
+	default:
+		break;
+	}
+	return (ctl_code & FSCTL_ACCESS_WRITE) != 0;
+}
+
 static struct tevent_req *smbd_smb2_ioctl_send(TALLOC_CTX *mem_ctx,
 					       struct tevent_context *ev,
 					       struct smbd_smb2_request *smb2req,
@@ -457,6 +488,15 @@ static struct tevent_req *smbd_smb2_ioctl_send(TALLOC_CTX *mem_ctx,
 		return tevent_req_post(req, ev);
 	}
 	state->smbreq = smbreq;
+
+	if ((fsp != NULL) && smbd_smb2_ioctl_modifies(in_ctl_code)) {
+		/* Before a change that a crash can lose */
+		NTSTATUS status = truenas_hastate_dirty(fsp);
+
+		if (tevent_req_nterror(req, status)) {
+			return tevent_req_post(req, ev);
+		}
+	}
 
 	switch (in_ctl_code & IOCTL_DEV_TYPE_MASK) {
 	case FSCTL_DFS:

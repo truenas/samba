@@ -25,6 +25,7 @@
 #include "../libcli/smb/smb_common.h"
 #include "../lib/util/tevent_ntstatus.h"
 #include "locking/leases_db.h"
+#include "truenas_hastate/truenas_hastate.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_SMB2
@@ -404,6 +405,8 @@ static struct tevent_req *smbd_smb2_lease_break_send(
 				lls.ids,
 				&in_lease_key,
 				in_lease_state);
+	/* TrueNAS: before the reply, after the share mode lock */
+	truenas_hastate_settle();
 
 	if (NT_STATUS_EQUAL(status, NT_STATUS_OPLOCK_BREAK_IN_PROGRESS)) {
 		tevent_req_done(req);

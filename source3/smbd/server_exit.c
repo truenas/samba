@@ -40,6 +40,7 @@
 #include "lib/gencache.h"
 #include "rpc_server/rpc_config.h"
 #include "lib/global_contexts.h"
+#include "truenas_hastate/truenas_hastate.h"
 
 static struct files_struct *log_writeable_file_fn(
 	struct files_struct *fsp, void *private_data)
@@ -176,6 +177,9 @@ static void exit_server_common(enum server_exit_reason how,
 	}
 
 	change_to_root_user();
+
+	/* TrueNAS: after the logoff closed and disconnected all files */
+	truenas_hastate_exit();
 
 	if (client != NULL) {
 		struct smbXsrv_connection *xconn_next = NULL;

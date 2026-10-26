@@ -1,0 +1,27 @@
+# Copyright (C) iXsystems, Inc. 2026
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Installed by truenas_smbhad/build.sh. The daemon runs on both controllers
+# of an HA system. On a system that is not HA, it detects no HA heartbeat
+# address and does nothing. smbd restores durable handles from it at start.
+[Unit]
+Description=TrueNAS SMB durable handle replication
+After=network-online.target
+Wants=network-online.target
+Before=smbd.service
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/truenas_smbhad --config /etc/truenas_smbhad.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=1
+# One connection per smbd process.
+LimitNOFILE=1048576
+RuntimeDirectory=truenas_smbhad
+RuntimeDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

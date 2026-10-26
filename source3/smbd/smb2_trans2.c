@@ -49,6 +49,7 @@
 #include "source3/lib/adouble.h"
 #include "source3/smbd/dir.h"
 #include "source3/modules/util_reparse.h"
+#include "truenas_hastate/truenas_hastate.h"
 
 #define DIR_ENTRY_SAFETY_MARGIN 4096
 
@@ -4229,6 +4230,8 @@ NTSTATUS smb_set_file_disposition_info(connection_struct *conn,
 				 conn->session_info->unix_token)) {
 		return NT_STATUS_ACCESS_DENIED;
 	}
+	/* TrueNAS: smbd does not restore a file with delete on close */
+	truenas_hastate_delete_on_close(fsp, delete_on_close);
 	return NT_STATUS_OK;
 }
 

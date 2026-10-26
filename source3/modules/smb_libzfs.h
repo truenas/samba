@@ -94,6 +94,9 @@ struct zfs_dataset_prop
 	bool readonly;
 	bool checksum_enabled;
 	uint64_t record_size;
+	bool sync_disabled;
+	/* The same after a rename, a reboot and an import of the pool */
+	uint64_t objsetid;
 };
 
 /*
@@ -122,6 +125,17 @@ struct zfs_dataset
  *		not ZFS, otherwise the failure of the lookup itself
  */
 const struct zfs_dataset *smb_zfs_lookup_dataset(uint64_t mnt_id);
+
+/*
+ * Returns the properties of a dataset that need libzfs: snapdir, checksum,
+ * record size, sync and objsetid. Opens the dataset if it is not open.
+ * Returns NULL with errno set if libzfs cannot open the dataset or read the
+ * properties.
+ * casesens and readonly come from the mount table. They are valid in
+ * ds->properties without this call.
+ */
+const struct zfs_dataset_prop *smb_zfs_dataset_props(
+	const struct zfs_dataset *ds);
 
 /*
  * Get userspace quotas for a given mount, ID, and quota type.

@@ -1,0 +1,19 @@
+<samba:parameter name="truenas smbhad socket"
+                 context="G"
+                 type="string"
+                 xmlns:samba="http://www.samba.org/samba/DTD/samba-doc">
+<description>
+	<para>With <smbconfoption name="truenas stateful failover">yes</smbconfoption>,
+	smbd sends the state of its durable handles to truenas_smbhad
+	through this socket. truenas_smbhad keeps a copy of the state in the
+	memory of the standby controller. When smbd starts, it restores the
+	durable handles from truenas_smbhad.
+	</para>
+	<para>If truenas_smbhad does not run, for example on a system that is
+	not HA, smbd does not restore durable handles. smbd then works with
+	durable handles as without this option.
+	</para>
+</description>
+
+<value type="default">/run/truenas_smbhad/smbd.sock</value>
+</samba:parameter>
