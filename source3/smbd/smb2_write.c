@@ -25,6 +25,7 @@
 #include "../lib/util/tevent_ntstatus.h"
 #include "rpc_server/srv_pipe_hnd.h"
 #include "libcli/security/security.h"
+#include "truenas_hastate/truenas_hastate.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_SMB2
@@ -237,7 +238,8 @@ static NTSTATUS smb2_write_complete_internal(struct tevent_req *req,
 
 	state->out_count = nwritten;
 
-	return NT_STATUS_OK;
+	/* TrueNAS: a flush during the write can clear the dirty flag */
+	return truenas_hastate_dirty(fsp);
 }
 
 NTSTATUS smb2_write_complete(struct tevent_req *req, ssize_t nwritten, int err)
@@ -355,6 +357,13 @@ static struct tevent_req *smbd_smb2_write_send(TALLOC_CTX *mem_ctx,
 		   state->in_offset != VFS_PWRITE_APPEND_OFFSET)
 	{
 		tevent_req_nterror(req, NT_STATUS_INVALID_PARAMETER);
+		return tevent_req_post(req, ev);
+	}
+
+	/* Before a write that a crash can lose */
+	status = truenas_hastate_dirty(fsp);
+	if (!NT_STATUS_IS_OK(status)) {
+		tevent_req_nterror(req, status);
 		return tevent_req_post(req, ev);
 	}
 

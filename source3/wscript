@@ -1864,6 +1864,25 @@ int main(void) {
 
     if not conf.CONFIG_SET('HAVE_RPC_XDR_H'):
         conf.CHECK_HEADERS('rpc/types.h rpc/xdr.h', together=True, lib='tirpc')
+    # TrueNAS: smbd links the client of truenas_smbhad, a static library.
+    # truenas_smbhad/build.sh builds it before waf runs.
+    smbhad = os.path.join(conf.srcnode.abspath(), 'truenas_smbhad')
+    smbhad_lib = os.path.join(smbhad, 'target', 'release')
+    if not os.path.exists(os.path.join(smbhad_lib,
+                                       'libtruenas_smbhad_client.a')):
+        conf.fatal('libtruenas_smbhad_client.a not found: '
+                   'run truenas_smbhad/build.sh')
+    conf.ADD_EXTRA_INCLUDES('#truenas_smbhad/client/include')
+    conf.env.STLIBPATH_TRUENAS_SMBHAD_CLIENT = [smbhad_lib]
+    conf.env.STLIB_TRUENAS_SMBHAD_CLIENT = ['truenas_smbhad_client']
+    conf.env.LIB_TRUENAS_SMBHAD_CLIENT = ['gcc_s', 'util', 'rt', 'pthread',
+                                          'm', 'dl']
+    # smbd calls only the smbhad_*() functions: hide the symbols of the
+    # library and drop the code that smbd does not use.
+    conf.env.LINKFLAGS_TRUENAS_SMBHAD_CLIENT = [
+        '-Wl,--exclude-libs,libtruenas_smbhad_client.a',
+        '-Wl,--gc-sections']
+    conf.SET_TARGET_TYPE('truenas_smbhad_client', 'SYSLIB')
 
     if conf.CHECK_FUNCS_IN('nscd_flush_cache', 'nscd', headers='libnscd.h'):
         conf.DEFINE('HAVE_NSCD_FLUSH_CACHE', '1')

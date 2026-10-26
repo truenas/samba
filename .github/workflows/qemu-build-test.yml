@@ -126,6 +126,15 @@ jobs:
       timeout-minutes: 60
       run: bash .github/workflows/scripts/qemu-4-test.sh
 
+    - name: truenas_smbhad tests
+      timeout-minutes: 30
+      run: bash .github/workflows/scripts/qemu-4.5-smbhad.sh
+
+    # Runs last against the VM: it ends with a crash of the VM through sysrq.
+    - name: Durable handles across failovers, smbd restarts and a VM crash
+      timeout-minutes: 60
+      run: bash .github/workflows/scripts/qemu-4.6-durable.sh
+
     - name: Collect logs
       if: always()
       timeout-minutes: 5

@@ -1514,6 +1514,9 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 	/* smbd metadata cache subtests (truenas_mdcache.c) */
 	torture_truenas_mdcache_suite(suite);
 
+	/* durable handle subtests (truenas_durable.c) */
+	torture_truenas_durable_suite(suite);
+
 	suite->description = talloc_strdup(suite,
 		"TrueNAS VFS stack tests (zfs_core, truenas_streams_xattr, "
 		"shadow_copy_zfs, ixnas, truenas_audit)");

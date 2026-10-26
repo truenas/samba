@@ -1,0 +1,47 @@
+# truenas_smbhad: durable SMB handle state for TrueNAS HA.
+#
+# A Cargo workspace in the Samba tree:
+# - proto: the messages of smbd and the daemon, and the epoch file
+# - daemon: truenas_smbhad
+# - client: the client in smbd, with the record of a durable handle and the
+#   durable cookie of vfs_zfs_core. A static library with a C header that
+#   smbd links.
+# build.sh builds the workspace before waf builds Samba. Cargo.lock is in
+# git. `rev` pins each git dependency to a commit. A package build is
+# reproducible.
+[workspace]
+resolver = "3"
+members = ["proto", "daemon", "client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+truenas_ros = { git = "https://github.com/truenas/truenas_ros", rev = "933e5192778ac9cb70cdc1bdfb896f2f0718c4fb", default-features = false }
+truenas_xdr = { git = "https://github.com/truenas/truenas_ros_utils", rev = "0c3bf46bb3e4bdac62d1688ae87815e9b6b4bea8" }
+truenas_smbhad_proto = { path = "proto" }
+truenas_smbhad_client = { path = "client" }
+serde = { version = "1", features = ["derive"] }
+libc = "0.2"
+# OpenSSL (libcrypto) for the link handshake: HKDF, HMAC and the random
+# nonces, as in truenas_ros. The package build needs libssl-dev. In FIPS
+# mode, the FIPS provider of OpenSSL does this work.
+openssl = "0.10"
+
+# proto and daemon forbid unsafe code at their crate roots. Only the C
+# interface of the client allows it.
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+debug = 1

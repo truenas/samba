@@ -31,6 +31,7 @@
 #include "messages.h"
 #include "librpc/gen_ndr/ndr_quota.h"
 #include "libcli/security/security.h"
+#include "truenas_hastate/truenas_hastate.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_SMB2
@@ -192,6 +193,8 @@ static void smbd_smb2_setinfo_cleanup(struct tevent_req *req,
 		req, struct smbd_smb2_setinfo_state);
 
 	if (req_state == TEVENT_REQ_DONE) {
+		/* TrueNAS: a flush during the request can clear the flag */
+		(void)truenas_hastate_dirty(state->fsp);
 		return;
 	}
 	TALLOC_FREE(state->lck);
@@ -235,6 +238,13 @@ static struct tevent_req *smbd_smb2_setinfo_send(TALLOC_CTX *mem_ctx,
 
 	if (IS_IPC(conn)) {
 		tevent_req_nterror(req, NT_STATUS_NOT_SUPPORTED);
+		return tevent_req_post(req, ev);
+	}
+
+	/* Before a change that a crash can lose */
+	status = truenas_hastate_dirty(fsp);
+	if (!NT_STATUS_IS_OK(status)) {
+		tevent_req_nterror(req, status);
 		return tevent_req_post(req, ev);
 	}
 

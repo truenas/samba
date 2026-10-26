@@ -94,9 +94,14 @@ char *hasmntopt (const struct mntent *__mnt,
 #define ZFS_CACHE_TAG_MNT 'M'
 #define ZFS_CACHE_TAG_ALIAS 'A'
 
+/* A failed read of the properties of a dataset is read again after this. */
+#define ZFS_PROPS_RETRY_SECS 60
+
 typedef struct dataset_entry_internal {
 	struct zfs_dataset *ds;		/* published, as a const pointer */
 	zfs_handle_t *zhandle;		/* never leaves this library */
+	bool props_loaded;		/* snapdir, checksum, record size */
+	time_t props_retry;		/* no read of the properties before */
 } dataset_t;
 
 /*
@@ -151,14 +156,27 @@ static void global_handle_decref()
 	}
 }
 
-static void global_handle_incref()
+/* false with errno set if libzfs_init() fails, for example without /dev/zfs */
+static bool global_handle_incref(void)
 {
 	if (g_refcount == 0) {
 		g_libzfs_handle = libzfs_init();
+		if (g_libzfs_handle == NULL) {
+			int saved_errno = errno;
+			char errstr[128];
+			/* GNU strerror_r(): no lib/replace in this file */
+			const char *msg = strerror_r(saved_errno,
+						     errstr,
+						     sizeof(errstr));
+
+			DBG_ERR("libzfs_init() failed: %s\n", msg);
+			errno = saved_errno;
+			return false;
+		}
 		libzfs_print_on_error(g_libzfs_handle, B_TRUE);
-		SMB_ASSERT(g_libzfs_handle != NULL);
 	}
 	g_refcount++;
+	return true;
 }
 
 /*
@@ -265,13 +283,17 @@ static int dataset_entry_destructor(dataset_t *entry)
 	if (entry->zhandle != NULL) {
 		zfs_close(entry->zhandle);
 		entry->zhandle = NULL;
+		global_handle_decref();
 	}
-	global_handle_decref();
 	return 0;
 }
 
-static libzfs_handle_t *get_global_smblibzfs_handle() {
-	global_handle_incref();
+/* NULL with errno set, see global_handle_incref() */
+static libzfs_handle_t *get_global_smblibzfs_handle(void)
+{
+	if (!global_handle_incref()) {
+		return NULL;
+	}
 	return g_libzfs_handle;
 }
 
@@ -431,31 +453,71 @@ static int entry_resolve_base(TALLOC_CTX *mem_ctx,
 	return 0;
 }
 
-static zfs_handle_t *zhandle_from_entry(libzfs_handle_t *lz,
-					const struct tn_mount_entry *entry)
-{
-	zfs_handle_t *zfsp = NULL;
-
-	zfsp = zfs_open(lz, entry->sb_source, ZFS_TYPE_FILESYSTEM);
-	if (zfsp == NULL) {
-		DBG_ERR("%s: zfs_open() failed: %s\n",
-			entry->sb_source, libzfs_error_description(lz));
-	}
-	return zfsp;
-}
-
 bool inode_is_ctldir(ino_t ino)
 {
 	return ino == ZFSCTL_INO_ROOT ? true : false;
 }
 
 /*
- * Resolve a mount ID to its cache entry, opening the dataset and filling
- * the entry in on a miss. The entry, and so the ZFS dataset handle it
- * owns, belongs to the cache: callers borrow it for the duration of an
- * operation and never free it.
+ * Resolve a mount ID to its cache entry. On a miss, build the entry from
+ * the mount table. The dataset is opened on first use, see
+ * mntid_get_zhandle_cached(). The entry and its dataset handle belong to
+ * the cache. Callers use the entry for one operation and do not free it.
  */
 static dataset_t *mntid_get_entry(uint64_t mnt_id);
+static int zhandle_get_props(zfs_handle_t *zfsp,
+			     struct zfs_dataset_prop *props);
+
+/* The ZFS dataset handle of entry. The first call opens the dataset. */
+static zfs_handle_t *entry_get_zhandle(dataset_t *entry)
+{
+	libzfs_handle_t *lz = NULL;
+	zfs_handle_t *zfsp = NULL;
+
+	if (entry->zhandle != NULL) {
+		if (!entry->props_loaded &&
+		    (time(NULL) >= entry->props_retry)) {
+			/*
+			 * A failed read is not kept, but is not read again on
+			 * each stat: zfs_core gets the file id of each entry
+			 * of a listing.
+			 */
+			entry->props_loaded = (zhandle_get_props(
+				entry->zhandle, entry->ds->properties) == 0);
+			if (!entry->props_loaded) {
+				entry->props_retry =
+					time(NULL) + ZFS_PROPS_RETRY_SECS;
+			}
+		}
+		return entry->zhandle;
+	}
+
+	/*
+	 * mntid_get_entry() uses only the mount table. The first operation
+	 * that needs libzfs opens the dataset here.
+	 */
+	lz = get_global_smblibzfs_handle();
+	if (lz == NULL) {
+		return NULL;
+	}
+	zfsp = zfs_open(lz, entry->ds->dataset_name, ZFS_TYPE_FILESYSTEM);
+	if (zfsp == NULL) {
+		DBG_ERR("%s: zfs_open() failed: %s\n",
+			entry->ds->dataset_name,
+			libzfs_error_description(lz));
+		global_handle_decref();
+		errno = ENOENT;
+		return NULL;
+	}
+	/* the entry now owns zfsp and its libzfs reference */
+	entry->zhandle = zfsp;
+	entry->props_loaded =
+		(zhandle_get_props(zfsp, entry->ds->properties) == 0);
+	if (!entry->props_loaded) {
+		entry->props_retry = time(NULL) + ZFS_PROPS_RETRY_SECS;
+	}
+	return entry->zhandle;
+}
 
 /*
  * The ZFS dataset handle for a mount ID. Every operation this library
@@ -463,13 +525,27 @@ static dataset_t *mntid_get_entry(uint64_t mnt_id);
  */
 static zfs_handle_t *mntid_get_zhandle_cached(uint64_t mnt_id)
 {
-	dataset_t *entry = NULL;
+	dataset_t *entry = mntid_get_entry(mnt_id);
 
-	entry = mntid_get_entry(mnt_id);
 	if (entry == NULL) {
 		return NULL;
 	}
-	return entry->zhandle;
+	return entry_get_zhandle(entry);
+}
+
+const struct zfs_dataset_prop *smb_zfs_dataset_props(
+	const struct zfs_dataset *ds)
+{
+	dataset_t *entry = mntid_get_entry(ds->mnt_id);
+
+	if ((entry == NULL) || (entry_get_zhandle(entry) == NULL)) {
+		return NULL;
+	}
+	if (!entry->props_loaded) {
+		errno = EIO;
+		return NULL;
+	}
+	return entry->ds->properties;
 }
 
 struct zfs_quota_singleton_cache
@@ -775,6 +851,9 @@ smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 	libzfs_handle_t *lz = NULL;
 
 	lz = get_global_smblibzfs_handle();
+	if (lz == NULL) {
+		return -1;
+	}
 
 	tmp_ctx = talloc_new(mem_ctx);
 	if (tmp_ctx == NULL) {
@@ -973,6 +1052,15 @@ zhandle_get_props(zfs_handle_t *zfsp,
 	}
 
 	props->record_size = zfs_prop_get_int(zfsp, ZFS_PROP_RECORDSIZE);
+
+	if (zfs_prop_get(zfsp, ZFS_PROP_SYNC,
+	    buf, sizeof(buf), &sourcetype,
+	    NULL, 0, B_FALSE) != 0) {
+		DBG_ERR("Failed to look up sync property\n");
+		return -1;
+	}
+	props->sync_disabled = (strcmp(buf, "disabled") == 0);
+	props->objsetid = zfs_prop_get_int(zfsp, ZFS_PROP_OBJSETID);
 	return 0;
 }
 
@@ -990,29 +1078,21 @@ static void init_global_caches(void)
 }
 
 /*
- * Build the cache entry for a dataset mount: the ZFS dataset handle the
- * entry owns, plus the facts we publish about it. The mount entry has
- * already been resolved to the dataset mount by the caller.
- *
- * The dataset handle and its reference on the global libzfs handle are
- * consumed either way -- on failure they are released here.
+ * Build the cache entry for a dataset mount from the mount table. The
+ * caller has resolved the mount entry. This function does not open the
+ * dataset.
  */
-static dataset_t *dataset_entry_create(const struct tn_mount_entry *entry,
-				       zfs_handle_t *zfsp)
+static dataset_t *dataset_entry_create(const struct tn_mount_entry *entry)
 {
 	dataset_t *dsentry = NULL;
 	struct zfs_dataset *ds = NULL;
-	int ret;
 	int i;
 
 	dsentry = talloc_zero(global_zcache, dataset_t);
 	if (dsentry == NULL) {
-		zfs_close(zfsp);
-		global_handle_decref();
 		errno = ENOMEM;
 		return NULL;
 	}
-	dsentry->zhandle = zfsp;
 	talloc_set_destructor(dsentry, dataset_entry_destructor);
 
 	ds = talloc_zero(dsentry, struct zfs_dataset);
@@ -1035,7 +1115,8 @@ static dataset_t *dataset_entry_create(const struct tn_mount_entry *entry,
 
 	/*
 	 * Case sensitivity and the read-only state are reported through
-	 * the mount table; only the remaining properties need libzfs.
+	 * the mount table. mntid_get_zhandle_cached() reads the properties
+	 * that need libzfs when it opens the dataset.
 	 */
 	ds->properties->casesens = SMBZFS_SENSITIVE;
 	for (i = 0; i < ARRAY_SIZE(sens_opt_list); i++) {
@@ -1046,20 +1127,9 @@ static dataset_t *dataset_entry_create(const struct tn_mount_entry *entry,
 	}
 	ds->properties->readonly = tn_mount_is_readonly(entry);
 
-	ret = zhandle_get_props(zfsp, ds->properties);
-	if (ret != 0) {
-		DBG_ERR("%s: failed to get dataset properties\n",
-			ds->dataset_name);
-		goto fail;
-	}
-
 	return dsentry;
 
 fail:
-	/*
-	 * The entry owns the handle from the point it was attached, so
-	 * unwinding here closes it exactly once.
-	 */
 	TALLOC_FREE(dsentry);
 	return NULL;
 }
@@ -1069,8 +1139,6 @@ static dataset_t *mntid_get_entry(uint64_t mnt_id)
 	TALLOC_CTX *tmp_ctx = NULL;
 	struct tn_mount_entry *entry = NULL;
 	dataset_t *dsentry = NULL;
-	zfs_handle_t *zfsp = NULL;
-	libzfs_handle_t *lz = NULL;
 	uint64_t dataset_id;
 	bool found;
 	int ret;
@@ -1150,16 +1218,7 @@ static dataset_t *mntid_get_entry(uint64_t mnt_id)
 		}
 	}
 
-	lz = get_global_smblibzfs_handle();
-	zfsp = zhandle_from_entry(lz, entry);
-	if (zfsp == NULL) {
-		global_handle_decref();
-		TALLOC_FREE(tmp_ctx);
-		return NULL;
-	}
-
-	/* the entry takes over both the handle and its libzfs reference */
-	dsentry = dataset_entry_create(entry, zfsp);
+	dsentry = dataset_entry_create(entry);
 	TALLOC_FREE(tmp_ctx);
 	if (dsentry == NULL) {
 		return NULL;
@@ -1313,7 +1372,11 @@ snapshot_list *smb_zfs_list_snapshots(TALLOC_CTX *mem_ctx,
 	if (dsentry == NULL) {
 		return NULL;
 	}
-	zfs = dsentry->zhandle;
+	/* The cache opens the dataset on its first use. */
+	zfs = entry_get_zhandle(dsentry);
+	if (zfs == NULL) {
+		return NULL;
+	}
 
 	tmp_ctx = talloc_new(mem_ctx);
 	if (tmp_ctx == NULL) {
@@ -1419,6 +1482,9 @@ smb_zfs_delete_snapshots(struct snapshot_list *snaps)
 	libzfs_handle_t *lz = NULL;
 
 	lz = get_global_smblibzfs_handle();
+	if (lz == NULL) {
+		return -1;
+	}
 
 	ret = nvlist_alloc(&to_delete, NV_UNIQUE_NAME, 0);
 	if (ret != 0) {

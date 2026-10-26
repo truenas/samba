@@ -30,6 +30,7 @@
 #include "../librpc/gen_ndr/ndr_open_files.h"
 #include "lib/util/tevent_ntstatus.h"
 #include "source3/smbd/dir.h"
+#include "truenas_hastate/truenas_hastate.h"
 
 /*
  * helper function used by the kernel oplock backends to post the break message
@@ -262,6 +263,8 @@ bool remove_oplock(files_struct *fsp)
 	release_file_oplock(fsp);
 
 	TALLOC_FREE(lck);
+	/* without handle caching, a disconnect closes the handle */
+	truenas_hastate_update(fsp);
 	return ret;
 }
 
@@ -294,6 +297,8 @@ bool downgrade_oplock(files_struct *fsp)
 	downgrade_file_oplock(fsp);
 
 	TALLOC_FREE(lck);
+	/* without handle caching, a disconnect closes the handle */
+	truenas_hastate_update(fsp);
 	return ret;
 }
 
@@ -341,6 +346,7 @@ static void lease_timeout_handler(struct tevent_context *ctx,
 		DEBUG(10, ("lease break timeout race (epoch) for file %s - ignoring\n",
 			   fsp_str_dbg(fsp)));
 		TALLOC_FREE(lck);
+		truenas_hastate_settle();
 		return;
 	}
 
@@ -352,6 +358,7 @@ static void lease_timeout_handler(struct tevent_context *ctx,
 		DEBUG(10, ("lease break timeout race (flags) for file %s - ignoring\n",
 			   fsp_str_dbg(fsp)));
 		TALLOC_FREE(lck);
+		truenas_hastate_settle();
 		return;
 	}
 
@@ -364,12 +371,15 @@ static void lease_timeout_handler(struct tevent_context *ctx,
 			SMB2_LEASE_NONE);
 
 	TALLOC_FREE(lck);
+	truenas_hastate_settle();
 }
 
 bool fsp_lease_update(struct files_struct *fsp)
 {
 	const struct GUID *client_guid = fsp_client_guid(fsp);
 	struct fsp_lease *lease = fsp->lease;
+	/* TrueNAS: the lease before the update */
+	struct smb2_lease old = lease->lease;
 	uint32_t current_state;
 	bool breaking;
 	uint16_t lease_version, epoch;
@@ -391,6 +401,7 @@ bool fsp_lease_update(struct files_struct *fsp)
 		lease->lease.lease_state = SMB2_LEASE_NONE;
 		lease->lease.lease_epoch += 1;
 		lease->lease.lease_flags = 0;
+		truenas_hastate_lease(fsp, old.lease_state);
 		return false;
 	}
 
@@ -426,6 +437,12 @@ bool fsp_lease_update(struct files_struct *fsp)
 		TALLOC_FREE(lease->timeout);
 	}
 
+	if ((lease->lease.lease_state != old.lease_state) ||
+	    (lease->lease.lease_epoch != old.lease_epoch) ||
+	    (lease->lease.lease_flags != old.lease_flags)) {
+		/* TrueNAS: the records of the handles of the lease */
+		truenas_hastate_lease(fsp, old.lease_state);
+	}
 	return true;
 }
 
@@ -1002,6 +1019,7 @@ static void process_oplock_break_message(struct messaging_context *msg_ctx,
 		fsp_lease_update(fsp);
 
 		TALLOC_FREE(lck);
+		truenas_hastate_settle();
 	}
 
 	if (!break_needed) {

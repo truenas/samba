@@ -26,6 +26,7 @@
 #include "serverid.h"
 #include "locking/proto.h"
 #include "cleanupdb.h"
+#include "truenas_hastate/truenas_hastate.h"
 
 struct smbd_cleanupd_state {
 	pid_t parent_pid;
@@ -162,6 +163,9 @@ static void smbd_cleanupd_process_exited(struct messaging_context *msg,
 		}
 
 		smbprofile_cleanup(child->pid, state->parent_pid);
+
+		/* TrueNAS: also after a clean exit, if its last send failed */
+		truenas_hastate_forget_pid(child->pid);
 
 		ret = messaging_cleanup(msg, child->pid);
 
