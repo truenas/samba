@@ -525,6 +525,7 @@ static bool shadow_copy_zfs_update_snaplist(struct vfs_handle_struct *handle,
 	struct shadow_copy_zfs_config *config = NULL;
 	struct snapshot_list *cached_snaps = NULL;
 	const struct zfs_dataset *ds = NULL;
+	const struct zfs_dataset_prop *props = NULL;
 
 	time(&snap_time);
 	SMB_VFS_HANDLE_GET_DATA(handle, config, struct shadow_copy_zfs_config,
@@ -534,7 +535,12 @@ static bool shadow_copy_zfs_update_snaplist(struct vfs_handle_struct *handle,
 	} else {
 		ds = shadow_fsp_to_dataset(handle, config, fsp);
 	}
-	if (!ds || (ds->properties->snapdir != SMBZFS_SNAPDIR_HIDDEN)) {
+	if (ds == NULL) {
+		*snapp = NULL;
+		return false;
+	}
+	props = smb_zfs_dataset_props(ds);
+	if ((props == NULL) || (props->snapdir != SMBZFS_SNAPDIR_HIDDEN)) {
 		*snapp = NULL;
 		return false;
 	}

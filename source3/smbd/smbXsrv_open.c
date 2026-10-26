@@ -1558,6 +1558,100 @@ NTSTATUS smbXsrv_open_global_traverse(
 	return status;
 }
 
+struct smbXsrv_open_global_restore_state {
+	struct smbXsrv_open_global0 *global;
+	NTSTATUS status;
+};
+
+static void smbXsrv_open_global_restore_fn(
+	struct db_record *rec, TDB_DATA oldval, void *private_data)
+{
+	struct smbXsrv_open_global_restore_state *state = private_data;
+	TDB_DATA key = dbwrap_record_get_key(rec);
+
+	if (oldval.dsize != 0) {
+		state->status = NT_STATUS_OBJECTID_EXISTS;
+		return;
+	}
+	state->status = smbXsrv_open_global_store(
+		rec, key, oldval, state->global);
+}
+
+/*
+ * TrueNAS: store global and its replay cache entry for a restored durable
+ * open, see truenas_hastate/restore.c
+ */
+NTSTATUS smbXsrv_open_global_restore(struct smbXsrv_open_global0 *global)
+{
+	struct smbXsrv_open_global_restore_state state = {
+		.global = global,
+	};
+	struct smbXsrv_open_global_key_buf key_buf;
+	struct smbXsrv_open_global_key_buf val_buf;
+	struct smbXsrv_open_replay_cache_key_buf rc_key_buf;
+	TDB_DATA key, rc_key, val;
+	NTSTATUS status;
+
+	if ((global->open_global_id == 0) ||
+	    (global->open_global_id & SMBXSRV_OPEN_GLOBAL_ID_NO_RECORD) ||
+	    (global->open_persistent_id != global->open_global_id)) {
+		return NT_STATUS_INVALID_PARAMETER;
+	}
+
+	status = smbXsrv_open_global_init();
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+
+	key = smbXsrv_open_global_id_to_key(global->open_global_id, &key_buf);
+	status = dbwrap_do_locked(smbXsrv_open_global_db_ctx,
+				  key,
+				  smbXsrv_open_global_restore_fn,
+				  &state);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+	if (!NT_STATUS_IS_OK(state.status)) {
+		return state.status;
+	}
+
+	if (GUID_all_zero(&global->create_guid)) {
+		return NT_STATUS_OK;
+	}
+	rc_key = smbXsrv_open_replay_cache_key(&global->client_guid,
+					       &global->create_guid,
+					       &rc_key_buf);
+	val = smbXsrv_open_global_id_to_key(global->open_global_id, &val_buf);
+	status = dbwrap_store(smbXsrv_open_global_db_ctx,
+			      rc_key,
+			      val,
+			      TDB_REPLACE);
+	if (!NT_STATUS_IS_OK(status)) {
+		(void)dbwrap_delete(smbXsrv_open_global_db_ctx, key);
+	}
+	return status;
+}
+
+/*
+ * TrueNAS: delete the records that smbXsrv_open_global_restore() stored,
+ * after a failed restore
+ */
+NTSTATUS smbXsrv_open_global_unrestore(
+	const struct smbXsrv_open_global0 *global)
+{
+	struct smbXsrv_open_global_key_buf key_buf;
+	TDB_DATA key;
+	NTSTATUS status;
+
+	key = smbXsrv_open_global_id_to_key(global->open_global_id, &key_buf);
+	status = dbwrap_delete(smbXsrv_open_global_db_ctx, key);
+	if (!NT_STATUS_IS_OK(status) || GUID_all_zero(&global->create_guid)) {
+		return status;
+	}
+	return smbXsrv_replay_cleanup(&global->client_guid,
+				      &global->create_guid);
+}
+
 struct smbXsrv_open_cleanup_state {
 	uint32_t global_id;
 	struct GUID client_guid;

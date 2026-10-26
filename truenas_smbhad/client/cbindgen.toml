@@ -1,0 +1,41 @@
+# cbindgen makes include/truenas_smbhad_client.h from src/ffi.rs:
+#   cbindgen --config cbindgen.toml --output include/truenas_smbhad_client.h
+# The header is in git. The package build does not run cbindgen. The test
+# header_is_current checks the header.
+language = "C"
+style = "tag"
+include_guard = "_TRUENAS_SMBHAD_CLIENT_H_"
+header = """/*
+ * The client of truenas_smbhad in smbd, see truenas_smbhad/client.
+ *
+ * Copyright (C) iXsystems, Inc. 2026
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Include the headers of Samba with struct GUID, struct dom_sid and
+ * struct smb2_lease_key first.
+ */"""
+autogen_warning = "/* Made by cbindgen from src/ffi.rs. Do not edit. */"
+sys_includes = ["stdbool.h", "stddef.h", "stdint.h"]
+no_includes = true
+usize_is_size_t = true
+documentation_style = "doxy"
+tab_width = 8
+
+[parse]
+parse_deps = false
+
+[export]
+exclude = ["Guid", "DomSid", "LeaseKey"]
+
+[export.rename]
+"Guid" = "struct GUID"
+"DomSid" = "struct dom_sid"
+"LeaseKey" = "struct smb2_lease_key"
+"Lock" = "truenas_durable_lock"
+"DurableRecord" = "truenas_durable_record"
+"Hello" = "smbhad_hello"
+"Put" = "smbhad_put"
+"Page" = "smbhad_page"
+"Cookie" = "smbhad_cookie"
+"Conn" = "smbhad_conn"
+"Batch" = "smbhad_batch"

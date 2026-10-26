@@ -655,6 +655,7 @@ static bool test_libzfs_conn_init(struct torture_context *tctx)
 	const char *ds = tn_mount_setting(tctx, "tn_mount_ds");
 	const char *mp = tn_mount_setting(tctx, "tn_mount_mp");
 	const struct zfs_dataset *zds = NULL;
+	const struct zfs_dataset_prop *props = NULL;
 	int ret;
 
 	if (ds == NULL || mp == NULL) {
@@ -673,7 +674,11 @@ static bool test_libzfs_conn_init(struct torture_context *tctx)
 	torture_assert_int_equal(tctx, zds->properties->casesens,
 				 SMBZFS_SENSITIVE, "casesensitive");
 	torture_assert(tctx, !zds->properties->readonly, "read-write");
-	torture_assert(tctx, zds->properties->record_size != 0,
+
+	/* smb_zfs_dataset_props() reads the properties that need libzfs */
+	props = smb_zfs_dataset_props(zds);
+	torture_assert(tctx, props != NULL, "properties from libzfs");
+	torture_assert(tctx, props->record_size != 0,
 		       "recordsize from libzfs");
 
 	return true;

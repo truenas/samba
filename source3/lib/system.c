@@ -276,6 +276,9 @@ void init_stat_ex_from_stat (struct stat_ex *dst,
 	dst->st_ex_blocks = src->stx_blocks;
 #ifdef STATX_CHANGE_COOKIE
 	dst->st_ex_change_cookie = src->stx_change_cookie;
+	if (src->stx_mask & STATX_CHANGE_COOKIE) {
+		dst->st_ex_iflags |= ST_EX_IFLAG_HAS_CHANGE_COOKIE;
+	}
 #endif
 	dst->st_ex_gen = src->stx_gen;
 	if (src->stx_mask & STATX_GEN) {

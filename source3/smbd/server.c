@@ -54,6 +54,7 @@
 #include "locking/leases_db.h"
 #include "smbd/notifyd/notifyd.h"
 #include "smbd/smbd_cleanupd.h"
+#include "truenas_hastate/truenas_hastate.h"
 #include "lib/util/sys_rw.h"
 #include "cleanupdb.h"
 #include "g_lock.h"
@@ -2488,6 +2489,9 @@ quic_disabled:
 			return -1;
 		}
 	}
+
+	/* Before a client can open a file that a durable handle holds */
+	truenas_hastate_restore(msg_ctx);
 
 	/* This MUST be done before start_epmd() because otherwise
 	 * start_epmd() forks and races against dcesrv_ep_setup() to

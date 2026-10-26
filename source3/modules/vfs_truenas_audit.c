@@ -391,8 +391,17 @@ static int tn_audit_connect(vfs_handle_struct *handle,
 	struct json_object msg, entry, js_conn;
 	bool ok;
 	bool enabled;
+	bool internal;
 
-	if (!conn_using_smb2(handle->conn->sconn)) {
+	/*
+	 * TrueNAS: smbd's own connections as SYSTEM have no client, for
+	 * example the restore of durable handles. They are not audited.
+	 */
+	internal = (handle->conn->sconn->client == NULL) &&
+		   security_token_is_system(
+			handle->conn->session_info->security_token);
+
+	if (!internal && !conn_using_smb2(handle->conn->sconn)) {
 		DBG_ERR("%s: user connected to service [%s] via SMB1 protocol. "
 			"SMB1 connections are not permitted to shares where "
 			"auditing is enabled.\n", user, svc);
@@ -414,6 +423,12 @@ static int tn_audit_connect(vfs_handle_struct *handle,
 	ok = tn_audit_backend_init(handle, svc, user, config);
 	if (!ok) {
 		goto disconnect_out;
+	}
+	if (internal) {
+		config->audit_fn = tn_audit_do_noop;
+		SMB_VFS_HANDLE_SET_DATA(handle, config, NULL,
+					tn_audit_conf_t, return -1);
+		return result;
 	}
 
 	// If we fail to generate our connection info, then

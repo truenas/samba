@@ -498,6 +498,20 @@ net sam rights grant smbtest SeDiskOperatorPrivilege \
 SMBTORTURE="$(command -v smbtorture || echo /usr/bin/smbtorture)"
 test -x "$SMBTORTURE" || { echo "ERROR: smbtorture not found (expected in truenas-samba)"; exit 1; }
 echo "smbtorture: $SMBTORTURE"
+# smbtorture for the truenas tests. Each truenas test runs only on a share
+# that has what it needs, so a skipped test fails the run.
+tn_torture() {
+  local log rc=0
+  log="$(mktemp)"
+  "$SMBTORTURE" "$@" >"$log" 2>&1 || rc=$?
+  cat "$log"
+  if [ "$rc" -eq 0 ] && grep -q '^skip:' "$log"; then
+    echo "ERROR: skipped tests:"; grep -A2 '^skip:' "$log"
+    rc=1
+  fi
+  rm -f "$log"
+  return "$rc"
+}
 
 echo "=========================================="
 echo "Run the local library test suites"
@@ -526,26 +540,26 @@ if "$SMBTORTURE" ncalrpc:localhost -U% \
 else
   echo "ERROR: local library test suites FAILED"; exit 1
 fi
-# ztest is casesensitivity=insensitive with zfs_core + truenas_streams_xattr, so
-# truenas.rename.case_insensitive and truenas.streams.cap_and_offset run here.
-# truenas.shadow_copy.* and truenas.acl.* self-skip on this share (no
-# shadow_copy_zfs; not an ixnas NFSv4 share) -- they run against zsc/zacl below.
+# ztest is casesensitivity=insensitive with zfs_core + truenas_streams_xattr:
+# truenas.rename and truenas.streams run here. The other truenas suites run
+# below on the shares that have what they need, truenas.durable in the
+# durable job.
 # The streams cap matches the global "smbd max xattr size"; now that CI runs on
 # the TrueNAS kernel, both could be raised to exercise multi-MiB streams.
-if "$SMBTORTURE" //127.0.0.1/ztest -U 'smbtest%testpass123' \
-     --option='torture:streams_cap=32768' truenas; then
-  echo "truenas smbtorture suite PASSED"
+if tn_torture //127.0.0.1/ztest -U 'smbtest%testpass123' \
+     --option='torture:streams_cap=32768' truenas.rename truenas.streams; then
+  echo "truenas.rename and truenas.streams PASSED"
 else
-  echo "ERROR: truenas smbtorture suite FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
+  echo "ERROR: truenas.rename or truenas.streams FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
 fi
-# truenas.fruit.* self-skips on ztest (no vfs_fruit); run it where fruit is.
-if "$SMBTORTURE" //127.0.0.1/zfruit -U 'smbtest%testpass123' truenas.fruit; then
+# truenas.fruit runs where vfs_fruit is.
+if tn_torture //127.0.0.1/zfruit -U 'smbtest%testpass123' truenas.fruit; then
   echo "truenas.fruit suite PASSED"
 else
   echo "ERROR: truenas.fruit suite FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
 fi
 # Same stream tests on the xattr_compat = yes layout.
-if "$SMBTORTURE" //127.0.0.1/ztest_compat -U 'smbtest%testpass123' \
+if tn_torture //127.0.0.1/ztest_compat -U 'smbtest%testpass123' \
      --option='torture:streams_cap=32768' truenas.streams; then
   echo "truenas.streams (xattr_compat = yes) PASSED"
 else
@@ -595,7 +609,7 @@ if out=$(cat /tank/share/.zfs/snapshot/sc1/sc_canary 2>&1); then
 else
   echo "  FS-level snapshot read FAILED ($out) -> ZFS automount issue, not SMB"
 fi
-if "$SMBTORTURE" //127.0.0.1/zsc -U 'smbtest%testpass123' \
+if tn_torture //127.0.0.1/zsc -U 'smbtest%testpass123' \
      --option='torture:sc_file=sc_canary' \
      --option='torture:sc_expect=snapshot-version' \
      truenas.shadow_copy; then
@@ -648,8 +662,11 @@ echo "=========================================="
 # and ixnas self-disables. Mapping only; kernel access-check edge cases (delete,
 # ABE) need the patched base kernel and are not asserted here.
 if python3 -c "import os; os.getxattr('/tank/acl', 'system.nfs4_acl_xdr')" 2>/dev/null; then
-  if "$SMBTORTURE" //127.0.0.1/zacl -U 'smbtest%testpass123' \
-       --option='torture:acl_nfs4=yes' truenas.acl; then
+  # truenas.acl.fixture_scope needs the fixture below.
+  if tn_torture //127.0.0.1/zacl -U 'smbtest%testpass123' \
+       --option='torture:acl_nfs4=yes' truenas.acl.get_sd_nfs4 \
+       truenas.acl.perm_bits truenas.acl.null_dacl truenas.acl.special_demote \
+       truenas.acl.create_ctx_open_everyone truenas.acl.owner_full_escalate; then
     echo "truenas.acl mapping suite PASSED"
   else
     echo "ERROR: truenas.acl mapping suite FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
@@ -691,7 +708,7 @@ assert "WRITE_ACL" in o and "WRITE_OWNER" in o, \
     echo "on-disk ACL (before SMB GET):"; truenas_getfacl -n "$FIX" || true
     assert_ondisk_owner_full "$FIX" \
       || { echo "ERROR: fixture setup -- owner@ lacks WRITE_ACL/WRITE_OWNER on disk"; exit 1; }
-    if "$SMBTORTURE" //127.0.0.1/zacl -U 'smbtest%testpass123' \
+    if tn_torture //127.0.0.1/zacl -U 'smbtest%testpass123' \
          --option='torture:acl_nfs4=yes' --option='torture:acl_fixture=pyfix' \
          truenas.acl.fixture_scope; then
       echo "truenas.acl.fixture_scope PASSED (SMB demotes group@, keeps owner@/everyone@/named)"
@@ -713,8 +730,8 @@ fi
 echo "=========================================="
 echo "smbd metadata cache (truenas.mdcache)"
 echo "=========================================="
-# ixnas fills the cache on [zacl]; the test self-skips if nothing does.
-if "$SMBTORTURE" //127.0.0.1/zacl -U 'smbtest%testpass123' truenas.mdcache; then
+# ixnas fills the cache on [zacl].
+if tn_torture //127.0.0.1/zacl -U 'smbtest%testpass123' truenas.mdcache; then
   echo "truenas.mdcache suite PASSED"
 else
   echo "ERROR: truenas.mdcache suite FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
@@ -1003,7 +1020,7 @@ echo "=========================================="
 echo "SMB auditing (truenas_audit)"
 echo "=========================================="
 AUDIT_LOG=/var/log/samba4/truenas_audit.log
-if "$SMBTORTURE" //127.0.0.1/zaudit -U 'smbtest%testpass123' \
+if tn_torture //127.0.0.1/zaudit -U 'smbtest%testpass123' \
      --option=torture:audit_log="$AUDIT_LOG" \
      --option=torture:audit_ignored_share=zaudit_ignored \
      --option=torture:audit_watched_share=zaudit_watched \

@@ -39,6 +39,7 @@ static bool zfs_core_get_integrity_info(struct vfs_handle_struct *handle,
 					struct zfs_integrity_info *info)
 {
 	const struct zfs_dataset *ds = NULL;
+	const struct zfs_dataset_prop *props = NULL;
 	struct zfs_core_config_data *config = NULL;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
@@ -58,9 +59,19 @@ static bool zfs_core_get_integrity_info(struct vfs_handle_struct *handle,
 		return false;
 	}
 
+	props = smb_zfs_dataset_props(ds);
+	if (props == NULL) {
+		char errstr[128];
+
+		(void)strerror_r(errno, errstr, sizeof(errstr));
+		DBG_ERR("%s: failed to retrieve ZFS dataset properties: %s\n",
+			fsp_str_dbg(fsp), errstr);
+		return false;
+	}
+
 	*info = (struct zfs_integrity_info){
-		.checksum_enabled = ds->properties->checksum_enabled,
-		.record_size = ds->properties->record_size,
+		.checksum_enabled = props->checksum_enabled,
+		.record_size = props->record_size,
 	};
 
 	return true;

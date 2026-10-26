@@ -810,27 +810,71 @@ disconnect_out:
 	return -1;
 }
 
-#define ZC_FILE_ID_OBJ_BITS 48	/* ZFS object numbers are below 2^48 */
-
 /*
- * Off the share's dataset: device minor above the object number. Minors
- * are unique among mounted filesystems and never 0.
+ * Off the share's dataset, the file id is the objsetid of the dataset above
+ * the object number of the file. An objsetid is unique in the pool, never
+ * 0, and does not change. A device minor can change at a failover.
+ *
+ * In ZFS both numbers can use 48 bits (DN_MAX_OBJECT_SHIFT), so no split of
+ * 64 bits holds every pair. The split is 24 bits for the objsetid and 40
+ * bits for the object number:
+ * - An objsetid is an object number in the MOS of the pool. It grows with
+ *   the history of dataset and snapshot creation. Real pools have
+ *   objsetids above 2^16, for example 138,892. 2^24 is 16.7 million.
+ * - The object number of a file follows the peak file count of its
+ *   dataset, times the dnode slots of a file. 2^40 is 1.1 trillion.
+ * Above these limits, the file id is the default of vfs_default, which can
+ * change at a failover. smbd logs a warning for such a dataset.
  */
+#define ZC_FILE_ID_OBJ_BITS 40
+#define ZC_FILE_ID_SET_BITS (64 - ZC_FILE_ID_OBJ_BITS)
+
 static uint64_t zfs_core_fs_file_id(struct vfs_handle_struct *handle,
 				    const SMB_STRUCT_STAT *psbuf)
 {
-	unsigned int dev_minor = minor(psbuf->st_ex_dev);
+	struct zfs_core_config_data *config = NULL;
+	const struct zfs_dataset *ds = NULL;
+	const struct zfs_dataset_prop *props = NULL;
 
 	if ((psbuf->st_ex_dev == handle->conn->base_share_dev) ||
 	    !(psbuf->st_ex_iflags & ST_EX_IFLAG_HAS_GEN) ||
-	    (major(psbuf->st_ex_dev) != 0) ||
-	    (dev_minor == 0) ||
-	    (dev_minor > UINT16_MAX) ||
+	    (psbuf->st_ex_mnt_id == 0) ||
 	    ((psbuf->st_ex_ino >> ZC_FILE_ID_OBJ_BITS) != 0)) {
 		return SMB_VFS_NEXT_FS_FILE_ID(handle, psbuf);
 	}
+	SMB_VFS_HANDLE_GET_DATA(handle,
+				config,
+				struct zfs_core_config_data,
+				return SMB_VFS_NEXT_FS_FILE_ID(handle, psbuf));
+	/*
+	 * The entries of a directory are mostly in one dataset. A failed
+	 * lookup is not kept: the next stat looks up again.
+	 */
+	if (psbuf->st_ex_mnt_id != config->fid_mnt_id) {
+		ds = smb_zfs_lookup_dataset(psbuf->st_ex_mnt_id);
+		if (ds != NULL) {
+			props = smb_zfs_dataset_props(ds);
+		}
+		if (props == NULL) {
+			return SMB_VFS_NEXT_FS_FILE_ID(handle, psbuf);
+		}
+		config->fid_mnt_id = psbuf->st_ex_mnt_id;
+		config->fid_objsetid = props->objsetid;
+		if ((config->fid_objsetid >> ZC_FILE_ID_SET_BITS) != 0) {
+			DBG_WARNING("%s: objsetid %" PRIu64 " is above 2^%d: "
+				    "default file ids, which can change at a "
+				    "failover\n",
+				    ds->dataset_name,
+				    config->fid_objsetid,
+				    ZC_FILE_ID_SET_BITS);
+		}
+	}
+	if ((config->fid_objsetid == 0) ||
+	    ((config->fid_objsetid >> ZC_FILE_ID_SET_BITS) != 0)) {
+		return SMB_VFS_NEXT_FS_FILE_ID(handle, psbuf);
+	}
 
-	return ((uint64_t)dev_minor << ZC_FILE_ID_OBJ_BITS) |
+	return (config->fid_objsetid << ZC_FILE_ID_OBJ_BITS) |
 	       psbuf->st_ex_ino;
 }
 
@@ -847,7 +891,10 @@ static struct vfs_fn_pointers zfs_core_fns = {
 	.get_quota_fn = zfs_core_get_quota,
 	.set_quota_fn = zfs_core_set_quota,
 	.disk_free_fn = zfs_core_disk_free,
-	.fs_file_id_fn = zfs_core_fs_file_id
+	.fs_file_id_fn = zfs_core_fs_file_id,
+	.durable_cookie_fn = zfs_core_durable_cookie,
+	.durable_disconnect_fn = zfs_core_durable_disconnect,
+	.durable_reconnect_fn = zfs_core_durable_reconnect
 };
 
 static_decl_vfs

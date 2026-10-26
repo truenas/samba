@@ -45,6 +45,7 @@
 #include "lib/util/time_basic.h"
 #include "lib/util/smb_strtox.h"
 #include "source3/smbd/dir.h"
+#include "truenas_hastate/truenas_hastate.h"
 
 #if defined(HAVE_LINUX_MAGIC_H)
 #include <linux/magic.h>
@@ -6008,6 +6009,9 @@ void msg_file_was_renamed(struct messaging_context *msg_ctx,
 			DBG_DEBUG("fsp_set_smb_fname failed\n");
 		}
 		fsp->fsp_name->st = fsp_orig_sbuf;
+		if (ok) {
+			truenas_hastate_renamed(fsp);
+		}
 	} else {
 		/* TODO. JRA. */
 		/*

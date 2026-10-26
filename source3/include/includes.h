@@ -179,6 +179,8 @@ typedef sig_atomic_t volatile SIG_ATOMIC_T;
 #define ST_EX_IFLAG_CALCULATED_BTIME		(1 << 0)
 /* Did statx return STATX_GEN ? Only ZFS fills it. */
 #define ST_EX_IFLAG_HAS_GEN			(1 << 1)
+/* TrueNAS: did statx return STATX_CHANGE_COOKIE ? */
+#define ST_EX_IFLAG_HAS_CHANGE_COOKIE		(1 << 2)
 
 /*
  * Type for stat structure.

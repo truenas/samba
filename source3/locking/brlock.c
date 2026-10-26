@@ -1818,6 +1818,131 @@ struct byte_range_lock *brl_get_locks_readonly(files_struct *fsp)
 	return br_lock;
 }
 
+/*
+ * TrueNAS: the lock array, for truenas_hastate/record.c
+ */
+const struct lock_struct *brl_lock_data(const struct byte_range_lock *brl)
+{
+	return brl->lock_data;
+}
+
+/*
+ * TrueNAS: add the byte range locks of a restored durable open, see
+ * truenas_hastate/restore.c. Each lock gets the disconnected state that
+ * brl_mark_disconnected() sets.
+ */
+bool brl_restore_disconnected(struct file_id fid,
+			      uint64_t open_persistent_id,
+			      const struct lock_struct *locks,
+			      unsigned int num_locks)
+{
+	TALLOC_CTX *frame = talloc_stackframe();
+	TDB_DATA key = make_tdb_data((void *)&fid, sizeof(fid));
+	struct db_record *rec = NULL;
+	struct lock_struct *data = NULL;
+	TDB_DATA val;
+	size_t num_old;
+	unsigned int i;
+	NTSTATUS status;
+	bool ok = false;
+
+	if (num_locks == 0) {
+		TALLOC_FREE(frame);
+		return true;
+	}
+
+	rec = dbwrap_fetch_locked(brlock_db, frame, key);
+	if (rec == NULL) {
+		goto done;
+	}
+	val = dbwrap_record_get_value(rec);
+	num_old = val.dsize / sizeof(struct lock_struct);
+
+	data = talloc_zero_array(frame,
+				 struct lock_struct,
+				 num_old + num_locks);
+	if (data == NULL) {
+		goto done;
+	}
+	if (num_old != 0) {
+		memcpy(data, val.dptr, num_old * sizeof(struct lock_struct));
+	}
+	for (i = 0; i < num_locks; i++) {
+		struct lock_struct *l = &data[num_old + i];
+
+		l->context.smblctx = open_persistent_id;
+		l->context.tid = TID_FIELD_INVALID;
+		server_id_set_disconnected(&l->context.pid);
+		l->start = locks[i].start;
+		l->size = locks[i].size;
+		l->fnum = FNUM_FIELD_INVALID;
+		l->lock_type = locks[i].lock_type;
+		l->lock_flav = locks[i].lock_flav;
+	}
+
+	status = dbwrap_record_store(
+		rec,
+		make_tdb_data((uint8_t *)data,
+			      (num_old + num_locks) *
+			      sizeof(struct lock_struct)),
+		TDB_REPLACE);
+	ok = NT_STATUS_IS_OK(status);
+done:
+	TALLOC_FREE(frame);
+	return ok;
+}
+
+/*
+ * TrueNAS: the byte range locks of a disconnected durable open, read
+ * without an fsp, see truenas_hastate/send.c. *locks is allocated on
+ * mem_ctx.
+ */
+bool brl_get_disconnected_locks(TALLOC_CTX *mem_ctx,
+				struct file_id fid,
+				uint64_t open_persistent_id,
+				struct lock_struct **locks,
+				unsigned int *num_locks)
+{
+	struct byte_range_lock *br_lck = NULL;
+	struct brl_get_locks_readonly_state state = {
+		.mem_ctx = mem_ctx,
+		.br_lock = &br_lck,
+	};
+	const struct lock_struct *all = NULL;
+	unsigned int i, n = 0;
+	NTSTATUS status;
+
+	*locks = NULL;
+	*num_locks = 0;
+
+	status = dbwrap_parse_record(brlock_db,
+				     make_tdb_data((uint8_t *)&fid,
+						   sizeof(fid)),
+				     brl_get_locks_readonly_parser,
+				     &state);
+	if (NT_STATUS_EQUAL(status, NT_STATUS_NOT_FOUND)) {
+		return true;
+	}
+	if (!NT_STATUS_IS_OK(status) || (br_lck == NULL)) {
+		return false;
+	}
+	all = br_lck->lock_data;
+	*locks = talloc_array(mem_ctx, struct lock_struct, br_lck->num_locks);
+	if ((*locks == NULL) && (br_lck->num_locks != 0)) {
+		TALLOC_FREE(br_lck);
+		return false;
+	}
+	for (i = 0; i < br_lck->num_locks; i++) {
+		if ((all[i].context.smblctx == open_persistent_id) &&
+		    server_id_is_disconnected(&all[i].context.pid)) {
+			(*locks)[n++] = all[i];
+		}
+	}
+	*num_locks = n;
+	TALLOC_FREE(br_lck);
+	return true;
+}
+
 bool brl_cleanup_disconnected(struct file_id fid, uint64_t open_persistent_id)
 {
 	bool ret = false;

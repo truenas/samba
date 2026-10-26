@@ -15,6 +15,12 @@
 	<para>This parameter should only be set to <value type="example">yes</value>
 	on TrueNAS systems configured for High Availability.
 	</para>
+
+	<para>smbd ignores this parameter if
+	<smbconfoption name="clustering"/> is
+	<value type="example">yes</value>. Durable handles survive an HA
+	failover. A restart of smbd or of the controller restores no handles.
+	</para>
 </description>
 <value type="default">no</value>
 </samba:parameter>

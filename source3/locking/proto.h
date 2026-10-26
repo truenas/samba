@@ -104,6 +104,16 @@ struct byte_range_lock *brl_get_locks(TALLOC_CTX *mem_ctx,
 					files_struct *fsp);
 struct byte_range_lock *brl_get_locks_readonly(files_struct *fsp);
 bool brl_cleanup_disconnected(struct file_id fid, uint64_t open_persistent_id);
+const struct lock_struct *brl_lock_data(const struct byte_range_lock *brl);
+bool brl_restore_disconnected(struct file_id fid,
+			      uint64_t open_persistent_id,
+			      const struct lock_struct *locks,
+			      unsigned int num_locks);
+bool brl_get_disconnected_locks(TALLOC_CTX *mem_ctx,
+				struct file_id fid,
+				uint64_t open_persistent_id,
+				struct lock_struct **locks,
+				unsigned int *num_locks);
 void brl_set_modified(struct byte_range_lock *br_lck, bool modified);
 bool file_has_brlocks(files_struct *fsp);
 
