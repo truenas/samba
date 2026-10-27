@@ -2083,6 +2083,14 @@ static struct files_struct *file_close_conn_fn(
 		return NULL;
 	}
 
+	if (fsp->dirfsp != NULL) {
+		/*
+		 * An fsp_new_fdless() fsp belongs to a directory handle. The
+		 * close of the handle frees it.
+		 */
+		return NULL;
+	}
+
 	if (fsp->op != NULL && fsp->op->global->durable) {
 		/*
 		 * A tree disconnect closes a durable handle
