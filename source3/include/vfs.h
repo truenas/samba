@@ -946,6 +946,11 @@ struct smb_file_time {
 	struct timespec atime;
 	struct timespec ctime;
 	struct timespec create_time;
+	/*
+	 * TrueNAS: with kernel dosmodes, the DOS attributes to set with the
+	 * times, so in one ZFS transaction. 0: none.
+	 */
+	uint32_t dosmode;
 };
 
 /*

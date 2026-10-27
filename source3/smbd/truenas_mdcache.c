@@ -19,7 +19,7 @@
 /*
  * Per-process cache of what smbd derives from ZFS metadata. A flat table
  * holds a small slot per file, keyed by its file_id: the change cookie,
- * dosmode, DOSATTRIB create time and security descriptor variant. The
+ * DOSATTRIB create time and security descriptor variant. The
  * file_id includes the inode generation, so a reused inode number gets a
  * new slot, and ZFS bumps the cookie on every change, so a slot is only
  * used while the cookie it was filled under is current.

@@ -767,6 +767,72 @@ uint32_t fdos_mode(struct files_struct *fsp)
 }
 
 /*
+ * TrueNAS: with kernel dosmodes the DOS attributes are ZFS flags, which
+ * statx gives in st_ex_zfsflags and system.truenas_setattr sets.
+ */
+static const struct {
+	uint32_t dosmode;
+	uint64_t flag;
+} zfs_dosmodes[] = {
+	{ FILE_ATTRIBUTE_READONLY, ST_EX_ZFS_READONLY },
+	{ FILE_ATTRIBUTE_ARCHIVE, ST_EX_ZFS_ARCHIVE },
+	{ FILE_ATTRIBUTE_SYSTEM, ST_EX_ZFS_SYSTEM },
+	{ FILE_ATTRIBUTE_HIDDEN, ST_EX_ZFS_HIDDEN },
+	{ FILE_ATTRIBUTE_SPARSE, ST_EX_ZFS_SPARSE },
+	{ FILE_ATTRIBUTE_OFFLINE, ST_EX_ZFS_OFFLINE },
+#ifdef DEVELOPER
+	{ FILE_ATTRIBUTE_REPARSE_POINT, ST_EX_ZFS_REPARSE },
+#endif
+};
+
+/*
+ * The DOS attributes in the ZFS flags of st. ZFS sets ZFS_ARCHIVE on a
+ * directory whenever it changes and Windows does not, so a directory
+ * never has ARCHIVE.
+ */
+uint32_t dos_mode_from_zfsflags(const SMB_STRUCT_STAT *st)
+{
+	uint32_t dosmode = 0;
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(zfs_dosmodes); i++) {
+		if (st->st_ex_zfsflags & zfs_dosmodes[i].flag) {
+			dosmode |= zfs_dosmodes[i].dosmode;
+		}
+	}
+	if (S_ISDIR(st->st_ex_mode)) {
+		dosmode &= ~FILE_ATTRIBUTE_ARCHIVE;
+	}
+	return dosmode;
+}
+
+/*
+ * The ZFS flags for dosmode, and in *_mask each ZFS flag that is a DOS
+ * attribute of st's file. ZFS keeps ZFS_ARCHIVE of a directory itself.
+ */
+uint64_t zfsflags_from_dos_mode(const SMB_STRUCT_STAT *st,
+				uint32_t dosmode,
+				uint64_t *_mask)
+{
+	uint64_t mask = 0;
+	uint64_t flags = 0;
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(zfs_dosmodes); i++) {
+		mask |= zfs_dosmodes[i].flag;
+		if (dosmode & zfs_dosmodes[i].dosmode) {
+			flags |= zfs_dosmodes[i].flag;
+		}
+	}
+	if (S_ISDIR(st->st_ex_mode)) {
+		mask &= ~ST_EX_ZFS_ARCHIVE;
+		flags &= ~ST_EX_ZFS_ARCHIVE;
+	}
+	*_mask = mask;
+	return flags;
+}
+
+/*
  * fdos_mode() for a regular file or directory that returns the VFS error
  * instead of a default
  */
@@ -1257,6 +1323,14 @@ int file_ntimes(connection_struct *conn,
 	}
 
 	if((errno != EPERM) && (errno != EACCES)) {
+		return -1;
+	}
+
+	/*
+	 * TrueNAS: with kernel dosmodes the VFS already tried as root what
+	 * Samba allows, also for ft->dosmode.
+	 */
+	if (lp_kernel_dosmodes(SNUM(conn))) {
 		return -1;
 	}
 

@@ -1174,6 +1174,11 @@ bld.SAMBA3_SUBSYSTEM('TRUENAS_MEMPOOL',
                           ''')
 
 
+bld.SAMBA3_SUBSYSTEM('TRUENAS_SETATTR',
+                     source='lib/truenas_setattr.c',
+                     deps='replace')
+
+
 bld.SAMBA3_LIBRARY('truenas_mount',
                    source='lib/truenas_mount.c',
                    deps='''

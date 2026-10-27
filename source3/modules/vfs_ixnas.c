@@ -34,6 +34,7 @@ static int vfs_ixnas_debug_level = DBGC_VFS;
 struct ixnas_config_data {
 	struct smbacl4_vfs_params nfs4_params;
 	bool dosattrib_xattr;
+	bool dosattrib_create_time;
 	bool advertise_enforced_acl;
 };
 
@@ -43,36 +44,7 @@ enum ixnas_dacl_type {
 	IXNAS_NORMAL_DACL
 };
 
-#define	UF_READONLY		0x0000000100000000ull
-#define	UF_HIDDEN		0x0000000200000000ull
-#define	UF_SYSTEM		0x0000000400000000ull
-#define	UF_ARCHIVE		0x0000000800000000ull
-#define	UF_REPARSE		0x0000080000000000ull
-#define	UF_OFFLINE		0x0000100000000000ull
-#define	UF_SPARSE		0x0000200000000000ull
-
 #define ACL_XATTR "system.posix_acl_access"
-
-#define ZFS_IOC_GETDOSFLAGS     _IOR(0x83, 1, uint64_t)
-#define ZFS_IOC_SETDOSFLAGS     _IOW(0x83, 2, uint64_t)
-
-static const struct {
-	uint32_t dosmode;
-	uint64_t flag;
-} dosmode2flag[] = {
-	{ FILE_ATTRIBUTE_READONLY, UF_READONLY },
-	{ FILE_ATTRIBUTE_ARCHIVE, UF_ARCHIVE },
-	{ FILE_ATTRIBUTE_SYSTEM, UF_SYSTEM },
-	{ FILE_ATTRIBUTE_HIDDEN, UF_HIDDEN },
-	{ FILE_ATTRIBUTE_SPARSE, UF_SPARSE },
-	{ FILE_ATTRIBUTE_OFFLINE, UF_OFFLINE },
-#ifdef DEVELOPER
-	{ FILE_ATTRIBUTE_REPARSE_POINT, UF_REPARSE },
-#endif
-};
-
-#define KERN_DOSMODES (UF_READONLY | UF_ARCHIVE | UF_SYSTEM | \
-	UF_HIDDEN | UF_SPARSE | UF_OFFLINE | UF_REPARSE)
 
 static void _dump_acl_info(zfsacl_t theacl, const char *fn)
 {
@@ -93,149 +65,17 @@ static void _dump_acl_info(zfsacl_t theacl, const char *fn)
 }
 #define dump_acl_info(x) _dump_acl_info(x, __func__)
 
-/*
- * This function converts a file opened via O_PATH to one opened under
- * different flags by using procfs.
- */
-static int ixnas_pathref_reopen(const files_struct *fsp, int flags)
-{
-	int fd_out = -1;
-	const char *p = NULL;
-	struct sys_proc_fd_path_buf buf;
-
-	p = sys_proc_fd_path(fsp_get_pathref_fd(fsp), &buf);
-	if (p == NULL) {
-		errno = EBADF;
-		return fd_out;
-	}
-	if (S_ISDIR(fsp->fsp_name->st.st_ex_mode)) {
-		fd_out = open(p, O_DIRECTORY);
-	} else {
-		fd_out = open(p, flags);
-	}
-	return fd_out;
-}
-
-static int procfs_get_native_dosmode(struct files_struct *fsp, uint64_t *_dosmode)
-{
-	int fd, err;
-
-	fd = ixnas_pathref_reopen(fsp, O_RDONLY);
-	if ((fd == -1) && (errno == EACCES)) {
-		become_root();
-		fd = ixnas_pathref_reopen(fsp, O_RDONLY);
-		unbecome_root();
-	}
-
-	if (fd == -1) {
-		DBG_WARNING("%s: open() failed: %s\n",
-			    fsp_str_dbg(fsp), strerror(errno));
-		return -1;
-	}
-
-	err = ioctl(fd, ZFS_IOC_GETDOSFLAGS, _dosmode);
-	close(fd);
-
-	return err;
-}
-
-static bool ixnas_get_native_dosmode(struct files_struct *fsp, uint64_t *_dosmode)
-{
-	int err;
-	if (fsp_has_read_access(fsp)) {
-		err = ioctl(fsp_get_pathref_fd(fsp), ZFS_IOC_GETDOSFLAGS, _dosmode);
-	} else {
-		err = procfs_get_native_dosmode(fsp, _dosmode);
-	}
-	if (err) {
-		DBG_ERR("%s: ioctl() to get dos flags failed: %s\n",
-			fsp_str_dbg(fsp), strerror(errno));
-		return false;
-	}
-	return true;
-}
-
-static bool ixnas_set_native_dosmode(struct files_struct *fsp, uint64_t dosmode)
-{
-	int err;
-	if (fsp_has_read_access(fsp)) {
-		// ZFS checks ownership, not how the file was opened
-		err = ioctl(fsp_get_pathref_fd(fsp), ZFS_IOC_SETDOSFLAGS, &dosmode);
-	} else {
-		int fd;
-		fd = ixnas_pathref_reopen(fsp, O_RDWR);
-		if (fd == -1) {
-			if ((errno != EACCES) && (errno != EPERM)) {
-				DBG_WARNING("%s: open() failed: %s\n",
-					    fsp_str_dbg(fsp), strerror(errno));
-			} else {
-				DBG_DEBUG("Setting dosmode failed for %s: %s\n",
-					  fsp_str_dbg(fsp), strerror(errno));
-			}
-			return false;
-		}
-		err = ioctl(fd, ZFS_IOC_SETDOSFLAGS, &dosmode);
-		close(fd);
-	}
-
-	if (err) {
-		if ((errno != EACCES) && (errno != EPERM)) {
-			DBG_WARNING("Setting dosmode failed for %s: %s\n",
-				    fsp_str_dbg(fsp), strerror(errno));
-		} else {
-			DBG_DEBUG("Setting dosmode failed for %s: %s\n",
-				  fsp_str_dbg(fsp), strerror(errno));
-		}
-		return false;
-	}
-	return true;
-}
-
-static uint32_t ixnas_merge_dosmode(struct files_struct *fsp,
-				    uint32_t xattr_dosmode,
-				    uint64_t kern_dosmode)
-{
-	uint32_t dosmode = xattr_dosmode;
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(dosmode2flag); i++) {
-		if (kern_dosmode & dosmode2flag[i].flag) {
-			dosmode |= dosmode2flag[i].dosmode;
-		}
-	}
-
-	/*
-	 * Windows default behavior appears to be that the archive bit
-	 * on a directory is only explicitly set by clients. ZFS
-	 * sets this bit when the directory's contents are modified.
-	 *
-	 * This means that we _must_ rely on the xattr-encoded dosmode
-	 * to provide guidance as to whether it is set for the file.
-	 */
-	if (S_ISDIR(fsp->fsp_name->st.st_ex_mode) &&
-	    ((xattr_dosmode & FILE_ATTRIBUTE_ARCHIVE) == 0)) {
-		dosmode &= ~FILE_ATTRIBUTE_ARCHIVE;
-	}
-
-	return dosmode;
-}
-
-/*
- * Read DOSATTRIB and the ZFS DOS flags into the inode's cache slot. The
- * xattr is parsed into a copy of the name to learn whether it carries a
- * create time, which every later hit applies to the stat as well.
- */
-static bool ixnas_read_dosmode(struct files_struct *fsp,
-			       uint64_t cookie,
-			       uint32_t *dosmode)
+/* The create time in fsp's DOSATTRIB, UTIME_OMIT if there is none */
+static bool ixnas_dosattrib_read_btime(struct files_struct *fsp,
+				       struct timespec *btime)
 {
 	uint8_t buf[sizeof(fstring)];
-	struct smb_filename tmp;
-	struct mdcache_inode *slot = NULL;
-	uint32_t xattr_dosmode = 0;
-	uint64_t kern_dosmode = 0;
+	struct smb_filename tmp = *fsp->fsp_name;
+	uint32_t attr = 0;
 	ssize_t len;
 	NTSTATUS status;
+
+	*btime = (struct timespec) { .tv_nsec = UTIME_OMIT };
 
 	len = SMB_VFS_FGETXATTR(fsp, SAMBA_XATTR_DOS_ATTRIB, buf, sizeof(buf));
 	if ((len == -1) && ((errno == EPERM) || (errno == EACCES))) {
@@ -245,232 +85,131 @@ static bool ixnas_read_dosmode(struct files_struct *fsp,
 		unbecome_root();
 	}
 	if (len == -1) {
-		if (errno != ENOATTR) {
-			return false;
-		}
-		len = 0;
+		/* .zfs and .zfs/snapshot have no xattrs */
+		return (errno == ENOATTR) || (errno == ENOTSUP);
 	}
 
-	if (!ixnas_get_native_dosmode(metadata_fsp(fsp), &kern_dosmode)) {
-		return false;
-	}
-
-	tmp = *fsp->fsp_name;
-	tmp.st.st_ex_btime = (struct timespec) { .tv_nsec = UTIME_OMIT };
-	if (len > 0) {
-		status = parse_dos_attribute_blob(&tmp,
-						  data_blob_const(buf, len),
-						  &xattr_dosmode);
-		if (!NT_STATUS_IS_OK(status)) {
-			return false;
-		}
-	}
-
-	*dosmode = ixnas_merge_dosmode(fsp, xattr_dosmode, kern_dosmode);
-	if (tmp.st.st_ex_btime.tv_nsec != UTIME_OMIT) {
-		update_stat_ex_create_time(&fsp->fsp_name->st,
-					   tmp.st.st_ex_btime);
-	}
-
-	slot = mdcache_inode_peek(&fsp->file_id, cookie);
-	if (slot != NULL) {
-		slot->dosmode = *dosmode;
-		slot->btime_sec = tmp.st.st_ex_btime.tv_sec;
-		slot->btime_nsec = tmp.st.st_ex_btime.tv_nsec;
-		slot->flags |= MDCACHE_HAVE_DOSMODE;
+	tmp.st.st_ex_btime = *btime;
+	status = parse_dos_attribute_blob(&tmp,
+					  data_blob_const(buf, len),
+					  &attr);
+	if (NT_STATUS_IS_OK(status)) {
+		*btime = tmp.st.st_ex_btime;
 	}
 	return true;
 }
 
-static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
-					  struct files_struct *fsp,
-				          uint32_t *dosmode)
+/*
+ * Before Samba stored the create time natively, a create time that a
+ * client set went into DOSATTRIB only, so DOSATTRIB's wins. The inode's
+ * slot keeps it. A listed entry without an fd needs the slot.
+ */
+static NTSTATUS ixnas_dosattrib_btime(struct files_struct *fsp)
 {
-	struct ixnas_config_data *config = NULL;
+	SMB_STRUCT_STAT *st = &fsp->fsp_name->st;
 	struct mdcache_inode *slot = NULL;
-	bool ok;
-	uint64_t kern_dosmode = 0;
-	uint32_t xattr_dosmode = 0;
-	NTSTATUS status;
+	struct timespec btime;
 
-	SMB_VFS_HANDLE_GET_DATA(handle, config,
-				struct ixnas_config_data,
-				return NT_STATUS_INTERNAL_ERROR);
-
-	if (!config->dosattrib_xattr &&
-	    lp_store_dos_attributes(SNUM(handle->conn))) {
-		if (fsp_get_pathref_fd(fsp) == -1) {
-			/* A directory entry listed without an open */
-			slot = mdcache_inode_peek(
-				&fsp->file_id,
-				fsp->fsp_name->st.st_ex_change_cookie);
-		} else {
-			slot = mdcache_inode_fetch(fsp);
-		}
-	}
-	if (slot != NULL) {
-		if (slot->flags & MDCACHE_HAVE_DOSMODE) {
-			*dosmode = slot->dosmode;
-			if (slot->btime_nsec != UTIME_OMIT) {
-				update_stat_ex_create_time(
-					&fsp->fsp_name->st,
-					(struct timespec) {
-						.tv_sec = slot->btime_sec,
-						.tv_nsec = slot->btime_nsec,
-					});
-			}
-			return NT_STATUS_OK;
-		}
-	}
 	if (fsp_get_pathref_fd(fsp) == -1) {
-		return NT_STATUS_RETRY;
+		slot = mdcache_inode_peek(&fsp->file_id,
+					  st->st_ex_change_cookie);
+		if ((slot == NULL) || !(slot->flags & MDCACHE_HAVE_BTIME)) {
+			return NT_STATUS_RETRY;
+		}
+	} else {
+		slot = mdcache_inode_fetch(fsp);
 	}
-	if (slot != NULL) {
-		if (ixnas_read_dosmode(fsp, slot->cookie, dosmode)) {
-			return NT_STATUS_OK;
+
+	if ((slot != NULL) && (slot->flags & MDCACHE_HAVE_BTIME)) {
+		btime = (struct timespec) {
+			.tv_sec = slot->btime_sec,
+			.tv_nsec = slot->btime_nsec,
+		};
+	} else {
+		if (!ixnas_dosattrib_read_btime(fsp, &btime)) {
+			return map_nt_error_from_unix(errno);
+		}
+		if (slot != NULL) {
+			slot->btime_sec = btime.tv_sec;
+			slot->btime_nsec = btime.tv_nsec;
+			slot->flags |= MDCACHE_HAVE_BTIME;
 		}
 	}
 
-	status = SMB_VFS_NEXT_FGET_DOS_ATTRIBUTES(handle,
-						  fsp,
-						  &xattr_dosmode);
-
-	if (config->dosattrib_xattr) {
-		return status;
+	if (btime.tv_nsec != UTIME_OMIT) {
+		update_stat_ex_create_time(st, btime);
 	}
-
-	if (!NT_STATUS_IS_OK(status)) {
-		if (NT_STATUS_EQUAL(status, NT_STATUS_NOT_SUPPORTED)) {
-			// .zfs and .zfs/snapshot do not support xattrs
-			return NT_STATUS_OK;
-		} else if (!NT_STATUS_EQUAL(status, NT_STATUS_NOT_FOUND)) {
-			return status;
-		}
-	}
-
-	ok = ixnas_get_native_dosmode(metadata_fsp(fsp), &kern_dosmode);
-	if (!ok) {
-		return map_nt_error_from_unix(errno);
-	}
-
-	*dosmode = ixnas_merge_dosmode(fsp, xattr_dosmode, kern_dosmode);
 	return NT_STATUS_OK;
 }
 
-/*
- * DOSATTRIB adds nothing to a regular file whose attributes all live in
- * the ZFS flags, as long as the create time to store is the native one.
- */
-static bool ixnas_dosattrib_redundant(struct files_struct *fsp,
-				      uint32_t dosmode,
-				      uint32_t native_dosmode)
+static NTSTATUS ixnas_fget_dos_attributes(struct vfs_handle_struct *handle,
+					  struct files_struct *fsp,
+					  uint32_t *dosmode)
 {
-	SMB_STRUCT_STAT sbuf;
-	ssize_t len;
-
-	if (!S_ISREG(fsp->fsp_name->st.st_ex_mode) ||
-	    (dosmode != native_dosmode)) {
-		return false;
-	}
-	if ((sys_fstat(fsp_get_pathref_fd(fsp), &sbuf, false) != 0) ||
-	    (sbuf.st_ex_iflags & ST_EX_IFLAG_CALCULATED_BTIME) ||
-	    !timespec_equal(&sbuf.st_ex_btime,
-			    &fsp->fsp_name->st.st_ex_btime)) {
-		return false;
-	}
-	len = SMB_VFS_FGETXATTR(fsp, SAMBA_XATTR_DOS_ATTRIB, NULL, 0);
-	return (len == -1) && (errno == ENOATTR);
-}
-
-static NTSTATUS ixnas_fset_dos_attributes(struct vfs_handle_struct *handle,
-                                            struct files_struct *fsp,
-                                            uint32_t dosmode)
-{
-	NTSTATUS status;
 	struct ixnas_config_data *config = NULL;
-	uint64_t flags = 0;
-	uint64_t cur_flags = 0;
-	uint32_t native_dosmode = 0;
-	int ret, i;
-	bool set_dosmode_ok = false;
-	bool ok;
-
-	if (is_named_stream(fsp->fsp_name)) {
-		// Streams don't have separate dos attribute metadata
-		return NT_STATUS_OK;
-	}
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config,
 				struct ixnas_config_data,
 				return NT_STATUS_INTERNAL_ERROR);
 
 	if (config->dosattrib_xattr) {
-		return SMB_VFS_NEXT_FSET_DOS_ATTRIBUTES(handle,
-							fsp,
-							dosmode);
+		return SMB_VFS_NEXT_FGET_DOS_ATTRIBUTES(handle, fsp, dosmode);
 	}
 
-	DBG_INFO("ixnas:set_dos_attributes: set attribute 0x%x, on file %s\n",
-		 dosmode, fsp_str_dbg(fsp));
-	/*
-	* Optimization. This is most likely set by file owner. First try without
-	* performing additional permissions checks and using become_root().
-	*/
-	if (!CAN_WRITE(handle->conn)) {
-		return NT_STATUS_ACCESS_DENIED;
-	}
-
-	for (i = 0; i < ARRAY_SIZE(dosmode2flag); i++) {
-		if (dosmode & dosmode2flag[i].dosmode) {
-			flags |= dosmode2flag[i].flag;
-			native_dosmode |= dosmode2flag[i].dosmode;
-		}
-	}
-
-	if (ixnas_get_native_dosmode(fsp, &cur_flags) && (cur_flags == flags)) {
-		goto out;
-	}
-
-	ok = ixnas_set_native_dosmode(fsp, flags);
-	if (ok) {
-		goto out;
-	} else if ((errno != EACCES) && (errno != EPERM)) {
-		return map_nt_error_from_unix(errno);
-	}
-
-	status = smbd_check_access_rights_fsp(handle->conn->cwd_fsp, fsp,
-					      false, FILE_WRITE_ATTRIBUTES);
-	if (NT_STATUS_IS_OK(status)) {
-		set_dosmode_ok = true;
-	}
-
-	if (!set_dosmode_ok && lp_dos_filemode(SNUM(handle->conn))) {
-		set_dosmode_ok = can_write_to_fsp(fsp);
-	}
-
-	if (!set_dosmode_ok){
-		return NT_STATUS_ACCESS_DENIED;
-	}
-
-	/* becomeroot() because non-owners need to write flags */
-
-	become_root();
-	ok = ixnas_set_native_dosmode(fsp, flags);
-	unbecome_root();
-
-	if (!ok) {
-		DBG_WARNING("Setting dosmode failed for %s: %s\n",
-			    fsp_str_dbg(fsp), strerror(errno));
-		return map_nt_error_from_unix(errno);
-	}
-
-out:
-	if (ixnas_dosattrib_redundant(fsp, dosmode, native_dosmode)) {
+	*dosmode = dos_mode_from_zfsflags(&fsp->fsp_name->st);
+	if (!config->dosattrib_create_time) {
 		return NT_STATUS_OK;
 	}
-	return SMB_VFS_NEXT_FSET_DOS_ATTRIBUTES(handle,
+	return ixnas_dosattrib_btime(fsp);
+}
+
+/*
+ * A create time set now is native. A DOSATTRIB create time from before
+ * would still win in ixnas_dosattrib_btime(), so DOSATTRIB goes, unless
+ * the inode's slot shows that it has none.
+ */
+static int ixnas_fntimes(struct vfs_handle_struct *handle,
+			 struct files_struct *fsp,
+			 struct smb_file_time *ft)
+{
+	struct ixnas_config_data *config = NULL;
+	struct timespec btime = fsp->fsp_name->st.st_ex_btime;
+	uint64_t cookie = fsp->fsp_name->st.st_ex_change_cookie;
+	struct mdcache_inode *slot = NULL;
+	int ret;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config,
+				struct ixnas_config_data,
+				return -1);
+
+	ret = SMB_VFS_NEXT_FNTIMES(handle, fsp, ft);
+	if ((ret != 0) || config->dosattrib_xattr ||
+	    !config->dosattrib_create_time || (ft == NULL) ||
+	    is_omit_timespec(&ft->create_time) ||
+	    timespec_equal(&ft->create_time, &btime)) {
+		return ret;
+	}
+
+	slot = mdcache_inode_peek(&fsp->file_id, cookie);
+	if ((slot != NULL) && (slot->flags & MDCACHE_HAVE_BTIME) &&
+	    (slot->btime_nsec == UTIME_OMIT)) {
+		return 0;
+	}
+
+	ret = SMB_VFS_NEXT_FREMOVEXATTR(handle, fsp, SAMBA_XATTR_DOS_ATTRIB);
+	if ((ret == -1) && ((errno == EPERM) || (errno == EACCES))) {
+		/* Samba allowed the create time, which DOSATTRIB holds */
+		become_root();
+		ret = SMB_VFS_NEXT_FREMOVEXATTR(handle,
 						fsp,
-						dosmode);
+						SAMBA_XATTR_DOS_ATTRIB);
+		unbecome_root();
+	}
+	if ((ret == -1) && (errno != ENOATTR)) {
+		DBG_WARNING("%s: removing DOSATTRIB failed: %s\n",
+			    fsp_str_dbg(fsp), strerror(errno));
+	}
+	return 0;
 }
 
 static zfsacl_t fsp_get_zfsacl(files_struct *fsp)
@@ -1876,6 +1615,15 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 	}
 
 	/*
+	 * Before Samba set the create time natively, it stored it only in
+	 * DOSATTRIB. A share whose files have no such DOSATTRIB can skip it.
+	 */
+	config->dosattrib_create_time =
+		lp_store_dos_attributes(SNUM(handle->conn)) &&
+		lp_parm_bool(SNUM(handle->conn),
+			     "ixnas", "dosattrib_create_time", true);
+
+	/*
 	 * Reconcile the SMB ACL view and set operations with what the ZFS backend
 	 * actually enforces. On (default): strip the WRITE_ACL/WRITE_OWNER that ZFS
 	 * won't honor from owner@/group@/everyone@ in the SD we report (not from
@@ -1953,7 +1701,7 @@ static struct vfs_fn_pointers ixnas_fns = {
 	.openat_fn = ixnas_openat,
 	/* dosmode_enabled */
 	.fget_dos_attributes_fn = ixnas_fget_dos_attributes,
-	.fset_dos_attributes_fn = ixnas_fset_dos_attributes,
+	.fntimes_fn = ixnas_fntimes,
 	.fget_nt_acl_fn = ixnas_fget_nt_acl,
 	.fset_nt_acl_fn = ixnas_fset_nt_acl,
 	.sys_acl_get_fd_fn = ixnas_fail__sys_acl_get_fd,

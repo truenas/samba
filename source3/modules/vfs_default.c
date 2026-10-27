@@ -38,6 +38,7 @@
 #include "offload_token.h"
 #include "util_reparse.h"
 #include "lib/util/string_wrappers.h"
+#include "lib/truenas_setattr.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_VFS
@@ -2059,12 +2060,143 @@ static NTSTATUS vfswrap_fget_dos_attributes(struct vfs_handle_struct *handle,
 	return fget_ea_dos_attribute(fsp, dosmode);
 }
 
+/*
+ * TrueNAS: as set_ea_dos_attribute() and file_ntimes() decide when the
+ * filesystem refuses the caller: may Samba set sa as root?
+ */
+static bool vfswrap_kernel_setattr_allowed(connection_struct *conn,
+					   struct files_struct *fsp,
+					   const struct truenas_setattr *sa)
+{
+	NTSTATUS status;
+	bool allowed = CAN_WRITE(conn);
+
+	if (allowed && (sa->zsa_valid & TRUENAS_SETATTR_DOSFLAGS)) {
+		status = smbd_check_access_rights_fsp(conn->cwd_fsp,
+						      fsp,
+						      false,
+						      FILE_WRITE_ATTRIBUTES);
+		allowed = NT_STATUS_IS_OK(status) ||
+			  (lp_dos_filemode(SNUM(conn)) &&
+			   can_write_to_fsp(fsp));
+	}
+	if (allowed && (sa->zsa_valid & TRUENAS_SETATTR_TIMES)) {
+		allowed = lp_dos_filetimes(SNUM(conn)) && can_write_to_fsp(fsp);
+	}
+	return allowed;
+}
+
+/*
+ * TrueNAS: name a time in sa unless it is omitted or already the file's.
+ * True if only the owner may set it: ZFS lets anyone with write access set
+ * the time to now.
+ */
+static bool vfswrap_setattr_time(struct truenas_setattr *sa,
+				 uint64_t which,
+				 const struct timespec *ts,
+				 const struct timespec *cur)
+{
+	if (is_omit_timespec(ts) || timespec_equal(ts, cur)) {
+		return false;
+	}
+	truenas_setattr_time(sa, which, *ts);
+	return (which == TRUENAS_SETATTR_BTIME) || (ts->tv_nsec != UTIME_NOW);
+}
+
+/*
+ * TrueNAS: with kernel dosmodes, set the times in ft and the DOS
+ * attributes in ft->dosmode (0: none) of fsp's file with one
+ * system.truenas_setattr. ZFS lets only the owner set a time other than
+ * now, so for anyone else that goes as root at once if Samba allows it.
+ * Other changes go as the caller, and as root only if ZFS refuses and
+ * Samba allows it.
+ */
+static int vfswrap_kernel_setattr(struct vfs_handle_struct *handle,
+				  struct files_struct *fsp,
+				  const struct smb_file_time *ft)
+{
+	connection_struct *conn = handle->conn;
+	SMB_STRUCT_STAT *st = &fsp->fsp_name->st;
+	struct sys_proc_fd_path_buf buf;
+	struct truenas_setattr sa;
+	const char *path = NULL;
+	uid_t uid = get_current_uid(conn);
+	bool owner_only = false;
+	bool as_user;
+	uint64_t mask = 0;
+	uint64_t flags = 0;
+	int fd = -1;
+	int ret, err;
+
+	truenas_setattr_init(&sa);
+	if (ft->dosmode != 0) {
+		flags = zfsflags_from_dos_mode(st, ft->dosmode, &mask);
+		if ((st->st_ex_zfsflags & mask) != flags) {
+			truenas_setattr_dosflags(&sa, flags, mask & ~flags);
+		}
+	}
+	owner_only |= vfswrap_setattr_time(&sa, TRUENAS_SETATTR_ATIME,
+					   &ft->atime, &st->st_ex_atime);
+	owner_only |= vfswrap_setattr_time(&sa, TRUENAS_SETATTR_MTIME,
+					   &ft->mtime, &st->st_ex_mtime);
+	owner_only |= vfswrap_setattr_time(&sa, TRUENAS_SETATTR_BTIME,
+					   &ft->create_time, &st->st_ex_btime);
+	if (sa.zsa_valid == 0) {
+		return 0;
+	}
+	as_user = (uid == 0) || (uid == st->st_ex_uid) || !owner_only;
+
+	if (fsp_has_read_access(fsp)) {
+		fd = fsp_get_pathref_fd(fsp);
+	} else if (fsp->fsp_flags.have_proc_fds) {
+		path = sys_proc_fd_path(fsp_get_pathref_fd(fsp), &buf);
+	} else {
+		path = fsp->fsp_name->base_name;
+	}
+
+	if (as_user) {
+		ret = truenas_setattr(fd, path, &sa);
+		if ((ret == 0) || ((errno != EPERM) && (errno != EACCES))) {
+			goto done;
+		}
+	}
+	if (!vfswrap_kernel_setattr_allowed(conn, fsp, &sa)) {
+		errno = EACCES;
+		return -1;
+	}
+	become_root();
+	ret = truenas_setattr(fd, path, &sa);
+	err = errno;
+	unbecome_root();
+	errno = err;
+
+done:
+	if (ret == -1) {
+		DBG_INFO("%s: setting attributes failed: %s\n",
+			 fsp_str_dbg(fsp), strerror(errno));
+		return -1;
+	}
+
+	st->st_ex_zfsflags = (st->st_ex_zfsflags & ~mask) | flags;
+	return 0;
+}
+
 static NTSTATUS vfswrap_fset_dos_attributes(struct vfs_handle_struct *handle,
 					    struct files_struct *fsp,
 					    uint32_t dosmode)
 {
 	SMB_ASSERT(!fsp_is_alternate_stream(fsp));
 
+	if (lp_kernel_dosmodes(SNUM(handle->conn))) {
+		struct smb_file_time ft;
+
+		init_smb_file_time(&ft);
+		ft.dosmode = dosmode;
+		if (vfswrap_kernel_setattr(handle, fsp, &ft) != 0) {
+			return map_nt_error_from_unix(errno);
+		}
+		return NT_STATUS_OK;
+	}
 	return set_ea_dos_attribute(handle->conn, fsp->fsp_name, dosmode);
 }
 
@@ -2917,6 +3049,20 @@ static int vfswrap_fntimes(vfs_handle_struct *handle,
 
 	if (fsp_is_alternate_stream(fsp)) {
 		errno = ENOENT;
+		goto out;
+	}
+
+	if (lp_kernel_dosmodes(SNUM(handle->conn))) {
+		struct smb_file_time now = {
+			.atime.tv_nsec = UTIME_NOW,
+			.mtime.tv_nsec = UTIME_NOW,
+			.ctime.tv_nsec = UTIME_OMIT,
+			.create_time.tv_nsec = UTIME_OMIT,
+		};
+
+		result = vfswrap_kernel_setattr(handle,
+						fsp,
+						(ft != NULL) ? ft : &now);
 		goto out;
 	}
 

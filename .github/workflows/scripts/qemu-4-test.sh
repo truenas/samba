@@ -304,6 +304,28 @@ cat > /etc/smb4.conf <<CONF
     guest ok = yes
     vfs objects = io_uring
 
+[zkdos]
+    # [zacl] where a listing gives entries from the stat: "ea support = no",
+    # no ABE and no create time from an older DOSATTRIB (truenas.dosmode).
+    path = /tank/acl
+    read only = no
+    vfs objects = ixnas zfs_core
+    ea support = no
+    ixnas:truenas_abe = no
+    ixnas:dosattrib_create_time = no
+    nfs4:mode = simple
+    nfs4:acedup = merge
+
+[zworm]
+    # [zacl] with worm below ixnas, in middleware's order, and a grace
+    # period of one second (truenas.worm).
+    path = /tank/acl
+    read only = no
+    vfs objects = ixnas zfs_core worm
+    worm:grace_period = 1
+    nfs4:mode = simple
+    nfs4:acedup = merge
+
 [zfruit]
     # Stream-backed metadata and resource forks, in middleware's object
     # order, for truenas.fruit.
@@ -745,6 +767,29 @@ if tn_torture //127.0.0.1/zmdcache -U 'smbtest%testpass123' truenas.mdcache; the
   echo "truenas.mdcache suite PASSED"
 else
   echo "ERROR: truenas.mdcache suite FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
+fi
+
+echo "=========================================="
+echo "Kernel dosmodes (truenas.dosmode)"
+echo "=========================================="
+# [zacl] opens each listed entry, [zkdos] lists from the stat.
+for share in zacl zkdos; do
+  if tn_torture //127.0.0.1/$share -U 'smbtest%testpass123' truenas.dosmode; then
+    echo "truenas.dosmode suite PASSED on [$share]"
+  else
+    echo "ERROR: truenas.dosmode suite FAILED on [$share]"
+    tail -80 /var/log/samba4/smbd.log; exit 1
+  fi
+done
+
+echo "=========================================="
+echo "vfs_worm (truenas.worm)"
+echo "=========================================="
+if tn_torture //127.0.0.1/zworm -U 'smbtest%testpass123' \
+     --option='torture:worm_grace=1' truenas.worm; then
+  echo "truenas.worm suite PASSED"
+else
+  echo "ERROR: truenas.worm suite FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
 fi
 
 echo "=========================================="
