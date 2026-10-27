@@ -263,6 +263,16 @@ cat > /etc/smb4.conf <<CONF
     nfs4:mode = simple
     nfs4:acedup = merge
 
+[zmdcache]
+    # [zacl] with "ea support = no", as middleware sets it. Only then does
+    # a listing use the metadata cache (truenas.mdcache).
+    path = /tank/acl
+    read only = no
+    vfs objects = ixnas zfs_core
+    ea support = no
+    nfs4:mode = simple
+    nfs4:acedup = merge
+
 [zhome]
     # Per-user dataset auto-creation with the *full* production-shaped stack:
     # vfs_fruit (whose cwd_fsp-relative stat triggered the regression) + the
@@ -730,8 +740,8 @@ fi
 echo "=========================================="
 echo "smbd metadata cache (truenas.mdcache)"
 echo "=========================================="
-# ixnas fills the cache on [zacl].
-if tn_torture //127.0.0.1/zacl -U 'smbtest%testpass123' truenas.mdcache; then
+# ixnas fills the cache on [zmdcache].
+if tn_torture //127.0.0.1/zmdcache -U 'smbtest%testpass123' truenas.mdcache; then
   echo "truenas.mdcache suite PASSED"
 else
   echo "ERROR: truenas.mdcache suite FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1

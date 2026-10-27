@@ -6,7 +6,8 @@
    These use FSCTL_SMBTORTURE_MDCACHE to shorten the cache's idle timeout
    and read its size, so smbd needs "smbd:FSCTL_SMBTORTURE = yes". They
    self-skip on shares where nothing fills the cache (no ixnas, or a kernel
-   without STATX_CHANGE_COOKIE).
+   without STATX_CHANGE_COOKIE). A listing uses the cache only with
+   "ea support = no", as middleware sets it.
 
    Copyright (C) iXsystems 2026
 
@@ -70,8 +71,41 @@ static NTSTATUS mdc_fsctl(struct torture_context *tctx,
 	return NT_STATUS_OK;
 }
 
-/* List MDC_DIR and check it has every test file, with f0 hidden */
-static bool mdc_list(struct torture_context *tctx, struct smb2_tree *tree)
+/* How mdc_fsctl() fails without "smbd:FSCTL_SMBTORTURE = yes" */
+static bool mdc_no_fsctl(NTSTATUS status)
+{
+	return NT_STATUS_EQUAL(status, NT_STATUS_INVALID_DEVICE_REQUEST) ||
+	       NT_STATUS_EQUAL(status, NT_STATUS_FS_DRIVER_REQUIRED) ||
+	       NT_STATUS_EQUAL(status, NT_STATUS_NOT_SUPPORTED);
+}
+
+/* Create the test files in MDC_DIR, f0 hidden */
+static bool mdc_create_files(struct torture_context *tctx,
+			     struct smb2_tree *tree)
+{
+	struct smb2_handle fh = {{0}};
+	NTSTATUS status;
+	int i;
+
+	for (i = 0; i < MDC_FILES; i++) {
+		const char *fname = talloc_asprintf(tctx, MDC_DIR "\\f%d", i);
+
+		status = torture_smb2_testfile(tree, fname, &fh);
+		torture_assert_ntstatus_ok(tctx, status, "create file");
+		smb2_util_close(tree, fh);
+	}
+	status = smb2_util_setatr(tree, MDC_DIR "\\f0", FILE_ATTRIBUTE_HIDDEN);
+	torture_assert_ntstatus_ok(tctx, status, "set FILE_ATTRIBUTE_HIDDEN");
+	return true;
+}
+
+/*
+ * List MDC_DIR and check it has every test file, with f0 hidden. With _h,
+ * the directory stays open in *_h.
+ */
+static bool mdc_list(struct torture_context *tctx,
+		     struct smb2_tree *tree,
+		     struct smb2_handle *_h)
 {
 	struct smb2_handle h = {{0}};
 	struct smb2_find f;
@@ -114,7 +148,11 @@ static bool mdc_list(struct torture_context *tctx, struct smb2_tree *tree)
 	torture_assert_goto(tctx, hidden, ret, done, "f0 listed as hidden");
 
 done:
-	smb2_util_close(tree, h);
+	if ((_h != NULL) && ret) {
+		*_h = h;
+	} else {
+		smb2_util_close(tree, h);
+	}
 	return ret;
 }
 
@@ -126,7 +164,6 @@ static bool test_truenas_mdcache_idle(struct torture_context *tctx,
 				      struct smb2_tree *tree)
 {
 	struct smb2_handle h = {{0}};
-	struct smb2_handle fh = {{0}};
 	uint32_t slots = 0, count = 0;
 	NTSTATUS status;
 	bool ret = true;
@@ -138,28 +175,16 @@ static bool test_truenas_mdcache_idle(struct torture_context *tctx,
 					"create directory");
 
 	status = mdc_fsctl(tctx, tree, h, MDC_IDLE, &slots, &count);
-	if (NT_STATUS_EQUAL(status, NT_STATUS_INVALID_DEVICE_REQUEST) ||
-	    NT_STATUS_EQUAL(status, NT_STATUS_FS_DRIVER_REQUIRED) ||
-	    NT_STATUS_EQUAL(status, NT_STATUS_NOT_SUPPORTED)) {
+	if (mdc_no_fsctl(status)) {
 		torture_skip_goto(tctx, done,
 				  "smbd:FSCTL_SMBTORTURE is not enabled\n");
 	}
 	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
 					"FSCTL_SMBTORTURE_MDCACHE");
 
-	for (i = 0; i < MDC_FILES; i++) {
-		const char *fname = talloc_asprintf(tctx, MDC_DIR "\\f%d", i);
-
-		status = torture_smb2_testfile(tree, fname, &fh);
-		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
-						"create file");
-		smb2_util_close(tree, fh);
-	}
-	status = smb2_util_setatr(tree, MDC_DIR "\\f0", FILE_ATTRIBUTE_HIDDEN);
-	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
-					"set FILE_ATTRIBUTE_HIDDEN");
-
-	torture_assert_goto(tctx, mdc_list(tctx, tree), ret, done,
+	torture_assert_goto(tctx, mdc_create_files(tctx, tree), ret, done,
+			    "create the test files");
+	torture_assert_goto(tctx, mdc_list(tctx, tree, NULL), ret, done,
 			    "first listing");
 	status = mdc_fsctl(tctx, tree, h, 0, &slots, &count);
 	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
@@ -181,7 +206,7 @@ static bool test_truenas_mdcache_idle(struct torture_context *tctx,
 	torture_assert_int_equal_goto(tctx, slots, 0, ret, done,
 				      "cache freed after idling");
 
-	torture_assert_goto(tctx, mdc_list(tctx, tree), ret, done,
+	torture_assert_goto(tctx, mdc_list(tctx, tree, NULL), ret, done,
 			    "listing after the cache was freed");
 	status = mdc_fsctl(tctx, tree, h, 0, &slots, &count);
 	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
@@ -195,12 +220,79 @@ done:
 	return ret;
 }
 
+/*
+ * A tree disconnect closes a directory handle that listed from the cache.
+ * The listing gave the handle an fsp for its entries. Only the handle
+ * frees that fsp.
+ */
+static bool test_truenas_mdcache_tdis(struct torture_context *tctx,
+				      struct smb2_tree *tree)
+{
+	struct smb2_tree *tree2 = NULL;
+	struct smb2_handle h = {{0}};
+	struct smb2_handle h2 = {{0}};
+	uint32_t slots = 0, count = 0;
+	NTSTATUS status;
+	bool ret = true;
+
+	smb2_deltree(tree, MDC_DIR);
+	status = torture_smb2_testdir(tree, MDC_DIR, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"create directory");
+
+	status = mdc_fsctl(tctx, tree, h, 0, &slots, &count);
+	if (mdc_no_fsctl(status)) {
+		torture_skip_goto(tctx, done,
+				  "smbd:FSCTL_SMBTORTURE is not enabled\n");
+	}
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"FSCTL_SMBTORTURE_MDCACHE");
+
+	torture_assert_goto(tctx, mdc_create_files(tctx, tree), ret, done,
+			    "create the test files");
+	torture_assert_goto(tctx, mdc_list(tctx, tree, NULL), ret, done,
+			    "first listing");
+	status = mdc_fsctl(tctx, tree, h, 0, &slots, &count);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"FSCTL_SMBTORTURE_MDCACHE");
+	if (count == 0) {
+		torture_skip_goto(tctx, done, "nothing fills the metadata "
+				  "cache on this share\n");
+	}
+
+	/*
+	 * The cache keeps the ABE answers of each tree connect. The first
+	 * listing on a tree stores them, the second comes from the cache.
+	 */
+	torture_assert_goto(tctx,
+			    torture_smb2_tree_connect(tctx, tree->session,
+						      tctx, &tree2),
+			    ret, done, "second tree connect");
+	torture_assert_goto(tctx, mdc_list(tctx, tree2, NULL), ret, done,
+			    "first listing on the second tree");
+	torture_assert_goto(tctx, mdc_list(tctx, tree2, &h2), ret, done,
+			    "second listing on the second tree");
+	status = smb2_tdis(tree2);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"tree disconnect, directory open");
+	torture_assert_goto(tctx, mdc_list(tctx, tree, NULL), ret, done,
+			    "listing after the tree disconnect");
+
+done:
+	TALLOC_FREE(tree2);
+	smb2_util_close(tree, h);
+	smb2_deltree(tree, MDC_DIR);
+	return ret;
+}
+
 void torture_truenas_mdcache_suite(struct torture_suite *suite)
 {
 	struct torture_suite *mdcache = torture_suite_create(suite, "mdcache");
 
 	torture_suite_add_1smb2_test(mdcache, "idle",
 				     test_truenas_mdcache_idle);
+	torture_suite_add_1smb2_test(mdcache, "tdis",
+				     test_truenas_mdcache_tdis);
 
 	torture_suite_add_suite(suite, mdcache);
 }
