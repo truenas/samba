@@ -3638,10 +3638,11 @@ static bool max_access_key(struct files_struct *fsp,
 	}
 
 	if (!ignore_readonly && S_ISREG(fsp->fsp_name->st.st_ex_mode)) {
-		if (!(slot->flags & MDCACHE_HAVE_DOSMODE)) {
+		if (!lp_kernel_dosmodes(SNUM(fsp->conn))) {
 			return false;
 		}
-		readonly = (slot->dosmode & FILE_ATTRIBUTE_READONLY) != 0;
+		readonly = (fsp->fsp_name->st.st_ex_zfsflags &
+			    ST_EX_ZFS_READONLY) != 0;
 	}
 
 	*key = (struct mdcache_access_key) {

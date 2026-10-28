@@ -128,6 +128,11 @@ def configure(conf):
         conf.fatal('STATX_GEN is not declared in linux/stat.h. Build '
                    'against the TrueNAS kernel headers.')
 
+    # ixnas reads the ZFS DOS attributes from the stat, with no ioctl.
+    if not conf.CHECK_DECLS('STATX_ZFSFLAGS', headers='linux/stat.h'):
+        conf.fatal('STATX_ZFSFLAGS is not declared in linux/stat.h. Build '
+                   'against the TrueNAS kernel headers.')
+
     conf.CHECK_FUNCS('getcwd fchown chmod fchmod mknod mknodat')
     conf.CHECK_FUNCS('strtol strchr strupr chflags fchflags')
     conf.CHECK_FUNCS('getrlimit fsync setpgid')

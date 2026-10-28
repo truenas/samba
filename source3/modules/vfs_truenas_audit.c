@@ -1721,6 +1721,21 @@ static int tn_audit_fntimes(vfs_handle_struct *handle,
 		return rv.error;
 	}
 
+	/*
+	 * With kernel dosmodes smb_set_file_basic_info() passes changed DOS
+	 * attributes along: log them as fset_dos_attributes does.
+	 */
+	if (requested.dosmode != 0) {
+		log_setattr_common(handle, fsp, TN_SETATTR_DOSMODE, rv, NULL,
+				   requested.dosmode);
+		if (is_omit_timespec(&requested.create_time) &&
+		    is_omit_timespec(&requested.atime) &&
+		    is_omit_timespec(&requested.mtime) &&
+		    is_omit_timespec(&requested.ctime)) {
+			return rv.error;
+		}
+	}
+
 	fsp_ext = (tn_audit_ext_t *)VFS_FETCH_FSP_EXTENSION(handle, fsp);
 	if (fsp_ext == NULL) {
 		return rv.error;
