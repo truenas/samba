@@ -564,7 +564,8 @@ static bool dirent_cache_usable(connection_struct *conn,
 {
 	int snum = SNUM(conn);
 
-	return get_dosmode && !(dir_fname->flags & SMB_FILENAME_POSIX_PATH) &&
+	return get_dosmode && lp_kernel_dosmodes(snum) &&
+	       !(dir_fname->flags & SMB_FILENAME_POSIX_PATH) &&
 	       (dir_fname->twrp == 0) && !lp_ea_support(snum) &&
 	       !(conn->fs_capabilities & FILE_FILE_COMPRESSION) &&
 	       !lp_hide_unreadable(snum) && !lp_hide_unwriteable_files(snum) &&
@@ -671,9 +672,10 @@ enum dirent_cached { DIRENT_OPEN, DIRENT_HIDDEN, DIRENT_LISTED };
 #define DIRENT_CACHE_MISSES 32
 
 /*
- * List smb_fname without opening it, from what the metadata cache holds
- * for the version of the file a stat by name finds. DIRENT_OPEN means it
- * has to be opened after all.
+ * List smb_fname without opening it. With kernel dosmodes the stat by name
+ * gives the DOS attributes. ABE answers and what modules cached come from
+ * the metadata cache for the version of the file that stat finds.
+ * DIRENT_OPEN means it has to be opened after all.
  */
 static enum dirent_cached dirent_from_cache(TALLOC_CTX *ctx,
 					    struct smb_Dir *dir_hnd,
@@ -714,16 +716,16 @@ static enum dirent_cached dirent_from_cache(TALLOC_CTX *ctx,
 	} else {
 		id = vfs_file_id_from_sbuf(conn, st);
 	}
-	slot = mdcache_inode_peek(&id, st->st_ex_change_cookie);
-	if (slot == NULL) {
-		return DIRENT_OPEN;
-	}
 
 	/* ABE first: a hidden entry needs nothing else */
 	if ((conn->internal_tcon_flags & TCON_FLAG_TRUENAS_ABE) &&
 	    !ISDOT(smb_fname->base_name) && !ISDOTDOT(smb_fname->base_name)) {
 		bool visible;
 
+		slot = mdcache_inode_peek(&id, st->st_ex_change_cookie);
+		if (slot == NULL) {
+			return DIRENT_OPEN;
+		}
 		if (mdcache_abe_get(slot, mdcache_abe_ctx(conn), &visible)) {
 			read_access = visible ? FILE_READ_DATA : 0;
 		} else if (!dirent_abe_key(conn, slot, &key) ||
@@ -733,10 +735,6 @@ static enum dirent_cached dirent_from_cache(TALLOC_CTX *ctx,
 		if (read_access == 0) {
 			return DIRENT_HIDDEN;
 		}
-	}
-
-	if (!(slot->flags & MDCACHE_HAVE_DOSMODE)) {
-		return DIRENT_OPEN;
 	}
 
 	fsp = dir_entry_fsp(dir_hnd, smb_fname, &id);

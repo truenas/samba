@@ -3980,6 +3980,43 @@ static NTSTATUS smb_set_file_dosmode(connection_struct *conn,
 	return NT_STATUS_OK;
 }
 
+/*
+ * TrueNAS: with kernel dosmodes, the attributes of FileBasicInformation go
+ * to the VFS with its times in one SMB_VFS_FNTIMES, so one ZFS
+ * transaction. Decide the DOS mode to put in ft->dosmode as
+ * smb_set_file_dosmode() and file_set_dosmode() do, against the ZFS flags
+ * in the stat: 0 if nothing changes.
+ */
+static NTSTATUS smb_kernel_dosmode(struct files_struct *fsp,
+				   uint32_t dosmode,
+				   uint32_t *_dosmode)
+{
+	const SMB_STRUCT_STAT *st = &metadata_fsp(fsp)->fsp_name->st;
+	uint64_t mask = 0;
+	uint64_t flags;
+
+	*_dosmode = 0;
+	if (dosmode == 0) {
+		return NT_STATUS_OK;
+	}
+
+	if (S_ISDIR(st->st_ex_mode)) {
+		if (dosmode & FILE_ATTRIBUTE_TEMPORARY) {
+			return NT_STATUS_INVALID_PARAMETER;
+		}
+		dosmode |= FILE_ATTRIBUTE_DIRECTORY;
+	} else {
+		dosmode &= ~FILE_ATTRIBUTE_DIRECTORY;
+	}
+	dosmode &= SAMBA_ATTRIBUTES_MASK;
+
+	flags = zfsflags_from_dos_mode(st, dosmode, &mask);
+	if ((st->st_ex_zfsflags & mask) != flags) {
+		*_dosmode = (dosmode != 0) ? dosmode : FILE_ATTRIBUTE_NORMAL;
+	}
+	return NT_STATUS_OK;
+}
+
 /****************************************************************************
  Deal with setting the size from any of the setfilepathinfo functions.
 ****************************************************************************/
@@ -4685,10 +4722,6 @@ static NTSTATUS smb_set_file_basic_info(connection_struct *conn,
 
 	/* Set the attributes */
 	dosmode = IVAL(pdata,32);
-	status = smb_set_file_dosmode(conn, fsp, dosmode);
-	if (!NT_STATUS_IS_OK(status)) {
-		return status;
-	}
 
 	/* create time */
 	ft.create_time = pull_long_date_full_timespec(pdata);
@@ -4704,6 +4737,34 @@ static NTSTATUS smb_set_file_basic_info(connection_struct *conn,
 
 	DEBUG(10, ("smb_set_file_basic_info: file %s\n",
 		   smb_fname_str_dbg(smb_fname)));
+
+	if (lp_kernel_dosmodes(SNUM(conn)) && CAN_WRITE(conn) &&
+	    (fsp != NULL) && VALID_STAT(fsp->fsp_name->st) &&
+	    !S_ISLNK(fsp->fsp_name->st.st_ex_mode)) {
+		struct files_struct *dos_fsp = metadata_fsp(fsp);
+
+		status = smb_kernel_dosmode(fsp, dosmode, &ft.dosmode);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
+		status = smb_set_file_time(conn, fsp, smb_fname, &ft, true);
+		if (!NT_STATUS_IS_OK(status) || (ft.dosmode == 0)) {
+			return status;
+		}
+		dos_fsp->fsp_name->st.cached_dos_attributes = ft.dosmode;
+		notify_fname(conn,
+			     NOTIFY_ACTION_MODIFIED |
+			     NOTIFY_ACTION_DIRLEASE_BREAK,
+			     FILE_NOTIFY_CHANGE_ATTRIBUTES,
+			     dos_fsp->fsp_name,
+			     fsp_get_smb2_lease(dos_fsp));
+		return NT_STATUS_OK;
+	}
+
+	status = smb_set_file_dosmode(conn, fsp, dosmode);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
 
 	status = smb_set_file_time(conn, fsp, smb_fname, &ft, true);
 	if (!NT_STATUS_IS_OK(status)) {

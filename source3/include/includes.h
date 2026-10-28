@@ -182,6 +182,15 @@ typedef sig_atomic_t volatile SIG_ATOMIC_T;
 /* TrueNAS: did statx return STATX_CHANGE_COOKIE ? */
 #define ST_EX_IFLAG_HAS_CHANGE_COOKIE		(1 << 2)
 
+/* TrueNAS: the DOS attributes in st_ex_zfsflags (ZFS_* in sys/zfs_znode.h) */
+#define ST_EX_ZFS_READONLY	0x0000000100000000ULL
+#define ST_EX_ZFS_HIDDEN	0x0000000200000000ULL
+#define ST_EX_ZFS_SYSTEM	0x0000000400000000ULL
+#define ST_EX_ZFS_ARCHIVE	0x0000000800000000ULL
+#define ST_EX_ZFS_REPARSE	0x0000080000000000ULL
+#define ST_EX_ZFS_OFFLINE	0x0000100000000000ULL
+#define ST_EX_ZFS_SPARSE	0x0000200000000000ULL
+
 /*
  * Type for stat structure.
  */
@@ -210,6 +219,8 @@ struct stat_ex {
 	uint64_t	st_ex_mnt_id;
 	uint64_t	st_ex_change_cookie;
 	uint64_t	st_ex_attributes;
+	/* TrueNAS: statx stx_zfsflags, else 0 */
+	uint64_t	st_ex_zfsflags;
 };
 
 typedef struct stat_ex SMB_STRUCT_STAT;
