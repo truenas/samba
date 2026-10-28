@@ -30,7 +30,8 @@
 /* read a freelist record and check for simple errors */
 int tdb_rec_free_read(struct tdb_context *tdb, tdb_off_t off, struct tdb_record *rec)
 {
-	if (tdb->methods->tdb_read(tdb, off, rec, sizeof(*rec),DOCONV()) == -1)
+	if (!tdb_read_mapped(tdb, off, rec, sizeof(*rec)) &&
+	    tdb->methods->tdb_read(tdb, off, rec, sizeof(*rec),DOCONV()) == -1)
 		return -1;
 
 	if (rec->magic == TDB_MAGIC) {
@@ -111,8 +112,11 @@ static int read_record_on_left(struct tdb_context *tdb, tdb_off_t rec_ptr,
 	}
 
 	/* Now read in the left record */
-	ret = tdb->methods->tdb_read(tdb, left_ptr, &left_rec,
-				     sizeof(left_rec), DOCONV());
+	ret = 0;
+	if (!tdb_read_mapped(tdb, left_ptr, &left_rec, sizeof(left_rec))) {
+		ret = tdb->methods->tdb_read(tdb, left_ptr, &left_rec,
+					     sizeof(left_rec), DOCONV());
+	}
 	if (ret == -1) {
 		TDB_LOG((tdb, TDB_DEBUG_FATAL,
 			 "tdb_free: left read failed at %u (%u)\n",
@@ -538,16 +542,35 @@ static tdb_off_t tdb_allocate_from_freelist(
 	return 0;
 }
 
+/*
+ * Take a dead record out of chain "hash". "move_ok" is NULL if it stays
+ * in that chain: a traverse sitting on it then picks it up again under
+ * the same chain lock. Moving it to another chain would send such a
+ * traverse into a chain it has not locked, so with "move_ok" only take
+ * it if no traverse can be on it, and give up on moves for the rest of
+ * the allocation otherwise.
+ */
 static bool tdb_alloc_dead(
 	struct tdb_context *tdb, int hash, tdb_len_t length,
-	tdb_off_t *rec_ptr, struct tdb_record *rec)
+	tdb_off_t *rec_ptr, struct tdb_record *rec, bool *move_ok)
 {
 	tdb_off_t last_ptr;
+
+	if ((move_ok != NULL) && !*move_ok) {
+		return false;
+	}
 
 	*rec_ptr = tdb_find_dead(tdb, hash, rec, length, &last_ptr);
 	if (*rec_ptr == 0) {
 		return false;
 	}
+
+	if ((move_ok != NULL) &&
+	    (tdb_have_travlock(tdb, *rec_ptr) || !tdb_no_record_locks(tdb))) {
+		*move_ok = false;
+		return false;
+	}
+
 	/*
 	 * Unlink the record from the hash chain, it's about to be moved into
 	 * another one.
@@ -575,6 +598,7 @@ tdb_off_t tdb_allocate(struct tdb_context *tdb, int hash, tdb_len_t length,
 {
 	tdb_off_t ret;
 	uint32_t i;
+	bool move_ok = true;
 
 	if (tdb->max_dead_records == 0) {
 		/*
@@ -604,7 +628,9 @@ tdb_off_t tdb_allocate(struct tdb_context *tdb, int hash, tdb_len_t length,
 		if (tdb_lock_nonblock(tdb, list, F_WRLCK) == 0) {
 			bool got_dead;
 
-			got_dead = tdb_alloc_dead(tdb, list, length, &ret, rec);
+			got_dead = tdb_alloc_dead(
+				tdb, list, length, &ret, rec,
+				(list == BUCKET(hash)) ? NULL : &move_ok);
 			tdb_unlock(tdb, list, F_WRLCK);
 
 			if (got_dead) {

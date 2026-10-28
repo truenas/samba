@@ -332,6 +332,66 @@ static struct tdb_lock_type *find_nestlock(struct tdb_context *tdb,
 	return NULL;
 }
 
+/*
+ * tdb_brlock() of one byte for tdb_nest_lock(). Freelist and chain
+ * offsets of mutexed tdbs go to their mutex directly instead of through
+ * the fcntl emulation in fcntl_lock().
+ */
+static int tdb_nest_brlock(struct tdb_context *tdb, int ltype,
+			   tdb_off_t offset, enum tdb_lock_flags flags)
+{
+#ifdef USE_TDB_MUTEX_LOCKING
+	if ((tdb->feature_flags & TDB_FEATURE_FLAG_MUTEX) &&
+	    (offset >= lock_offset(-1)) &&
+	    !(flags & TDB_LOCK_MARK_ONLY)) {
+		int ret;
+
+		if ((ltype == F_WRLCK) &&
+		    (tdb->read_only || tdb->traverse_read)) {
+			tdb->ecode = TDB_ERR_RDONLY;
+			return -1;
+		}
+		ret = tdb_mutex_lock_idx(tdb,
+					 (offset - lock_offset(-1)) / 4,
+					 ltype,
+					 flags & TDB_LOCK_WAIT);
+		if (ret == -1) {
+			tdb->ecode = TDB_ERR_LOCK;
+			if (!(flags & TDB_LOCK_PROBE) && errno != EAGAIN) {
+				TDB_LOG((tdb, TDB_DEBUG_TRACE,
+					 "tdb_brlock failed (fd=%d) at offset "
+					 "%u rw_type=%d flags=%d len=1\n",
+					 tdb->fd, offset, ltype, flags));
+			}
+		}
+		return ret;
+	}
+#endif
+	return tdb_brlock(tdb, ltype, offset, 1, flags);
+}
+
+static int tdb_nest_brunlock(struct tdb_context *tdb, int ltype,
+			     tdb_off_t offset)
+{
+#ifdef USE_TDB_MUTEX_LOCKING
+	if ((tdb->feature_flags & TDB_FEATURE_FLAG_MUTEX) &&
+	    (offset >= lock_offset(-1))) {
+		int ret;
+
+		ret = tdb_mutex_unlock_idx(tdb,
+					   (offset - lock_offset(-1)) / 4);
+		if (ret == -1) {
+			TDB_LOG((tdb, TDB_DEBUG_TRACE,
+				 "tdb_brunlock failed (fd=%d) at offset %u "
+				 "rw_type=%u len=1\n",
+				 tdb->fd, offset, ltype));
+		}
+		return ret;
+	}
+#endif
+	return tdb_brunlock(tdb, ltype, offset, 1);
+}
+
 /* lock an offset in the database. */
 int tdb_nest_lock(struct tdb_context *tdb, uint32_t offset, int ltype,
 		  enum tdb_lock_flags flags)
@@ -387,7 +447,7 @@ int tdb_nest_lock(struct tdb_context *tdb, uint32_t offset, int ltype,
 
 	/* Since fcntl locks don't nest, we do a lock for the first one,
 	   and simply bump the count for future ones */
-	if (tdb_brlock(tdb, ltype, offset, 1, flags)) {
+	if (tdb_nest_brlock(tdb, ltype, offset, flags)) {
 		return -1;
 	}
 
@@ -549,7 +609,7 @@ int tdb_nest_unlock(struct tdb_context *tdb, uint32_t offset, int ltype,
 	if (mark_lock) {
 		ret = 0;
 	} else {
-		ret = tdb_brunlock(tdb, ltype, offset, 1);
+		ret = tdb_nest_brunlock(tdb, ltype, offset);
 	}
 
 	/*
@@ -950,6 +1010,43 @@ int tdb_write_unlock_record(struct tdb_context *tdb, tdb_off_t off)
 		return 0;
 	}
 	return tdb_brunlock(tdb, F_WRLCK, off, 1);
+}
+
+/* Is one of our own traverses at the record at "off"? */
+bool tdb_have_travlock(struct tdb_context *tdb, tdb_off_t off)
+{
+	struct tdb_traverse_lock *i;
+
+	for (i = &tdb->travlocks; i != NULL; i = i->next) {
+		if (i->off == off) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Traversals take their record read locks only while holding the
+ * record's chain lock. With that chain locked by us, if no other process
+ * holds any record lock now, none can appear in the chain until we
+ * unlock it.
+ */
+bool tdb_no_record_locks(struct tdb_context *tdb)
+{
+	struct flock fl = {
+		.l_type = F_WRLCK,
+		.l_whence = SEEK_SET,
+		.l_start = TDB_DATA_START(tdb->hash_size),
+		.l_len = 0,
+	};
+
+	if ((tdb->flags & TDB_NOLOCK) || (tdb->allrecord_lock.count != 0)) {
+		return false;
+	}
+	if (fcntl(tdb->fd, F_GETLK, &fl) == -1) {
+		return false;
+	}
+	return (fl.l_type == F_UNLCK);
 }
 
 /* fcntl locks don't stack: avoid unlocking someone else's */

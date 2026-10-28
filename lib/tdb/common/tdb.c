@@ -204,20 +204,25 @@ static int tdb_update_hash_cmp(TDB_DATA key, TDB_DATA data, void *private_data)
 
 /* update an entry in place - this only works if the new data size
    is <= the old data size and the key exists.
-   on failure return -1.
+   on failure return -1, with *prec_ptr and *prec describing the
+   existing record if there is one, *prec_ptr is 0 otherwise.
 */
 static int tdb_update_hash(struct tdb_context *tdb, TDB_DATA key,
 			   uint32_t hash,
 			   const TDB_DATA *dbufs, int num_dbufs,
-			   tdb_len_t dbufs_len)
+			   tdb_len_t dbufs_len,
+			   tdb_off_t *prec_ptr, struct tdb_record *prec)
 {
 	struct tdb_record rec;
 	tdb_off_t rec_ptr, ofs;
 	int i;
 
 	/* find entry */
+	*prec_ptr = 0;
 	if (!(rec_ptr = tdb_find(tdb, key, hash, &rec)))
 		return -1;
+	*prec_ptr = rec_ptr;
+	*prec = rec;
 
 	/* it could be an exact duplicate of what is there - this is
 	 * surprisingly common (eg. with a ldb re-index). */
@@ -228,7 +233,8 @@ static int tdb_update_hash(struct tdb_context *tdb, TDB_DATA key,
 		};
 		int ret;
 
-		ret = tdb_parse_record(tdb, key, tdb_update_hash_cmp, &state);
+		ret = tdb_parse_data(tdb, key, rec_ptr + sizeof(rec) + rec.key_len,
+				     rec.data_len, tdb_update_hash_cmp, &state);
 		if (ret == 0) {
 			return 0;
 		}
@@ -370,24 +376,31 @@ _PUBLIC_ int tdb_exists(struct tdb_context *tdb, TDB_DATA key)
 
 /*
  * Move a dead record to the freelist. The hash chain and freelist
- * must be locked.
+ * must be locked. Without "probe" the caller has checked
+ * tdb_no_record_locks().
  */
 static int tdb_del_dead(struct tdb_context *tdb,
 			uint32_t last_ptr,
 			uint32_t rec_ptr,
 			struct tdb_record *rec,
+			bool probe,
 			bool *deleted)
 {
 	int ret;
 
-	ret = tdb_write_lock_record(tdb, rec_ptr);
-	if (ret == -1) {
-		/* Someone traversing here: Just leave it dead */
+	if (probe) {
+		ret = tdb_write_lock_record(tdb, rec_ptr);
+		if (ret == -1) {
+			/* Someone traversing here: Just leave it dead */
+			return 0;
+		}
+		ret = tdb_write_unlock_record(tdb, rec_ptr);
+		if (ret == -1) {
+			return -1;
+		}
+	} else if (tdb_have_travlock(tdb, rec_ptr)) {
+		/* Our own traverse is here */
 		return 0;
-	}
-	ret = tdb_write_unlock_record(tdb, rec_ptr);
-	if (ret == -1) {
-		return -1;
 	}
 	ret = tdb_ofs_write(tdb, last_ptr, &rec->next);
 	if (ret == -1) {
@@ -410,6 +423,7 @@ int tdb_trim_dead(struct tdb_context *tdb, uint32_t hash)
 	struct tdb_record rec;
 	tdb_off_t last_ptr, rec_ptr;
 	bool locked_freelist = false;
+	int probe = -1;
 	int num_dead = 0;
 	int ret;
 
@@ -461,11 +475,16 @@ int tdb_trim_dead(struct tdb_context *tdb, uint32_t hash)
 					locked_freelist = true;
 				}
 
+				if (probe == -1) {
+					probe = !tdb_no_record_locks(tdb);
+				}
+
 				ret = tdb_del_dead(
 					tdb,
 					last_ptr,
 					rec_ptr,
 					&rec,
+					probe,
 					&deleted);
 
 				if (ret == -1) {
@@ -503,6 +522,26 @@ fail:
 	return ret;
 }
 
+/*
+ * Mark a record found in chain "hash" dead. The chain must be write
+ * locked.
+ */
+static int tdb_delete_rec(struct tdb_context *tdb, tdb_off_t rec_ptr,
+			  struct tdb_record *rec, uint32_t hash)
+{
+	int ret;
+
+	rec->magic = TDB_DEAD_MAGIC;
+	ret = tdb_rec_write(tdb, rec_ptr, rec);
+	if (ret == -1) {
+		return -1;
+	}
+
+	tdb_increment_seqnum(tdb);
+
+	return tdb_trim_dead(tdb, hash);
+}
+
 /* delete an entry in the database given a key */
 static int tdb_delete_hash(struct tdb_context *tdb, TDB_DATA key, uint32_t hash)
 {
@@ -520,19 +559,8 @@ static int tdb_delete_hash(struct tdb_context *tdb, TDB_DATA key, uint32_t hash)
 		return -1;
 	}
 
-	/*
-	 * Mark the record dead
-	 */
-	rec.magic = TDB_DEAD_MAGIC;
-	ret = tdb_rec_write(tdb, rec_ptr, &rec);
-	if (ret == -1) {
-		goto done;
-	}
+	ret = tdb_delete_rec(tdb, rec_ptr, &rec, hash);
 
-	tdb_increment_seqnum(tdb);
-
-	ret = tdb_trim_dead(tdb, hash);
-done:
 	if (tdb_unlock(tdb, BUCKET(hash), F_WRLCK) != 0)
 		TDB_LOG((tdb, TDB_DEBUG_WARNING, "tdb_delete: WARNING tdb_unlock failed!\n"));
 	return ret;
@@ -606,8 +634,8 @@ static int _tdb_storev(struct tdb_context *tdb, TDB_DATA key,
 		       const TDB_DATA *dbufs, int num_dbufs,
 		       int flag, uint32_t hash)
 {
-	struct tdb_record rec;
-	tdb_off_t rec_ptr, ofs;
+	struct tdb_record rec, old_rec;
+	tdb_off_t rec_ptr, ofs, old_ptr = 0;
 	tdb_len_t rec_len, dbufs_len;
 	int i;
 	int ret = -1;
@@ -644,7 +672,7 @@ static int _tdb_storev(struct tdb_context *tdb, TDB_DATA key,
 	} else {
 		/* first try in-place update, on modify or replace. */
 		if (tdb_update_hash(tdb, key, hash, dbufs, num_dbufs,
-				    dbufs_len) == 0) {
+				    dbufs_len, &old_ptr, &old_rec) == 0) {
 			goto done;
 		}
 		if (tdb->ecode == TDB_ERR_NOEXIST &&
@@ -657,11 +685,11 @@ static int _tdb_storev(struct tdb_context *tdb, TDB_DATA key,
 	/* reset the error code potentially set by the tdb_update_hash() */
 	tdb->ecode = TDB_SUCCESS;
 
-	/* delete any existing record - if it doesn't exist we don't
-           care.  Doing this first reduces fragmentation, and avoids
+	/* delete the existing record tdb_update_hash() found, if any.
+           Doing this first reduces fragmentation, and avoids
            coalescing with `allocated' block before it's updated. */
-	if (flag != TDB_INSERT)
-		tdb_delete_hash(tdb, key, hash);
+	if (old_ptr != 0)
+		tdb_delete_rec(tdb, old_ptr, &old_rec, hash);
 
 	/* we have to allocate some space */
 	rec_ptr = tdb_allocate(tdb, hash, rec_len, &rec);

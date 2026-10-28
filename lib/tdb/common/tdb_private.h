@@ -141,8 +141,10 @@ void tdb_trace_2rec_retrec(struct tdb_context *tdb, const char *op,
  * As all callers will lock the same wrong list consistently locking is still
  * consistent. We can not change this without an incompatible on-disk format
  * change, otherwise different tdb versions would use incompatible locking.
+ *
+ * tdb_bucket() computes exactly the same remainder.
  */
-#define BUCKET(hash) ((hash) % tdb->hash_size)
+#define BUCKET(hash) tdb_bucket(tdb, (hash))
 
 #define DOCONV() (tdb->flags & TDB_CONVERT)
 #define CONVERT(x) (DOCONV() ? tdb_convert(&x, sizeof(x)) : &x)
@@ -245,7 +247,8 @@ struct tdb_context {
 	struct tdb_mutexes *mutexes; /* mmap of the mutex area */
 
 	enum TDB_ERROR ecode; /* error code for last tdb error */
-	uint32_t hash_size;
+	uint32_t hash_size; /* set via tdb_set_hash_size() */
+	uint64_t hash_size_magic; /* fastmod constant for hash_size */
 	uint32_t feature_flags;
 	uint32_t flags; /* the flags passed to tdb_open */
 	struct tdb_traverse_lock travlocks; /* current traversal locks */
@@ -264,6 +267,31 @@ struct tdb_context {
 #endif
 	volatile sig_atomic_t *interrupt_sig_ptr;
 };
+
+static inline void tdb_set_hash_size(struct tdb_context *tdb,
+				     uint32_t hash_size)
+{
+	tdb->hash_size = hash_size;
+	/* ceil(2^64 / hash_size), wraps to 0 for 1, which still works */
+	tdb->hash_size_magic = (hash_size != 0) ?
+		(UINT64_MAX / hash_size + 1) : 0;
+}
+
+/*
+ * hash % tdb->hash_size without a divide instruction, see Lemire et al,
+ * "Faster Remainder by Direct Computation", exact for all 32-bit
+ * values.
+ */
+static inline uint32_t tdb_bucket(const struct tdb_context *tdb,
+				  uint32_t hash)
+{
+#ifdef __SIZEOF_INT128__
+	uint64_t lowbits = tdb->hash_size_magic * hash;
+	return (uint32_t)(((unsigned __int128)lowbits * tdb->hash_size) >> 64);
+#else
+	return hash % tdb->hash_size;
+#endif
+}
 
 
 /*
@@ -298,6 +326,8 @@ int tdb_allrecord_unlock(struct tdb_context *tdb, int ltype, bool mark_lock);
 int tdb_allrecord_upgrade(struct tdb_context *tdb);
 int tdb_write_lock_record(struct tdb_context *tdb, tdb_off_t off);
 int tdb_write_unlock_record(struct tdb_context *tdb, tdb_off_t off);
+bool tdb_have_travlock(struct tdb_context *tdb, tdb_off_t off);
+bool tdb_no_record_locks(struct tdb_context *tdb);
 int tdb_ofs_read(struct tdb_context *tdb, tdb_off_t offset, tdb_off_t *d);
 int tdb_ofs_write(struct tdb_context *tdb, tdb_off_t offset, tdb_off_t *d);
 void *tdb_convert(void *buf, uint32_t size);
@@ -316,6 +346,26 @@ static inline int tdb_oob(
 	return _tdb_oob(tdb, off, len, probe);
 }
 
+
+/*
+ * Copy a small fixed-size item straight out of the map, avoiding the
+ * methods->tdb_read() indirection. Only outside transactions and for
+ * native byte order; returns false if the caller has to take the slow
+ * path (which also remaps the file if it grew).
+ */
+static inline bool tdb_read_mapped(struct tdb_context *tdb, tdb_off_t off,
+				   void *buf, tdb_len_t len)
+{
+	if ((tdb->transaction != NULL) || (tdb->map_ptr == NULL) ||
+	    (tdb->flags & TDB_CONVERT)) {
+		return false;
+	}
+	if ((off + len < off) || (off + len > tdb->map_size)) {
+		return false;
+	}
+	memcpy(buf, (const char *)tdb->map_ptr + off, len);
+	return true;
+}
 
 int tdb_ofs_read(struct tdb_context *tdb, tdb_off_t offset, tdb_off_t *d);
 int tdb_ofs_write(struct tdb_context *tdb, tdb_off_t offset, tdb_off_t *d);
@@ -361,6 +411,9 @@ bool tdb_mutex_lock(struct tdb_context *tdb, int rw, off_t off, off_t len,
 		    bool waitflag, int *pret);
 bool tdb_mutex_unlock(struct tdb_context *tdb, int rw, off_t off, off_t len,
 		      int *pret);
+int tdb_mutex_lock_idx(struct tdb_context *tdb, unsigned idx, int rw,
+		       bool waitflag);
+int tdb_mutex_unlock_idx(struct tdb_context *tdb, unsigned idx);
 int tdb_mutex_allrecord_lock(struct tdb_context *tdb, int ltype,
 			     enum tdb_lock_flags flags);
 int tdb_mutex_allrecord_unlock(struct tdb_context *tdb);
