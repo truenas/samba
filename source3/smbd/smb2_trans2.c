@@ -4012,7 +4012,7 @@ static NTSTATUS smb_kernel_dosmode(struct files_struct *fsp,
 
 	flags = zfsflags_from_dos_mode(st, dosmode, &mask);
 	if ((st->st_ex_zfsflags & mask) != flags) {
-		*_dosmode = dosmode;
+		*_dosmode = (dosmode != 0) ? dosmode : FILE_ATTRIBUTE_NORMAL;
 	}
 	return NT_STATUS_OK;
 }

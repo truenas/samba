@@ -3638,7 +3638,6 @@ static bool max_access_key(struct files_struct *fsp,
 	}
 
 	if (!ignore_readonly && S_ISREG(fsp->fsp_name->st.st_ex_mode)) {
-		/* With kernel dosmodes the stat has READONLY */
 		if (!lp_kernel_dosmodes(SNUM(fsp->conn))) {
 			return false;
 		}

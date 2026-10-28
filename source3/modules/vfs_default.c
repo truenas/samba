@@ -2087,9 +2087,8 @@ static bool vfswrap_kernel_setattr_allowed(connection_struct *conn,
 }
 
 /*
- * TrueNAS: name a time in sa unless it is omitted or already the file's.
- * True if only the owner may set it: ZFS lets anyone with write access set
- * the time to now.
+ * TrueNAS: true if only the owner may set the time: ZFS lets anyone with
+ * write access set it to now.
  */
 static bool vfswrap_setattr_time(struct truenas_setattr *sa,
 				 uint64_t which,
@@ -2105,7 +2104,7 @@ static bool vfswrap_setattr_time(struct truenas_setattr *sa,
 
 /*
  * TrueNAS: with kernel dosmodes, set the times in ft and the DOS
- * attributes in ft->dosmode (0: none) of fsp's file with one
+ * attributes in ft->dosmode of fsp's file with one
  * system.truenas_setattr. ZFS lets only the owner set a time other than
  * now, so for anyone else that goes as root at once if Samba allows it.
  * Other changes go as the caller, and as root only if ZFS refuses and
@@ -2191,7 +2190,7 @@ static NTSTATUS vfswrap_fset_dos_attributes(struct vfs_handle_struct *handle,
 		struct smb_file_time ft;
 
 		init_smb_file_time(&ft);
-		ft.dosmode = dosmode;
+		ft.dosmode = (dosmode != 0) ? dosmode : FILE_ATTRIBUTE_NORMAL;
 		if (vfswrap_kernel_setattr(handle, fsp, &ft) != 0) {
 			return map_nt_error_from_unix(errno);
 		}

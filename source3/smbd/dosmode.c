@@ -766,10 +766,6 @@ uint32_t fdos_mode(struct files_struct *fsp)
 	return fsp->fsp_name->st.cached_dos_attributes;
 }
 
-/*
- * TrueNAS: with kernel dosmodes the DOS attributes are ZFS flags, which
- * statx gives in st_ex_zfsflags and system.truenas_setattr sets.
- */
 static const struct {
 	uint32_t dosmode;
 	uint64_t flag;
@@ -786,9 +782,8 @@ static const struct {
 };
 
 /*
- * The DOS attributes in the ZFS flags of st. ZFS sets ZFS_ARCHIVE on a
- * directory whenever it changes and Windows does not, so a directory
- * never has ARCHIVE.
+ * TrueNAS: ZFS sets ZFS_ARCHIVE on a directory whenever it changes and
+ * Windows does not, so a directory never has ARCHIVE.
  */
 uint32_t dos_mode_from_zfsflags(const SMB_STRUCT_STAT *st)
 {

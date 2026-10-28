@@ -370,6 +370,84 @@ done:
 	return ret;
 }
 
+/* A stream handle sees the base file's current attributes */
+static bool test_truenas_dosmode_stream(struct torture_context *tctx,
+					struct smb2_tree *tree)
+{
+	struct smb2_create c = {
+		.in.desired_access = SEC_RIGHTS_FILE_ALL,
+		.in.share_access = NTCREATEX_SHARE_ACCESS_MASK,
+		.in.create_disposition = NTCREATEX_DISP_CREATE,
+		.in.fname = DM_DIR "\\f:s",
+	};
+	union smb_fileinfo finfo = {
+		.all_info2.level = RAW_FILEINFO_SMB2_ALL_INFORMATION,
+	};
+	union smb_setfileinfo sfinfo;
+	struct smb2_handle h = {{0}};
+	uint32_t hidsys = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+	uint32_t attrib = 0;
+	NTTIME ct = 0;
+	NTSTATUS status;
+	bool ret = true;
+
+	smb2_deltree(tree, DM_DIR);
+	status = torture_smb2_testdir(tree, DM_DIR, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"create directory");
+	smb2_util_close(tree, h);
+	status = torture_smb2_testfile(tree, DM_DIR "\\f", &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"create file");
+	smb2_util_close(tree, h);
+	ZERO_STRUCT(h);
+
+	status = smb2_create(tree, tctx, &c);
+	if (NT_STATUS_EQUAL(status, NT_STATUS_OBJECT_NAME_INVALID)) {
+		torture_skip_goto(tctx, done, "the share has no streams\n");
+	}
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"create stream");
+	h = c.out.file.handle;
+
+	finfo.all_info2.in.file.handle = h;
+	status = smb2_getinfo_file(tree, tctx, &finfo);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "getinfo");
+	attrib = finfo.all_info2.out.attrib;
+
+	status = smb2_util_setatr(tree, DM_DIR "\\f", hidsys);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"set attributes");
+	ZERO_STRUCT(sfinfo);
+	sfinfo.basic_info.level = RAW_SFILEINFO_BASIC_INFORMATION;
+	sfinfo.basic_info.in.file.handle = h;
+	sfinfo.basic_info.in.attrib = attrib;
+	status = smb2_setinfo_file(tree, &sfinfo);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"set attributes through the stream");
+	torture_assert_goto(tctx, dm_query(tctx, tree, "f", &attrib, &ct),
+			    ret, done, "query");
+	torture_assert_int_equal_goto(tctx, attrib & hidsys, 0, ret, done,
+				      "attributes set through the stream");
+
+	status = smb2_util_setatr(tree, DM_DIR "\\f", FILE_ATTRIBUTE_HIDDEN);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"set attributes");
+	status = smb2_getinfo_file(tree, tctx, &finfo);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "getinfo");
+	torture_assert_int_equal_goto(tctx,
+				      finfo.all_info2.out.attrib & hidsys,
+				      FILE_ATTRIBUTE_HIDDEN, ret, done,
+				      "attributes read through the stream");
+
+done:
+	if (!smb2_util_handle_empty(h)) {
+		smb2_util_close(tree, h);
+	}
+	smb2_deltree(tree, DM_DIR);
+	return ret;
+}
+
 void torture_truenas_dosmode_suite(struct torture_suite *suite)
 {
 	struct torture_suite *dosmode = torture_suite_create(suite,
@@ -383,6 +461,8 @@ void torture_truenas_dosmode_suite(struct torture_suite *suite)
 				     test_truenas_dosmode_create_time);
 	torture_suite_add_1smb2_test(dosmode, "basic_info",
 				     test_truenas_dosmode_basic_info);
+	torture_suite_add_1smb2_test(dosmode, "stream",
+				     test_truenas_dosmode_stream);
 
 	torture_suite_add_suite(suite, dosmode);
 }

@@ -256,10 +256,12 @@ cat > /etc/smb4.conf <<CONF
 
 [zacl]
     # ACL<->Security-Descriptor mapping via ixnas on an NFSv4-ACL dataset.
-    # Object order follows middleware util_smbconf.py (ixnas before zfs_core).
+    # Object order follows middleware util_smbconf.py (streams, ixnas, then
+    # zfs_core).
     path = /tank/acl
     read only = no
-    vfs objects = ixnas zfs_core
+    vfs objects = truenas_streams_xattr ixnas zfs_core
+    ixnas:dosattrib_create_time = yes
     nfs4:mode = simple
     nfs4:acedup = merge
 
@@ -309,10 +311,9 @@ cat > /etc/smb4.conf <<CONF
     # no ABE and no create time from an older DOSATTRIB (truenas.dosmode).
     path = /tank/acl
     read only = no
-    vfs objects = ixnas zfs_core
+    vfs objects = truenas_streams_xattr ixnas zfs_core
     ea support = no
     ixnas:truenas_abe = no
-    ixnas:dosattrib_create_time = no
     nfs4:mode = simple
     nfs4:acedup = merge
 

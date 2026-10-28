@@ -1615,13 +1615,13 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 	}
 
 	/*
-	 * Before Samba set the create time natively, it stored it only in
-	 * DOSATTRIB. A share whose files have no such DOSATTRIB can skip it.
+	 * Create times that Samba stored only in DOSATTRIB, before it set them
+	 * natively. Reading them costs an fgetxattr per file.
 	 */
 	config->dosattrib_create_time =
 		lp_store_dos_attributes(SNUM(handle->conn)) &&
 		lp_parm_bool(SNUM(handle->conn),
-			     "ixnas", "dosattrib_create_time", true);
+			     "ixnas", "dosattrib_create_time", false);
 
 	/*
 	 * Reconcile the SMB ACL view and set operations with what the ZFS backend
