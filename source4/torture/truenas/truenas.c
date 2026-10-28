@@ -1514,6 +1514,12 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 	/* smbd metadata cache subtests (truenas_mdcache.c) */
 	torture_truenas_mdcache_suite(suite);
 
+	/* kernel dosmodes subtests (truenas_dosmode.c) */
+	torture_truenas_dosmode_suite(suite);
+
+	/* vfs_worm subtests (truenas_worm.c) */
+	torture_truenas_worm_suite(suite);
+
 	/* durable handle subtests (truenas_durable.c) */
 	torture_truenas_durable_suite(suite);
 

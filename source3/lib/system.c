@@ -286,14 +286,18 @@ void init_stat_ex_from_stat (struct stat_ex *dst,
 	}
 	dst->st_ex_mnt_id = src->stx_mnt_id;
 	dst->st_ex_attributes = src->stx_attributes;
+	dst->st_ex_zfsflags = 0;
+	if (src->stx_mask & STATX_ZFSFLAGS) {
+		dst->st_ex_zfsflags = src->stx_zfsflags;
+	}
 }
 
 #ifdef STATX_CHANGE_COOKIE
 #define TNSTATX_FLAGS (STATX_BASIC_STATS|STATX_BTIME|STATX_MNT_ID_UNIQUE| \
-	STATX_CHANGE_COOKIE|STATX_GEN)
+	STATX_CHANGE_COOKIE|STATX_GEN|STATX_ZFSFLAGS)
 #else
 #define TNSTATX_FLAGS (STATX_BASIC_STATS|STATX_BTIME|STATX_MNT_ID_UNIQUE| \
-	STATX_GEN)
+	STATX_GEN|STATX_ZFSFLAGS)
 #endif
 
 /*******************************************************************

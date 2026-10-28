@@ -24,7 +24,7 @@ struct connection_struct;
 
 #define ACL4_XATTR "system.nfs4_acl_xdr"
 
-#define MDCACHE_HAVE_DOSMODE	0x1
+#define MDCACHE_HAVE_BTIME	0x1	/* btime_*: the DOSATTRIB create time */
 #define MDCACHE_HAVE_STREAMS	0x2	/* MDCACHE_STREAMS and MDCACHE_MACMETA */
 #define MDCACHE_STREAMS		0x4	/* has named streams */
 #define MDCACHE_MACMETA		0x8	/* has an AfpInfo or resource fork */
@@ -42,7 +42,6 @@ struct mdcache_inode {
 	uint64_t sd_seq;	/* security descriptor variant, 0 if unknown */
 	int64_t btime_sec;	/* create time from DOSATTRIB */
 	uint32_t btime_nsec;	/* UTIME_OMIT if DOSATTRIB has none */
-	uint32_t dosmode;
 	uint32_t flags;		/* MDCACHE_* and the ABE context */
 	uint32_t tick;
 };

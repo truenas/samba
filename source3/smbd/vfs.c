@@ -1299,6 +1299,12 @@ NTSTATUS vfs_stat_fsp(files_struct *fsp)
 	}
 	update_stat_ex_from_saved_stat(&fsp->fsp_name->st, &saved_stat);
 	fsp->fsp_flags.is_directory = S_ISDIR(fsp->fsp_name->st.st_ex_mode);
+
+	/* TrueNAS: a stream's DOS attributes are in its base file's stat */
+	if (fsp_is_alternate_stream(fsp) &&
+	    lp_kernel_dosmodes(SNUM(fsp->conn))) {
+		return vfs_stat_fsp(fsp->base_fsp);
+	}
 	return NT_STATUS_OK;
 }
 
