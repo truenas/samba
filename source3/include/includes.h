@@ -182,14 +182,26 @@ typedef sig_atomic_t volatile SIG_ATOMIC_T;
 /* TrueNAS: did statx return STATX_CHANGE_COOKIE ? */
 #define ST_EX_IFLAG_HAS_CHANGE_COOKIE		(1 << 2)
 
-/* TrueNAS: the DOS attributes in st_ex_zfsflags (ZFS_* in sys/zfs_znode.h) */
-#define ST_EX_ZFS_READONLY	0x0000000100000000ULL
-#define ST_EX_ZFS_HIDDEN	0x0000000200000000ULL
-#define ST_EX_ZFS_SYSTEM	0x0000000400000000ULL
-#define ST_EX_ZFS_ARCHIVE	0x0000000800000000ULL
-#define ST_EX_ZFS_REPARSE	0x0000080000000000ULL
-#define ST_EX_ZFS_OFFLINE	0x0000100000000000ULL
-#define ST_EX_ZFS_SPARSE	0x0000200000000000ULL
+/* TrueNAS: st_ex_flags. ST_EX_ZFS_MASK is stx_zfsflags >> 32 (DOS flags) */
+#define ST_EX_ZFS_MASK		0x0000ffffU
+#define ST_EX_ZFS_FROM_PFLAGS(z) ((uint32_t)((z) >> 32) & ST_EX_ZFS_MASK)
+#define ST_EX_ZFS_TO_PFLAGS(f)	((uint64_t)((f) & ST_EX_ZFS_MASK) << 32)
+#define ST_EX_ZFS_READONLY	0x00000001U
+#define ST_EX_ZFS_HIDDEN	0x00000002U
+#define ST_EX_ZFS_SYSTEM	0x00000004U
+#define ST_EX_ZFS_ARCHIVE	0x00000008U
+#define ST_EX_ZFS_REPARSE	0x00000800U
+#define ST_EX_ZFS_OFFLINE	0x00001000U
+#define ST_EX_ZFS_SPARSE	0x00002000U
+#define ST_EX_ZFS_ACL_TRIVIAL	0x00010000U
+#define ST_EX_ATTR_MOUNT_ROOT	0x00100000U
+#define ST_EX_ATTR_POSIXACL	0x00200000U
+#define ST_EX_ATTR_NFSV4ACL	0x00400000U
+#define ST_EX_ATTR_ACLTYPE	0x00800000U	/* ACL type bits are valid */
+/* An empty DACL is also a trivial ACL, with mode 000 */
+#define ST_EX_ACL_FROM_MODE(st) \
+	((((st)->st_ex_flags & ST_EX_ZFS_ACL_TRIVIAL) != 0) && \
+	 (((st)->st_ex_mode & 0777) != 0))
 
 /*
  * Type for stat structure.
@@ -200,6 +212,7 @@ struct stat_ex {
 	ino_t		st_ex_ino;
 	uint64_t	st_ex_gen;
 	mode_t		st_ex_mode;
+	uint32_t	cached_dos_attributes;
 	nlink_t		st_ex_nlink;
 	uid_t		st_ex_uid;
 	gid_t		st_ex_gid;
@@ -209,7 +222,6 @@ struct stat_ex {
 	struct timespec st_ex_mtime;
 	struct timespec st_ex_ctime;
 	struct timespec st_ex_btime; /* birthtime */
-	uint32_t	cached_dos_attributes;
 
 	blksize_t	st_ex_blksize;
 	blkcnt_t	st_ex_blocks;
@@ -218,9 +230,7 @@ struct stat_ex {
 	uint32_t	st_ex_iflags;
 	uint64_t	st_ex_mnt_id;
 	uint64_t	st_ex_change_cookie;
-	uint64_t	st_ex_attributes;
-	/* TrueNAS: statx stx_zfsflags, else 0 */
-	uint64_t	st_ex_zfsflags;
+	uint64_t	st_ex_epoch;	/* TrueNAS: mdcache epoch of fstat, else 0 */
 };
 
 typedef struct stat_ex SMB_STRUCT_STAT;

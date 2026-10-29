@@ -23,7 +23,6 @@
 #include "system/filesys.h"
 #include "smbd/smbd.h"
 #include "smbd/globals.h"
-#include "smbd/truenas_mdcache.h"
 #include "ntioctl.h"
 #include "smbprofile.h"
 #include "../libcli/security/security.h"
@@ -737,6 +736,7 @@ done:
 	}
 
 out:
+	fsp_set_open_flags(fsp, result, flags);
 	END_PROFILE_X(syscall_openat);
 	return result;
 }
@@ -1366,9 +1366,6 @@ static int vfswrap_fstat(vfs_handle_struct *handle, files_struct *fsp, SMB_STRUC
 	START_PROFILE_X(SNUM(handle->conn), syscall_fstat);
 	result = sys_fstat(fsp_get_pathref_fd(fsp),
 			   sbuf, lp_fake_directory_create_times(SNUM(handle->conn)));
-	if (result == 0) {
-		mdcache_stat_taken(fsp, sbuf);
-	}
 	END_PROFILE_X(syscall_fstat);
 	return result;
 }
@@ -2122,16 +2119,19 @@ static int vfswrap_kernel_setattr(struct vfs_handle_struct *handle,
 	uid_t uid = get_current_uid(conn);
 	bool owner_only = false;
 	bool as_user;
-	uint64_t mask = 0;
-	uint64_t flags = 0;
+	uint32_t mask = 0;
+	uint32_t flags = 0;
 	int fd = -1;
 	int ret, err;
 
 	truenas_setattr_init(&sa);
 	if (ft->dosmode != 0) {
 		flags = zfsflags_from_dos_mode(st, ft->dosmode, &mask);
-		if ((st->st_ex_zfsflags & mask) != flags) {
-			truenas_setattr_dosflags(&sa, flags, mask & ~flags);
+		if ((st->st_ex_flags & mask) != flags) {
+			truenas_setattr_dosflags(
+				&sa,
+				ST_EX_ZFS_TO_PFLAGS(flags),
+				ST_EX_ZFS_TO_PFLAGS(mask & ~flags));
 		}
 	}
 	owner_only |= vfswrap_setattr_time(&sa, TRUENAS_SETATTR_ATIME,
@@ -2176,7 +2176,7 @@ done:
 		return -1;
 	}
 
-	st->st_ex_zfsflags = (st->st_ex_zfsflags & ~mask) | flags;
+	st->st_ex_flags = (st->st_ex_flags & ~mask) | flags;
 	return 0;
 }
 

@@ -281,61 +281,6 @@ access_denied:
 }
 
 /*
- * A specific access check needs only the DACL's maximum for the token:
- * the ACE walk of se_access_check() grants a bit when an allow ACE for
- * the token carries it and no earlier deny ACE does, which is how
- * access_check_max_allowed() builds the maximum, and applies the
- * privilege rules after the walk. The maximum is cached per SD variant
- * and token, so a check is a lookup instead of a descriptor fetch,
- * unpack and walk.
- */
-static bool dacl_max_key(struct files_struct *fsp,
-			 const struct mdcache_inode *slot,
-			 struct mdcache_access_key *key)
-{
-	if (slot->sd_seq == 0) {
-		return false;
-	}
-	*key = (struct mdcache_access_key) {
-		.sd_seq = slot->sd_seq,
-		.vuid = get_current_vuid(fsp->conn),
-		.cnum = fsp->conn->cnum,
-		.uid = get_current_uid(fsp->conn),
-		.access_mask = SEC_FLAG_MAXIMUM_ALLOWED,
-		.flags = MDCACHE_ACCESS_DACL_MAX,
-	};
-	return true;
-}
-
-/*
- * The cached maximum of fsp's DACL for the current token. *pcookie is
- * the slot's change cookie, 0 if the file can't be cached or the share
- * does not identify SD variants.
- */
-static bool dacl_max_get(struct files_struct *fsp,
-			 uint64_t *pcookie,
-			 uint32_t *max)
-{
-	struct mdcache_inode *slot = NULL;
-	struct mdcache_access_key key;
-
-	*pcookie = 0;
-	if (!(fsp->conn->internal_tcon_flags & TCON_FLAG_MDCACHE_SD)) {
-		return false;
-	}
-	slot = mdcache_inode_fetch(fsp);
-	if (slot == NULL) {
-		return false;
-	}
-	*pcookie = slot->cookie;
-	mdcache_sd_seq(fsp, &slot);
-	if (slot == NULL) {
-		return false;
-	}
-	return dacl_max_key(fsp, slot, &key) && mdcache_access_get(&key, max);
-}
-
-/*
  * The maximum of sd's DACL for the token. se_access_check() grants a
  * present NULL DACL everything, while access_check_max_allowed() gives
  * it only the owner's rights; an absent DACL is left to the walk.
@@ -364,28 +309,10 @@ static bool dacl_max_from_sd(const struct security_descriptor *sd,
 	return true;
 }
 
-/* Cache max for fsp's SD variant, unless the file changed meanwhile */
-static void dacl_max_put(struct files_struct *fsp,
-			 uint64_t cookie,
-			 uint32_t max)
-{
-	struct mdcache_inode *slot = NULL;
-	struct mdcache_access_key key;
-
-	if ((cookie == 0) || !mdcache_inode_unchanged(fsp, cookie)) {
-		return;
-	}
-	slot = mdcache_inode_peek(&fsp->file_id, cookie);
-	if ((slot != NULL) && dacl_max_key(fsp, slot, &key)) {
-		mdcache_access_put(&key, max);
-	}
-}
-
 /*
- * fsp's DACL maximum for the current token in *max, from the cache or
- * from the descriptor, which is then cached. When the file can't be
- * cached or no maximum stands for the descriptor, *have_max is false
- * and *psd holds it for the caller to walk.
+ * fsp's DACL maximum for the current token in *max, cached per SD variant
+ * and token. If it can't be cached, *have_max is false and *psd holds the
+ * descriptor for the caller to walk.
  */
 static NTSTATUS dacl_max_fetch(struct files_struct *fsp,
 			       TALLOC_CTX *mem_ctx,
@@ -393,11 +320,19 @@ static NTSTATUS dacl_max_fetch(struct files_struct *fsp,
 			       bool *have_max,
 			       struct security_descriptor **psd)
 {
-	uint64_t cookie = 0;
+	struct mdcache_access_key key;
+	uint64_t cookie, variant;
+	bool cacheable;
 	NTSTATUS status;
 
 	*psd = NULL;
-	*have_max = dacl_max_get(fsp, &cookie, max);
+	variant = mdcache_fsp_variant(fsp, &cookie);
+	cacheable = mdcache_access_key(fsp->conn,
+				       variant,
+				       SEC_FLAG_MAXIMUM_ALLOWED,
+				       MDCACHE_ACCESS_DACL_MAX,
+				       &key);
+	*have_max = cacheable && mdcache_access_get(&key, max);
 	if (*have_max) {
 		return NT_STATUS_OK;
 	}
@@ -410,9 +345,9 @@ static NTSTATUS dacl_max_fetch(struct files_struct *fsp,
 	if (!NT_STATUS_IS_OK(status)) {
 		return status;
 	}
-	if ((cookie != 0) && (*psd != NULL) &&
+	if (cacheable && (*psd != NULL) &&
 	    dacl_max_from_sd(*psd, get_current_nttok(fsp->conn), max)) {
-		dacl_max_put(fsp, cookie, *max);
+		mdcache_access_put(fsp, cookie, &key, *max);
 		TALLOC_FREE(*psd);
 		*have_max = true;
 	}
@@ -1190,23 +1125,14 @@ static int tn_reopen_from_fsp_fast(struct files_struct *fsp,
 		return -1;
 	}
 
-	if ((old_fd == AT_FDCWD) || (old_fd == -1)) {
+	if (!fsp_has_status_flags(fsp)) {
 		return -1;
 	}
-
-	if (fsp_get_status_flags(fsp) & O_PATH) {
+	fd_status = fsp_get_status_flags(fsp);
+	if (fd_status & O_PATH) {
 		// This is an O_PATH open and so no real
 		// hope that it will *actually* match new
 		// access mode.
-		return -1;
-
-	}
-
-	// get current status flags (not cached)
-	fd_status = fcntl(old_fd, F_GETFL);
-	if (fd_status < 0) {
-		DBG_ERR("%s: fcntl() failed on file: %s\n",
-			fsp_str_dbg(fsp), strerror(errno));
 		return -1;
 	}
 
@@ -3625,7 +3551,7 @@ static NTSTATUS check_and_store_share_mode(
  * ACL share it. DELETE granted by the parent directory is not part of it.
  */
 static bool max_access_key(struct files_struct *fsp,
-			   const struct mdcache_inode *slot,
+			   uint64_t sd_variant,
 			   bool use_privs,
 			   bool ignore_readonly,
 			   uint32_t access_mask,
@@ -3633,28 +3559,22 @@ static bool max_access_key(struct files_struct *fsp,
 {
 	bool readonly = false;
 
-	if (slot->sd_seq == 0) {
-		return false;
-	}
-
 	if (!ignore_readonly && S_ISREG(fsp->fsp_name->st.st_ex_mode)) {
 		if (!lp_kernel_dosmodes(SNUM(fsp->conn))) {
 			return false;
 		}
-		readonly = (fsp->fsp_name->st.st_ex_zfsflags &
+		readonly = (fsp->fsp_name->st.st_ex_flags &
 			    ST_EX_ZFS_READONLY) != 0;
 	}
 
-	*key = (struct mdcache_access_key) {
-		.sd_seq = slot->sd_seq,
-		.vuid = get_current_vuid(fsp->conn),
-		.cnum = fsp->conn->cnum,
-		.uid = get_current_uid(fsp->conn),
-		.access_mask = access_mask,
-		.flags = (use_privs ? 1 : 0) | (ignore_readonly ? 2 : 0) |
-			 (readonly ? 4 : 0),
-	};
-	return true;
+	return mdcache_access_key(
+		fsp->conn,
+		sd_variant,
+		access_mask,
+		(use_privs ? MDCACHE_ACCESS_PRIVS : 0) |
+		(ignore_readonly ? MDCACHE_ACCESS_IGNORE_RO : 0) |
+		(readonly ? MDCACHE_ACCESS_READONLY : 0),
+		key);
 }
 
 /* The cached maximum plus DELETE through the parent's FILE_DELETE_CHILD */
@@ -3680,10 +3600,9 @@ static NTSTATUS smbd_calculate_maximum_allowed_access_fsp(
 	uint32_t access_granted = 0;
 	uint32_t orig_access_mask = *p_access_mask;
 	uint32_t dosattrs;
-	struct mdcache_inode *slot = NULL;
 	struct mdcache_access_key key;
-	uint64_t cookie = 0;
-	bool cacheable = false;
+	uint64_t cookie, variant;
+	bool cacheable;
 	NTSTATUS status;
 
 	/* Cope with symlinks */
@@ -3703,20 +3622,14 @@ static NTSTATUS smbd_calculate_maximum_allowed_access_fsp(
 		return NT_STATUS_OK;
 	}
 
-	slot = mdcache_inode_fetch(fsp);
-	if (slot != NULL) {
-		cookie = slot->cookie;
-		cacheable = true;
-		mdcache_sd_seq(fsp, &slot);
-		if ((slot != NULL) &&
-		    max_access_key(fsp, slot, use_privs, ignore_readonly,
-				   orig_access_mask, &key) &&
-		    mdcache_access_get(&key, p_access_mask)) {
-			*p_access_mask = with_parent_delete(dirfsp,
-							    fsp,
-							    *p_access_mask);
-			return NT_STATUS_OK;
-		}
+	variant = mdcache_fsp_variant(fsp, &cookie);
+	cacheable = max_access_key(fsp, variant, use_privs, ignore_readonly,
+				   orig_access_mask, &key);
+	if (cacheable && mdcache_access_get(&key, p_access_mask)) {
+		*p_access_mask = with_parent_delete(dirfsp,
+						    fsp,
+						    *p_access_mask);
+		return NT_STATUS_OK;
 	}
 
 	status = SMB_VFS_FGET_NT_ACL(metadata_fsp(fsp),
@@ -3799,13 +3712,8 @@ static NTSTATUS smbd_calculate_maximum_allowed_access_fsp(
 	}
 
 done:
-	if (cacheable && mdcache_inode_unchanged(fsp, cookie)) {
-		slot = mdcache_inode_peek(&fsp->file_id, cookie);
-		if ((slot != NULL) &&
-		    max_access_key(fsp, slot, use_privs, ignore_readonly,
-				   orig_access_mask, &key)) {
-			mdcache_access_put(&key, *p_access_mask);
-		}
+	if (cacheable) {
+		mdcache_access_put(fsp, cookie, &key, *p_access_mask);
 	}
 	*p_access_mask = with_parent_delete(dirfsp, fsp, *p_access_mask);
 	return NT_STATUS_OK;
@@ -3817,7 +3725,7 @@ done:
  * for an fsp_new_fdless() entry of a listing
  */
 bool smbd_cached_maximum_access(struct files_struct *fsp,
-				const struct mdcache_inode *slot,
+				uint64_t sd_variant,
 				uint32_t *access_mask_out)
 {
 	struct mdcache_access_key key;
@@ -3825,7 +3733,7 @@ bool smbd_cached_maximum_access(struct files_struct *fsp,
 
 	if (get_current_uid(fsp->conn) == (uid_t)0) {
 		access_mask |= FILE_GENERIC_ALL;
-	} else if (!max_access_key(fsp, slot, false, false,
+	} else if (!max_access_key(fsp, sd_variant, false, false,
 				   SEC_FLAG_MAXIMUM_ALLOWED, &key) ||
 		   !mdcache_access_get(&key, &access_mask)) {
 		return false;

@@ -196,8 +196,10 @@ impl Node {
         }
     }
 
-    /// Writes the configuration with `role` and sends SIGHUP.
+    /// Writes the configuration with `role` and sends SIGHUP. For a primary,
+    /// waits for a hello from a new instance.
     pub fn set_role(&mut self, role: &str) {
+        let old = self.try_hello().map(|h| h.instance);
         role.clone_into(&mut self.role);
         self.write_config();
         self.signal("-HUP");
@@ -205,7 +207,7 @@ impl Node {
             assert!(
                 wait_for(Duration::from_secs(10), || self
                     .try_hello()
-                    .is_some()),
+                    .is_some_and(|h| Some(h.instance) != old)),
                 "{} did not become primary:\n{}",
                 self.name,
                 self.log()

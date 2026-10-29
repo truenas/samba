@@ -99,6 +99,7 @@
 #define SET_STAT_INVALID(st) { \
 		(st).st_ex_nlink = 0;					\
 		(st).cached_dos_attributes = FILE_ATTRIBUTE_INVALID;	\
+		(st).st_ex_epoch = 0;					\
 };
 
 /* Macros to get at offsets within smb_lkrng and smb_unlkrng
