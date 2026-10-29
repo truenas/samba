@@ -155,9 +155,10 @@ static bool tdb_have_mutex_chainlocks(struct tdb_context *tdb)
 		bool ret;
 		unsigned idx;
 
+		/* lockrecs are one byte locks, count is the nesting */
 		ret = tdb_mutex_index(tdb,
 				      tdb->lockrecs[i].off,
-				      tdb->lockrecs[i].count,
+				      1,
 				      &idx);
 		if (!ret) {
 			continue;
@@ -174,14 +175,40 @@ static bool tdb_have_mutex_chainlocks(struct tdb_context *tdb)
 	return false;
 }
 
+static inline void tdb_cpu_relax(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+	__builtin_ia32_pause();
+#elif defined(__aarch64__)
+	__asm__ __volatile__("yield" ::: "memory");
+#endif
+}
+
+/*
+ * glibc's robust mutexes never spin: a contended lock goes straight to
+ * futex_wait() and the next owner pays a futex_wake() on unlock. Chain
+ * mutexes are held only briefly, so retry a few times before blocking.
+ */
+#define TDB_CHAIN_MUTEX_SPIN 10
+
 static int chain_mutex_lock(pthread_mutex_t *m, bool waitflag)
 {
 	int ret;
 
-	if (waitflag) {
-		ret = pthread_mutex_lock(m);
-	} else {
-		ret = pthread_mutex_trylock(m);
+	ret = pthread_mutex_trylock(m);
+	if ((ret == EBUSY) && waitflag) {
+		int i;
+
+		for (i = 0; i < TDB_CHAIN_MUTEX_SPIN; i++) {
+			tdb_cpu_relax();
+			ret = pthread_mutex_trylock(m);
+			if (ret != EBUSY) {
+				break;
+			}
+		}
+		if (ret == EBUSY) {
+			ret = pthread_mutex_lock(m);
+		}
 	}
 	if (ret != EOWNERDEAD) {
 		return ret;
@@ -219,16 +246,26 @@ static int allrecord_mutex_lock(struct tdb_mutexes *m, bool waitflag)
 bool tdb_mutex_lock(struct tdb_context *tdb, int rw, off_t off, off_t len,
 		    bool waitflag, int *pret)
 {
-	struct tdb_mutexes *m = tdb->mutexes;
-	pthread_mutex_t *chain;
-	int ret;
 	unsigned idx;
-	bool allrecord_ok;
 
 	if (!tdb_mutex_index(tdb, off, len, &idx)) {
 		return false;
 	}
-	chain = &m->hashchains[idx];
+	*pret = tdb_mutex_lock_idx(tdb, idx, rw, waitflag);
+	return true;
+}
+
+/*
+ * Lock chain mutex "idx", 0 being the freelist. Returns 0, or -1 with
+ * errno set like fcntl_lock().
+ */
+int tdb_mutex_lock_idx(struct tdb_context *tdb, unsigned idx, int rw,
+		       bool waitflag)
+{
+	struct tdb_mutexes *m = tdb->mutexes;
+	pthread_mutex_t *chain = &m->hashchains[idx];
+	int ret;
+	bool allrecord_ok;
 
 again:
 	ret = chain_mutex_lock(chain, waitflag);
@@ -246,8 +283,7 @@ again:
 		 * the allrecord lock. So we're done once we got the
 		 * freelist mutex.
 		 */
-		*pret = 0;
-		return true;
+		return 0;
 	}
 
 	if (tdb_have_mutex_chainlocks(tdb)) {
@@ -268,8 +304,7 @@ again:
 		 * chain lock.
 		 */
 
-		*pret = 0;
-		return true;
+		return 0;
 	}
 
 	/*
@@ -293,8 +328,7 @@ again:
 	}
 
 	if (allrecord_ok) {
-		*pret = 0;
-		return true;
+		return 0;
 	}
 
 	ret = pthread_mutex_unlock(chain);
@@ -327,31 +361,31 @@ again:
 	goto again;
 
 fail:
-	*pret = -1;
-	return true;
+	return -1;
 }
 
 bool tdb_mutex_unlock(struct tdb_context *tdb, int rw, off_t off, off_t len,
 		      int *pret)
 {
-	struct tdb_mutexes *m = tdb->mutexes;
-	pthread_mutex_t *chain;
-	int ret;
 	unsigned idx;
 
 	if (!tdb_mutex_index(tdb, off, len, &idx)) {
 		return false;
 	}
-	chain = &m->hashchains[idx];
-
-	ret = pthread_mutex_unlock(chain);
-	if (ret == 0) {
-		*pret = 0;
-		return true;
-	}
-	errno = ret;
-	*pret = -1;
+	*pret = tdb_mutex_unlock_idx(tdb, idx);
 	return true;
+}
+
+int tdb_mutex_unlock_idx(struct tdb_context *tdb, unsigned idx)
+{
+	int ret;
+
+	ret = pthread_mutex_unlock(&tdb->mutexes->hashchains[idx]);
+	if (ret != 0) {
+		errno = ret;
+		return -1;
+	}
+	return 0;
 }
 
 int tdb_mutex_allrecord_lock(struct tdb_context *tdb, int ltype,

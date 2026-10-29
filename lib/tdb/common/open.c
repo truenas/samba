@@ -100,7 +100,7 @@ static int tdb_new_database(struct tdb_context *tdb, struct tdb_header *header,
 	 * E.g. tdb_mutex_size() requires it
 	 */
 	tdb->feature_flags = newdb->feature_flags;
-	tdb->hash_size = newdb->hash_size;
+	tdb_set_hash_size(tdb, newdb->hash_size);
 
 	if (tdb->flags & TDB_INTERNAL) {
 		tdb->map_size = size;
@@ -449,7 +449,7 @@ _PUBLIC_ struct tdb_context *tdb_open_ex(const char *name, int hash_size, int td
 			TDB_LOG((tdb, TDB_DEBUG_ERROR, "tdb_open_ex: tdb_new_database failed!"));
 			goto fail;
 		}
-		tdb->hash_size = hash_size;
+		tdb_set_hash_size(tdb, hash_size);
 		goto internal;
 	}
 
@@ -571,7 +571,7 @@ _PUBLIC_ struct tdb_context *tdb_open_ex(const char *name, int hash_size, int td
 		goto fail;
 	}
 
-	tdb->hash_size = header.hash_size;
+	tdb_set_hash_size(tdb, header.hash_size);
 
 	if (header.rwlocks == TDB_FEATURE_FLAG_MAGIC) {
 		tdb->feature_flags = header.feature_flags;
