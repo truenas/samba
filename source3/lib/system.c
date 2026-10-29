@@ -255,6 +255,36 @@ void copy_stat_ex_timestamps(struct stat_ex *st,
 	}
 }
 
+/* TrueNAS: ZFS_ACL_TRIVIAL in sys/zfs_znode.h */
+#define STX_ZFS_ACL_TRIVIAL 0x4ULL
+
+static uint32_t stx_flags(const struct statx *stx)
+{
+	uint32_t flags = 0;
+
+	if (stx->stx_mask & STATX_ZFSFLAGS) {
+		flags = ST_EX_ZFS_FROM_PFLAGS(stx->stx_zfsflags);
+		if (stx->stx_zfsflags & STX_ZFS_ACL_TRIVIAL) {
+			flags |= ST_EX_ZFS_ACL_TRIVIAL;
+		}
+	}
+	if (stx->stx_attributes & STATX_ATTR_MOUNT_ROOT) {
+		flags |= ST_EX_ATTR_MOUNT_ROOT;
+	}
+#ifdef STATX_ATTR_NFSV4ACL
+	if (stx->stx_attributes & STATX_ATTR_POSIXACL) {
+		flags |= ST_EX_ATTR_POSIXACL;
+	}
+	if (stx->stx_attributes & STATX_ATTR_NFSV4ACL) {
+		flags |= ST_EX_ATTR_NFSV4ACL;
+	}
+	if (stx->stx_attributes_mask & STATX_ATTR_NFSV4ACL) {
+		flags |= ST_EX_ATTR_ACLTYPE;
+	}
+#endif
+	return flags;
+}
+
 void init_stat_ex_from_stat (struct stat_ex *dst,
 			    const struct statx *src,
 			    bool fake_dir_create_times)
@@ -274,31 +304,21 @@ void init_stat_ex_from_stat (struct stat_ex *dst,
 	make_create_timespec(src, dst, fake_dir_create_times);
 	dst->st_ex_blksize = src->stx_blksize;
 	dst->st_ex_blocks = src->stx_blocks;
-#ifdef STATX_CHANGE_COOKIE
 	dst->st_ex_change_cookie = src->stx_change_cookie;
 	if (src->stx_mask & STATX_CHANGE_COOKIE) {
 		dst->st_ex_iflags |= ST_EX_IFLAG_HAS_CHANGE_COOKIE;
 	}
-#endif
 	dst->st_ex_gen = src->stx_gen;
 	if (src->stx_mask & STATX_GEN) {
 		dst->st_ex_iflags |= ST_EX_IFLAG_HAS_GEN;
 	}
 	dst->st_ex_mnt_id = src->stx_mnt_id;
-	dst->st_ex_attributes = src->stx_attributes;
-	dst->st_ex_zfsflags = 0;
-	if (src->stx_mask & STATX_ZFSFLAGS) {
-		dst->st_ex_zfsflags = src->stx_zfsflags;
-	}
+	dst->st_ex_flags = stx_flags(src);
+	dst->st_ex_epoch = 0;
 }
 
-#ifdef STATX_CHANGE_COOKIE
 #define TNSTATX_FLAGS (STATX_BASIC_STATS|STATX_BTIME|STATX_MNT_ID_UNIQUE| \
 	STATX_CHANGE_COOKIE|STATX_GEN|STATX_ZFSFLAGS)
-#else
-#define TNSTATX_FLAGS (STATX_BASIC_STATS|STATX_BTIME|STATX_MNT_ID_UNIQUE| \
-	STATX_GEN|STATX_ZFSFLAGS)
-#endif
 
 /*******************************************************************
 A stat() wrapper.

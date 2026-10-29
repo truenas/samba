@@ -1529,6 +1529,13 @@ void _smb_vfs_deny_pop(struct smb_vfs_deny_state *state, const char *location)
 	} \
 } while(0)
 
+/* TrueNAS: end the mdcache epoch after a call that changes the file system */
+#define EPOCH_BUMP(__call__) ({ \
+	__typeof__(__call__) __epoch_bump_ret = (__call__); \
+	mdcache_bump_epoch(handle->conn->sconn); \
+	__epoch_bump_ret; \
+})
+
 int smb_vfs_call_connect(struct vfs_handle_struct *handle,
 			 const char *service, const char *user)
 {
@@ -1609,16 +1616,12 @@ NTSTATUS smb_vfs_call_create_dfs_pathat(struct vfs_handle_struct *handle,
 				const struct referral *reflist,
 				size_t referral_count)
 {
-	NTSTATUS result;
-
 	VFS_FIND(create_dfs_pathat);
-	result = handle->fns->create_dfs_pathat_fn(handle,
+	return EPOCH_BUMP(handle->fns->create_dfs_pathat_fn(handle,
 						dirfsp,
 						smb_fname,
 						reflist,
-						referral_count);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+						referral_count));
 }
 
 NTSTATUS smb_vfs_call_read_dfs_pathat(struct vfs_handle_struct *handle,
@@ -1666,15 +1669,11 @@ int smb_vfs_call_mkdirat(struct vfs_handle_struct *handle,
 			const struct smb_filename *smb_fname,
 			mode_t mode)
 {
-	int result;
-
 	VFS_FIND(mkdirat);
-	result = handle->fns->mkdirat_fn(handle,
+	return EPOCH_BUMP(handle->fns->mkdirat_fn(handle,
 			dirfsp,
 			smb_fname,
-			mode);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+			mode));
 }
 
 int smb_vfs_call_closedir(struct vfs_handle_struct *handle,
@@ -1820,12 +1819,8 @@ ssize_t smb_vfs_call_pwrite(struct vfs_handle_struct *handle,
 			    struct files_struct *fsp, const void *data,
 			    size_t n, off_t offset)
 {
-	ssize_t result;
-
 	VFS_FIND(pwrite);
-	result = handle->fns->pwrite_fn(handle, fsp, data, n, offset);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->pwrite_fn(handle, fsp, data, n, offset));
 }
 
 struct smb_vfs_call_pwrite_state {
@@ -1918,12 +1913,9 @@ ssize_t smb_vfs_call_recvfile(struct vfs_handle_struct *handle, int fromfd,
 			      files_struct *tofsp, off_t offset,
 			      size_t count)
 {
-	ssize_t result;
-
 	VFS_FIND(recvfile);
-	result = handle->fns->recvfile_fn(handle, fromfd, tofsp, offset, count);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->recvfile_fn(handle, fromfd, tofsp,
+						   offset, count));
 }
 
 int smb_vfs_call_renameat(struct vfs_handle_struct *handle,
@@ -1933,17 +1925,13 @@ int smb_vfs_call_renameat(struct vfs_handle_struct *handle,
 			const struct smb_filename *smb_fname_dst,
 			const struct vfs_rename_how *how)
 {
-	int result;
-
 	VFS_FIND(renameat);
-	result = handle->fns->renameat_fn(handle,
+	return EPOCH_BUMP(handle->fns->renameat_fn(handle,
 				srcfsp,
 				smb_fname_src,
 				dstfsp,
 				smb_fname_dst,
-				how);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+				how));
 }
 
 int smb_vfs_call_rename_stream(struct vfs_handle_struct *handle,
@@ -1951,15 +1939,11 @@ int smb_vfs_call_rename_stream(struct vfs_handle_struct *handle,
 			       const char *dst_name,
 			       bool replace_if_exists)
 {
-	int result;
-
 	VFS_FIND(rename_stream);
-	result = handle->fns->rename_stream_fn(handle,
-					       src_fsp,
-					       dst_name,
-					       replace_if_exists);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->rename_stream_fn(handle,
+							src_fsp,
+							dst_name,
+							replace_if_exists));
 }
 
 struct smb_vfs_call_fsync_state {
@@ -2077,8 +2061,16 @@ int smb_vfs_call_stat(struct vfs_handle_struct *handle,
 int smb_vfs_call_fstat(struct vfs_handle_struct *handle,
 		       struct files_struct *fsp, SMB_STRUCT_STAT *sbuf)
 {
+	uint64_t epoch;
+	int result;
+
 	VFS_FIND(fstat);
-	return handle->fns->fstat_fn(handle, fsp, sbuf);
+	epoch = mdcache_epoch(handle->conn);
+	result = handle->fns->fstat_fn(handle, fsp, sbuf);
+	if (result == 0) {
+		sbuf->st_ex_epoch = epoch;
+	}
+	return result;
 }
 
 int smb_vfs_call_lstat(struct vfs_handle_struct *handle,
@@ -2138,37 +2130,25 @@ int smb_vfs_call_unlinkat(struct vfs_handle_struct *handle,
 			const struct smb_filename *smb_fname,
 			int flags)
 {
-	int result;
-
 	VFS_FIND(unlinkat);
-	result = handle->fns->unlinkat_fn(handle,
+	return EPOCH_BUMP(handle->fns->unlinkat_fn(handle,
 			dirfsp,
 			smb_fname,
-			flags);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+			flags));
 }
 
 int smb_vfs_call_fchmod(struct vfs_handle_struct *handle,
 			struct files_struct *fsp, mode_t mode)
 {
-	int result;
-
 	VFS_FIND(fchmod);
-	result = handle->fns->fchmod_fn(handle, fsp, mode);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->fchmod_fn(handle, fsp, mode));
 }
 
 int smb_vfs_call_fchown(struct vfs_handle_struct *handle,
 			struct files_struct *fsp, uid_t uid, gid_t gid)
 {
-	int result;
-
 	VFS_FIND(fchown);
-	result = handle->fns->fchown_fn(handle, fsp, uid, gid);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->fchown_fn(handle, fsp, uid, gid));
 }
 
 int smb_vfs_call_lchown(struct vfs_handle_struct *handle,
@@ -2176,12 +2156,8 @@ int smb_vfs_call_lchown(struct vfs_handle_struct *handle,
 			uid_t uid,
 			gid_t gid)
 {
-	int result;
-
 	VFS_FIND(lchown);
-	result = handle->fns->lchown_fn(handle, smb_fname, uid, gid);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->lchown_fn(handle, smb_fname, uid, gid));
 }
 
 int smb_vfs_call_chdir(struct vfs_handle_struct *handle,
@@ -2203,23 +2179,15 @@ int smb_vfs_call_fntimes(struct vfs_handle_struct *handle,
 			 struct files_struct *fsp,
 			 struct smb_file_time *ft)
 {
-	int result;
-
 	VFS_FIND(fntimes);
-	result = handle->fns->fntimes_fn(handle, fsp, ft);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->fntimes_fn(handle, fsp, ft));
 }
 
 int smb_vfs_call_ftruncate(struct vfs_handle_struct *handle,
 			   struct files_struct *fsp, off_t offset)
 {
-	int result;
-
 	VFS_FIND(ftruncate);
-	result = handle->fns->ftruncate_fn(handle, fsp, offset);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->ftruncate_fn(handle, fsp, offset));
 }
 
 int smb_vfs_call_fallocate(struct vfs_handle_struct *handle,
@@ -2228,12 +2196,9 @@ int smb_vfs_call_fallocate(struct vfs_handle_struct *handle,
 			   off_t offset,
 			   off_t len)
 {
-	int result;
-
 	VFS_FIND(fallocate);
-	result = handle->fns->fallocate_fn(handle, fsp, mode, offset, len);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->fallocate_fn(handle, fsp, mode, offset,
+						    len));
 }
 
 int smb_vfs_call_filesystem_sharemode(struct vfs_handle_struct *handle,
@@ -2275,15 +2240,11 @@ int smb_vfs_call_symlinkat(struct vfs_handle_struct *handle,
 			struct files_struct *dirfsp,
 			const struct smb_filename *new_smb_fname)
 {
-	int result;
-
 	VFS_FIND(symlinkat);
-	result = handle->fns->symlinkat_fn(handle,
+	return EPOCH_BUMP(handle->fns->symlinkat_fn(handle,
 				link_target,
 				dirfsp,
-				new_smb_fname);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+				new_smb_fname));
 }
 
 int smb_vfs_call_readlinkat(struct vfs_handle_struct *handle,
@@ -2307,17 +2268,13 @@ int smb_vfs_call_linkat(struct vfs_handle_struct *handle,
 			const struct smb_filename *new_smb_fname,
 			int flags)
 {
-	int result;
-
 	VFS_FIND(linkat);
-	result = handle->fns->linkat_fn(handle,
+	return EPOCH_BUMP(handle->fns->linkat_fn(handle,
 				srcfsp,
 				old_smb_fname,
 				dstfsp,
 				new_smb_fname,
-				flags);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+				flags));
 }
 
 int smb_vfs_call_mknodat(struct vfs_handle_struct *handle,
@@ -2326,16 +2283,12 @@ int smb_vfs_call_mknodat(struct vfs_handle_struct *handle,
 			mode_t mode,
 			SMB_DEV_T dev)
 {
-	int result;
-
 	VFS_FIND(mknodat);
-	result = handle->fns->mknodat_fn(handle,
+	return EPOCH_BUMP(handle->fns->mknodat_fn(handle,
 				dirfsp,
 				smb_fname,
 				mode,
-				dev);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+				dev));
 }
 
 struct smb_filename *smb_vfs_call_realpath(struct vfs_handle_struct *handle,
@@ -2350,12 +2303,8 @@ int smb_vfs_call_fchflags(struct vfs_handle_struct *handle,
 			struct files_struct *fsp,
 			unsigned int flags)
 {
-	int result;
-
 	VFS_FIND(fchflags);
-	result = handle->fns->fchflags_fn(handle, fsp, flags);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->fchflags_fn(handle, fsp, flags));
 }
 
 struct file_id smb_vfs_call_file_id_create(struct vfs_handle_struct *handle,
@@ -2438,14 +2387,11 @@ NTSTATUS smb_vfs_call_fsctl(struct vfs_handle_struct *handle,
 			    uint32_t max_out_len,
 			    uint32_t *out_len)
 {
-	NTSTATUS result;
-
 	VFS_FIND(fsctl);
-	result = handle->fns->fsctl_fn(handle, fsp, ctx, function, req_flags,
-				       in_data, in_len, out_data, max_out_len,
-				       out_len);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->fsctl_fn(handle, fsp, ctx, function,
+						req_flags, in_data, in_len,
+						out_data, max_out_len,
+						out_len));
 }
 
 NTSTATUS smb_vfs_call_fget_dos_attributes(struct vfs_handle_struct *handle,
@@ -2460,12 +2406,9 @@ NTSTATUS smb_vfs_call_fset_dos_attributes(struct vfs_handle_struct *handle,
 					  struct files_struct *fsp,
 					  uint32_t dosmode)
 {
-	NTSTATUS result;
-
 	VFS_FIND(fset_dos_attributes);
-	result = handle->fns->fset_dos_attributes_fn(handle, fsp, dosmode);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->fset_dos_attributes_fn(handle, fsp,
+							      dosmode));
 }
 
 struct tevent_req *smb_vfs_call_offload_read_send(TALLOC_CTX *mem_ctx,
@@ -2504,26 +2447,21 @@ struct tevent_req *smb_vfs_call_offload_write_send(struct vfs_handle_struct *han
 						   off_t dest_off,
 						   off_t num)
 {
-	struct tevent_req *result;
-
 	VFS_FIND(offload_write_send);
-	result = handle->fns->offload_write_send_fn(handle, mem_ctx, ev, fsctl,
-					       token, transfer_offset,
-					       dest_fsp, dest_off, num);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->offload_write_send_fn(handle, mem_ctx,
+							     ev, fsctl, token,
+							     transfer_offset,
+							     dest_fsp, dest_off,
+							     num));
 }
 
 NTSTATUS smb_vfs_call_offload_write_recv(struct vfs_handle_struct *handle,
 					 struct tevent_req *req,
 					 off_t *copied)
 {
-	NTSTATUS result;
-
 	VFS_FIND(offload_write_recv);
-	result = handle->fns->offload_write_recv_fn(handle, req, copied);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->offload_write_recv_fn(handle, req,
+							     copied));
 }
 
 struct smb_vfs_call_get_dos_attributes_state {
@@ -2642,13 +2580,9 @@ NTSTATUS smb_vfs_call_set_compression(vfs_handle_struct *handle,
 				      struct files_struct *fsp,
 				      uint16_t compression_fmt)
 {
-	NTSTATUS result;
-
 	VFS_FIND(set_compression);
-	result = handle->fns->set_compression_fn(handle, mem_ctx, fsp,
-						 compression_fmt);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->set_compression_fn(handle, mem_ctx, fsp,
+							  compression_fmt));
 }
 
 NTSTATUS smb_vfs_call_snap_check_path(vfs_handle_struct *handle,
@@ -2669,13 +2603,10 @@ NTSTATUS smb_vfs_call_snap_create(struct vfs_handle_struct *handle,
 				  char **base_path,
 				  char **snap_path)
 {
-	NTSTATUS result;
-
 	VFS_FIND(snap_create);
-	result = handle->fns->snap_create_fn(handle, mem_ctx, base_volume, tstamp,
-					     rw, base_path, snap_path);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->snap_create_fn(handle, mem_ctx,
+						      base_volume, tstamp, rw,
+						      base_path, snap_path));
 }
 
 NTSTATUS smb_vfs_call_snap_delete(struct vfs_handle_struct *handle,
@@ -2683,13 +2614,9 @@ NTSTATUS smb_vfs_call_snap_delete(struct vfs_handle_struct *handle,
 				  char *base_path,
 				  char *snap_path)
 {
-	NTSTATUS result;
-
 	VFS_FIND(snap_delete);
-	result = handle->fns->snap_delete_fn(handle, mem_ctx, base_path,
-					     snap_path);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->snap_delete_fn(handle, mem_ctx,
+						      base_path, snap_path));
 }
 
 NTSTATUS smb_vfs_call_fget_nt_acl(struct vfs_handle_struct *handle,
@@ -2708,13 +2635,9 @@ NTSTATUS smb_vfs_call_fset_nt_acl(struct vfs_handle_struct *handle,
 				  uint32_t security_info_sent,
 				  const struct security_descriptor *psd)
 {
-	NTSTATUS result;
-
 	VFS_FIND(fset_nt_acl);
-	result = handle->fns->fset_nt_acl_fn(handle, fsp, security_info_sent,
-					     psd);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->fset_nt_acl_fn(handle, fsp,
+						      security_info_sent, psd));
 }
 
 SMB_ACL_T smb_vfs_call_sys_acl_get_fd(struct vfs_handle_struct *handle,
@@ -2741,23 +2664,16 @@ int smb_vfs_call_sys_acl_set_fd(struct vfs_handle_struct *handle,
 				SMB_ACL_TYPE_T type,
 				SMB_ACL_T theacl)
 {
-	int result;
-
 	VFS_FIND(sys_acl_set_fd);
-	result = handle->fns->sys_acl_set_fd_fn(handle, fsp, type, theacl);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->sys_acl_set_fd_fn(handle, fsp, type,
+							 theacl));
 }
 
 int smb_vfs_call_sys_acl_delete_def_fd(struct vfs_handle_struct *handle,
 				struct files_struct *fsp)
 {
-	int result;
-
 	VFS_FIND(sys_acl_delete_def_fd);
-	result = handle->fns->sys_acl_delete_def_fd_fn(handle, fsp);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->sys_acl_delete_def_fd_fn(handle, fsp));
 }
 
 struct smb_vfs_call_getxattrat_state {
@@ -2885,24 +2801,17 @@ ssize_t smb_vfs_call_flistxattr(struct vfs_handle_struct *handle,
 int smb_vfs_call_fremovexattr(struct vfs_handle_struct *handle,
 			      struct files_struct *fsp, const char *name)
 {
-	int result;
-
 	VFS_FIND(fremovexattr);
-	result = handle->fns->fremovexattr_fn(handle, fsp, name);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->fremovexattr_fn(handle, fsp, name));
 }
 
 int smb_vfs_call_fsetxattr(struct vfs_handle_struct *handle,
 			   struct files_struct *fsp, const char *name,
 			   const void *value, size_t size, int flags)
 {
-	int result;
-
 	VFS_FIND(fsetxattr);
-	result = handle->fns->fsetxattr_fn(handle, fsp, name, value, size, flags);
-	mdcache_bump_epoch(handle->conn->sconn);
-	return result;
+	return EPOCH_BUMP(handle->fns->fsetxattr_fn(handle, fsp, name, value,
+						    size, flags));
 }
 
 bool smb_vfs_call_aio_force(struct vfs_handle_struct *handle,

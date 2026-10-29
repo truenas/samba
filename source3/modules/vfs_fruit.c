@@ -4877,7 +4877,9 @@ static NTSTATUS fruit_freaddir_attr(struct vfs_handle_struct *handle,
 		attr_data->attr_data.aapl.max_access = FILE_GENERIC_ALL;
 	} else if (cached) {
 		if (!smbd_cached_maximum_access(
-			    fsp, slot, &attr_data->attr_data.aapl.max_access)) {
+			    fsp,
+			    slot->sd_variant,
+			    &attr_data->attr_data.aapl.max_access)) {
 			TALLOC_FREE(attr_data);
 			return NT_STATUS_RETRY;
 		}

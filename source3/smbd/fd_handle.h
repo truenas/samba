@@ -44,7 +44,9 @@ int fsp_get_pathref_fd(const struct files_struct *fsp);
 void fsp_set_fd(struct files_struct *fsp, int fd);
 
 /* TrueNAS changes */
+void fsp_set_open_flags(struct files_struct *fsp, int fd, int flags);
 int fsp_get_status_flags(const struct files_struct *fsp);
+bool fsp_has_status_flags(const struct files_struct *fsp);
 bool fsp_must_use_procfd_path(const struct files_struct *fsp,
 			      int desired_access);
 bool fsp_has_read_access(const struct files_struct *fsp);

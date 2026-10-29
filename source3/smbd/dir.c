@@ -573,35 +573,12 @@ static bool dirent_cache_usable(connection_struct *conn,
 	       (lp_hide_new_files_timeout(snum) == 0);
 }
 
-/*
- * TrueNAS ABE lists a file if the user could open it read-only, which only
- * the file's ACL, owner, group and mode and the user's token decide
- */
-static bool dirent_abe_key(connection_struct *conn,
-			   const struct mdcache_inode *slot,
-			   struct mdcache_access_key *key)
-{
-	if (slot->sd_seq == 0) {
-		return false;
-	}
-
-	*key = (struct mdcache_access_key) {
-		.sd_seq = slot->sd_seq,
-		.vuid = get_current_vuid(conn),
-		.cnum = conn->cnum,
-		.uid = get_current_uid(conn),
-		.flags = MDCACHE_ACCESS_ABE,
-	};
-	return true;
-}
-
-/* The open's answer, for the file and, once known, its SD variant */
+/* TrueNAS ABE lists a file if the user could open it read-only */
 static void dirent_abe_remember(struct files_struct *fsp)
 {
 	const SMB_STRUCT_STAT *st = &fsp->fsp_name->st;
+	uint64_t cookie = st->st_ex_change_cookie;
 	struct mdcache_inode *slot = NULL;
-	struct mdcache_access_key key;
-	bool visible;
 
 	if (!S_ISREG(st->st_ex_mode) && !S_ISDIR(st->st_ex_mode)) {
 		return;
@@ -609,14 +586,11 @@ static void dirent_abe_remember(struct files_struct *fsp)
 
 	/* fetch, not peek: a hidden entry gets no later chance at a slot */
 	slot = mdcache_inode_fetch(fsp);
-	if ((slot == NULL) || (slot->cookie != st->st_ex_change_cookie)) {
+	if ((slot == NULL) || (slot->cookie != cookie)) {
 		return;
 	}
-	visible = !(fsp_get_status_flags(fsp) & O_PATH);
-	mdcache_abe_put(slot, mdcache_abe_ctx(fsp->conn), visible);
-	if (dirent_abe_key(fsp->conn, slot, &key)) {
-		mdcache_access_put(&key, visible ? FILE_READ_DATA : 0);
-	}
+	mdcache_abe_put(fsp->conn, slot,
+			!(fsp_get_status_flags(fsp) & O_PATH));
 }
 
 /*
@@ -687,11 +661,8 @@ static enum dirent_cached dirent_from_cache(TALLOC_CTX *ctx,
 	const SMB_STRUCT_STAT *st = &smb_fname->st;
 	struct files_struct *fsp = NULL;
 	struct mdcache_inode *slot = NULL;
-	struct mdcache_access_key key;
 	struct file_id id;
-	uint32_t read_access;
 	uint32_t mode;
-	enum dirent_cached ret = DIRENT_OPEN;
 	NTSTATUS status;
 	int rc;
 
@@ -723,16 +694,10 @@ static enum dirent_cached dirent_from_cache(TALLOC_CTX *ctx,
 		bool visible;
 
 		slot = mdcache_inode_peek(&id, st->st_ex_change_cookie);
-		if (slot == NULL) {
+		if ((slot == NULL) || !mdcache_abe_get(conn, slot, &visible)) {
 			return DIRENT_OPEN;
 		}
-		if (mdcache_abe_get(slot, mdcache_abe_ctx(conn), &visible)) {
-			read_access = visible ? FILE_READ_DATA : 0;
-		} else if (!dirent_abe_key(conn, slot, &key) ||
-			   !mdcache_access_get(&key, &read_access)) {
-			return DIRENT_OPEN;
-		}
-		if (read_access == 0) {
+		if (!visible) {
 			return DIRENT_HIDDEN;
 		}
 	}
@@ -745,7 +710,7 @@ static enum dirent_cached dirent_from_cache(TALLOC_CTX *ctx,
 	status = fdos_mode_vfs(fsp, &mode);
 	if (!NT_STATUS_IS_OK(status) ||
 	    (mode & FILE_ATTRIBUTE_REPARSE_POINT)) {
-		goto out;
+		return DIRENT_OPEN;
 	}
 
 	if (_rdattr != NULL) {
@@ -753,15 +718,13 @@ static enum dirent_cached dirent_from_cache(TALLOC_CTX *ctx,
 		if (!NT_STATUS_IS_OK(status) &&
 		    !NT_STATUS_EQUAL(status, NT_STATUS_NOT_SUPPORTED)) {
 			TALLOC_FREE(*_rdattr);
-			goto out;
+			return DIRENT_OPEN;
 		}
 	}
 
 	smb_fname->st = fsp->fsp_name->st;
 	*_mode = mode;
-	ret = DIRENT_LISTED;
-out:
-	return ret;
+	return DIRENT_LISTED;
 }
 
 bool smbd_dirptr_get_entry(TALLOC_CTX *ctx,

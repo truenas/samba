@@ -90,11 +90,11 @@ static NTSTATUS truenas_acl_open(struct smb2_tree *tree,
 	return status;
 }
 
-static NTSTATUS truenas_acl_get(struct smb2_tree *tree,
-				struct torture_context *tctx,
-				struct smb2_handle h,
-				uint32_t secinfo,
-				struct security_descriptor **sd)
+NTSTATUS truenas_acl_get(struct smb2_tree *tree,
+			 struct torture_context *tctx,
+			 struct smb2_handle h,
+			 uint32_t secinfo,
+			 struct security_descriptor **sd)
 {
 	union smb_fileinfo q;
 	NTSTATUS status;
@@ -110,9 +110,9 @@ static NTSTATUS truenas_acl_get(struct smb2_tree *tree,
 	return status;
 }
 
-static NTSTATUS truenas_acl_set(struct smb2_tree *tree,
-				struct smb2_handle h,
-				struct security_descriptor *sd)
+NTSTATUS truenas_acl_set(struct smb2_tree *tree,
+			 struct smb2_handle h,
+			 struct security_descriptor *sd)
 {
 	union smb_setfileinfo s;
 
