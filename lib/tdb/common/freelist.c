@@ -566,7 +566,8 @@ static bool tdb_alloc_dead(
 	}
 
 	if ((move_ok != NULL) &&
-	    (tdb_have_travlock(tdb, *rec_ptr) || !tdb_no_record_locks(tdb))) {
+	    (tdb_have_travlock(tdb, *rec_ptr) ||
+	     !tdb_no_record_locks(tdb, *rec_ptr, 1))) {
 		*move_ok = false;
 		return false;
 	}

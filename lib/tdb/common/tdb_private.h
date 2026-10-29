@@ -327,7 +327,8 @@ int tdb_allrecord_upgrade(struct tdb_context *tdb);
 int tdb_write_lock_record(struct tdb_context *tdb, tdb_off_t off);
 int tdb_write_unlock_record(struct tdb_context *tdb, tdb_off_t off);
 bool tdb_have_travlock(struct tdb_context *tdb, tdb_off_t off);
-bool tdb_no_record_locks(struct tdb_context *tdb);
+bool tdb_no_record_locks(struct tdb_context *tdb, tdb_off_t off,
+			 tdb_len_t len);
 int tdb_ofs_read(struct tdb_context *tdb, tdb_off_t offset, tdb_off_t *d);
 int tdb_ofs_write(struct tdb_context *tdb, tdb_off_t offset, tdb_off_t *d);
 void *tdb_convert(void *buf, uint32_t size);

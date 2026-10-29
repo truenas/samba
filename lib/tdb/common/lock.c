@@ -1028,16 +1028,17 @@ bool tdb_have_travlock(struct tdb_context *tdb, tdb_off_t off)
 /*
  * Traversals take their record read locks only while holding the
  * record's chain lock. With that chain locked by us, if no other process
- * holds any record lock now, none can appear in the chain until we
- * unlock it.
+ * holds a record lock in [off, off+len) now (len 0: to the end), none
+ * can appear there in the chain until we unlock it.
  */
-bool tdb_no_record_locks(struct tdb_context *tdb)
+bool tdb_no_record_locks(struct tdb_context *tdb, tdb_off_t off,
+			 tdb_len_t len)
 {
 	struct flock fl = {
 		.l_type = F_WRLCK,
 		.l_whence = SEEK_SET,
-		.l_start = TDB_DATA_START(tdb->hash_size),
-		.l_len = 0,
+		.l_start = off,
+		.l_len = len,
 	};
 
 	if ((tdb->flags & TDB_NOLOCK) || (tdb->allrecord_lock.count != 0)) {

@@ -476,7 +476,10 @@ int tdb_trim_dead(struct tdb_context *tdb, uint32_t hash)
 				}
 
 				if (probe == -1) {
-					probe = !tdb_no_record_locks(tdb);
+					probe = !tdb_no_record_locks(
+						tdb,
+						TDB_DATA_START(tdb->hash_size),
+						0);
 				}
 
 				ret = tdb_del_dead(
