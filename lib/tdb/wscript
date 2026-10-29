@@ -62,6 +62,10 @@ tdb1_unit_tests = [
     'run-traverse-dead-free',
     'run-mutex-die-waiter',
     'run-mutex-allrecord-nested',
+    'run-transaction-unmap',
+    'run-wipe-all-unlock',
+    'run-freelist-merge-lock',
+    'run-transaction-remap',
 ]
 
 def options(opt):
