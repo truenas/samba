@@ -3992,8 +3992,8 @@ static NTSTATUS smb_kernel_dosmode(struct files_struct *fsp,
 				   uint32_t *_dosmode)
 {
 	const SMB_STRUCT_STAT *st = &metadata_fsp(fsp)->fsp_name->st;
-	uint64_t mask = 0;
-	uint64_t flags;
+	uint32_t mask = 0;
+	uint32_t flags;
 
 	*_dosmode = 0;
 	if (dosmode == 0) {
@@ -4011,7 +4011,7 @@ static NTSTATUS smb_kernel_dosmode(struct files_struct *fsp,
 	dosmode &= SAMBA_ATTRIBUTES_MASK;
 
 	flags = zfsflags_from_dos_mode(st, dosmode, &mask);
-	if ((st->st_ex_zfsflags & mask) != flags) {
+	if ((st->st_ex_flags & mask) != flags) {
 		*_dosmode = (dosmode != 0) ? dosmode : FILE_ATTRIBUTE_NORMAL;
 	}
 	return NT_STATUS_OK;

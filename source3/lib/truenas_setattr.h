@@ -49,7 +49,7 @@ struct truenas_setattr {
 	struct truenas_setattr_time zsa_atime;
 	struct truenas_setattr_time zsa_mtime;
 	struct truenas_setattr_time zsa_btime;
-	uint64_t zsa_dos_set;	/* ZFS DOS flags, ST_EX_ZFS_* */
+	uint64_t zsa_dos_set;	/* ZFS DOS flags, ZFS_* in sys/zfs_znode.h */
 	uint64_t zsa_dos_clear;
 	uint32_t zsa_acl_len;
 	uint32_t zsa_flags;

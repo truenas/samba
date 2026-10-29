@@ -455,18 +455,30 @@ static bool fsp_set_zfsacl_escalate(files_struct *fsp, zfsacl_t zfsacl,
 	return ok;
 }
 
-/*
- * fsp_get_aclbrand() and path_get_aclbrand() both get the ACL brand on the
- * underlying filesystem. In almost all cases we rely on the ACL brand we
- * detected on the initial SMB tree connect, which is preferable to detecting
- * on a per-file basis. Unfortunately, certain types of users disregard UI
- * warnings and alerts and nest datasets with different ACL properties (or
- * mount random filesystems via the unix shell) and so we need to handle the
- * unexpected if initial attempt to read the file's ACL fails.
- */
+/* Nested datasets and mounts can have a different ACL type than the share */
+static enum acl_brand stat_acl_brand(const SMB_STRUCT_STAT *st)
+{
+	if ((st->st_ex_flags & ST_EX_ATTR_ACLTYPE) == 0) {
+		return TRUENAS_ACL_BRAND_UNKNOWN;
+	}
+	if (st->st_ex_flags & ST_EX_ATTR_NFSV4ACL) {
+		return TRUENAS_ACL_BRAND_NFS4;
+	}
+	if (st->st_ex_flags & ST_EX_ATTR_POSIXACL) {
+		return TRUENAS_ACL_BRAND_POSIX;
+	}
+	return TRUENAS_ACL_BRAND_NONE;
+}
+
 static int fsp_get_acl_brand(files_struct *fsp)
 {
 	ssize_t rv;
+	enum acl_brand brand = stat_acl_brand(&fsp->fsp_name->st);
+
+	if (brand != TRUENAS_ACL_BRAND_UNKNOWN) {
+		return brand;
+	}
+
 	rv = SMB_VFS_FGETXATTR(fsp, ACL_XATTR, NULL, 0);
 	if (rv == -1) {
 		if (errno == ENODATA) {
@@ -495,9 +507,40 @@ static int fsp_get_acl_brand(files_struct *fsp)
 	return TRUENAS_ACL_BRAND_NFS4;
 }
 
+static bool fsp_acl_is_posix(files_struct *fsp)
+{
+	const files_struct *mfsp = metadata_fsp(fsp);
+	enum acl_brand brand = stat_acl_brand(&mfsp->fsp_name->st);
+
+	if (brand == TRUENAS_ACL_BRAND_UNKNOWN) {
+		brand = fsp->conn->aclbrand;
+	}
+	return brand == TRUENAS_ACL_BRAND_POSIX;
+}
+
+static bool fsp_acl_is_nfs4(const files_struct *fsp)
+{
+	enum acl_brand brand = stat_acl_brand(&fsp->fsp_name->st);
+
+	if (brand == TRUENAS_ACL_BRAND_UNKNOWN) {
+		brand = fsp->conn->aclbrand;
+	}
+	return brand == TRUENAS_ACL_BRAND_NFS4;
+}
+
 static int path_get_aclbrand(const char *path)
 {
 	ssize_t rv;
+	SMB_STRUCT_STAT st;
+
+	if (sys_stat(path, &st, false) == 0) {
+		enum acl_brand brand = stat_acl_brand(&st);
+
+		if (brand != TRUENAS_ACL_BRAND_UNKNOWN) {
+			return brand;
+		}
+	}
+
 	rv = getxattr(path, ACL_XATTR, NULL, 0);
 	if (rv == -1) {
 		if (errno == ENODATA) {
@@ -963,6 +1006,118 @@ static NTSTATUS ixnas_generate_special_dacl_sd(struct vfs_handle_struct *handle,
 	return NT_STATUS_OK;
 }
 
+static bool fsp_acl_trivial(files_struct *fsp)
+{
+	const SMB_STRUCT_STAT *st = &fsp->fsp_name->st;
+	uint64_t epoch = mdcache_epoch(fsp->conn);
+
+	if (!ST_EX_ACL_FROM_MODE(st)) {
+		return false;
+	}
+	if ((epoch == 0) || (st->st_ex_epoch != epoch)) {
+		if (!NT_STATUS_IS_OK(vfs_stat_fsp(fsp))) {
+			return false;
+		}
+	}
+	return ST_EX_ACL_FROM_MODE(st);
+}
+
+static bool zfsacl_add_special(zfsacl_t zfsacl,
+			       zfsace_entry_type_t type,
+			       zfsace_who_t who,
+			       zfsace_permset_t perms)
+{
+	zfsacl_entry_t entry = NULL;
+
+	return zfsacl_create_aclentry(zfsacl, ZFSACL_APPEND_ENTRY, &entry) &&
+	       zfsace_set_permset(entry, perms) &&
+	       zfsace_set_flagset(entry, 0) &&
+	       zfsace_set_entry_type(entry, type) &&
+	       zfsace_set_who(entry, who, ZFSACL_UNDEFINED_ID);
+}
+
+/* As acl_trivial_access_masks() and zfs_acl_chmod() in ZFS */
+static zfsacl_t zfsacl_from_trivial_mode(mode_t mode)
+{
+	zfsace_permset_t r = ZFSACE_READ_DATA;
+	zfsace_permset_t w = ZFSACE_WRITE_DATA | ZFSACE_APPEND_DATA;
+	zfsace_permset_t x = ZFSACE_EXECUTE;
+	zfsace_permset_t base = ZFSACE_READ_ACL | ZFSACE_READ_ATTRIBUTES |
+				ZFSACE_READ_NAMED_ATTRS | ZFSACE_SYNCHRONIZE;
+	zfsace_permset_t allow0 = 0, deny1 = 0, deny2 = 0;
+	zfsace_permset_t owner, group, everyone;
+	zfsacl_t zfsacl = NULL;
+	bool ok;
+
+	if (S_ISDIR(mode)) {
+		w |= ZFSACE_DELETE_CHILD;
+	}
+
+	if (!(mode & S_IRUSR) && (mode & (S_IRGRP|S_IROTH))) {
+		deny1 |= r;
+	}
+	if (!(mode & S_IWUSR) && (mode & (S_IWGRP|S_IWOTH))) {
+		deny1 |= w;
+	}
+	if (!(mode & S_IXUSR) && (mode & (S_IXGRP|S_IXOTH))) {
+		deny1 |= x;
+	}
+
+	if (!(mode & S_IRGRP) && (mode & S_IROTH)) {
+		deny2 |= r;
+	}
+	if (!(mode & S_IWGRP) && (mode & S_IWOTH)) {
+		deny2 |= w;
+	}
+	if (!(mode & S_IXGRP) && (mode & S_IXOTH)) {
+		deny2 |= x;
+	}
+
+	if ((mode & S_IRUSR) && !(mode & S_IRGRP) && (mode & S_IROTH)) {
+		allow0 |= r;
+	}
+	if ((mode & S_IWUSR) && !(mode & S_IWGRP) && (mode & S_IWOTH)) {
+		allow0 |= w;
+	}
+	if ((mode & S_IXUSR) && !(mode & S_IXGRP) && (mode & S_IXOTH)) {
+		allow0 |= x;
+	}
+
+	owner = base | ZFSACE_WRITE_ATTRIBUTES | ZFSACE_WRITE_OWNER |
+		ZFSACE_WRITE_ACL | ZFSACE_WRITE_NAMED_ATTRS |
+		((mode & S_IRUSR) ? r : 0) | ((mode & S_IWUSR) ? w : 0) |
+		((mode & S_IXUSR) ? x : 0);
+	group = base | ((mode & S_IRGRP) ? r : 0) |
+		((mode & S_IWGRP) ? w : 0) | ((mode & S_IXGRP) ? x : 0);
+	everyone = base | ((mode & S_IROTH) ? r : 0) |
+		   ((mode & S_IWOTH) ? w : 0) | ((mode & S_IXOTH) ? x : 0);
+
+	zfsacl = zfsacl_init(6, ZFSACL_BRAND_NFSV4);
+	if (zfsacl == NULL) {
+		return NULL;
+	}
+	ok = ((allow0 == 0) ||
+	      zfsacl_add_special(zfsacl, ZFSACL_ENTRY_TYPE_ALLOW,
+				 ZFSACL_USER_OBJ, allow0)) &&
+	     ((deny1 == 0) ||
+	      zfsacl_add_special(zfsacl, ZFSACL_ENTRY_TYPE_DENY,
+				 ZFSACL_USER_OBJ, deny1)) &&
+	     ((deny2 == 0) ||
+	      zfsacl_add_special(zfsacl, ZFSACL_ENTRY_TYPE_DENY,
+				 ZFSACL_GROUP_OBJ, deny2)) &&
+	     zfsacl_add_special(zfsacl, ZFSACL_ENTRY_TYPE_ALLOW,
+				ZFSACL_USER_OBJ, owner) &&
+	     zfsacl_add_special(zfsacl, ZFSACL_ENTRY_TYPE_ALLOW,
+				ZFSACL_GROUP_OBJ, group) &&
+	     zfsacl_add_special(zfsacl, ZFSACL_ENTRY_TYPE_ALLOW,
+				ZFSACL_EVERYONE, everyone);
+	if (!ok) {
+		zfsacl_free(&zfsacl);
+		return NULL;
+	}
+	return zfsacl;
+}
+
 static NTSTATUS ixnas_fget_nt_acl_uncached(struct vfs_handle_struct *handle,
 					    struct files_struct *fsp,
 					    uint32_t security_info,
@@ -973,7 +1128,8 @@ static NTSTATUS ixnas_fget_nt_acl_uncached(struct vfs_handle_struct *handle,
 	TALLOC_CTX *frame = NULL;
 	struct files_struct *to_check = NULL;
 	NTSTATUS status;
-	zfsacl_t zfsacl;
+	zfsacl_t zfsacl = NULL;
+	enum acl_brand brand;
 	bool ok;
 	enum ixnas_dacl_type dtype = IXNAS_NORMAL_DACL;
 	struct ixnas_config_data *config = NULL;
@@ -983,29 +1139,52 @@ static NTSTATUS ixnas_fget_nt_acl_uncached(struct vfs_handle_struct *handle,
 				return NT_STATUS_INTERNAL_ERROR);
 
 	to_check = metadata_fsp(fsp);
-	zfsacl = fsp_get_zfsacl(to_check);
-	if (zfsacl == NULL) {
-		if ((errno == EINVAL) || (errno == EOPNOTSUPP)) {
-			switch (fsp_get_acl_brand(to_check)) {
-			case TRUENAS_ACL_BRAND_POSIX:
-			case TRUENAS_ACL_BRAND_UNKNOWN:
-				status = SMB_VFS_NEXT_FGET_NT_ACL(handle, fsp, security_info, mem_ctx, ppdesc);
-				if (NT_STATUS_IS_OK(status)) {
-						(*ppdesc)->type |= SEC_DESC_DACL_PROTECTED;
-				}
-				return status;
-			case TRUENAS_ACL_BRAND_NONE:
-				zfsacl = fsp_get_zfsacl_from_mode(to_check);
-				if (zfsacl == NULL) {
-					return map_nt_error_from_unix(errno);
-				}
-				break;
-			default:
-				smb_panic("Unknown ACL brand");
-			}
-		} else {
+	brand = stat_acl_brand(&to_check->fsp_name->st);
+	if ((brand == TRUENAS_ACL_BRAND_NFS4) && fsp_acl_trivial(to_check)) {
+		zfsacl = zfsacl_from_trivial_mode(
+			to_check->fsp_name->st.st_ex_mode);
+		if (zfsacl == NULL) {
 			return map_nt_error_from_unix(errno);
 		}
+	} else if ((brand == TRUENAS_ACL_BRAND_NFS4) ||
+		   (brand == TRUENAS_ACL_BRAND_UNKNOWN)) {
+		zfsacl = fsp_get_zfsacl(to_check);
+		if (zfsacl == NULL) {
+			int err = errno;
+
+			if ((err != EINVAL) && (err != EOPNOTSUPP)) {
+				return map_nt_error_from_unix(err);
+			}
+			if (brand == TRUENAS_ACL_BRAND_UNKNOWN) {
+				brand = fsp_get_acl_brand(to_check);
+			} else if (err == EOPNOTSUPP) {
+				/* The .zfs directories have no ACL */
+				brand = TRUENAS_ACL_BRAND_NONE;
+			}
+			if (brand == TRUENAS_ACL_BRAND_NFS4) {
+				return map_nt_error_from_unix(err);
+			}
+		}
+	}
+	switch (brand) {
+	case TRUENAS_ACL_BRAND_NFS4:
+		break;
+	case TRUENAS_ACL_BRAND_POSIX:
+	case TRUENAS_ACL_BRAND_UNKNOWN:
+		status = SMB_VFS_NEXT_FGET_NT_ACL(handle, fsp, security_info,
+						  mem_ctx, ppdesc);
+		if (NT_STATUS_IS_OK(status)) {
+			(*ppdesc)->type |= SEC_DESC_DACL_PROTECTED;
+		}
+		return status;
+	case TRUENAS_ACL_BRAND_NONE:
+		zfsacl = fsp_get_zfsacl_from_mode(to_check);
+		if (zfsacl == NULL) {
+			return map_nt_error_from_unix(errno);
+		}
+		break;
+	default:
+		smb_panic("Unknown ACL brand");
 	}
 	dump_acl_info(zfsacl);
 
@@ -1056,25 +1235,24 @@ static NTSTATUS ixnas_fget_nt_acl(struct vfs_handle_struct *handle,
 				  TALLOC_CTX *mem_ctx,
 				  struct security_descriptor **ppdesc)
 {
-	struct mdcache_inode *slot = NULL;
-	uint64_t seq = 0, cookie = 0;
+	uint64_t cookie, variant;
 	NTSTATUS status;
 
-	slot = mdcache_inode_fetch(fsp);
-	if (slot != NULL) {
-		cookie = slot->cookie;
-		seq = mdcache_sd_seq(fsp, &slot);
-		if ((seq != 0) &&
-		    mdcache_sd_get(seq, security_info, mem_ctx, ppdesc)) {
-			return NT_STATUS_OK;
-		}
+	if (fsp_acl_is_posix(fsp)) {
+		return SMB_VFS_NEXT_FGET_NT_ACL(handle, fsp, security_info,
+						mem_ctx, ppdesc);
+	}
+
+	variant = mdcache_fsp_variant(fsp, &cookie);
+	if ((variant != 0) &&
+	    mdcache_sd_get(variant, security_info, mem_ctx, ppdesc)) {
+		return NT_STATUS_OK;
 	}
 
 	status = ixnas_fget_nt_acl_uncached(handle, fsp, security_info,
 					    mem_ctx, ppdesc);
-	if ((seq != 0) && NT_STATUS_IS_OK(status) &&
-	    mdcache_inode_unchanged(fsp, cookie)) {
-		mdcache_sd_put(seq, security_info, *ppdesc);
+	if ((variant != 0) && NT_STATUS_IS_OK(status)) {
+		mdcache_sd_put(fsp, cookie, variant, security_info, *ppdesc);
 	}
 	return status;
 }
@@ -1305,6 +1483,11 @@ static NTSTATUS ixnas_fset_nt_acl(vfs_handle_struct *handle,
 				struct ixnas_config_data,
 				return NT_STATUS_INTERNAL_ERROR);
 
+	if (fsp_acl_is_posix(fsp)) {
+		return SMB_VFS_NEXT_FSET_NT_ACL(handle, fsp, security_info_sent,
+						psd);
+	}
+
 	if ((security_info_sent & SECINFO_DACL) &&
 	    (psd->dacl == NULL)) {
 		return ixnas_fset_special_dacl(handle, fsp, IXNAS_NULL_DACL);
@@ -1325,29 +1508,82 @@ static NTSTATUS ixnas_fset_nt_acl(vfs_handle_struct *handle,
 /*
  * Functions below are related to posix1e ACLs. Logic copied from vfs_zfsacl.
  */
-static SMB_ACL_T ixnas_fail__sys_acl_get_fd(vfs_handle_struct *handle,
-					     files_struct *fsp,
-					     SMB_ACL_TYPE_T type,
-					     TALLOC_CTX *mem_ctx)
+static SMB_ACL_T ixnas_sys_acl_get_fd(vfs_handle_struct *handle,
+				      files_struct *fsp,
+				      SMB_ACL_TYPE_T type,
+				      TALLOC_CTX *mem_ctx)
 {
+	if (fsp_acl_is_posix(fsp)) {
+		return SMB_VFS_NEXT_SYS_ACL_GET_FD(handle, fsp, type, mem_ctx);
+	}
 	return (SMB_ACL_T)NULL;
 }
 
-static int ixnas_fail__sys_acl_set_fd(vfs_handle_struct *handle,
-				       files_struct *fsp,
-				       SMB_ACL_TYPE_T type,
-				       SMB_ACL_T theacl)
+static int ixnas_sys_acl_set_fd(vfs_handle_struct *handle,
+				files_struct *fsp,
+				SMB_ACL_TYPE_T type,
+				SMB_ACL_T theacl)
 {
+	if (fsp_acl_is_posix(fsp)) {
+		return SMB_VFS_NEXT_SYS_ACL_SET_FD(handle, fsp, type, theacl);
+	}
 	return -1;
 }
 
-static int ixnas_fail__sys_acl_blob_get_fd(vfs_handle_struct *handle,
-			files_struct *fsp,
-			TALLOC_CTX *mem_ctx,
-			char **blob_description,
-			DATA_BLOB *blob)
+static int ixnas_sys_acl_blob_get_fd(vfs_handle_struct *handle,
+				     files_struct *fsp,
+				     TALLOC_CTX *mem_ctx,
+				     char **blob_description,
+				     DATA_BLOB *blob)
 {
+	if (fsp_acl_is_posix(fsp)) {
+		return SMB_VFS_NEXT_SYS_ACL_BLOB_GET_FD(handle, fsp, mem_ctx,
+							blob_description,
+							blob);
+	}
 	return -1;
+}
+
+/* nfs4_acl_*stat() retry with CAP_DAC_OVERRIDE, which only NFSv4 permits */
+static int ixnas_stat(struct vfs_handle_struct *handle,
+		      struct smb_filename *smb_fname)
+{
+	if (handle->conn->aclbrand == TRUENAS_ACL_BRAND_NFS4) {
+		return nfs4_acl_stat(handle, smb_fname);
+	}
+	return SMB_VFS_NEXT_STAT(handle, smb_fname);
+}
+
+static int ixnas_lstat(struct vfs_handle_struct *handle,
+		       struct smb_filename *smb_fname)
+{
+	if (handle->conn->aclbrand == TRUENAS_ACL_BRAND_NFS4) {
+		return nfs4_acl_lstat(handle, smb_fname);
+	}
+	return SMB_VFS_NEXT_LSTAT(handle, smb_fname);
+}
+
+static int ixnas_fstat(struct vfs_handle_struct *handle,
+		       struct files_struct *fsp,
+		       SMB_STRUCT_STAT *sbuf)
+{
+	if (fsp_acl_is_nfs4(fsp)) {
+		return nfs4_acl_fstat(handle, fsp, sbuf);
+	}
+	return SMB_VFS_NEXT_FSTAT(handle, fsp, sbuf);
+}
+
+static int ixnas_fstatat(struct vfs_handle_struct *handle,
+			 const struct files_struct *dirfsp,
+			 const struct smb_filename *smb_fname,
+			 SMB_STRUCT_STAT *sbuf,
+			 int flags)
+{
+	if (fsp_acl_is_nfs4(dirfsp)) {
+		return nfs4_acl_fstatat(handle, dirfsp, smb_fname, sbuf,
+					flags);
+	}
+	return SMB_VFS_NEXT_FSTATAT(handle, dirfsp, smb_fname, sbuf, flags);
 }
 
 static int mode_to_acl(zfsacl_t *new_acl, mode_t mode)
@@ -1559,17 +1795,10 @@ static bool set_acl_parameters(struct vfs_handle_struct *handle,
 		errno = ENOMEM;
 		return false;
 	}
-	/*
-	 * Disable the get/set NT ACL functions here if the path lacks NFSv4 ACL support.
-	 * The user may have mounted a non-ZFS filesystem and shared it via Samba. Our
-	 * middleware will probably not let the user get this far, but it's better to
-	 * be somewhat safer.
-	 */
-	handle->conn->aclbrand = path_get_aclbrand(handle->conn->connectpath);
+	handle->conn->aclbrand = path_get_aclbrand(chkpath);
 	if (handle->conn->aclbrand != TRUENAS_ACL_BRAND_NFS4) {
-		DBG_ERR("Connectpath does not support NFSv4 ACLs. Disabling ZFS ACL handling.\n");
-		TALLOC_FREE(chkpath);
-		return false;
+		DBG_INFO("%s: no NFSv4 ACLs (brand %d)\n",
+			 chkpath, handle->conn->aclbrand);
 	}
 	TALLOC_FREE(chkpath);
 
@@ -1648,7 +1877,8 @@ static int ixnas_connect(struct vfs_handle_struct *handle,
 
 	handle->conn->internal_tcon_flags |= TCON_FLAG_MDCACHE_SD;
 
-	if (lp_parm_bool(SNUM(handle->conn), "ixnas", "truenas_abe", true)) {
+	if (lp_parm_bool(SNUM(handle->conn), "ixnas", "truenas_abe",
+			 handle->conn->aclbrand == TRUENAS_ACL_BRAND_NFS4)) {
 		/*
 		 * The support team requested that ABE be enabled by default
 		 * on NFSv4 ACL shares in order to preserve FreeBSD behavior
@@ -1704,13 +1934,13 @@ static struct vfs_fn_pointers ixnas_fns = {
 	.fntimes_fn = ixnas_fntimes,
 	.fget_nt_acl_fn = ixnas_fget_nt_acl,
 	.fset_nt_acl_fn = ixnas_fset_nt_acl,
-	.sys_acl_get_fd_fn = ixnas_fail__sys_acl_get_fd,
-	.sys_acl_blob_get_fd_fn = ixnas_fail__sys_acl_blob_get_fd,
-	.sys_acl_set_fd_fn = ixnas_fail__sys_acl_set_fd,
-	.stat_fn = nfs4_acl_stat,
-	.fstat_fn = nfs4_acl_fstat,
-	.lstat_fn = nfs4_acl_lstat,
-	.fstatat_fn = nfs4_acl_fstatat,
+	.sys_acl_get_fd_fn = ixnas_sys_acl_get_fd,
+	.sys_acl_blob_get_fd_fn = ixnas_sys_acl_blob_get_fd,
+	.sys_acl_set_fd_fn = ixnas_sys_acl_set_fd,
+	.stat_fn = ixnas_stat,
+	.fstat_fn = ixnas_fstat,
+	.lstat_fn = ixnas_lstat,
+	.fstatat_fn = ixnas_fstatat,
 };
 
 NTSTATUS vfs_ixnas_init(TALLOC_CTX *);
