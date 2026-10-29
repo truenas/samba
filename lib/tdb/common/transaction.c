@@ -611,7 +611,12 @@ static int _tdb_transaction_cancel(struct tdb_context *tdb)
 		return 0;
 	}
 
-	tdb->map_size = tdb->transaction->old_map_size;
+	if (tdb->map_size != tdb->transaction->old_map_size) {
+		/* Unmap first: tdb_munmap() unmaps map_size bytes */
+		tdb_munmap(tdb);
+		tdb->map_size = tdb->transaction->old_map_size;
+		tdb_mmap(tdb);
+	}
 
 	/* free all the transaction blocks */
 	for (i=0;i<tdb->transaction->num_blocks;i++) {
@@ -1067,7 +1072,6 @@ static int _tdb_transaction_prepare_commit(struct tdb_context *tdb)
 			_tdb_transaction_cancel(tdb);
 			return -1;
 		}
-		tdb->map_size = tdb->transaction->old_map_size;
 		methods->tdb_oob(tdb, tdb->map_size, 1, 1);
 	}
 

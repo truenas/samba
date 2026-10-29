@@ -1029,7 +1029,7 @@ _PUBLIC_ int tdb_wipe_all(struct tdb_context *tdb)
 		struct tdb_record rec;
 		if (tdb->methods->tdb_read(tdb, recovery_head, &rec, sizeof(rec), DOCONV()) == -1) {
 			TDB_LOG((tdb, TDB_DEBUG_FATAL, "tdb_wipe_all: failed to read recovery record\n"));
-			return -1;
+			goto failed;
 		}
 		recovery_size = rec.rec_len + sizeof(rec);
 	}
