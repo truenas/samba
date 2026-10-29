@@ -670,6 +670,8 @@ blocking_freelist_allocate:
 
 /**
  * Merge adjacent records in the freelist.
+ *
+ * This changes the freelist, so it needs the write lock.
  */
 static int tdb_freelist_merge_adjacent(struct tdb_context *tdb,
 				       int *count_records, int *count_merged)
@@ -679,7 +681,7 @@ static int tdb_freelist_merge_adjacent(struct tdb_context *tdb,
 	int merged = 0;
 	int ret;
 
-	ret = tdb_lock(tdb, -1, F_RDLCK);
+	ret = tdb_lock(tdb, -1, F_WRLCK);
 	if (ret == -1) {
 		return -1;
 	}
@@ -723,7 +725,7 @@ static int tdb_freelist_merge_adjacent(struct tdb_context *tdb,
 	ret = 0;
 
 done:
-	tdb_unlock(tdb, -1, F_RDLCK);
+	tdb_unlock(tdb, -1, F_WRLCK);
 	return ret;
 }
 
@@ -752,15 +754,15 @@ static int tdb_freelist_size_no_merge(struct tdb_context *tdb)
  * return the size of the freelist - used to decide if we should repack
  *
  * As a side effect, adjacent records are merged unless the
- * database is read-only, in order to reduce the fragmentation
- * without repacking.
+ * database is read-only or in a read-only traverse, in order to
+ * reduce the fragmentation without repacking.
  */
 _PUBLIC_ int tdb_freelist_size(struct tdb_context *tdb)
 {
 
 	int count = 0;
 
-	if (tdb->read_only) {
+	if (tdb->read_only || tdb->traverse_read) {
 		count = tdb_freelist_size_no_merge(tdb);
 	} else {
 		int ret;

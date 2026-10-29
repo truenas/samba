@@ -132,6 +132,8 @@ static int tdb_fstat(struct tdb_context *tdb, struct stat *buf)
 	return ret;
 }
 
+static bool should_mmap(const struct tdb_context *tdb);
+
 /* check for an out of bounds access - if it is out of bounds then
    see if the database has been expanded by someone else and expand
    if necessary
@@ -140,6 +142,8 @@ static int tdb_notrans_oob(
 	struct tdb_context *tdb, tdb_off_t off, tdb_len_t len, int probe)
 {
 	struct stat st;
+	bool remap;
+
 	if (len + off < len) {
 		if (!probe) {
 			/* Ensure ecode is set for log fn. */
@@ -181,19 +185,30 @@ static int tdb_notrans_oob(
 		return -1;
 	}
 
-	/* Unmap, update size, remap.  We do this unconditionally, to handle
-	 * the unusual case where the db is truncated.
+	/* Unmap, update size, remap.  We do this when the size changed,
+	 * which also handles the unusual case where the db is truncated.
 	 *
 	 * This can happen to a child using tdb_reopen_all(true) on a
 	 * TDB_CLEAR_IF_FIRST tdb whose parent crashes: the next
-	 * opener will truncate the database. */
-	if (tdb_munmap(tdb) == -1) {
-		tdb->ecode = TDB_ERR_IO;
-		return -1;
-	}
-	tdb->map_size = st.st_size;
-	if (tdb_mmap(tdb) != 0) {
-		return -1;
+	 * opener will truncate the database.
+	 *
+	 * Don't remap if the size is the same: every transaction start
+	 * comes here, and a remap makes it fault in all its pages again. */
+#ifdef HAVE_INCOHERENT_MMAP
+	remap = true;
+#else
+	remap = (tdb->map_ptr == NULL) || !should_mmap(tdb) ||
+		(st.st_size != tdb->map_size);
+#endif
+	if (remap) {
+		if (tdb_munmap(tdb) == -1) {
+			tdb->ecode = TDB_ERR_IO;
+			return -1;
+		}
+		tdb->map_size = st.st_size;
+		if (tdb_mmap(tdb) != 0) {
+			return -1;
+		}
 	}
 
 	if (st.st_size < (size_t)off + len) {
