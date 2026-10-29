@@ -676,6 +676,9 @@ int _tdb_oob(struct tdb_context *tdb, tdb_off_t off, tdb_len_t len, int probe)
 /* read/write a tdb_off_t */
 int tdb_ofs_read(struct tdb_context *tdb, tdb_off_t offset, tdb_off_t *d)
 {
+	if (tdb_read_mapped(tdb, offset, d, sizeof(*d))) {
+		return 0;
+	}
 	return tdb->methods->tdb_read(tdb, offset, (char*)d, sizeof(*d), DOCONV());
 }
 
@@ -747,7 +750,8 @@ int tdb_rec_read(struct tdb_context *tdb, tdb_off_t offset, struct tdb_record *r
 	int ret;
 	tdb_len_t overall_len;
 
-	if (tdb->methods->tdb_read(tdb, offset, rec, sizeof(*rec),DOCONV()) == -1)
+	if (!tdb_read_mapped(tdb, offset, rec, sizeof(*rec)) &&
+	    tdb->methods->tdb_read(tdb, offset, rec, sizeof(*rec),DOCONV()) == -1)
 		return -1;
 	if (TDB_BAD_MAGIC(rec)) {
 		/* Ensure ecode is set for log fn. */

@@ -58,6 +58,10 @@ tdb1_unit_tests = [
     'run-circular-chain',
     'run-circular-freelist',
     'run-traverse-chain',
+    'run-traverse-dead-move',
+    'run-traverse-dead-free',
+    'run-mutex-die-waiter',
+    'run-mutex-allrecord-nested',
 ]
 
 def options(opt):
