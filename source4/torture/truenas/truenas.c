@@ -2518,7 +2518,9 @@ done:
  *
  * Run on a share whose root is torture:sc_subdir below torture:sc_mp,
  * with a child dataset mounted at <share root>/inner and the directory
- * <sc_mp>/sc_outside next to the share root.
+ * <sc_mp>/sc_outside next to the share root. The share of
+ * truenas.shadow_copy is rooted at the mountpoint, so this test is in a
+ * suite of its own.
  */
 static bool test_truenas_shadow_copy_subdir_share(struct torture_context *tctx,
 						  struct smb2_tree *tree)
@@ -3051,6 +3053,8 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 		torture_suite_create(suite, "streams");
 	struct torture_suite *sc_suite =
 		torture_suite_create(suite, "shadow_copy");
+	struct torture_suite *sc_subdir_suite =
+		torture_suite_create(suite, "shadow_copy_subdir");
 	struct torture_suite *fruit_suite =
 		torture_suite_create(suite, "fruit");
 
@@ -3091,7 +3095,7 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 				     test_truenas_shadow_copy_child_dataset);
 	torture_suite_add_1smb2_test(sc_suite, "same_second",
 				     test_truenas_shadow_copy_same_second);
-	torture_suite_add_1smb2_test(sc_suite, "subdir_share",
+	torture_suite_add_1smb2_test(sc_subdir_suite, "subdir_share",
 				     test_truenas_shadow_copy_subdir_share);
 	torture_suite_add_1smb2_test(sc_suite, "stale_mountpoint",
 				     test_truenas_shadow_copy_stale_mountpoint);
@@ -3105,6 +3109,7 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 	torture_suite_add_suite(suite, streams_suite);
 	torture_suite_add_suite(suite, fruit_suite);
 	torture_suite_add_suite(suite, sc_suite);
+	torture_suite_add_suite(suite, sc_subdir_suite);
 
 	/* ACL <-> Security-Descriptor mapping subtests (truenas_acl.c) */
 	torture_truenas_acl_suite(suite);

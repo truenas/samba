@@ -655,7 +655,7 @@ echo "=========================================="
 # sc_child a child dataset for child_dataset, created after sc1 so that the
 # other tests see no change in it. sc_nest/inner is mounted below a plain
 # directory: stale_mountpoint renames that directory, and it is the root of
-# zscsub, which subdir_share runs on.
+# zscsub, which truenas.shadow_copy_subdir runs on.
 printf 'snapshot-version' > "$SHARE/sc_canary"
 zfs snapshot tank/share@sc1
 zfs create tank/share/sc_child
@@ -700,7 +700,7 @@ fi
 if tn_torture //127.0.0.1/zscsub -U 'smbtest%testpass123' \
      --option="torture:sc_mp=$SHARE" \
      --option='torture:sc_subdir=sc_nest' \
-     truenas.shadow_copy.subdir_share; then
+     truenas.shadow_copy_subdir; then
   echo "shadow_copy subdirectory share PASSED"
 else
   echo "ERROR: shadow_copy subdirectory share FAILED"
