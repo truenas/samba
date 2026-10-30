@@ -37,7 +37,6 @@
  */
 struct snapshot_entry
 {
-	uint64_t createtxg;
 	char label[SMBGMT_NAMELEN];	/* @GMT-prefixed label for snapshot */
 	char name[ZFSDS_NAMELEN];	/* name of snapshot */
 	time_t cr_time;			/* creation time of snapshot */
@@ -47,23 +46,28 @@ struct snapshot_entry
 
 struct snapshot_list
 {
-	time_t timestamp;			/* when list generated */
+	uint64_t mnt_id;			/* mount ID of the dataset */
+	/*
+	 * mtime and link count of <mountpoint>/.zfs/snapshot when the list
+	 * was read. ZFS sets the mtime on every snapshot create, destroy,
+	 * rename and promote, and the link count is 2 + the snapshots.
+	 */
+	struct timespec snapdir_mtime;
+	uint64_t snapdir_nlink;
 	char mountpoint[PATH_MAX];		/* mountpoint of underlying ds */
 	char dataset_name[ZFSDS_NAMELEN];	/* ZFS dataset name */
 	size_t num_entries;			/* number of entries in snapshot list */
+	/*
+	 * Newest first. Snapshots taken in the same second share cr_time,
+	 * nt_time and label, and are ordered by name.
+	 */
 	struct snapshot_entry *entries;
-	struct snapshot_entry *last;
 };
 
 struct snap_filter
 {
-	bool ignore_empty_snaps;
 	char **inclusions;
 	char **exclusions;
-	time_t start;
-	time_t end;
-	uint64_t start_txg;
-	uint64_t end_txg;
 };
 
 enum casesensitivity {SMBZFS_SENSITIVE, SMBZFS_INSENSITIVE, SMBZFS_MIXED};
@@ -207,31 +211,39 @@ int smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 			   bool create_ancestors);
 
 /*
- * This function returns a list of ZFS snapshots matching the specified
- * filters, allocated under a user-provided talloc memory context. Returns
- * NULL on error.
+ * List the snapshots of a dataset, newest first, from a read of the
+ * <mountpoint>/.zfs/snapshot directory. The creation time of a snapshot
+ * is the birth time of its entry there, which ZFS reports without
+ * mounting the snapshot. Allocated under mem_ctx; NULL with errno set on
+ * error.
  *
- * @param[in]	mnt_id			mount ID of the dataset.
  * @param[in]	mem_ctx			talloc memory context
- * @param[in]	ignore_empty_snaps	ignore snapshots with zero space used
- * @param[in]	inclusions		list of filters to determine whether to
- *					include a snapshot
- * @param[in]	exclusions		list of filters to determine whether to
- *					exclude a snapshot
- * @param[in]	start			snapshots with create time greater than
- *					this will be included
- * @param[in]	end			snapshots with create time less than
- *					this will be included
+ * @param[in]	mnt_id			mount ID of the dataset
+ * @param[in]	filter			inclusion and exclusion patterns for
+ *					snapshot names, or NULL
  *
  * @return	struct snapshot_list
  */
 struct snapshot_list *smb_zfs_list_snapshots(TALLOC_CTX *mem_ctx,
 					     uint64_t mnt_id,
-					     struct snap_filter *filter);
+					     const struct snap_filter *filter);
 
-bool update_snapshot_list(uint64_t mnt_id,
-			  struct snapshot_list *snaps,
-			  struct snap_filter *filter);
+/*
+ * Whether the snapshots of the dataset are still those of a list from
+ * smb_zfs_list_snapshots(): one statx of <mountpoint>/.zfs/snapshot,
+ * which must still be the snapshot directory of the mount.
+ */
+bool smb_zfs_snapshot_list_current(const struct snapshot_list *snaps);
+
+/*
+ * Open <mountpoint>/.zfs/snapshot (O_RDONLY | O_DIRECTORY) without
+ * following symlinks, and only if it is the snapshot directory of the
+ * mount mnt_id. A mountpoint gone stale -- a directory above it renamed
+ * -- gives -1 with errno ESTALE rather than whatever is at the old path.
+ *
+ * @return	fd, or -1 with errno set
+ */
+int smb_zfs_open_snapdir(const char *mountpoint, uint64_t mnt_id);
 
 /*
  * Delete a list of ZFS snapshots. List is converted into an nvlist
@@ -282,5 +294,4 @@ bool smb_zfs_pool_feature_enabled(uint64_t mnt_id,
 int conn_zfs_init(const char *connectpath,
 		  const struct zfs_dataset **ppds);
 
-bool inode_is_ctldir(ino_t ino);
 #endif	/* !__SMB_LIBZFS_H */
