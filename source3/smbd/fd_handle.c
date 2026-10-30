@@ -32,7 +32,11 @@ struct fd_handle {
 	 * NTCREATEX_FLAG_DENY_FCB.
 	 */
 	uint32_t private_options;
-	int status_flags;  /* TrueNAS */
+	/* TrueNAS */
+	bool have_status_flags;
+	int status_flags;
+	int opened_fd;
+	int opened_flags;
 	uint64_t gen_id;
 };
 
@@ -50,7 +54,7 @@ struct fd_handle *fd_handle_create(TALLOC_CTX *mem_ctx)
 	if (fh == NULL) {
 		return NULL;
 	}
-	*fh = (struct fd_handle) { .fd = -1, };
+	*fh = (struct fd_handle) { .fd = -1, .opened_fd = -1, };
 
 	talloc_set_destructor(fh, fd_handle_destructor);
 
@@ -138,21 +142,58 @@ void fsp_set_fd(struct files_struct *fsp, int fd)
 
 	fsp->fh->fd = fd;
 
-	/* TrueNAS changes */
-	if (fd_changed || fsp->fh->status_flags == 0) {
-		if (fsp->fh->fd == -1 || fsp->fh->fd == AT_FDCWD ||
-		    fsp_is_xattr_stream(fsp)) {
-			fsp->fh->status_flags = 0;
-		} else {
-			fsp->fh->status_flags = fcntl(fd, F_GETFL);
-		}
+	/* TrueNAS: F_GETFL only for fds vfswrap_openat() did not open */
+	if ((fd == -1) || (fd == AT_FDCWD) || fsp_is_xattr_stream(fsp)) {
+		fsp->fh->have_status_flags = false;
+		fsp->fh->status_flags = 0;
+	} else if (fd == fsp->fh->opened_fd) {
+		fsp->fh->have_status_flags = true;
+		fsp->fh->status_flags = fsp->fh->opened_flags;
+	} else if (fd_changed || !fsp->fh->have_status_flags) {
+		fsp->fh->status_flags = fcntl(fd, F_GETFL);
+		fsp->fh->have_status_flags = (fsp->fh->status_flags != -1);
 	}
+	/* A reopen closes the old fd before setting the new one */
+	if ((fd != -1) && (fd != AT_FDCWD)) {
+		fsp->fh->opened_fd = -1;
+	}
+}
+
+/* vfs_set_blocking() clears O_NONBLOCK on FIFOs behind the cache */
+#define STATUS_FLAGS_USED (O_ACCMODE | O_PATH | O_DIRECTORY | O_APPEND | \
+			   O_DIRECT | O_NOATIME | O_ASYNC)
+
+/* TrueNAS */
+void fsp_set_open_flags(struct files_struct *fsp, int fd, int flags)
+{
+	fsp->fh->opened_fd = fd;
+	fsp->fh->opened_flags =
+		flags & ~(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC);
 }
 
 /* TrueNAS changes */
 int fsp_get_status_flags(const struct files_struct *fsp)
 {
+#ifdef DEVELOPER
+	if (fsp->fh->have_status_flags) {
+		int flags = fcntl(fsp->fh->fd, F_GETFL);
+
+		if ((flags & STATUS_FLAGS_USED) !=
+		    (fsp->fh->status_flags & STATUS_FLAGS_USED)) {
+			DBG_ERR("%s: status flags 0x%x, F_GETFL 0x%x\n",
+				fsp_str_dbg(fsp),
+				fsp->fh->status_flags,
+				flags);
+			smb_panic("stale status flags");
+		}
+	}
+#endif
 	return fsp->fh->status_flags;
+}
+
+bool fsp_has_status_flags(const struct files_struct *fsp)
+{
+	return fsp->fh->have_status_flags;
 }
 
 /*
@@ -168,11 +209,12 @@ int fsp_get_status_flags(const struct files_struct *fsp)
 bool fsp_must_use_procfd_path(const struct files_struct *fsp,
 			      int desired_access)
 {
-	int status = fsp_get_status_flags(fsp);
+	int status;
 
-	if (status == 0) {
+	if (!fsp_has_status_flags(fsp)) {
 		return true;
 	}
+	status = fsp_get_status_flags(fsp);
 
 	if (desired_access == O_RDONLY) {
 		// Allow O_DIRECTORY to fulfill request for O_RDONLY

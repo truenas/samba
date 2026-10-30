@@ -216,9 +216,9 @@ uint32_t dos_mode_msdfs(connection_struct *conn,
 uint32_t fdos_mode(struct files_struct *fsp);
 NTSTATUS fdos_mode_vfs(struct files_struct *fsp, uint32_t *_dosmode);
 uint32_t dos_mode_from_zfsflags(const SMB_STRUCT_STAT *st);
-uint64_t zfsflags_from_dos_mode(const SMB_STRUCT_STAT *st,
+uint32_t zfsflags_from_dos_mode(const SMB_STRUCT_STAT *st,
 				uint32_t dosmode,
-				uint64_t *_mask);
+				uint32_t *_mask);
 struct tevent_req *dos_mode_at_send(TALLOC_CTX *mem_ctx,
 				    struct tevent_context *ev,
 				    files_struct *dir_fsp,

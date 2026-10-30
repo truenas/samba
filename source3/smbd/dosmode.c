@@ -768,7 +768,7 @@ uint32_t fdos_mode(struct files_struct *fsp)
 
 static const struct {
 	uint32_t dosmode;
-	uint64_t flag;
+	uint32_t flag;
 } zfs_dosmodes[] = {
 	{ FILE_ATTRIBUTE_READONLY, ST_EX_ZFS_READONLY },
 	{ FILE_ATTRIBUTE_ARCHIVE, ST_EX_ZFS_ARCHIVE },
@@ -791,7 +791,7 @@ uint32_t dos_mode_from_zfsflags(const SMB_STRUCT_STAT *st)
 	size_t i;
 
 	for (i = 0; i < ARRAY_SIZE(zfs_dosmodes); i++) {
-		if (st->st_ex_zfsflags & zfs_dosmodes[i].flag) {
+		if (st->st_ex_flags & zfs_dosmodes[i].flag) {
 			dosmode |= zfs_dosmodes[i].dosmode;
 		}
 	}
@@ -805,12 +805,12 @@ uint32_t dos_mode_from_zfsflags(const SMB_STRUCT_STAT *st)
  * The ZFS flags for dosmode, and in *_mask each ZFS flag that is a DOS
  * attribute of st's file. ZFS keeps ZFS_ARCHIVE of a directory itself.
  */
-uint64_t zfsflags_from_dos_mode(const SMB_STRUCT_STAT *st,
+uint32_t zfsflags_from_dos_mode(const SMB_STRUCT_STAT *st,
 				uint32_t dosmode,
-				uint64_t *_mask)
+				uint32_t *_mask)
 {
-	uint64_t mask = 0;
-	uint64_t flags = 0;
+	uint32_t mask = 0;
+	uint32_t flags = 0;
 	size_t i;
 
 	for (i = 0; i < ARRAY_SIZE(zfs_dosmodes); i++) {

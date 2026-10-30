@@ -34,10 +34,11 @@
  * Both are freed once the process goes MDCACHE_IDLE_TIMEOUT seconds
  * without using them.
  *
- * Finding a file's slot takes a statx of its fd, unless one was taken in
- * the current epoch. The epoch ends whenever smbd wakes up from waiting,
- * with each request and with each change smbd makes, so a change made
- * elsewhere goes unseen at most until smbd next waits.
+ * A file's slot is found from the stat in fsp->fsp_name, taken again
+ * unless it came from the fd in the current epoch. The epoch ends whenever
+ * smbd wakes up from waiting, with each request and with each change smbd
+ * makes, so a change made elsewhere goes unseen at most until smbd next
+ * waits.
  */
 
 #include "includes.h"
@@ -59,7 +60,7 @@ static struct {
 	uint32_t mask;
 	uint32_t count;
 	uint32_t tick;
-	uint64_t seq;
+	uint64_t last_variant;
 	struct memcache *mc;
 	struct tevent_timer *idle_timer;
 	uint32_t idle_tick;
@@ -236,9 +237,9 @@ static void mdcache_idle_arm(struct tevent_context *ev)
 }
 
 /*
- * Free everything if the cache wasn't used since the last check. seq
- * keeps counting, so a variant number held across this is never given
- * to a different ACL.
+ * Free everything if the cache wasn't used since the last check.
+ * last_variant keeps counting, so a variant number held across this is
+ * never given to a different ACL.
  */
 static void mdcache_idle(struct tevent_context *ev,
 			 struct tevent_timer *te,
@@ -274,9 +275,9 @@ void mdcache_bump_epoch(struct smbd_server_connection *sconn)
  * Moves with every SMB request (num_requests) and with every wake-up and
  * change of our own (mdcache_epoch). 0 is never current.
  */
-static uint64_t mdcache_epoch(const struct files_struct *fsp)
+uint64_t mdcache_epoch(const struct connection_struct *conn)
 {
-	struct smbd_server_connection *sconn = fsp->conn->sconn;
+	struct smbd_server_connection *sconn = conn->sconn;
 
 	if (sconn == NULL) {
 		return 0;
@@ -284,80 +285,34 @@ static uint64_t mdcache_epoch(const struct files_struct *fsp)
 	return sconn->num_requests + sconn->mdcache_epoch;
 }
 
-#ifdef STATX_CHANGE_COOKIE
-static void mdcache_set_stat(struct files_struct *fsp, const struct statx *stx)
-{
-	fsp->mdcache_stat = (struct mdcache_stat) {
-		.epoch = mdcache_epoch(fsp),
-		.cookie = stx->stx_change_cookie,
-		.gen = stx->stx_gen,
-		.dev = makedev(stx->stx_dev_major, stx->stx_dev_minor),
-		.ino = stx->stx_ino,
-		.uid = stx->stx_uid,
-		.gid = stx->stx_gid,
-		.mode = stx->stx_mode,
-	};
-}
-#endif
-
-/* sbuf is a stat of fsp's fd */
-void mdcache_stat_taken(struct files_struct *fsp, const SMB_STRUCT_STAT *sbuf)
-{
-#ifdef STATX_CHANGE_COOKIE
-	struct statx stx = {
-		.stx_change_cookie = sbuf->st_ex_change_cookie,
-		.stx_gen = sbuf->st_ex_gen,
-		.stx_dev_major = major(sbuf->st_ex_dev),
-		.stx_dev_minor = minor(sbuf->st_ex_dev),
-		.stx_ino = sbuf->st_ex_ino,
-		.stx_uid = sbuf->st_ex_uid,
-		.stx_gid = sbuf->st_ex_gid,
-		.stx_mode = sbuf->st_ex_mode,
-	};
-
-	mdcache_set_stat(fsp, &stx);
-#endif
-}
-
 /*
  * Return the slot for the current version of fsp's file, emptied if the
- * file changed since it was filled, or NULL if it can't be cached. Values
- * derived for the slot use the owner, group and mode in fsp's stat, so
- * the cache is skipped when those are out of date.
+ * file changed since it was filled, or NULL if it can't be cached.
  */
 struct mdcache_inode *mdcache_inode_fetch(struct files_struct *fsp)
 {
-#ifdef STATX_CHANGE_COOKIE
 	const SMB_STRUCT_STAT *st = &fsp->fsp_name->st;
-	const struct mdcache_stat *m = &fsp->mdcache_stat;
-	uint64_t epoch = mdcache_epoch(fsp);
+	uint64_t epoch = mdcache_epoch(fsp->conn);
 	struct mdcache_inode *s = NULL;
 
-	if (fsp_is_alternate_stream(fsp)) {
+	if (fsp_is_alternate_stream(fsp) || (fsp_get_pathref_fd(fsp) == -1)) {
 		return NULL;
 	}
 
-	if ((epoch == 0) || (m->epoch != epoch)) {
-		struct statx stx;
+	if ((epoch == 0) || (st->st_ex_epoch != epoch)) {
+		NTSTATUS status = vfs_stat_fsp(fsp);
 
-		if (statx(fsp_get_pathref_fd(fsp), "", AT_EMPTY_PATH,
-			  STATX_TYPE | STATX_MODE | STATX_UID | STATX_GID |
-			  STATX_INO | STATX_CHANGE_COOKIE | STATX_GEN,
-			  &stx) != 0) {
+		if (!NT_STATUS_IS_OK(status)) {
 			return NULL;
 		}
-		mdcache_set_stat(fsp, &stx);
 	}
 
-	if ((m->cookie == 0) ||
-	    (m->uid != st->st_ex_uid) ||
-	    (m->gid != st->st_ex_gid) ||
-	    (m->mode != st->st_ex_mode)) {
+	if (st->st_ex_change_cookie == 0) {
 		// a zero cookie is the .zfs control directory
 		return NULL;
 	}
 
-	if (m->gen == 0) {
+	if (st->st_ex_gen == 0) {
 		static bool logged;
 
 		if (!logged) {
@@ -369,9 +324,9 @@ struct mdcache_inode *mdcache_inode_fetch(struct files_struct *fsp)
 	}
 
 	/* The slot is keyed by fsp->file_id, so it must be this fd's file */
-	if ((m->dev != fsp->file_id.devid) ||
-	    (m->ino != fsp->file_id.inode) ||
-	    (m->gen != fsp->file_id.extid)) {
+	if ((st->st_ex_dev != fsp->file_id.devid) ||
+	    (st->st_ex_ino != fsp->file_id.inode) ||
+	    (st->st_ex_gen != fsp->file_id.extid)) {
 		return NULL;
 	}
 
@@ -383,18 +338,15 @@ struct mdcache_inode *mdcache_inode_fetch(struct files_struct *fsp)
 		mdcache_idle_arm(fsp->conn->sconn->ev_ctx);
 	}
 
-	if (s->cookie != m->cookie) {
+	if (s->cookie != st->st_ex_change_cookie) {
 		*s = (struct mdcache_inode) {
 			.id = s->id,
-			.cookie = m->cookie,
+			.cookie = st->st_ex_change_cookie,
 			.btime_nsec = UTIME_OMIT,
 		};
 	}
 	s->tick = ++mdc.tick;
 	return s;
-#else
-	return NULL;
-#endif
 }
 
 void mdcache_inode_prefetch(const struct file_id *id)
@@ -414,22 +366,22 @@ struct mdcache_inode *mdcache_inode_peek(const struct file_id *id,
 	if ((s == NULL) || (s->cookie != cookie)) {
 		return NULL;
 	}
+	s->tick = ++mdc.tick;
 	return s;
 }
 
-bool mdcache_inode_unchanged(struct files_struct *fsp, uint64_t cookie)
+static bool mdcache_inode_unchanged(struct files_struct *fsp, uint64_t cookie)
 {
-#ifdef STATX_CHANGE_COOKIE
-	struct statx stx;
+	NTSTATUS status;
 
-	if (statx(fsp_get_pathref_fd(fsp), "", AT_EMPTY_PATH,
-		  STATX_CHANGE_COOKIE, &stx) != 0) {
+	if (fsp_get_pathref_fd(fsp) == -1) {
 		return false;
 	}
-	return stx.stx_change_cookie == cookie;
-#else
-	return false;
-#endif
+	status = vfs_stat_fsp(fsp);
+	if (!NT_STATUS_IS_OK(status)) {
+		return false;
+	}
+	return fsp->fsp_name->st.st_ex_change_cookie == cookie;
 }
 
 static struct memcache *mdcache_mc(void)
@@ -441,26 +393,26 @@ static struct memcache *mdcache_mc(void)
 }
 
 /* Variant number for a raw ACL, owner, group and mode */
-uint64_t mdcache_sd_variant(DATA_BLOB content)
+static uint64_t mdcache_sd_variant(DATA_BLOB content)
 {
 	struct memcache *mc = mdcache_mc();
 	DATA_BLOB val;
-	uint64_t seq;
+	uint64_t variant;
 
 	if (mc == NULL) {
 		return 0;
 	}
 
 	if (memcache_lookup(mc, MDCACHE_SD_VARIANT, content, &val) &&
-	    (val.length == sizeof(seq))) {
-		memcpy(&seq, val.data, sizeof(seq));
-		return seq;
+	    (val.length == sizeof(variant))) {
+		memcpy(&variant, val.data, sizeof(variant));
+		return variant;
 	}
 
-	seq = ++mdc.seq;
+	variant = ++mdc.last_variant;
 	memcache_add(mc, MDCACHE_SD_VARIANT, content,
-		     data_blob_const(&seq, sizeof(seq)));
-	return seq;
+		     data_blob_const(&variant, sizeof(variant)));
+	return variant;
 }
 
 #define ACL4_XDR_MAX 20488	/* what libzfsacl reads, 1024 entries */
@@ -483,7 +435,16 @@ static uint64_t mdcache_sd_variant_fsp(struct files_struct *fsp)
 	uint8_t small[sizeof(hdr) + ACL4_XDR_SMALL];
 	uint8_t *buf = small;
 	ssize_t len;
-	uint64_t seq = 0;
+	uint64_t variant = 0;
+
+	/* vfs_ixnas makes the SD of a trivial ACL from the mode */
+	if (ST_EX_ACL_FROM_MODE(st)) {
+		return mdcache_sd_variant(data_blob_const(&hdr, sizeof(hdr)));
+	}
+	if ((st->st_ex_flags & ST_EX_ATTR_ACLTYPE) &&
+	    !(st->st_ex_flags & ST_EX_ATTR_NFSV4ACL)) {
+		return 0;
+	}
 
 	/*
 	 * Linux allocates and zeroes a buffer of the requested size on
@@ -503,50 +464,54 @@ static uint64_t mdcache_sd_variant_fsp(struct files_struct *fsp)
 	}
 	if (len > 0) {
 		memcpy(buf, &hdr, sizeof(hdr));
-		seq = mdcache_sd_variant(data_blob_const(buf,
-							 sizeof(hdr) + len));
+		variant = mdcache_sd_variant(
+			data_blob_const(buf, sizeof(hdr) + len));
 	}
 	if (buf != small) {
 		TALLOC_FREE(buf);
 	}
-	return seq;
+	return variant;
 }
 
-/*
- * The slot's SD variant, read from the file if it has none. The read
- * may move the slot: *pslot is looked up again, NULL if it is gone.
- */
-uint64_t mdcache_sd_seq(struct files_struct *fsp,
-			struct mdcache_inode **pslot)
+/* The SD variant of fsp's file, 0 if none, and its change cookie */
+uint64_t mdcache_fsp_variant(struct files_struct *fsp, uint64_t *pcookie)
 {
-	struct mdcache_inode *slot = *pslot;
-	uint64_t cookie = slot->cookie;
-	uint64_t seq = slot->sd_seq;
+	struct mdcache_inode *slot = NULL;
+	uint64_t variant;
 
-	if ((seq != 0) ||
-	    !(fsp->conn->internal_tcon_flags & TCON_FLAG_MDCACHE_SD)) {
-		return seq;
+	*pcookie = 0;
+	if (!(fsp->conn->internal_tcon_flags & TCON_FLAG_MDCACHE_SD)) {
+		return 0;
 	}
-	seq = mdcache_sd_variant_fsp(fsp);
-	slot = mdcache_inode_peek(&fsp->file_id, cookie);
+	slot = mdcache_inode_fetch(fsp);
+	if (slot == NULL) {
+		return 0;
+	}
+	*pcookie = slot->cookie;
+	if (slot->sd_variant != 0) {
+		return slot->sd_variant;
+	}
+
+	/* Reading the ACL can move the slot */
+	variant = mdcache_sd_variant_fsp(fsp);
+	slot = mdcache_inode_peek(&fsp->file_id, *pcookie);
 	if (slot != NULL) {
-		slot->sd_seq = seq;
+		slot->sd_variant = variant;
 	}
-	*pslot = slot;
-	return seq;
+	return variant;
 }
 
 struct mdcache_sd_key {
-	uint64_t seq;
+	uint64_t variant;
 	uint32_t security_info;
 	uint32_t pad;
 };
 
-bool mdcache_sd_get(uint64_t seq, uint32_t security_info,
+bool mdcache_sd_get(uint64_t variant, uint32_t security_info,
 		    TALLOC_CTX *mem_ctx, struct security_descriptor **ppdesc)
 {
 	struct mdcache_sd_key key = {
-		.seq = seq,
+		.variant = variant,
 		.security_info = security_info,
 	};
 	DATA_BLOB val;
@@ -562,18 +527,22 @@ bool mdcache_sd_get(uint64_t seq, uint32_t security_info,
 	return NT_STATUS_IS_OK(status);
 }
 
-void mdcache_sd_put(uint64_t seq, uint32_t security_info,
+/* Cache psd for the SD variant, unless fsp's file changed since cookie */
+void mdcache_sd_put(struct files_struct *fsp,
+		    uint64_t cookie,
+		    uint64_t variant,
+		    uint32_t security_info,
 		    const struct security_descriptor *psd)
 {
 	struct mdcache_sd_key key = {
-		.seq = seq,
+		.variant = variant,
 		.security_info = security_info,
 	};
 	uint8_t *data = NULL;
 	size_t len;
 	NTSTATUS status;
 
-	if (mdcache_mc() == NULL) {
+	if ((mdcache_mc() == NULL) || !mdcache_inode_unchanged(fsp, cookie)) {
 		return;
 	}
 
@@ -585,6 +554,26 @@ void mdcache_sd_put(uint64_t seq, uint32_t security_info,
 	memcache_add(mdc.mc, MDCACHE_SD, data_blob_const(&key, sizeof(key)),
 		     data_blob_const(data, len));
 	TALLOC_FREE(data);
+}
+
+bool mdcache_access_key(struct connection_struct *conn,
+			uint64_t sd_variant,
+			uint32_t access_mask,
+			uint32_t flags,
+			struct mdcache_access_key *key)
+{
+	if (sd_variant == 0) {
+		return false;
+	}
+	*key = (struct mdcache_access_key) {
+		.sd_variant = sd_variant,
+		.vuid = get_current_vuid(conn),
+		.cnum = conn->cnum,
+		.uid = get_current_uid(conn),
+		.access_mask = access_mask,
+		.flags = flags,
+	};
+	return true;
 }
 
 bool mdcache_access_get(const struct mdcache_access_key *key,
@@ -603,8 +592,8 @@ bool mdcache_access_get(const struct mdcache_access_key *key,
 	return true;
 }
 
-void mdcache_access_put(const struct mdcache_access_key *key,
-			uint32_t access_mask)
+static void mdcache_access_store(const struct mdcache_access_key *key,
+				 uint32_t access_mask)
 {
 	if (mdcache_mc() == NULL) {
 		return;
@@ -612,6 +601,17 @@ void mdcache_access_put(const struct mdcache_access_key *key,
 
 	memcache_add(mdc.mc, MDCACHE_ACCESS, data_blob_const(key, sizeof(*key)),
 		     data_blob_const(&access_mask, sizeof(access_mask)));
+}
+
+/* Cache an access decision, unless fsp's file changed since cookie */
+void mdcache_access_put(struct files_struct *fsp,
+			uint64_t cookie,
+			const struct mdcache_access_key *key,
+			uint32_t access_mask)
+{
+	if (mdcache_inode_unchanged(fsp, cookie)) {
+		mdcache_access_store(key, access_mask);
+	}
 }
 
 /* Maximum access and ABE answers depend on share settings and the token */
@@ -623,7 +623,7 @@ void mdcache_flush_access(void)
 	mdcache_abe_drop_ctxs();
 }
 
-uint32_t mdcache_abe_ctx(struct connection_struct *conn)
+static uint32_t mdcache_abe_ctx(struct connection_struct *conn)
 {
 	uint64_t vuid = get_current_vuid(conn);
 	uint32_t uid = get_current_uid(conn);
@@ -660,25 +660,44 @@ uint32_t mdcache_abe_ctx(struct connection_struct *conn)
 	return c->num;
 }
 
-bool mdcache_abe_get(const struct mdcache_inode *slot, uint32_t ctx,
+bool mdcache_abe_get(struct connection_struct *conn,
+		     const struct mdcache_inode *slot,
 		     bool *visible)
 {
-	if ((ctx == 0) || ((slot->flags >> MDCACHE_ABE_CTX_SHIFT) != ctx)) {
+	uint32_t ctx = mdcache_abe_ctx(conn);
+	struct mdcache_access_key key;
+	uint32_t read_access;
+
+	if ((ctx != 0) && ((slot->flags >> MDCACHE_ABE_CTX_SHIFT) == ctx)) {
+		*visible = (slot->flags & MDCACHE_ABE_VISIBLE) != 0;
+		return true;
+	}
+	if (!mdcache_access_key(conn, slot->sd_variant, 0,
+				MDCACHE_ACCESS_ABE, &key) ||
+	    !mdcache_access_get(&key, &read_access)) {
 		return false;
 	}
-	*visible = (slot->flags & MDCACHE_ABE_VISIBLE) != 0;
+	*visible = (read_access != 0);
 	return true;
 }
 
-void mdcache_abe_put(struct mdcache_inode *slot, uint32_t ctx, bool visible)
+void mdcache_abe_put(struct connection_struct *conn,
+		     struct mdcache_inode *slot,
+		     bool visible)
 {
-	if (ctx == 0) {
-		return;
+	uint32_t ctx = mdcache_abe_ctx(conn);
+	struct mdcache_access_key key;
+
+	if (ctx != 0) {
+		slot->flags &= ~MDCACHE_ABE_BITS;
+		slot->flags |= ctx << MDCACHE_ABE_CTX_SHIFT;
+		if (visible) {
+			slot->flags |= MDCACHE_ABE_VISIBLE;
+		}
 	}
-	slot->flags &= ~MDCACHE_ABE_BITS;
-	slot->flags |= ctx << MDCACHE_ABE_CTX_SHIFT;
-	if (visible) {
-		slot->flags |= MDCACHE_ABE_VISIBLE;
+	if (mdcache_access_key(conn, slot->sd_variant, 0,
+			       MDCACHE_ACCESS_ABE, &key)) {
+		mdcache_access_store(&key, visible ? FILE_READ_DATA : 0);
 	}
 }
 
