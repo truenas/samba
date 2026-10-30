@@ -45,6 +45,7 @@
 */
 
 #include "includes.h"
+#include "system/filesys.h"
 #include "torture/torture.h"
 #include "torture/local/proto.h"
 
@@ -1194,6 +1195,418 @@ static bool test_libzfs_lookup_stability(struct torture_context *tctx)
 	return true;
 }
 
+/*
+ * Snapshot listing. The snapshots are taken and destroyed in-process
+ * through smb_zfs_snapshot() and smb_zfs_delete_snapshots().
+ */
+static bool tn_snap_take(const struct zfs_dataset *zds, const char *name)
+{
+	return smb_zfs_snapshot(zds->mnt_id, name, false) == 0;
+}
+
+/* destroying a snapshot that does not exist is not an error in ZFS */
+static bool tn_snap_destroy(const struct zfs_dataset *zds, const char *name)
+{
+	struct snapshot_list l = { .num_entries = 1 };
+	struct snapshot_entry e = { 0 };
+
+	strlcpy(l.dataset_name, zds->dataset_name, sizeof(l.dataset_name));
+	strlcpy(e.name, name, sizeof(e.name));
+	l.entries = &e;
+	return smb_zfs_delete_snapshots(&l) == 0;
+}
+
+static const struct snapshot_entry *tn_snap_find(
+	const struct snapshot_list *l, const char *name)
+{
+	const struct snapshot_entry *e = NULL;
+
+	for (e = l->entries; e != NULL; e = e->next) {
+		if (strcmp(e->name, name) == 0) {
+			return e;
+		}
+	}
+	return NULL;
+}
+
+/* whether ds@snap is mounted, from the mount table */
+static bool tn_snap_mounted(const char *ds, const char *snap)
+{
+	char want[ZFSDS_NAMELEN * 2 + 2];
+	char line[PATH_MAX * 2];
+	FILE *f = NULL;
+	bool found = false;
+
+	snprintf(want, sizeof(want), "%s@%s ", ds, snap);
+	f = fopen("/proc/self/mounts", "r");
+	if (f == NULL) {
+		return false;
+	}
+	while (fgets(line, sizeof(line), f) != NULL) {
+		if (strncmp(line, want, strlen(want)) == 0) {
+			found = true;
+			break;
+		}
+	}
+	fclose(f);
+	return found;
+}
+
+/*
+ * smb_zfs_list_snapshots() lists the snapshots of a dataset newest first,
+ * with the creation time ZFS reports and the @GMT- label of it, applies the
+ * inclusion and exclusion patterns, orders snapshots taken in one second
+ * by name, and mounts none of them.
+ */
+static bool test_libzfs_snapshot_list(struct torture_context *tctx)
+{
+	const char *ds = tn_mount_setting(tctx, "tn_mount_ds");
+	const char *mp = tn_mount_setting(tctx, "tn_mount_mp");
+	const char *base_snap = tn_mount_setting(tctx, "tn_mount_snap_name");
+	const char *names[] = { "tn_sl_a", "tn_sl_b", "tn_sl_c", "tn_sl_d" };
+	/* newest first: c and d share a second and sort by name */
+	const char *order[] = { "tn_sl_c", "tn_sl_d", "tn_sl_b", "tn_sl_a" };
+	char *inclusions[] = { discard_const_p(char, "tn_sl_*"), NULL };
+	char *exclusions[] = { discard_const_p(char, "tn_sl_a"), NULL };
+	struct snap_filter filter = { .inclusions = inclusions };
+	const struct zfs_dataset *zds = NULL;
+	struct snapshot_list *l = NULL;
+	const struct snapshot_entry *e = NULL;
+	time_t before[4], after[4];
+	bool ret = true;
+	size_t i;
+	int attempt;
+
+	if ((ds == NULL) || (mp == NULL) || (base_snap == NULL)) {
+		return tn_skip_or_fail(tctx,
+			"no tn_mount_ds/tn_mount_mp/tn_mount_snap_name "
+			"configured");
+	}
+	if (geteuid() != 0) {
+		return tn_skip_or_fail(tctx, "not root");
+	}
+	torture_assert_int_equal(tctx, conn_zfs_init(mp, &zds), 0,
+				 "conn_zfs_init");
+	torture_assert(tctx, zds != NULL, "dataset resolved");
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		tn_snap_destroy(zds, names[i]);
+	}
+
+	/* a second apart, so that a, b and (c, d) have creation times of
+	 * their own */
+	before[0] = time(NULL);
+	torture_assert_goto(tctx, tn_snap_take(zds, "tn_sl_a"), ret, done,
+			    "snapshot a");
+	after[0] = time(NULL);
+	sleep(1);
+	before[1] = time(NULL);
+	torture_assert_goto(tctx, tn_snap_take(zds, "tn_sl_b"), ret, done,
+			    "snapshot b");
+	after[1] = time(NULL);
+	sleep(1);
+
+	/*
+	 * c and d in one second: start on a second boundary and take both
+	 * at once. A slow transaction sync can still push d into the next
+	 * second, so try a few times.
+	 */
+	for (attempt = 0; attempt < 3; attempt++) {
+		time_t t = time(NULL);
+		const struct snapshot_entry *c = NULL;
+		const struct snapshot_entry *d = NULL;
+
+		while (time(NULL) == t) {
+			usleep(10000);
+		}
+		before[2] = before[3] = time(NULL);
+		torture_assert_goto(tctx, tn_snap_take(zds, "tn_sl_c") &&
+				    tn_snap_take(zds, "tn_sl_d"),
+				    ret, done, "snapshots c and d");
+		after[2] = after[3] = time(NULL);
+
+		l = smb_zfs_list_snapshots(tctx, zds->mnt_id, &filter);
+		torture_assert_goto(tctx, l != NULL, ret, done, "list");
+		c = tn_snap_find(l, "tn_sl_c");
+		d = tn_snap_find(l, "tn_sl_d");
+		torture_assert_goto(tctx, (c != NULL) && (d != NULL),
+				    ret, done, "c and d listed");
+		if (c->cr_time == d->cr_time) {
+			break;
+		}
+		torture_comment(tctx, "c and d fell in two seconds, again\n");
+		TALLOC_FREE(l);
+		tn_snap_destroy(zds, "tn_sl_c");
+		tn_snap_destroy(zds, "tn_sl_d");
+		sleep(1);
+	}
+	torture_assert_goto(tctx, l != NULL, ret, done,
+			    "c and d in one second");
+
+	torture_assert_int_equal_goto(tctx, l->num_entries, ARRAY_SIZE(order),
+				      ret, done, "included snapshots");
+	torture_assert_u64_equal_goto(tctx, l->mnt_id, zds->mnt_id, ret, done,
+				      "mount ID of the list");
+	torture_assert_str_equal_goto(tctx, l->dataset_name, ds, ret, done,
+				      "dataset name");
+	torture_assert_str_equal_goto(tctx, l->mountpoint, mp, ret, done,
+				      "mountpoint");
+
+	for (i = 0, e = l->entries; i < ARRAY_SIZE(order);
+	     i++, e = e->next) {
+		char label[SMBGMT_NAMELEN];
+		size_t k = (order[i][6] - 'a');	/* index into names[] */
+		NTTIME nt;
+		struct tm tm;
+
+		torture_assert_goto(tctx, e != NULL, ret, done, "entry");
+		torture_assert_str_equal_goto(tctx, e->name, order[i],
+					      ret, done, "newest first");
+		torture_assert_goto(tctx,
+				    (e->cr_time >= before[k]) &&
+				    (e->cr_time <= after[k]),
+				    ret, done,
+				    "creation time within the snapshot call");
+		unix_to_nt_time(&nt, e->cr_time);
+		torture_assert_u64_equal_goto(tctx, e->nt_time, nt, ret, done,
+					      "creation as NTTIME");
+		gmtime_r(&e->cr_time, &tm);
+		strftime(label, sizeof(label), "@GMT-%Y.%m.%d-%H.%M.%S", &tm);
+		torture_assert_str_equal_goto(tctx, e->label, label, ret, done,
+					      "@GMT- label");
+	}
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		torture_assert_goto(tctx, !tn_snap_mounted(ds, names[i]),
+				    ret, done,
+				    "listing mounted no snapshot");
+	}
+	TALLOC_FREE(l);
+
+	filter.exclusions = exclusions;
+	l = smb_zfs_list_snapshots(tctx, zds->mnt_id, &filter);
+	torture_assert_goto(tctx, l != NULL, ret, done, "list (excluded)");
+	torture_assert_int_equal_goto(tctx, l->num_entries,
+				      ARRAY_SIZE(order) - 1, ret, done,
+				      "exclusion applied");
+	torture_assert_goto(tctx, tn_snap_find(l, "tn_sl_a") == NULL,
+			    ret, done, "excluded snapshot absent");
+	TALLOC_FREE(l);
+
+	l = smb_zfs_list_snapshots(tctx, zds->mnt_id, NULL);
+	torture_assert_goto(tctx, l != NULL, ret, done, "list (all)");
+	torture_assert_goto(tctx, l->num_entries >= ARRAY_SIZE(names) + 1,
+			    ret, done, "all snapshots");
+	torture_assert_goto(tctx, tn_snap_find(l, base_snap) != NULL,
+			    ret, done, "provisioned snapshot listed");
+	for (e = l->entries; (e != NULL) && (e->next != NULL); e = e->next) {
+		torture_assert_goto(tctx, e->cr_time >= e->next->cr_time,
+				    ret, done, "sorted newest first");
+	}
+
+done:
+	TALLOC_FREE(l);
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		tn_snap_destroy(zds, names[i]);
+	}
+	return ret;
+}
+
+/*
+ * smb_zfs_snapshot_list_current() tells a cached list from a stale one:
+ * a snapshot create or destroy makes a list out of date, and a write to
+ * the dataset does not.
+ */
+static bool test_libzfs_snapshot_list_current(struct torture_context *tctx)
+{
+	const char *ds = tn_mount_setting(tctx, "tn_mount_ds");
+	const char *mp = tn_mount_setting(tctx, "tn_mount_mp");
+	const struct zfs_dataset *zds = NULL;
+	struct snapshot_list *l = NULL;
+	char path[PATH_MAX];
+	bool ret = true;
+	int fd;
+
+	if ((ds == NULL) || (mp == NULL)) {
+		return tn_skip_or_fail(tctx,
+			"no tn_mount_ds/tn_mount_mp configured");
+	}
+	if (geteuid() != 0) {
+		return tn_skip_or_fail(tctx, "not root");
+	}
+	torture_assert_int_equal(tctx, conn_zfs_init(mp, &zds), 0,
+				 "conn_zfs_init");
+	torture_assert(tctx, zds != NULL, "dataset resolved");
+	tn_snap_destroy(zds, "tn_slc");
+
+	l = smb_zfs_list_snapshots(tctx, zds->mnt_id, NULL);
+	torture_assert_goto(tctx, l != NULL, ret, done, "list");
+	torture_assert_goto(tctx, smb_zfs_snapshot_list_current(l),
+			    ret, done, "fresh list is current");
+
+	snprintf(path, sizeof(path), "%s/tn_slc_file", mp);
+	fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+	torture_assert_goto(tctx, fd != -1, ret, done, "create file");
+	torture_assert_goto(tctx, write(fd, "data", 4) == 4, ret, done,
+			    "write file");
+	fsync(fd);
+	close(fd);
+	unlink(path);
+	torture_assert_goto(tctx, smb_zfs_snapshot_list_current(l),
+			    ret, done, "a write keeps the list current");
+
+	torture_assert_goto(tctx, tn_snap_take(zds, "tn_slc"), ret, done,
+			    "snapshot");
+	torture_assert_goto(tctx, !smb_zfs_snapshot_list_current(l),
+			    ret, done, "snapshot create makes it stale");
+	TALLOC_FREE(l);
+	l = smb_zfs_list_snapshots(tctx, zds->mnt_id, NULL);
+	torture_assert_goto(tctx, l != NULL, ret, done, "list again");
+	torture_assert_goto(tctx, smb_zfs_snapshot_list_current(l),
+			    ret, done, "new list is current");
+	torture_assert_goto(tctx, tn_snap_find(l, "tn_slc") != NULL,
+			    ret, done, "new snapshot listed");
+
+	torture_assert_goto(tctx, tn_snap_destroy(zds, "tn_slc"), ret, done,
+			    "destroy");
+	torture_assert_goto(tctx, !smb_zfs_snapshot_list_current(l),
+			    ret, done, "snapshot destroy makes it stale");
+	TALLOC_FREE(l);
+	l = smb_zfs_list_snapshots(tctx, zds->mnt_id, NULL);
+	torture_assert_goto(tctx, l != NULL, ret, done, "list after destroy");
+	torture_assert_goto(tctx, tn_snap_find(l, "tn_slc") == NULL,
+			    ret, done, "destroyed snapshot gone");
+
+done:
+	TALLOC_FREE(l);
+	tn_snap_destroy(zds, "tn_slc");
+	return ret;
+}
+
+/*
+ * The mountpoint smb_libzfs keeps for a dataset is the one it had when
+ * first resolved. With a directory above it renamed, that path is the
+ * user's to fill: smb_zfs_open_snapdir() and the listing must refuse a
+ * symlink there and a tree of ordinary directories named .zfs/snapshot,
+ * and a list read before must no longer pass as current.
+ * tn_mount_nest_mp is a dataset mounted below a directory that is not a
+ * mountpoint (its parent dataset has canmount=off).
+ */
+static bool test_libzfs_snapdir_stale_mountpoint(struct torture_context *tctx)
+{
+	const char *mp = tn_mount_setting(tctx, "tn_mount_nest_mp");
+	const char *snap = "tn_sd_stale";
+	const struct zfs_dataset *zds = NULL;
+	struct snapshot_list *l = NULL;
+	struct snapshot_list *l2 = NULL;
+	char parent[PATH_MAX];
+	char moved[PATH_MAX];
+	char fake[PATH_MAX];
+	char *slash = NULL;
+	bool renamed = false;
+	bool linked = false;
+	bool ret = true;
+	int fd;
+
+	if (mp == NULL) {
+		return tn_skip_or_fail(tctx, "no tn_mount_nest_mp configured");
+	}
+	if (geteuid() != 0) {
+		return tn_skip_or_fail(tctx, "not root");
+	}
+	strlcpy(parent, mp, sizeof(parent));
+	slash = strrchr(parent, '/');
+	torture_assert(tctx, (slash != NULL) && (slash != parent),
+		       "tn_mount_nest_mp has a parent directory");
+	*slash = '\0';
+	snprintf(moved, sizeof(moved), "%s_moved", parent);
+	snprintf(fake, sizeof(fake), "%s/.zfs/snapshot/%s", mp, snap);
+
+	torture_assert_int_equal(tctx, conn_zfs_init(mp, &zds), 0,
+				 "conn_zfs_init");
+	torture_assert(tctx, zds != NULL, "dataset resolved");
+	tn_snap_destroy(zds, snap);
+	torture_assert(tctx, tn_snap_take(zds, snap), "snapshot");
+
+	fd = smb_zfs_open_snapdir(zds->mountpoint, zds->mnt_id);
+	torture_assert_goto(tctx, fd != -1, ret, done,
+			    "snapshot directory of the dataset opens");
+	close(fd);
+	fd = smb_zfs_open_snapdir(zds->mountpoint, zds->mnt_id + 1);
+	torture_assert_goto(tctx, (fd == -1) && (errno == ESTALE), ret, done,
+			    "snapshot directory of another mount ID refused");
+	l = smb_zfs_list_snapshots(tctx, zds->mnt_id, NULL);
+	torture_assert_goto(tctx, (l != NULL) && (tn_snap_find(l, snap) != NULL),
+			    ret, done, "list");
+	torture_assert_goto(tctx, smb_zfs_snapshot_list_current(l), ret, done,
+			    "list current");
+
+	/* the dataset moves along with the directory above it */
+	torture_assert_goto(tctx, rename(parent, moved) == 0, ret, done,
+			    "rename the directory above the mountpoint");
+	renamed = true;
+
+	/* a symlink where the directory was */
+	torture_assert_goto(tctx, symlink(moved, parent) == 0, ret, done,
+			    "symlink");
+	linked = true;
+	fd = smb_zfs_open_snapdir(zds->mountpoint, zds->mnt_id);
+	torture_assert_goto(tctx, fd == -1, ret, done,
+			    "snapshot directory through a symlink refused");
+	l2 = smb_zfs_list_snapshots(tctx, zds->mnt_id, NULL);
+	torture_assert_goto(tctx, l2 == NULL, ret, done,
+			    "list through a symlink refused");
+	torture_assert_goto(tctx, unlink(parent) == 0, ret, done, "unlink");
+	linked = false;
+
+	/* ordinary directories where the directory was */
+	torture_assert_goto(tctx,
+			    (mkdir(parent, 0755) == 0) &&
+			    (mkdir(mp, 0755) == 0) &&
+			    (snprintf(fake, sizeof(fake), "%s/.zfs", mp) > 0) &&
+			    (mkdir(fake, 0755) == 0) &&
+			    (snprintf(fake, sizeof(fake), "%s/.zfs/snapshot",
+				      mp) > 0) &&
+			    (mkdir(fake, 0755) == 0) &&
+			    (snprintf(fake, sizeof(fake), "%s/.zfs/snapshot/%s",
+				      mp, snap) > 0) &&
+			    (mkdir(fake, 0755) == 0),
+			    ret, done, "fake snapshot directory");
+	fd = smb_zfs_open_snapdir(zds->mountpoint, zds->mnt_id);
+	torture_assert_goto(tctx, (fd == -1) && (errno == ESTALE), ret, done,
+			    "fake snapshot directory refused");
+	l2 = smb_zfs_list_snapshots(tctx, zds->mnt_id, NULL);
+	torture_assert_goto(tctx, (l2 == NULL) && (errno == ESTALE), ret, done,
+			    "list of the fake snapshot directory refused");
+	torture_assert_goto(tctx, !smb_zfs_snapshot_list_current(l), ret, done,
+			    "fake snapshot directory is not current");
+
+done:
+	TALLOC_FREE(l);
+	TALLOC_FREE(l2);
+	if (linked) {
+		unlink(parent);
+	}
+	if (renamed) {
+		/* deepest first; any that do not exist are not an error */
+		snprintf(fake, sizeof(fake), "%s/.zfs/snapshot/%s", mp, snap);
+		rmdir(fake);
+		snprintf(fake, sizeof(fake), "%s/.zfs/snapshot", mp);
+		rmdir(fake);
+		snprintf(fake, sizeof(fake), "%s/.zfs", mp);
+		rmdir(fake);
+		rmdir(mp);
+		rmdir(parent);
+		if (rename(moved, parent) != 0) {
+			torture_comment(tctx, "rename %s back failed: %s\n",
+					moved, strerror(errno));
+			ret = false;
+		}
+	}
+	tn_snap_destroy(zds, snap);
+	return ret;
+}
+
 struct torture_suite *torture_local_smb_libzfs(TALLOC_CTX *mem_ctx)
 {
 	struct torture_suite *suite = NULL;
@@ -1222,6 +1635,12 @@ struct torture_suite *torture_local_smb_libzfs(TALLOC_CTX *mem_ctx)
 				      test_libzfs_space_in_name);
 	torture_suite_add_simple_test(suite, "lookup_stability",
 				      test_libzfs_lookup_stability);
+	torture_suite_add_simple_test(suite, "snapshot_list",
+				      test_libzfs_snapshot_list);
+	torture_suite_add_simple_test(suite, "snapshot_list_current",
+				      test_libzfs_snapshot_list_current);
+	torture_suite_add_simple_test(suite, "snapdir_stale_mountpoint",
+				      test_libzfs_snapdir_stale_mountpoint);
 
 	suite->description = talloc_strdup(suite,
 		"smb_libzfs mount ID -> ZFS dataset resolution tests");
