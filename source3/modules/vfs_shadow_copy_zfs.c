@@ -30,13 +30,13 @@
 #include "include/ntioctl.h"
 #include "modules/smb_libzfs.h"
 #include "source3/lib/truenas_mount.h"
-#include "../lib/util/memcache.h"
 #include "../lib/util/time.h"
 
-#define GMT_NAME_LEN 24 /* length of a @GMT- name */
 
 #define SHADOW_COPY_ZFS_SNAP_DIR ".zfs/snapshot"
 #define MAX_SNAPSHOT_COUNT 512
+/* snapshot lists kept per connection, one per dataset */
+#define MAX_CACHED_LISTS 16
 
 /*
  * This module does the following:
@@ -56,161 +56,292 @@ static int vfs_shadow_copy_zfs_debug_level = DBGC_VFS;
 
 struct shadow_copy_zfs_config;
 
-struct snapshot_data {
-	char mountpoint[PATH_MAX];
-	char shadow_cp[PATH_MAX];
-	enum casesensitivity sens;
-	struct snapshot_entry snap;
+/*
+ * A pathref fd (O_PATH) does not keep the automount of a ZFS snapshot from
+ * expiring, so every file open in a snapshot holds a reference on an
+ * O_DIRECTORY open of the root of the snapshot. The last reference closes
+ * it, which lets the snapshot unmount and be destroyed.
+ *
+ * The pin is also what every access to a snapshot is checked against. It
+ * is opened from the verified .zfs/snapshot directory of the dataset
+ * (smb_zfs_open_snapdir()), so its fd is the root of that snapshot and its
+ * device that of the snapshot mount, whatever the path of the dataset
+ * names today.
+ *
+ * A snapshot renamed while pinned leaves its old name to a new snapshot,
+ * so a pin is reused only for the same snapshot time, and the pins of a
+ * dataset leave the lookup list whenever its snapshot list is read again,
+ * staying only for the references they have.
+ */
+struct snapdir_pin {
+	struct snapdir_pin *prev, *next;
+	struct shadow_copy_zfs_config *config;
+	uint64_t mnt_id;	/* of the dataset */
+	char *name;		/* of the snapshot */
+	NTTIME twrp;		/* the time of the snapshot, as in a name */
+	int fd;			/* the root of the snapshot */
+	dev_t dev;		/* of the snapshot mount */
+	int refcnt;
+	bool listed;		/* in config->pins */
 };
 
-/*
- * Pathref fds (O_PATH opens) are insufficient to maintain the ZFS snapdir
- * temparary mountpoint. This means that we keep a per-snapshot refcounted
- * open of its root to prevent ops from periodically failing. The refcount
- * increases as more files within snapshot are opened and decreases as part
- * of FSP destructor for files in snapdir. When refcnt hits zero the file
- * is closed, but the snapdir_open_t is not freed. These are allocated under
- * the module's VFS handle private data and freed during session teardown, and
- * are stored as a linked-list `opens` in shadow_copy_zfs_config struct.
- */
-typedef struct open_snapdir {
-	struct snapshot_data data;
-	int mp_fd; // O_DIRECTORY open for mountpoint as root.
-	int refcnt;
-	struct shadow_copy_zfs_config *config;
-	struct open_snapdir *next, *prev;
-} snapdir_open_t;
+/* Where a name with a timewarp token is, from shadow_copy_zfs_convert(). */
+struct snap_target {
+	const char *mountpoint;	/* of the dataset */
+	uint64_t mnt_id;	/* of the dataset */
+	const char *name;	/* of the snapshot */
+	NTTIME twrp;		/* the time of the snapshot, as in a name */
+	const char *rel;	/* below the root of the snapshot; "" for it */
+};
+
+struct cached_snaps {
+	struct snapshot_list *snaps;
+	struct cached_snaps *prev, *next;
+};
 
 struct shadow_copy_zfs_config {
 	const struct zfs_dataset *ds;
 	bool snapshot_share;	/* share root is inside a snapshot */
-	struct memcache		*zcache;
+	struct cached_snaps	*cache;	/* most recently used first */
+	size_t			ncached;
 
-	int			timedelta;
 	bool			no_dataset_traversal;
+	bool			ignore_empty_snaps;
 	/* Snapshot parameters */
 	struct snap_filter	*filter;
-	struct snapshot_list 	*snapshots;
-	struct snapshot_data	*shadow_connectpath;
 
-	snapdir_open_t		*opens;
+	struct snapdir_pin	*pins;
 };
 
-typedef struct shadow_copy_fsp_ext {
-	struct snapshot_data data;
-	void *fsp_name_ptr;
-	struct files_struct *fsp;
-	vfs_handle_struct *handle;
-	struct open_snapdir *open;
-	struct shadow_copy_zfs_config *config;
-} shadow_fsp_ext_t;
+/* the extension of an fsp opened in a snapshot */
+struct shadow_fsp_ext {
+	struct snapdir_pin *pin;
+};
 
-#define cp_snapshot_data(in, out) memcpy(out, in, sizeof(struct snapshot_data))
-#define SHADOW_ZFS_INCREF(x) do { \
-	SMB_ASSERT(x->refcnt >= 0); \
-	x->refcnt++;\
-} while (0)
-#define SHADOW_ZFS_DECREF(x) do { \
-	SMB_ASSERT(x->refcnt > 0); \
-	x->refcnt--;\
-} while (0)
-
-static snapdir_open_t *check_for_open(snapdir_open_t *opens, const char *mp)
+/*
+ * smb_libzfs reports the path of a dataset gone stale -- a directory above
+ * its mountpoint renamed since it was resolved -- as ESTALE, which smbd
+ * has no status for. To the client, what the name meant is not there.
+ */
+static int shadow_copy_zfs_errno(int err)
 {
-	snapdir_open_t *entry = NULL;
-	if (opens == NULL) {
-		return NULL;
-	}
-
-	/*
-	 * check linked list of opens for this mountpoint
-	 * promote result to head of list if it isn't already
-	 * there.
-	 */
-	for (entry = opens; entry; entry = entry->next) {
-		if (strcmp(entry->data.shadow_cp, mp) == 0) {
-			if (entry != opens) {
-				DLIST_PROMOTE(opens, entry);
-			}
-			break;
-		}
-	}
-
-	return entry;
+	return (err == ESTALE) ? ENOENT : err;
 }
 
-static int snapdir_open_destructor(snapdir_open_t *entry)
+/*
+ * Open the root of snapshot name of the dataset mounted at mountpoint, as
+ * root: the user may not be able to open it. A single component below the
+ * verified snapshot directory, and the root of a mount of its own.
+ */
+static int snapdir_root_open(const struct snap_target *tgt, dev_t *pdev)
 {
-	if (entry->refcnt > 0) {
-		DBG_ERR("%s: snapdir open is still referenced by [%d] open "
-			"files. %zu bytes leaked.\n",
-			entry->data.mountpoint,
-			entry->refcnt,
-			sizeof(snapdir_open_t));
+	struct statx stx;
+	int dfd, fd = -1, saved_errno;
+
+	become_root();
+	dfd = smb_zfs_open_snapdir(tgt->mountpoint, tgt->mnt_id);
+	if (dfd != -1) {
+		fd = openat(dfd, tgt->name,
+			    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		saved_errno = errno;
+		close(dfd);
+	} else {
+		saved_errno = errno;
+	}
+	unbecome_root();
+	if (fd == -1) {
+		errno = shadow_copy_zfs_errno(saved_errno);
+		/* smb_libzfs logs a snapshot directory it cannot open */
+		if (dfd != -1) {
+			DBG_ERR("%s@%s: failed to open the snapshot: %s\n",
+				tgt->mountpoint, tgt->name, strerror(errno));
+		}
 		return -1;
 	}
 
-	return 0;
+	if (statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &stx) != 0) {
+		saved_errno = errno;
+		close(fd);
+		errno = saved_errno;
+		return -1;
+	}
+	if ((stx.stx_attributes_mask & STATX_ATTR_MOUNT_ROOT) &&
+	    !(stx.stx_attributes & STATX_ATTR_MOUNT_ROOT)) {
+		DBG_ERR("%s@%s: the snapshot is not mounted\n",
+			tgt->mountpoint, tgt->name);
+		close(fd);
+		errno = ENOENT;
+		return -1;
+	}
+	*pdev = makedev(stx.stx_dev_major, stx.stx_dev_minor);
+	return fd;
 }
 
-static void destroy_fsp_ext_snapshot_data(void *p_data)
+static struct snapdir_pin *snapdir_pin_get(struct shadow_copy_zfs_config *config,
+					   const struct snap_target *tgt)
 {
-	shadow_fsp_ext_t *data = (shadow_fsp_ext_t *)p_data;
-	if (data->open) {
-		SHADOW_ZFS_DECREF(data->open);
-		if (data->open->refcnt == 0) {
-			close(data->open->mp_fd);
-			data->open->mp_fd = -1;
+	struct snapdir_pin *pin = NULL;
+	dev_t dev;
+	int fd;
+
+	for (pin = config->pins; pin != NULL; pin = pin->next) {
+		if ((pin->mnt_id == tgt->mnt_id) &&
+		    (pin->twrp == tgt->twrp) &&
+		    (strcmp(pin->name, tgt->name) == 0)) {
+			pin->refcnt++;
+			return pin;
 		}
+	}
+
+	fd = snapdir_root_open(tgt, &dev);
+	if (fd == -1) {
+		return NULL;
+	}
+
+	pin = talloc_zero(config, struct snapdir_pin);
+	if (pin == NULL) {
+		close(fd);
+		errno = ENOMEM;
+		return NULL;
+	}
+	pin->name = talloc_strdup(pin, tgt->name);
+	if (pin->name == NULL) {
+		close(fd);
+		TALLOC_FREE(pin);
+		errno = ENOMEM;
+		return NULL;
+	}
+	pin->config = config;
+	pin->mnt_id = tgt->mnt_id;
+	pin->twrp = tgt->twrp;
+	pin->fd = fd;
+	pin->dev = dev;
+	pin->refcnt = 1;
+	pin->listed = true;
+	DLIST_ADD(config->pins, pin);
+	return pin;
+}
+
+static void snapdir_pin_put(struct snapdir_pin *pin)
+{
+	SMB_ASSERT(pin->refcnt > 0);
+	if (--pin->refcnt > 0) {
+		return;
+	}
+	if (pin->listed) {
+		DLIST_REMOVE(pin->config->pins, pin);
+	}
+	close(pin->fd);
+	TALLOC_FREE(pin);
+}
+
+/* Take the pins of the dataset mnt_id out of the lookup. */
+static void snapdir_pins_unlist(struct shadow_copy_zfs_config *config,
+				uint64_t mnt_id)
+{
+	struct snapdir_pin *pin = NULL;
+	struct snapdir_pin *next = NULL;
+
+	for (pin = config->pins; pin != NULL; pin = next) {
+		next = pin->next;
+		if (pin->mnt_id != mnt_id) {
+			continue;
+		}
+		DLIST_REMOVE(config->pins, pin);
+		pin->listed = false;
 	}
 }
 
-static bool open_snapdir(struct shadow_copy_fsp_ext *ext)
+/*
+ * An O_PATH fd on rel in the snapshot of pin, resolved beneath its root
+ * and through no symlink: rel names exactly what it says, inside that
+ * snapshot. With nofollow a symlink at the end is opened itself.
+ */
+static int snapdir_open_beneath(const struct snapdir_pin *pin,
+				const char *rel,
+				bool nofollow)
 {
-	SMB_ASSERT(ext->data.mountpoint[0] != '\0');
-	snapdir_open_t *snapdir= NULL;
+	struct open_how how = {
+		.flags = O_PATH | O_CLOEXEC | (nofollow ? O_NOFOLLOW : 0),
+		.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+	};
 
-	snapdir = check_for_open(ext->config->opens, ext->data.shadow_cp);
-	if ((snapdir != NULL) && (snapdir->refcnt)) {
-		goto out;
-	} else if (snapdir == NULL) {
-		snapdir = talloc_zero(ext->config, snapdir_open_t);
-		if (snapdir == NULL) {
-			return false;
-		}
-		snapdir->config = ext->config;
-		snapdir->mp_fd = -1;
-		cp_snapshot_data(&ext->data, &snapdir->data);
-		DLIST_ADD(snapdir->config->opens, snapdir);
-		talloc_set_destructor(snapdir, snapdir_open_destructor);
+	return openat2(pin->fd, (rel[0] == '\0') ? "." : rel, &how,
+		       sizeof(how));
+}
+
+static bool fd_on_dev(int fd, dev_t dev)
+{
+	struct stat st;
+
+	return (fstat(fd, &st) == 0) && (st.st_dev == dev);
+}
+
+/* Whether st, from a call by path, is the object fd was opened on. */
+static bool stat_is_fd(const SMB_STRUCT_STAT *st, int fd)
+{
+	struct stat fst;
+
+	return (fstat(fd, &fst) == 0) &&
+	       (st->st_ex_dev == fst.st_dev) &&
+	       (st->st_ex_ino == fst.st_ino);
+}
+
+/*
+ * How a name is opened in a snapshot. Read-only, whatever the client asked
+ * for. No symlinks, whatever smbd asked for: not inside the snapshot,
+ * where smbd relies on RESOLVE_NO_SYMLINKS to see them, nor in the path
+ * of the dataset, which is the one of the mount table and has none. With
+ * O_PATH and O_NOFOLLOW a symlink at the end is still opened itself, as
+ * smbd expects. RESOLVE_NO_XDEV goes: the path leads into the snapshot
+ * mount by design.
+ */
+static void shadow_copy_zfs_snap_how(struct vfs_open_how *how)
+{
+	how->flags &= ~(O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_EXCL |
+			O_APPEND);
+	how->resolve &= ~VFS_OPEN_HOW_RESOLVE_NO_XDEV;
+	how->resolve |= VFS_OPEN_HOW_RESOLVE_NO_SYMLINKS;
+}
+
+static void shadow_fsp_ext_destroy(void *p_data)
+{
+	struct shadow_fsp_ext *ext = (struct shadow_fsp_ext *)p_data;
+
+	if (ext->pin != NULL) {
+		snapdir_pin_put(ext->pin);
+		ext->pin = NULL;
 	}
+}
 
-	if (snapdir->mp_fd == -1) {
-		/*
-		 * If we fail to open, keep struct around so that we can
-		 * avoid list churn / memory allocations
-		 */
-		become_root();
-		snapdir->mp_fd = open(ext->data.shadow_cp, O_DIRECTORY);
-		unbecome_root();
-		if (snapdir->mp_fd == -1) {
-			DBG_ERR("%s: snapdir open failed: %s\n",
-				snapdir->data.shadow_cp, strerror(errno));
-			return false;
-		}
+/* fsp holds one reference on pin; an fsp opened again drops its old one */
+static bool shadow_fsp_set_pin(vfs_handle_struct *handle,
+			       files_struct *fsp,
+			       struct snapdir_pin *pin)
+{
+	struct shadow_fsp_ext *ext = NULL;
+
+	ext = VFS_ADD_FSP_EXTENSION(handle, fsp, struct shadow_fsp_ext,
+				    shadow_fsp_ext_destroy);
+	if (ext == NULL) {
+		errno = ENOMEM;
+		return false;
 	}
-
-out:
-	ext->open = snapdir;
-	SHADOW_ZFS_INCREF(snapdir);
-	DBG_DEBUG("%s: added reference: %d\n",
-		  snapdir->data.shadow_cp,
-		  snapdir->refcnt);
+	if (ext->pin != NULL) {
+		snapdir_pin_put(ext->pin);
+	}
+	ext->pin = pin;
 	return true;
 }
 
+static bool fsp_in_snapshot(vfs_handle_struct *handle,
+			    const struct files_struct *fsp)
+{
+	return (fsp != NULL) &&
+	       (VFS_FETCH_FSP_EXTENSION(handle, fsp) != NULL);
+}
+
 static const struct zfs_dataset *shadow_path_to_dataset(
-    struct vfs_handle_struct *handle,
     struct shadow_copy_zfs_config *config,
     const char *path)
 {
@@ -291,38 +422,6 @@ static const struct zfs_dataset *shadow_fsp_to_dataset(
 	return NULL;
 }
 
-static struct snapshot_list *get_cached_snapshot(TDB_DATA ds,
-			   struct shadow_copy_zfs_config *config)
-{
-	return (struct snapshot_list *)memcache_lookup_talloc(
-				config->zcache,
-				ZFS_CACHE,
-				data_blob_const(ds.dptr, ds.dsize));
-}
-
-static bool put_cached_snapshot(TDB_DATA key,
-				struct snapshot_list *snaps,
-				struct shadow_copy_zfs_config *config)
-{
-	memcache_add_talloc(config->zcache,
-				ZFS_CACHE,
-				data_blob_const(key.dptr, key.dsize),
-				&snaps);
-	return true;
-}
-
-/*
- * Position of the share root below the dataset mountpoint, e.g. "sub/dir"
- * when a directory inside a dataset is shared rather than the dataset
- * mountpoint itself (most commonly a [homes] share). NULL when the share is
- * rooted at the mountpoint.
- *
- * A share may also be rooted inside a snapshot automount, which is how
- * FSRVP exposes a shadow copy: the connectpath is then
- * <mountpoint>/.zfs/snapshot/<snap>[/<sub>]. That prefix identifies a
- * snapshot rather than a position within the dataset, so it is skipped --
- * previous versions of such a share are the same paths in other snapshots.
- */
 /*
  * Whether the share root itself lies inside a snapshot automount. FSRVP
  * creates such shares to expose a shadow copy; their contents are already
@@ -347,6 +446,18 @@ static bool shadow_copy_zfs_in_snapshot(const char *connectpath,
 	return strncmp(connectpath + mplen + 1, snapdir, strlen(snapdir)) == 0;
 }
 
+/*
+ * Position of the share root below the dataset mountpoint, e.g. "sub/dir"
+ * when a directory inside a dataset is shared rather than the dataset
+ * mountpoint itself (most commonly a [homes] share). NULL when the share is
+ * rooted at the mountpoint.
+ *
+ * A share may also be rooted inside a snapshot automount, which is how
+ * FSRVP exposes a shadow copy: the connectpath is then
+ * <mountpoint>/.zfs/snapshot/<snap>[/<sub>]. That prefix identifies a
+ * snapshot rather than a position within the dataset, so it is skipped --
+ * previous versions of such a share are the same paths in other snapshots.
+ */
 static const char *shadow_copy_zfs_mp_offset(const char *connectpath,
 					     const char *mountpoint)
 {
@@ -383,552 +494,433 @@ static const char *shadow_copy_zfs_mp_offset(const char *connectpath,
 	return offset;
 }
 
-char *get_snapshot_path(TALLOC_CTX *mem_ctx,
-			char *connectpath,
-			char *mountpoint,
-			char *filename,
-			const char *mpoffset,
-			struct snapshot_entry *snap,
-			enum casesensitivity sens)
+/* whether path is prefix, or below it */
+static bool path_is_below(const char *path, const char *prefix,
+			  int (*ncmp)(const char *, const char *, size_t))
 {
-	DBG_DEBUG("connectpath: %s, mountpoint: %s, "
-		  "filename: %s, mpoffset: %s, snapshot: %s\n",
-		  connectpath, mountpoint, filename,
-		  mpoffset, snap->name);
-	char *ret = NULL;
-	char buf[PATH_MAX] = {0};
-	char *tmp_name = buf;
-	char *child_offset = NULL;
-	int (*strcmp_fn)(const char *s1, const char *s2);
-	int (*strncmp_fn)(const char *s1, const char *s2, size_t len);
+	size_t len = strlen(prefix);
 
-	switch(sens) {
+	if ((len == 1) && (prefix[0] == '/')) {
+		return path[0] == '/';
+	}
+	if (ncmp(path, prefix, len) != 0) {
+		return false;
+	}
+	return (path[len] == '\0') || (path[len] == '/');
+}
+
+/*
+ * The path below the root of a snapshot of the dataset mounted at
+ * mountpoint for name, relative to the share root; "" for the root of the
+ * snapshot. With mpoffset the share root is that directory of the dataset,
+ * as for a share at /pool/ds/share of the dataset /pool/ds. Without it the
+ * dataset is mounted at the share root or at a child dataset below it, and
+ * name begins with the path of that child.
+ *
+ * name has no "." or ".." components (see shadow_copy_zfs_convert()), so
+ * the result is always within the share as it was in the snapshot.
+ */
+static char *get_snapshot_relpath(TALLOC_CTX *mem_ctx,
+				  const char *connectpath,
+				  const char *mountpoint,
+				  const char *name,
+				  const char *mpoffset,
+				  enum casesensitivity sens)
+{
+	int (*ncmp)(const char *s1, const char *s2, size_t len) = NULL;
+	const char *rel = name;
+
+	switch (sens) {
 	case SMBZFS_MIXED:
 	case SMBZFS_SENSITIVE:
-		strcmp_fn = strcmp;
-		strncmp_fn = strncmp;
+		ncmp = strncmp;
 		break;
 	case SMBZFS_INSENSITIVE:
-		strcmp_fn = strcasecmp_m;
-		strncmp_fn = strncasecmp_m;
+		ncmp = strncasecmp_m;
 		break;
 	default:
 		smb_panic("Unsupported case sensitivity setting");
 	}
 
-
-	strlcpy(buf, filename, sizeof(buf));
-	if (mpoffset == NULL) {
-		SMB_ASSERT(strcmp_fn(mountpoint, connectpath) >= 0);
-		child_offset = mountpoint + strlen(connectpath);
+	if (mpoffset != NULL) {
+		if (*rel == '\0') {
+			return talloc_strdup(mem_ctx, mpoffset);
+		}
+		return talloc_asprintf(mem_ctx, "%s/%s", mpoffset, rel);
 	}
 
-	if (child_offset && (*child_offset == '/')) {
-		/*
-		 * This is not the same dataset as the one underlying the connectpath.
-		 */
-		child_offset += 1;
-		if (strcmp_fn(child_offset, tmp_name) == 0) {
-			/* The path is a dataset mountpoint. Set last path component
-			 * to NULL so that we later exclude from our returned string.
-			 */
-			*tmp_name = '\0';
-			DBG_DEBUG("file [%s] is a sub-dataset mountpoint\n",
-				  filename);
-		} else {
-			if (strncmp_fn(tmp_name, child_offset, strlen(child_offset)) != 0) {
-				tmp_name = realpath(filename, buf);
-				if (tmp_name == NULL) {
-					DBG_ERR("%s: realpath() for path failed: %s. "
-						"Path does not appear to be within expected "
-						"dataset mountpoint.\n", filename, strerror(errno));
-					return NULL;
-				}
+	if (!path_is_below(mountpoint, connectpath, ncmp)) {
+		DBG_ERR("%s: dataset mountpoint %s is not in the share %s\n",
+			name, mountpoint, connectpath);
+		errno = EINVAL;
+		return NULL;
+	}
+	{
+		const char *child = mountpoint + strlen(connectpath);
+		size_t len;
 
-				if (strncmp_fn(tmp_name, mountpoint, strlen(mountpoint)) == 0) {
-					DBG_INFO("%s: unsupported symbolic link to path within dataset\n",
-						 filename);
-				} else {
-					DBG_ERR("%s: path does not lie within mountpoint: %s\n",
-						tmp_name, mountpoint);
-				}
+		if (*child == '/') {
+			child++;
+		}
+		len = strlen(child);
+		if (len > 0) {
+			if ((ncmp(name, child, len) != 0) ||
+			    ((name[len] != '\0') && (name[len] != '/'))) {
+				DBG_ERR("%s: not within the dataset mounted at "
+					"%s\n", name, mountpoint);
 				errno = EINVAL;
 				return NULL;
 			}
-			tmp_name += strlen(child_offset) + 1;
-			DBG_DEBUG("file [%s] is within sub-dataset [%s] base_name rewritten to [%s]\n",
-				  filename, mountpoint, tmp_name);
+			rel = name + len;
+			if (*rel == '/') {
+				rel++;
+			}
 		}
 	}
-	/*
-	 * A mountpoint offset occurs when a directory inside a dataset is shared
-	 * rather than the actual dataset mountpoint. We will only adjust the path
-	 * the path is not a child dataset.
-	 */
-	if (mpoffset) {
-		if (*filename != '\0') {
-			ret = talloc_asprintf(mem_ctx, "%s/.zfs/snapshot/%s/%s/%s",
-					      mountpoint, snap->name, mpoffset, tmp_name);
-		} else {
-			ret = talloc_asprintf(mem_ctx, "%s/.zfs/snapshot/%s/%s",
-					      mountpoint, snap->name, mpoffset);
-		}
-	}
-	/*
-	 * Path is a dataset mountpoint for child dataset or
-	 * the share's connectpath.
-	 */
-	else if ((*tmp_name == '\0') || (*filename == '\0')) {
-		ret = talloc_asprintf(mem_ctx, "%s/.zfs/snapshot/%s",
-				      mountpoint, snap->name);
-	}
-	/*
-	 * All other cases. If needed, we have adjusted the pointer for
-	 * the filename to make it relative to the snapshot mountpoint
-	 * rather than the share connectpath.
-	 */
-	else {
-		ret = talloc_asprintf(mem_ctx, "%s/.zfs/snapshot/%s/%s",
-				      mountpoint, snap->name, tmp_name);
-	}
-	return ret;
+	return talloc_strdup(mem_ctx, rel);
 }
 
-/**
- * This function will check if snaplist is updated or not. If snaplist
- * is empty then it will create a new list. Each time snaplist is updated
- * the time is recorded. If the snapshot time is greater than the snaplist
- * update time then chances are we are working on an older list. Then discard
- * the old list and fetch a new snaplist. End-users can adjust the timeout
- * period by adjusting the parameter "shadow:snap_timedelta=300"
- *
- * @param[in]	handle		VFS handle struct
- * @param[in]	mem_ctx		talloc context
- * @param[in]	path		full path in which to check snapshots
- * @param[in]	do_update	update existing snapshot list cache
- * @param[out]	snapp		snapshot list
- *
- * @return	true if the list is updated else false
- */
-static bool shadow_copy_zfs_update_snaplist(struct vfs_handle_struct *handle,
-					    TALLOC_CTX *mem_ctx,
-					    const char *path,
-					    files_struct *fsp,
-					    bool do_update,
-					    struct snapshot_list **snapp,
-					    enum casesensitivity *psens)
+/* "<mountpoint>/.zfs/snapshot/<name>[/<rel>]" */
+static char *snapshot_abspath(TALLOC_CTX *mem_ctx,
+			      const char *mountpoint,
+			      const char *snapname,
+			      const char *rel)
 {
-	bool snaplist_updated = false;
-	double seconds = 0.0;
-	time_t snap_time;
-	TDB_DATA key = { .dptr = NULL, .dsize = 0 };
+	const char *mp = (strcmp(mountpoint, "/") == 0) ? "" : mountpoint;
+
+	if (rel[0] == '\0') {
+		return talloc_asprintf(mem_ctx, "%s/" SHADOW_COPY_ZFS_SNAP_DIR
+				       "/%s", mp, snapname);
+	}
+	return talloc_asprintf(mem_ctx, "%s/" SHADOW_COPY_ZFS_SNAP_DIR "/%s/%s",
+			       mp, snapname, rel);
+}
+
+/*
+ * The snapshot list of the dataset of path, or of fsp when it is not NULL.
+ * A cached list is used while the .zfs/snapshot directory of the dataset is
+ * unchanged, and read again otherwise. The list belongs to the cache: it is
+ * valid until the next call.
+ */
+static struct snapshot_list *shadow_copy_zfs_get_snaplist(
+	struct vfs_handle_struct *handle,
+	const char *path,
+	files_struct *fsp,
+	enum casesensitivity *psens)
+{
 	struct shadow_copy_zfs_config *config = NULL;
-	struct snapshot_list *cached_snaps = NULL;
+	struct cached_snaps *c = NULL;
+	struct snapshot_list *snaps = NULL;
 	const struct zfs_dataset *ds = NULL;
 	const struct zfs_dataset_prop *props = NULL;
 
-	time(&snap_time);
 	SMB_VFS_HANDLE_GET_DATA(handle, config, struct shadow_copy_zfs_config,
 				return NULL);
 	if (fsp == NULL) {
-		ds = shadow_path_to_dataset(handle, config, path);
+		ds = shadow_path_to_dataset(config, path);
 	} else {
 		ds = shadow_fsp_to_dataset(handle, config, fsp);
 	}
 	if (ds == NULL) {
-		*snapp = NULL;
-		return false;
+		return NULL;
 	}
 	props = smb_zfs_dataset_props(ds);
 	if ((props == NULL) || (props->snapdir != SMBZFS_SNAPDIR_HIDDEN)) {
-		*snapp = NULL;
-		return false;
-	}
-	key.dptr = discard_const_p(uint8_t, ds->dataset_name);
-	key.dsize = strlen(ds->dataset_name);
-	cached_snaps = get_cached_snapshot(key, config);
-	if (cached_snaps != NULL) {
-		seconds = difftime(snap_time, cached_snaps->timestamp);
-	}
-	/*
-	 * If we have retrieved snapshots for this dataset before
-	 * perform optimized lookup based on createtxg of last snapshot
-	 * we've retrieved
-	 */
-	if ((seconds && seconds > config->timedelta) &&
-	     cached_snaps->num_entries > 0) {
-		bool ok;
-
-		DBG_INFO("refreshing stored snaplist - current timedelta: %f "
-			 "permitted timedelta: %d, dataset: %s\n",
-			 seconds, config->timedelta, ds->dataset_name);
-
-		ok = update_snapshot_list(ds->mnt_id, cached_snaps,
-					  config->filter);
-		if (!ok) {
-			DBG_ERR("%s: Failed to update snapshot list: %s\n",
-				cached_snaps->mountpoint, strerror(errno));
-			*snapp = NULL;
-			return false;
-		}
-		*snapp = cached_snaps;
-		snaplist_updated = true;
-	}
-	/*
-	 * We haven't gotten any snapshots before for this dataset.
-	 * Try from scratch.
-	 */
-	else if (cached_snaps == NULL) {
-		struct snapshot_list *snapshots = NULL;
-		snapshots = smb_zfs_list_snapshots(mem_ctx, ds->mnt_id,
-						   config->filter);
-		if (snapshots != NULL) {
-			snaplist_updated = put_cached_snapshot(key, snapshots,
-							       config);
-		} else {
-			DBG_ERR("Failed to get shadow copy data for %s\n", path);
-		}
-		*snapp = snapshots;
-	}
-	/*
-	 * We have snapshots, but timedelta hasn't been exceeded so use
-	 * cached values.
-	 */
-	else {
-		*snapp = cached_snaps;
+		return NULL;
 	}
 	*psens = ds->properties->casesens;
-	return snaplist_updated;
-}
 
-static bool shadow_copy_zfs_match_name(vfs_handle_struct *handle,
-				       const struct smb_filename *name)
-{
-	if (name->twrp == 0) {
-		return false;
-	}
-
-	if (name->fsp != NULL) {
-		shadow_fsp_ext_t *fsp_ext = NULL;
-		fsp_ext = (shadow_fsp_ext_t *)
-		    VFS_FETCH_FSP_EXTENSION(handle, name->fsp);
-
-		if (fsp_ext) {
-			return false;
-		}
-	}
-
-	return true;
-}
-
-static bool path_in_ctldir(const char *path, bool *is_snapdir)
-{
-	char *p = NULL;
-	struct stat st;
-	char tmp[PATH_MAX];
-	int err;
-
-	p = strstr(path, SHADOW_COPY_ZFS_SNAP_DIR);
-	if (p == NULL) {
-		*is_snapdir = false;
-		return true;
-	}
-
-	strlcpy(tmp, path, sizeof(tmp));
-	tmp[PTR_DIFF(p + strlen(".zfs"), path)] = '\0';
-	err = stat(tmp, &st);
-	if (err) {
-		DBG_ERR("%s: stat() failed: %s\n", tmp, strerror(errno));
-		return false;
-	}
-
-	*is_snapdir = inode_is_ctldir(st.st_ino);
-	return true;
-}
-
-static void fill_snapshot_from_open_path(const char *path,
-					 struct shadow_copy_zfs_config *config,
-					 struct snapshot_data *data)
-{
-	snapdir_open_t *entry = NULL;
-	char *p = NULL;
-	char *snap = NULL;
-	char tmp[PATH_MAX];
-
-	/*
-	 * Reduce the full path to just the snapshot root so we can look up
-	 * an existing O_DIRECTORY open for it.
-	 *
-	 * Examples:
-	 *   /mnt/dozer/.zfs/snapshot/auto-2024-01-01/subdir/file
-	 *     -> /mnt/dozer/.zfs/snapshot/auto-2024-01-01
-	 *
-	 *   /mnt/dozer/.zfs/snapshot/auto-2024-01-01
-	 *     -> /mnt/dozer/.zfs/snapshot/auto-2024-01-01  (unchanged)
-	 */
-	p = strstr(path, SHADOW_COPY_ZFS_SNAP_DIR);
-	SMB_ASSERT(p != NULL);
-
-	snap = strstr(p + strlen(SHADOW_COPY_ZFS_SNAP_DIR), "/");
-
-	/* ZFS ctldir should never be exposed over SMB. */
-	SMB_ASSERT(snap != NULL);
-
-	/* snap now points to the '/' preceding the snapshot name; advance
-	 * past it, then locate the '/' that ends the snapshot name, if any. */
-	snap++;
-	p = strstr(snap, "/");
-
-	strlcpy(tmp, path, sizeof(tmp));
-	if (p != NULL) {
-		tmp[PTR_DIFF(p, path)] = '\0';
-	}
-
-	entry = check_for_open(config->opens, tmp);
-
-	/* There should be an existing O_DIRECTORY open for this path */
-	SMB_ASSERT(entry != NULL);
-
-	cp_snapshot_data(&entry->data, data);
-}
-
-static void resolve_path(vfs_handle_struct *handle,
-			 struct shadow_copy_zfs_config *priv,
-			 const char *name,
-			 char *buf,
-			 size_t bufsz,
-			 struct snapshot_data *data,
-			 bool *is_shadow_path)
-{
-	if (name[0] != '/') {
-		char *scp = NULL;
-		char *cwd = handle->conn->cwd_fsp->fsp_name->base_name;
-
-		if (priv->shadow_connectpath) {
-			scp = priv->shadow_connectpath->shadow_cp;
-		}
-		if (scp && (strncmp(cwd, scp, strlen(scp)) == 0)) {
-			if (data != NULL) {
-				DBG_ERR("copying snapshot data\n");
-				cp_snapshot_data(priv->shadow_connectpath,
-						 data);
-			}
-			*is_shadow_path = true;
-		}
-		if (ISDOT(name) || name[0] == '\0') {
-			strlcpy(buf, cwd, bufsz);
-		}
-		else if (strncmp(name, "./", 2) == 0) {
-			snprintf(buf, bufsz, "%s/%s", cwd, name + 2);
-		}
-		else {
-			snprintf(buf, bufsz, "%s/%s", cwd, name);
-		}
-	}
-	else if (strncmp(handle->conn->connectpath,
-			 name, strlen(handle->conn->connectpath)) == 0) {
-		strlcpy(buf, name, bufsz);
-	}
-	else {
-		snprintf(buf, bufsz, "%s/%s",
-			 handle->conn->connectpath,
-			 name);
-	}
-	if (!(*is_shadow_path)) {
-		if (!path_in_ctldir(buf, is_shadow_path)) {
-			DBG_ERR("%s: could not determine whether path is "
-				"in ZFS snapdir: %s\n", buf, strerror(errno));
-		}
-
-		if (*is_shadow_path) {
-			fill_snapshot_from_open_path(buf, priv, data);
-		}
-	}
-}
-
-static void store_connectpath(vfs_handle_struct *handle,
-			      struct snapshot_data *data)
-{
-	struct shadow_copy_zfs_config *priv = NULL;
-	SMB_VFS_HANDLE_GET_DATA(handle, priv, struct shadow_copy_zfs_config,
-				return);
-
-	TALLOC_FREE(priv->shadow_connectpath);
-	if (data != NULL) {
-		DBG_INFO("shadow connectpath = %s\n", data->shadow_cp);
-		priv->shadow_connectpath = data;
-	}
-}
-
-static bool zfs_lookup_snapshot_list(vfs_handle_struct *handle,
-				     const struct smb_filename *fname_in,
-				     const char *res_fname,
-				     struct snapshot_data *data,
-				     const char *location)
-{
-	char *normalized_fname = NULL;
-	struct snapshot_list *snapshots = NULL;
-	struct snapshot_entry *entry = NULL;
-	enum casesensitivity sens;
-	int err;
-
-	if (fname_in->fsp != NULL) {
-		// Linked FSP may have snapshot data in extension
-		shadow_fsp_ext_t *fsp_ext = NULL;
-		fsp_ext = (shadow_fsp_ext_t *)
-		    VFS_FETCH_FSP_EXTENSION(handle, fname_in->fsp);
-
-		if (fsp_ext) {
-			DBG_ERR("[%s()] using stored snapshot data\n",
-				location);
-			cp_snapshot_data(&fsp_ext->data, data);
-			return true;
-		}
-	}
-
-	normalized_fname = canonicalize_absolute_path(handle->conn, res_fname);
-	if (normalized_fname == NULL) {
-		DBG_ERR("[%s()]: Failed to canonicalize %s\n", location, res_fname);
-		return false;
-	}
-
-	shadow_copy_zfs_update_snaplist(handle, handle->conn, normalized_fname,
-					NULL, false, &snapshots, &sens);
-	if (snapshots == NULL) {
-		DBG_ERR("[%s()]: Failed to get snapshot list for %s\n",
-			location, normalized_fname);
-		TALLOC_FREE(normalized_fname);
-		return false;
-	}
-
-	TALLOC_FREE(normalized_fname);
-
-	for (entry = snapshots->entries; entry; entry = entry->next) {
-		if (fname_in->twrp == entry->nt_time) {
+	for (c = config->cache; c != NULL; c = c->next) {
+		if (c->snaps->mnt_id == ds->mnt_id) {
 			break;
 		}
 	}
-
-	// We want mountpoint populated
-	strlcpy(data->mountpoint, snapshots->mountpoint,
-		sizeof(data->mountpoint));
-
-	if (entry == NULL) {
-		/*
-		 * snapshot of parent dir may not exist if
-		 * it is a different mountpoint.
-		 */
-		if (strcmp(fname_in->base_name, "..") != 0) {
-			DBG_ERR("[%s()]: %s: no snapshot found\n",
-				location, smb_fname_str_dbg(fname_in));
-		} else {
-			DBG_INFO("[%s()]: %s: no snapshot found\n",
-				 location, smb_fname_str_dbg(fname_in));
-		}
-		errno = ENOENT;
-		return false;
+	if ((c != NULL) && smb_zfs_snapshot_list_current(c->snaps)) {
+		DLIST_PROMOTE(config->cache, c);
+		return c->snaps;
 	}
 
-	// shadow connectpath has not been determined yet
-	data->shadow_cp[0] = '\0';
-	data->sens = sens;
-	memcpy(&data->snap, entry, sizeof(struct snapshot_entry));
-	data->snap.next = NULL;
-	data->snap.prev = NULL;
-	return true;
+	snaps = smb_zfs_list_snapshots(config, ds->mnt_id, config->filter);
+	if (snaps == NULL) {
+		/* the cause is logged by smb_libzfs */
+		DBG_INFO("%s: failed to list snapshots: %s\n",
+			 ds->dataset_name, strerror(errno));
+		errno = shadow_copy_zfs_errno(errno);
+		return NULL;
+	}
+	DBG_INFO("%s: read %zu snapshots\n",
+		 ds->dataset_name, snaps->num_entries);
+	snapdir_pins_unlist(config, snaps->mnt_id);
+
+	if (c == NULL) {
+		if (config->ncached == MAX_CACHED_LISTS) {
+			c = DLIST_TAIL(config->cache);
+			DLIST_REMOVE(config->cache, c);
+			TALLOC_FREE(c);
+			config->ncached--;
+		}
+		c = talloc_zero(config, struct cached_snaps);
+		if (c == NULL) {
+			TALLOC_FREE(snaps);
+			errno = ENOMEM;
+			return NULL;
+		}
+		DLIST_ADD(config->cache, c);
+		config->ncached++;
+	} else {
+		TALLOC_FREE(c->snaps);
+		DLIST_PROMOTE(config->cache, c);
+	}
+	c->snaps = talloc_move(c, &snaps);
+	return c->snaps;
 }
 
 /*
- * Convert a filename containing an @GMT token to a path in the corresponding
- * .zfs/snapshot/<snap_name> directory.
+ * Two versions of a file with the same inode, generation and change cookie
+ * hold the same data: ZFS persists the cookie with every change it counts,
+ * so a snapshot never has new data under an old cookie. The device is not
+ * compared, as every mounted snapshot has a device of its own. Without a
+ * cookie or generation, compare mtime.
  */
-static char *_do_convert_shadow_zfs_name(vfs_handle_struct *handle,
-					 const struct smb_filename *fname_in,
-					 struct snapshot_data *out,
-					 const char *location)
+static bool shadow_copy_zfs_same_version(const SMB_STRUCT_STAT *a,
+					 const SMB_STRUCT_STAT *b)
 {
-	struct shadow_copy_zfs_config *config = NULL;
-	struct snapshot_data snapshots;
-	const char *mpoffset = NULL;
-	char *ret = NULL, *res_fname = NULL;
-	char buf[PATH_MAX] = {0};
-	bool found = false;
+	uint32_t need = ST_EX_IFLAG_HAS_CHANGE_COOKIE | ST_EX_IFLAG_HAS_GEN;
 
-	ZERO_STRUCT(snapshots);
-	SMB_VFS_HANDLE_GET_DATA(handle, config,
-				struct shadow_copy_zfs_config,
-				smb_panic(location));
+	if (((a->st_ex_iflags & need) == need) &&
+	    ((b->st_ex_iflags & need) == need)) {
+		return (a->st_ex_ino == b->st_ex_ino) &&
+		       (a->st_ex_gen == b->st_ex_gen) &&
+		       (a->st_ex_change_cookie == b->st_ex_change_cookie);
+	}
+
+	return timespec_compare(&a->st_ex_mtime, &b->st_ex_mtime) == 0;
+}
+
+/* Path-based calls: a name with a timewarp token is a name in a snapshot. */
+static bool shadow_copy_zfs_match_name(const struct smb_filename *name)
+{
+	return name->twrp != 0;
+}
+
+/*
+ * fd-based calls: an fsp opened through this module has its fd in the
+ * snapshot already, and needs no conversion.
+ */
+static bool shadow_copy_zfs_match_fsp(vfs_handle_struct *handle,
+				      const struct files_struct *fsp)
+{
+	return (fsp->fsp_name->twrp != 0) && !fsp_in_snapshot(handle, fsp);
+}
+
+/* The absolute path of a name relative to the share root, or below it. */
+static char *shadow_copy_zfs_abspath(TALLOC_CTX *mem_ctx,
+				     const char *connectpath,
+				     const char *name)
+{
+	if (name[0] == '/') {
+		if (!path_is_below(name, connectpath, strncmp)) {
+			DBG_ERR("%s: not in the share %s\n", name, connectpath);
+			errno = EINVAL;
+			return NULL;
+		}
+		return talloc_strdup(mem_ctx, name);
+	}
+	if ((name[0] == '\0') || ISDOT(name)) {
+		return talloc_strdup(mem_ctx, connectpath);
+	}
+	if (strncmp(name, "./", 2) == 0) {
+		name += 2;
+	}
+	return talloc_asprintf(mem_ctx, "%s/%s", connectpath, name);
+}
+
+/*
+ * The path of a name with a timewarp token in the .zfs/snapshot directory
+ * of the snapshot taken at that time, allocated under talloc_tos(). With
+ * tgt, also where that is, with the strings allocated under the result.
+ *
+ * The name is made absolute and canonical first, so "." and ".." are gone
+ * and a name that leaves the share is refused; what remains is mapped to
+ * the same place below the share in the snapshot.
+ */
+static char *shadow_copy_zfs_convert(vfs_handle_struct *handle,
+				     const struct smb_filename *fname,
+				     struct snap_target *tgt)
+{
+	TALLOC_CTX *mem_ctx = talloc_tos();
+	TALLOC_CTX *frame = NULL;
+	struct shadow_copy_zfs_config *config = NULL;
+	const char *connectpath = handle->conn->connectpath;
+	struct snapshot_list *snaps = NULL;
+	const struct snapshot_entry *entry = NULL;
+	enum casesensitivity sens;
+	const char *mpoffset = NULL;
+	const char *rel = NULL;
+	char *path = NULL;
+	char *snaprel = NULL;
+	char *ret = NULL;
+
+	SMB_VFS_HANDLE_GET_DATA(handle, config, struct shadow_copy_zfs_config,
+				smb_panic(__func__));
 
 	if (config->ds == NULL) {
-		DBG_ERR("[%s()]: Refusing to convert to shadow copy due to "
-			"path not supporting snapshots.\n", location);
+		DBG_INFO("%s: the share is not on ZFS\n",
+			 smb_fname_str_dbg(fname));
 		errno = EINVAL;
 		return NULL;
 	}
-
 	if (config->snapshot_share) {
-		DBG_INFO("[%s()]: share is rooted inside a snapshot\n",
-			 location);
+		DBG_INFO("%s: the share is rooted inside a snapshot\n",
+			 smb_fname_str_dbg(fname));
 		errno = EINVAL;
 		return NULL;
 	}
 
-	resolve_path(handle, config, fname_in->base_name, buf, sizeof(buf), out, &found);
-	if (found) {
-		return talloc_strdup(talloc_tos(), buf);
+	frame = talloc_stackframe();
+
+	path = shadow_copy_zfs_abspath(frame, connectpath, fname->base_name);
+	if (path != NULL) {
+		path = canonicalize_absolute_path(frame, path);
+	}
+	if (path == NULL) {
+		goto fail;
+	}
+	if (!path_is_below(path, connectpath, strncmp)) {
+		DBG_ERR("%s: resolves outside the share\n",
+			smb_fname_str_dbg(fname));
+		errno = EINVAL;
+		goto fail;
 	}
 
-	found = zfs_lookup_snapshot_list(handle, fname_in, buf, &snapshots, location);
-	if (!found) {
-		DBG_INFO("[%s()]: failed to retrieve snapshot entry for filename: %s, ts: %ld,"
-			 "with snapshot mountpoint: %s\n",
-			 location, smb_fname_str_dbg(fname_in), fname_in->twrp, snapshots.mountpoint);
-		return NULL;
+	snaps = shadow_copy_zfs_get_snaplist(handle, path, NULL, &sens);
+	if (snaps == NULL) {
+		if (errno == 0) {
+			errno = ENOENT;
+		}
+		goto fail;
+	}
+	/* as live opens with RESOLVE_NO_XDEV: no child datasets */
+	if (config->no_dataset_traversal &&
+	    (snaps->mnt_id != config->ds->mnt_id)) {
+		DBG_INFO("%s: in the child dataset %s\n",
+			 smb_fname_str_dbg(fname), snaps->dataset_name);
+		errno = EXDEV;
+		goto fail;
+	}
+	for (entry = snaps->entries; entry != NULL; entry = entry->next) {
+		if (entry->nt_time == fname->twrp) {
+			break;
+		}
+	}
+	if (entry == NULL) {
+		DBG_INFO("%s: no snapshot taken at that time\n",
+			 smb_fname_str_dbg(fname));
+		errno = ENOENT;
+		goto fail;
 	}
 
-	res_fname = strstr(buf, handle->conn->connectpath);
-	SMB_ASSERT(res_fname != NULL);
-	res_fname += strlen(handle->conn->connectpath);
-	if (*res_fname == '/') {
-		res_fname++;
+	rel = path + strlen(connectpath);
+	if (*rel == '/') {
+		rel++;
+	}
+	mpoffset = shadow_copy_zfs_mp_offset(connectpath, snaps->mountpoint);
+	snaprel = get_snapshot_relpath(frame, connectpath, snaps->mountpoint,
+				       rel, mpoffset, sens);
+	if (snaprel == NULL) {
+		goto fail;
+	}
+	ret = snapshot_abspath(mem_ctx, snaps->mountpoint, entry->name,
+			       snaprel);
+	if (ret == NULL) {
+		errno = ENOMEM;
+		goto fail;
 	}
 
-	mpoffset = shadow_copy_zfs_mp_offset(handle->conn->connectpath,
-					     snapshots.mountpoint);
-
-	ret = get_snapshot_path(talloc_tos(), handle->conn->connectpath,
-				snapshots.mountpoint, res_fname,
-				mpoffset, &snapshots.snap, snapshots.sens);
-
-	if (out != NULL) {
-		int len;
-		cp_snapshot_data(&snapshots, out);
-		len = snprintf(out->shadow_cp, sizeof(out->shadow_cp),
-			       "%s/%s/%s", snapshots.mountpoint,
-			       SHADOW_COPY_ZFS_SNAP_DIR, snapshots.snap.name);
-		if (len < 0 || (size_t)len >= sizeof(out->shadow_cp)) {
-			DBG_ERR("[%s()]: shadow_cp path truncated\n", location);
-			out->shadow_cp[0] = '\0';
-		/*
-		 * This mountpoint ends up getting stored as part of CWD
-		 * in the chdir() function.
-		 */
-		} else if (mpoffset) {
-			snprintf(out->shadow_cp + len,
-				 sizeof(out->shadow_cp) - len,
-			         "/%s", mpoffset);
+	if (tgt != NULL) {
+		*tgt = (struct snap_target) {
+			.mountpoint = talloc_strdup(ret, snaps->mountpoint),
+			.mnt_id = snaps->mnt_id,
+			.name = talloc_strdup(ret, entry->name),
+			.twrp = entry->nt_time,
+			.rel = talloc_move(ret, &snaprel),
+		};
+		if ((tgt->mountpoint == NULL) || (tgt->name == NULL)) {
+			TALLOC_FREE(ret);
+			errno = ENOMEM;
+			goto fail;
 		}
 	}
 
+	TALLOC_FREE(frame);
 	return ret;
+
+fail:
+	{
+		int saved_errno = errno;
+		TALLOC_FREE(frame);
+		errno = saved_errno;
+	}
+	return NULL;
 }
 
-#define do_convert_shadow_zfs_name(handle, fname, data_out)\
-	(char *)_do_convert_shadow_zfs_name(handle, fname, data_out, __func__)
+/*
+ * shadow_copy_zfs_convert(), and the name resolved beneath the root of its
+ * snapshot through no symlink, from the pin rather than from the path of
+ * the dataset: the converted path names that object only if nothing above
+ * the snapshot changed, which the caller checks against *pfd. Returns the
+ * converted path with *ppin held, for snapdir_pin_put(), and *pfd, an
+ * O_PATH fd on the name, for close().
+ */
+static char *shadow_copy_zfs_convert_checked(vfs_handle_struct *handle,
+					     const struct smb_filename *fname,
+					     bool nofollow,
+					     struct snapdir_pin **ppin,
+					     int *pfd)
+{
+	struct shadow_copy_zfs_config *config = NULL;
+	struct snapdir_pin *pin = NULL;
+	struct snap_target tgt;
+	char *conv = NULL;
+	int saved_errno;
+	int fd;
 
-#define convert_shadow_zfs_name(handle, fname)\
-	(char *)_do_convert_shadow_zfs_name(handle, fname, NULL, __func__)
+	SMB_VFS_HANDLE_GET_DATA(handle, config, struct shadow_copy_zfs_config,
+				smb_panic(__func__));
 
+	conv = shadow_copy_zfs_convert(handle, fname, &tgt);
+	if (conv == NULL) {
+		return NULL;
+	}
+	pin = snapdir_pin_get(config, &tgt);
+	if (pin == NULL) {
+		goto fail;
+	}
+	fd = snapdir_open_beneath(pin, tgt.rel, nofollow);
+	if (fd == -1) {
+		saved_errno = errno;
+		DBG_INFO("%s: %s\n", conv, strerror(errno));
+		snapdir_pin_put(pin);
+		errno = saved_errno;
+		goto fail;
+	}
+	*ppin = pin;
+	*pfd = fd;
+	return conv;
+
+fail:
+	saved_errno = errno;
+	TALLOC_FREE(conv);
+	errno = saved_errno;
+	return NULL;
+}
+
+
+/*
+ * A snapshot is read-only. The kernel refuses changes through an fd in a
+ * snapshot, so only the path-based calls need refusing here: without that
+ * they would change the live file of the same name.
+ */
 static int shadow_copy_zfs_renameat(vfs_handle_struct *handle,
 				    files_struct *srcfsp,
 				    const struct smb_filename *smb_fname_src,
@@ -936,22 +928,16 @@ static int shadow_copy_zfs_renameat(vfs_handle_struct *handle,
 				    const struct smb_filename *smb_fname_dst,
 				    const struct vfs_rename_how *rhow)
 {
-	int ret_src, ret_dst;
-
-	ret_src = shadow_copy_zfs_match_name(handle, smb_fname_src);
-	ret_dst = shadow_copy_zfs_match_name(handle, smb_fname_dst);
-
-	if (ret_src != 0) {
+	if (shadow_copy_zfs_match_name(smb_fname_src)) {
 		errno = EXDEV;
 		return -1;
 	}
-
-	if (ret_dst != 0) {
+	if (shadow_copy_zfs_match_name(smb_fname_dst)) {
 		errno = EROFS;
 		return -1;
 	}
-
-	return SMB_VFS_NEXT_RENAMEAT(handle, srcfsp, smb_fname_src, dstfsp, smb_fname_dst, rhow);
+	return SMB_VFS_NEXT_RENAMEAT(handle, srcfsp, smb_fname_src, dstfsp,
+				     smb_fname_dst, rhow);
 }
 
 static int shadow_copy_zfs_symlinkat(vfs_handle_struct *handle,
@@ -959,16 +945,13 @@ static int shadow_copy_zfs_symlinkat(vfs_handle_struct *handle,
 				     struct files_struct *dirfsp,
 				     const struct smb_filename *new_smb_filename)
 {
-	int ret_old, ret_new;
-	ret_old = shadow_copy_zfs_match_name(handle, link_contents);
-	ret_new = shadow_copy_zfs_match_name(handle, new_smb_filename);
-
-	if ((ret_old != 0) || (ret_new != 0)) {
+	if (shadow_copy_zfs_match_name(link_contents) ||
+	    shadow_copy_zfs_match_name(new_smb_filename)) {
 		errno = EROFS;
 		return -1;
 	}
-
-	return SMB_VFS_NEXT_SYMLINKAT(handle, link_contents, dirfsp, new_smb_filename);
+	return SMB_VFS_NEXT_SYMLINKAT(handle, link_contents, dirfsp,
+				      new_smb_filename);
 }
 
 static int shadow_copy_zfs_linkat(vfs_handle_struct *handle,
@@ -978,69 +961,124 @@ static int shadow_copy_zfs_linkat(vfs_handle_struct *handle,
 				  const struct smb_filename *newname,
 				  int flags)
 {
-	int ret_old, ret_new;
-
-	ret_old = shadow_copy_zfs_match_name(handle, oldname);
-	ret_new = shadow_copy_zfs_match_name(handle, newname);
-
-	if ((ret_old != 0) || (ret_new != 0)) {
+	if (shadow_copy_zfs_match_name(oldname) ||
+	    shadow_copy_zfs_match_name(newname)) {
 		errno = EROFS;
 		return -1;
 	}
+	return SMB_VFS_NEXT_LINKAT(handle, srcfsp, oldname, dstfsp, newname,
+				   flags);
+}
 
-	return SMB_VFS_NEXT_LINKAT(handle, srcfsp, oldname, dstfsp, newname, flags);
+static int shadow_copy_zfs_unlinkat(vfs_handle_struct *handle,
+				    struct files_struct *dirfsp,
+				    const struct smb_filename *smb_fname,
+				    int flags)
+{
+	if (shadow_copy_zfs_match_name(smb_fname)) {
+		errno = EROFS;
+		return -1;
+	}
+	return SMB_VFS_NEXT_UNLINKAT(handle, dirfsp, smb_fname, flags);
+}
+
+static int shadow_copy_zfs_mkdirat(vfs_handle_struct *handle,
+				   struct files_struct *dirfsp,
+				   const struct smb_filename *smb_fname,
+				   mode_t mode)
+{
+	if (shadow_copy_zfs_match_name(smb_fname)) {
+		errno = EROFS;
+		return -1;
+	}
+	return SMB_VFS_NEXT_MKDIRAT(handle, dirfsp, smb_fname, mode);
+}
+
+static int shadow_copy_zfs_mknodat(vfs_handle_struct *handle,
+				   files_struct *dirfsp,
+				   const struct smb_filename *smb_fname,
+				   mode_t mode,
+				   SMB_DEV_T dev)
+{
+	if (shadow_copy_zfs_match_name(smb_fname)) {
+		errno = EROFS;
+		return -1;
+	}
+	return SMB_VFS_NEXT_MKNODAT(handle, dirfsp, smb_fname, mode, dev);
+}
+
+static int shadow_copy_zfs_lchown(vfs_handle_struct *handle,
+				  const struct smb_filename *smb_fname,
+				  uid_t uid,
+				  gid_t gid)
+{
+	if (shadow_copy_zfs_match_name(smb_fname)) {
+		errno = EROFS;
+		return -1;
+	}
+	return SMB_VFS_NEXT_LCHOWN(handle, smb_fname, uid, gid);
+}
+
+/*
+ * The stat of a name with a timewarp token, by path through the modules
+ * below, and only if it is what the name resolves to beneath the root of
+ * its snapshot without symlinks. A symlink at the end is not followed
+ * even for stat: only smbd decides where a symlink may lead.
+ */
+static int shadow_copy_zfs_stat_common(vfs_handle_struct *handle,
+				       struct smb_filename *smb_fname,
+				       bool nofollow)
+{
+	char *orig = smb_fname->base_name;
+	struct snapdir_pin *pin = NULL;
+	char *conv = NULL;
+	int fd = -1;
+	int saved_errno;
+	int ret;
+
+	conv = shadow_copy_zfs_convert_checked(handle, smb_fname, nofollow,
+					       &pin, &fd);
+	if (conv == NULL) {
+		return -1;
+	}
+	smb_fname->base_name = conv;
+	ret = nofollow ? SMB_VFS_NEXT_LSTAT(handle, smb_fname) :
+			 SMB_VFS_NEXT_STAT(handle, smb_fname);
+	saved_errno = errno;
+	smb_fname->base_name = orig;
+	if ((ret == 0) && !stat_is_fd(&smb_fname->st, fd)) {
+		DBG_ERR("%s: not the file in the snapshot\n", conv);
+		SET_STAT_INVALID(smb_fname->st);
+		saved_errno = ENOENT;
+		ret = -1;
+	}
+	close(fd);
+	snapdir_pin_put(pin);
+	TALLOC_FREE(conv);
+	errno = saved_errno;
+	return ret;
 }
 
 static int shadow_copy_zfs_stat(vfs_handle_struct *handle,
-			     struct smb_filename *smb_fname)
+				struct smb_filename *smb_fname)
 {
-	int ret;
-	char *tmp = NULL;
-
-	if (shadow_copy_zfs_match_name(handle, smb_fname)) {
-		tmp = smb_fname->base_name;
-		smb_fname->base_name = convert_shadow_zfs_name(
-		    handle, smb_fname);
-
-		if (smb_fname->base_name == NULL) {
-			smb_fname->base_name = tmp;
-			return -1;
-		}
-
-		ret = SMB_VFS_NEXT_STAT(handle, smb_fname);
-		TALLOC_FREE(smb_fname->base_name);
-		smb_fname->base_name = tmp;
-		return ret;
+	if (!shadow_copy_zfs_match_name(smb_fname)) {
+		return SMB_VFS_NEXT_STAT(handle, smb_fname);
 	}
-	return SMB_VFS_NEXT_STAT(handle, smb_fname);
+	return shadow_copy_zfs_stat_common(handle, smb_fname, false);
 }
 
 static int shadow_copy_zfs_lstat(vfs_handle_struct *handle,
-			      struct smb_filename *smb_fname)
+				 struct smb_filename *smb_fname)
 {
-	int ret;
-	char *tmp = NULL;
-
-	if (shadow_copy_zfs_match_name(handle, smb_fname)) {
-		tmp = smb_fname->base_name;
-		smb_fname->base_name = convert_shadow_zfs_name(
-		    handle, smb_fname);
-
-		if (smb_fname->base_name == NULL) {
-			smb_fname->base_name = tmp;
-			return -1;
-		}
-
-		ret = SMB_VFS_NEXT_LSTAT(handle, smb_fname);
-		TALLOC_FREE(smb_fname->base_name);
-		smb_fname->base_name = tmp;
-		return ret;
+	if (!shadow_copy_zfs_match_name(smb_fname)) {
+		return SMB_VFS_NEXT_LSTAT(handle, smb_fname);
 	}
-	return SMB_VFS_NEXT_LSTAT(handle, smb_fname);
+	return shadow_copy_zfs_stat_common(handle, smb_fname, true);
 }
 
 static int shadow_copy_zfs_fstat(vfs_handle_struct *handle, files_struct *fsp,
-			      SMB_STRUCT_STAT *sbuf)
+				 SMB_STRUCT_STAT *sbuf)
 {
 	int ret;
 	struct smb_filename *orig_smb_fname = NULL;
@@ -1048,13 +1086,13 @@ static int shadow_copy_zfs_fstat(vfs_handle_struct *handle, files_struct *fsp,
 	struct smb_filename *orig_base_smb_fname = NULL;
 	struct smb_filename vss_base_smb_fname;
 
-	if (!shadow_copy_zfs_match_name(handle, fsp->fsp_name)) {
+	if (!shadow_copy_zfs_match_fsp(handle, fsp)) {
 		return SMB_VFS_NEXT_FSTAT(handle, fsp, sbuf);
 	}
 
 	vss_smb_fname = *fsp->fsp_name;
-	vss_smb_fname.base_name = convert_shadow_zfs_name(handle, fsp->fsp_name);
-
+	vss_smb_fname.base_name = shadow_copy_zfs_convert(handle,
+							  fsp->fsp_name, NULL);
 	if (vss_smb_fname.base_name == NULL) {
 		return -1;
 	}
@@ -1075,7 +1113,97 @@ static int shadow_copy_zfs_fstat(vfs_handle_struct *handle, files_struct *fsp,
 	if (fsp->base_fsp != NULL) {
 		fsp->base_fsp->fsp_name = orig_base_smb_fname;
 	}
+	TALLOC_FREE(vss_smb_fname.base_name);
 	return ret;
+}
+
+/*
+ * Whether the single name below dirfsp is, live, the mounted root of a
+ * dataset other than mnt_id: a child dataset, whose previous versions are
+ * its own snapshots, while the snapshot of the parent holds only its
+ * empty mountpoint. A directory of that name put at a path of the dataset
+ * gone stale is not a mount root, and a symlink there is not followed.
+ */
+static bool shadow_copy_zfs_live_elsewhere(vfs_handle_struct *handle,
+					   const struct files_struct *dirfsp,
+					   const struct smb_filename *smb_fname,
+					   uint64_t mnt_id)
+{
+	TALLOC_CTX *frame = talloc_stackframe();
+	char *rel = NULL;
+	char *path = NULL;
+	struct statx stx;
+	bool ret = false;
+
+	rel = full_path_from_dirfsp_at_basename(frame, dirfsp,
+						smb_fname->base_name);
+	if (rel != NULL) {
+		path = shadow_copy_zfs_abspath(frame, handle->conn->connectpath,
+					       rel);
+	}
+	if (path != NULL) {
+		ret = (statx(AT_FDCWD, path,
+			     AT_NO_AUTOMOUNT | AT_SYMLINK_NOFOLLOW,
+			     STATX_MNT_ID_UNIQUE, &stx) == 0) &&
+		      (stx.stx_mask & STATX_MNT_ID_UNIQUE) &&
+		      (stx.stx_attributes_mask & STATX_ATTR_MOUNT_ROOT) &&
+		      (stx.stx_attributes & STATX_ATTR_MOUNT_ROOT) &&
+		      (stx.stx_mnt_id != mnt_id);
+	}
+	TALLOC_FREE(frame);
+	return ret;
+}
+
+/*
+ * Open a single name below a directory that is open in a snapshot, inside
+ * that snapshot: one open from the fd of the directory, on its pin. A
+ * snapshot holds no other mount, no symlink is followed and ".." does not
+ * come here, so this cannot leave the snapshot; the device of what was
+ * opened is checked all the same. A directory that is, live, the root of
+ * a child dataset has previous versions of its own: it is not opened
+ * here, and *child says so.
+ */
+static int shadow_copy_zfs_openat_in_snapshot(vfs_handle_struct *handle,
+					      const struct files_struct *dirfsp,
+					      struct snapdir_pin *pin,
+					      const struct smb_filename *smb_fname,
+					      files_struct *fsp,
+					      const struct vfs_open_how *how,
+					      bool *child)
+{
+	struct stat st;
+	int fd, saved_errno;
+
+	*child = false;
+
+	fd = SMB_VFS_NEXT_OPENAT(handle, dirfsp, smb_fname, fsp, how);
+	if (fd == -1) {
+		return -1;
+	}
+	if ((fstat(fd, &st) != 0) || (st.st_dev != pin->dev)) {
+		DBG_ERR("%s/%s: not in the snapshot %s\n", fsp_str_dbg(dirfsp),
+			smb_fname->base_name, pin->name);
+		close(fd);
+		errno = ENOENT;
+		return -1;
+	}
+	if (S_ISDIR(st.st_mode) && !ISDOT(smb_fname->base_name) &&
+	    shadow_copy_zfs_live_elsewhere(handle, dirfsp, smb_fname,
+					   pin->mnt_id)) {
+		close(fd);
+		*child = true;
+		return -1;
+	}
+
+	pin->refcnt++;
+	if (!shadow_fsp_set_pin(handle, fsp, pin)) {
+		saved_errno = errno;
+		close(fd);
+		snapdir_pin_put(pin);
+		errno = saved_errno;
+		return -1;
+	}
+	return fd;
 }
 
 static int shadow_copy_zfs_open(vfs_handle_struct *handle,
@@ -1084,24 +1212,22 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 				files_struct *fsp,
 				const struct vfs_open_how *how)
 {
-	int ret;
-	char *conv = NULL;
 	struct shadow_copy_zfs_config *config = NULL;
 	struct smb_filename *smb_fname = NULL;
-	struct snapshot_data data;
-	shadow_fsp_ext_t *fsp_ext = NULL;
-	struct vfs_open_how tmp_how = { .flags = how->flags, .mode = how->mode};
+	struct shadow_fsp_ext *dir_ext = NULL;
+	struct snapdir_pin *pin = NULL;
+	struct vfs_open_how snap_how = *how;
 	struct vfs_open_how noxdev_how;
+	struct snap_target tgt;
+	char *conv = NULL;
+	bool child = false;
+	int saved_errno;
+	int ret;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config, struct shadow_copy_zfs_config,
 				return -1);
 
-	smb_fname = full_path_from_dirfsp_atname(talloc_tos(),
-						 dirfsp,
-						 smb_fname_in);
-
-	if (!shadow_copy_zfs_match_name(handle, smb_fname)) {
-		TALLOC_FREE(smb_fname);
+	if (!shadow_copy_zfs_match_name(smb_fname_in)) {
 		if (!config->no_dataset_traversal ||
 		    is_named_stream(smb_fname_in) ||
 		    ISDOT(smb_fname_in->base_name) ||
@@ -1129,145 +1255,184 @@ static int shadow_copy_zfs_open(vfs_handle_struct *handle,
 					   smb_fname_in,
 					   fsp, &noxdev_how);
 	}
+
+	shadow_copy_zfs_snap_how(&snap_how);
+
 	/*
-	 * If dirfsp is an open in a snapshot directory, then concatenate the
-	 * dirfsp path with smb_fname relative path, convert into an absolute
-	 * path in the relevant snapdir, and pass to openat().
+	 * A single name below a directory open in a snapshot, at the time
+	 * of that snapshot, is in it: smbd walks a path and lists a
+	 * directory one name at a time. Not "..": at the root of the
+	 * snapshot it would lead into the snapshot directory, and the full
+	 * name maps it to the parent as it was at that time. Nor the root
+	 * of a child dataset, which has snapshots of its own.
 	 */
-
-	ZERO_STRUCT(data);
-	conv = do_convert_shadow_zfs_name(handle,
-					  smb_fname,
-					  &data);
-	if (conv == NULL) {
-		TALLOC_FREE(smb_fname);
-		return -1;
+	if (dirfsp != NULL) {
+		dir_ext = VFS_FETCH_FSP_EXTENSION(handle, dirfsp);
 	}
-
-	smb_fname->base_name = conv;
-	tmp_how.flags &= ~(O_WRONLY | O_RDWR | O_CREAT);
-
-	ret = SMB_VFS_NEXT_OPENAT(handle, dirfsp, smb_fname,
-				  fsp, &tmp_how);
-
-	if (ret != -1) {
-		fsp_ext = VFS_ADD_FSP_EXTENSION(handle, fsp, struct shadow_copy_fsp_ext,
-						destroy_fsp_ext_snapshot_data);
-		SMB_ASSERT(fsp_ext != NULL);
-		cp_snapshot_data(&data, &fsp_ext->data);
-		fsp_ext->handle = handle;
-		fsp_ext->fsp = fsp;
-		fsp_ext->fsp_name_ptr = fsp->fsp_name;
-		fsp_ext->config = config;
-		/*
-		 * O_PATH open is not sufficient to maintain dynamic mount of ZFS
-		 * snapshot. We need to pin it down with an O_DIRECTORY open, which may
-		 * fail due to permissions or TOCTOU issues. If it fails, then close
-		 * our O_PATH open and pass error back up stack.
-		 */
-		if (!open_snapdir(fsp_ext)) {
-			close(ret);
-			ret = -1;
+	if ((dir_ext != NULL) && (dir_ext->pin != NULL) &&
+	    (dir_ext->pin->twrp == smb_fname_in->twrp) &&
+	    (strchr(smb_fname_in->base_name, '/') == NULL) &&
+	    !ISDOTDOT(smb_fname_in->base_name)) {
+		ret = shadow_copy_zfs_openat_in_snapshot(handle, dirfsp,
+							 dir_ext->pin,
+							 smb_fname_in, fsp,
+							 &snap_how, &child);
+		if (!child) {
+			return ret;
 		}
 	}
 
-	TALLOC_FREE(smb_fname);
-	TALLOC_FREE(conv);
-	return ret;
-}
-
-static int shadow_copy_zfs_unlinkat(vfs_handle_struct *handle,
-				    struct files_struct *dirfsp,
-				    const struct smb_filename *smb_fname,
-				    int flags)
-{
-	if (shadow_copy_zfs_match_name(handle, smb_fname)) {
-		errno = EROFS;
-		return -1;
-	}
-	return SMB_VFS_NEXT_UNLINKAT(handle, dirfsp, smb_fname, flags);
-}
-
-static int shadow_copy_zfs_fchmod(vfs_handle_struct *handle,
-				  struct files_struct *fsp,
-				  mode_t mode)
-{
-	if (shadow_copy_zfs_match_name(handle, fsp->fsp_name)) {
-		errno = EROFS;
-		return -1;
-	}
-	return SMB_VFS_NEXT_FCHMOD(handle, fsp, mode);
-}
-
-static int shadow_copy_zfs_fchown(vfs_handle_struct *handle,
-				  files_struct *fsp,
-				  uid_t uid,
-				  gid_t gid)
-{
-	if (shadow_copy_zfs_match_name(handle, fsp->fsp_name)) {
-		errno = EROFS;
-		return -1;
-	}
-	return SMB_VFS_NEXT_FCHOWN(handle, fsp, uid, gid);
-}
-
-static int shadow_copy_zfs_lchown(vfs_handle_struct *handle,
-				  const struct smb_filename *smb_fname,
-				  uid_t uid,
-				  gid_t gid)
-{
-	if (shadow_copy_zfs_match_name(handle, smb_fname)) {
-		errno = EROFS;
-		return -1;
-	}
-	return SMB_VFS_NEXT_LCHOWN(handle, smb_fname, uid, gid);
-}
-
-static int shadow_copy_zfs_chdir(vfs_handle_struct *handle,
-				 const struct smb_filename *smb_fname)
-{
-	int ret;
-	struct snapshot_data *data = NULL;
-	struct smb_filename conv = { .flags = smb_fname->flags };
-
-	if (!shadow_copy_zfs_match_name(handle, smb_fname)) {
-		ret =  SMB_VFS_NEXT_CHDIR(handle, smb_fname);
-		store_connectpath(handle, NULL);
-		return ret;
-	}
-
-	data = talloc_zero(handle->conn, struct snapshot_data);
-	if (data == NULL) {
+	smb_fname = full_path_from_dirfsp_atname(talloc_tos(), dirfsp,
+						 smb_fname_in);
+	if (smb_fname == NULL) {
 		errno = ENOMEM;
 		return -1;
 	}
-
-	conv.base_name = do_convert_shadow_zfs_name(handle, smb_fname, data);
-	if (conv.base_name == NULL) {
-		TALLOC_FREE(data);
+	conv = shadow_copy_zfs_convert(handle, smb_fname, &tgt);
+	if (conv == NULL) {
+		saved_errno = errno;
+		TALLOC_FREE(smb_fname);
+		errno = saved_errno;
 		return -1;
 	}
+	smb_fname->base_name = conv;
 
-	ret = SMB_VFS_NEXT_CHDIR(handle, &conv);
-	if (ret == 0) {
-		store_connectpath(handle, data);
-	} else {
-		TALLOC_FREE(data);
+	pin = snapdir_pin_get(config, &tgt);
+	if (pin == NULL) {
+		ret = -1;
+		goto out;
 	}
 
-	TALLOC_FREE(conv.base_name);
+	ret = SMB_VFS_NEXT_OPENAT(handle, dirfsp, smb_fname, fsp, &snap_how);
+	if (ret == -1) {
+		saved_errno = errno;
+		snapdir_pin_put(pin);
+		errno = saved_errno;
+		goto out;
+	}
+
+	/*
+	 * The path of the dataset is the one it had when first resolved. A
+	 * directory above it renamed since leaves a path that may lead into
+	 * anything: what was opened must be in the snapshot of the pin, which
+	 * was found from the verified snapshot directory. Below the root of
+	 * the snapshot nothing can change, and there is no other mount.
+	 */
+	if (!fd_on_dev(ret, pin->dev)) {
+		DBG_ERR("%s: not in the snapshot %s of mount ID %" PRIu64
+			"\n", conv, pin->name, pin->mnt_id);
+		close(ret);
+		snapdir_pin_put(pin);
+		errno = ENOENT;
+		ret = -1;
+		goto out;
+	}
+
+	if (!shadow_fsp_set_pin(handle, fsp, pin)) {
+		saved_errno = errno;
+		close(ret);
+		snapdir_pin_put(pin);
+		errno = saved_errno;
+		ret = -1;
+		goto out;
+	}
+
+out:
+	saved_errno = errno;
+	TALLOC_FREE(smb_fname);
+	errno = saved_errno;
 	return ret;
 }
 
-static int shadow_copy_zfs_fntimes(vfs_handle_struct *handle,
-				   struct files_struct *fsp,
-				   struct smb_file_time *ft)
+/*
+ * A stat by name takes the rules of openat_fn, or the modules below would
+ * answer for the name as it is in the snapshot of the directory. smbd
+ * stats an entry of a listing by name when its open failed with other
+ * than ENOENT, EACCES, EPERM or EXDEV (openat_pathref_fsp_lcomp()), and a
+ * search for one name before any open (dptr_ReadDirName()). A single
+ * name below a directory open in a snapshot is stat'ed in it from its
+ * fd; the root of a child dataset has previous versions of its own, and
+ * none here with shadow:no_dataset_traversal, like any name on the full
+ * path.
+ */
+static int shadow_copy_zfs_fstatat(vfs_handle_struct *handle,
+				   const struct files_struct *dirfsp,
+				   const struct smb_filename *smb_fname_in,
+				   SMB_STRUCT_STAT *sbuf,
+				   int flags)
 {
-	if (shadow_copy_zfs_match_name(handle, fsp->fsp_name)) {
-		errno = EROFS;
+	struct shadow_fsp_ext *dir_ext = NULL;
+	struct smb_filename *smb_fname = NULL;
+	int saved_errno;
+	int ret;
+
+	if (!shadow_copy_zfs_match_name(smb_fname_in)) {
+		return SMB_VFS_NEXT_FSTATAT(handle, dirfsp, smb_fname_in,
+					    sbuf, flags);
+	}
+
+	if (dirfsp != NULL) {
+		dir_ext = VFS_FETCH_FSP_EXTENSION(handle, dirfsp);
+	}
+	if ((dir_ext != NULL) && (dir_ext->pin != NULL) &&
+	    (dir_ext->pin->twrp == smb_fname_in->twrp) &&
+	    (strchr(smb_fname_in->base_name, '/') == NULL) &&
+	    !ISDOTDOT(smb_fname_in->base_name)) {
+		ret = SMB_VFS_NEXT_FSTATAT(handle, dirfsp, smb_fname_in,
+					   sbuf, flags);
+		if (ret != 0) {
+			return ret;
+		}
+		if (sbuf->st_ex_dev != dir_ext->pin->dev) {
+			DBG_ERR("%s/%s: not in the snapshot %s\n",
+				fsp_str_dbg(dirfsp), smb_fname_in->base_name,
+				dir_ext->pin->name);
+			errno = ENOENT;
+			return -1;
+		}
+		if (!S_ISDIR(sbuf->st_ex_mode) ||
+		    ISDOT(smb_fname_in->base_name) ||
+		    !shadow_copy_zfs_live_elsewhere(handle, dirfsp,
+						    smb_fname_in,
+						    dir_ext->pin->mnt_id)) {
+			return 0;
+		}
+	}
+
+	smb_fname = full_path_from_dirfsp_atname(talloc_tos(), dirfsp,
+						 smb_fname_in);
+	if (smb_fname == NULL) {
+		errno = ENOMEM;
 		return -1;
 	}
-	return SMB_VFS_NEXT_FNTIMES(handle, fsp, ft);
+	ret = shadow_copy_zfs_stat_common(handle, smb_fname,
+					  (flags & AT_SYMLINK_NOFOLLOW) != 0);
+	if (ret == 0) {
+		*sbuf = smb_fname->st;
+	}
+	saved_errno = errno;
+	TALLOC_FREE(smb_fname);
+	errno = saved_errno;
+	return ret;
+}
+
+/*
+ * A batch stat of entries of dirfsp goes down with the names as they
+ * are. None in a snapshot, where an entry may need the conversion of
+ * fstatat_fn: each is then stat'ed through it.
+ */
+static int shadow_copy_zfs_batch_attr_submit(vfs_handle_struct *handle,
+					     const struct files_struct *dirfsp,
+					     struct vfs_attr_entry *ents,
+					     size_t count,
+					     uint32_t want)
+{
+	if ((dirfsp->fsp_name->twrp != 0) || fsp_in_snapshot(handle, dirfsp)) {
+		errno = ENOSYS;
+		return -1;
+	}
+	return SMB_VFS_NEXT_BATCH_ATTR_SUBMIT(handle, dirfsp, ents, count,
+					      want);
 }
 
 static int shadow_copy_zfs_readlinkat(vfs_handle_struct *handle,
@@ -1276,70 +1441,80 @@ static int shadow_copy_zfs_readlinkat(vfs_handle_struct *handle,
 				      char *buf,
 				      size_t bufsiz)
 {
+	struct smb_filename *full = NULL;
+	struct snapdir_pin *pin = NULL;
+	char *conv = NULL;
+	int saved_errno;
+	int fd = -1;
 	int ret;
-	int shadow_fd = -1;
-	int orig_fd = -1;
-	char *shadow_name = NULL;
-	struct smb_filename *conv = NULL;
 
-	if (shadow_copy_zfs_match_name(handle, smb_fname)) {
-		conv = cp_smb_filename(talloc_tos(), smb_fname);
-		if (conv == NULL) {
-			return -1;
-		}
-		shadow_name = convert_shadow_zfs_name(
-		    handle, smb_fname);
-		if (shadow_name == NULL){
-			TALLOC_FREE(conv);
-			return -1;
-		}
-		conv->base_name = shadow_name;
-		ret = SMB_VFS_NEXT_READLINKAT(handle, dirfsp, conv, buf, bufsiz);
-		TALLOC_FREE(conv);
-		TALLOC_FREE(shadow_name);
-		return ret;
+	/* a name relative to a directory open in a snapshot needs nothing */
+	if (!shadow_copy_zfs_match_name(smb_fname) ||
+	    fsp_in_snapshot(handle, dirfsp)) {
+		return SMB_VFS_NEXT_READLINKAT(handle, dirfsp, smb_fname, buf,
+					       bufsiz);
 	}
-	return SMB_VFS_NEXT_READLINKAT(handle, dirfsp, smb_fname, buf, bufsiz);
-}
 
-static int shadow_copy_zfs_mknodat(vfs_handle_struct *handle,
-				files_struct *dirfsp,
-				const struct smb_filename *smb_fname,
-				mode_t mode,
-				SMB_DEV_T dev)
-{
-	if (shadow_copy_zfs_match_name(handle, smb_fname)) {
-		errno = EROFS;
+	full = full_path_from_dirfsp_atname(talloc_tos(), dirfsp, smb_fname);
+	if (full == NULL) {
+		errno = ENOMEM;
 		return -1;
 	}
-	return SMB_VFS_NEXT_MKNODAT(handle, dirfsp, smb_fname, mode, dev);
+	conv = shadow_copy_zfs_convert_checked(handle, full, true, &pin, &fd);
+	saved_errno = errno;
+	TALLOC_FREE(full);
+	if (conv == NULL) {
+		errno = saved_errno;
+		return -1;
+	}
+	/* the link the name resolved to in the snapshot, not the path */
+	ret = readlinkat(fd, "", buf, bufsiz);
+	saved_errno = errno;
+	close(fd);
+	snapdir_pin_put(pin);
+	TALLOC_FREE(conv);
+	errno = saved_errno;
+	return ret;
 }
 
-static struct smb_filename *shadow_copy_zfs_realpath(vfs_handle_struct *handle, TALLOC_CTX *ctx,
-				   const struct smb_filename *smb_fname)
+static struct smb_filename *shadow_copy_zfs_realpath(vfs_handle_struct *handle,
+						     TALLOC_CTX *ctx,
+						     const struct smb_filename *smb_fname)
 {
 	struct smb_filename *ret = NULL;
-	char *conv = NULL;
 	struct smb_filename conv_smb_fname;
+	struct snapdir_pin *pin = NULL;
+	char *conv = NULL;
+	int fd = -1;
 
-	if (shadow_copy_zfs_match_name(handle, smb_fname)) {
-		conv = convert_shadow_zfs_name(
-		    handle, smb_fname);
-		if (conv == NULL) {
-			errno = ENOENT;
-			return NULL;
-		}
-		conv_smb_fname = (struct smb_filename) {
-			.base_name = conv,
-			.flags = smb_fname->flags
-		};
-
-		ret = SMB_VFS_NEXT_REALPATH(handle, ctx, &conv_smb_fname);
-		TALLOC_FREE(conv);
-		return ret;
+	if (!shadow_copy_zfs_match_name(smb_fname)) {
+		return SMB_VFS_NEXT_REALPATH(handle, ctx, smb_fname);
 	}
+	conv = shadow_copy_zfs_convert_checked(handle, smb_fname, false, &pin,
+					       &fd);
+	if (conv == NULL) {
+		errno = ENOENT;
+		return NULL;
+	}
+	close(fd);
+	snapdir_pin_put(pin);
 
-	return SMB_VFS_NEXT_REALPATH(handle, ctx, smb_fname);
+	conv_smb_fname = (struct smb_filename) {
+		.base_name = conv,
+		.flags = smb_fname->flags
+	};
+	ret = SMB_VFS_NEXT_REALPATH(handle, ctx, &conv_smb_fname);
+	/*
+	 * The name resolved without symlinks, so its real path is itself
+	 * unless something above the snapshot changed in between.
+	 */
+	if ((ret != NULL) && (strcmp(ret->base_name, conv) != 0)) {
+		DBG_ERR("%s: resolves to %s\n", conv, ret->base_name);
+		TALLOC_FREE(ret);
+		errno = ENOENT;
+	}
+	TALLOC_FREE(conv);
+	return ret;
 }
 
 static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
@@ -1353,16 +1528,18 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 	struct snapshot_entry *entry = NULL;
 	SMB_STRUCT_STAT sbuf, prev_st;
 	const SMB_STRUCT_STAT *psbuf = NULL;
-	uint idx = 0;
+	uint32_t idx = 0;
 	const char *mpoffset = NULL;
+	char *rel = NULL;
 	enum casesensitivity sens;
+	int snapdir_fd;
 	int rv;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config, struct shadow_copy_zfs_config,
 				return -1);
 
 	if (config->ds == NULL) {
-		DBG_ERR("No dataset present for share at path: %s\n",
+		DBG_INFO("No dataset present for share at path: %s\n",
 			handle->conn->connectpath);
 		return 0;
 	}
@@ -1388,13 +1565,7 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 	}
 	prev_st = *psbuf;
 
-	shadow_copy_zfs_update_snaplist(handle,
-					handle->conn,
-					NULL,
-					fsp,
-					true,
-					&snapshots,
-					&sens);
+	snapshots = shadow_copy_zfs_get_snaplist(handle, NULL, fsp, &sens);
 	if (snapshots == NULL) {
 		DBG_INFO("failed to retrieve snapshots for %s\n", fsp_str_dbg(fsp));
 		return -1;
@@ -1419,41 +1590,76 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 
 	mpoffset = shadow_copy_zfs_mp_offset(handle->conn->connectpath,
 					     snapshots->mountpoint);
+	rel = get_snapshot_relpath(talloc_tos(), handle->conn->connectpath,
+				   snapshots->mountpoint,
+				   fsp->fsp_name->base_name, mpoffset, sens);
+	if (rel == NULL) {
+		DBG_INFO("%s: no path in the snapshots of %s\n",
+			 fsp_str_dbg(fsp), snapshots->dataset_name);
+		shadow_copy_zfs_data->num_volumes = 0;
+		return 0;
+	}
+
+	/*
+	 * Each version is looked up below the verified snapshot directory,
+	 * beneath it and through no symlink, not by the path of the dataset.
+	 */
+	snapdir_fd = smb_zfs_open_snapdir(snapshots->mountpoint,
+					  snapshots->mnt_id);
+	if (snapdir_fd == -1) {
+		int saved_errno = shadow_copy_zfs_errno(errno);
+
+		TALLOC_FREE(rel);
+		errno = saved_errno;
+		return -1;
+	}
 
 	for (entry = snapshots->entries; entry && idx < MAX_SNAPSHOT_COUNT; entry = entry->next) {
 		/*
 		 * Directories should always be added if they exist in the
 		 * snapshot. Files only be added if mtime differs.
 		 */
+		struct open_how how = {
+			.flags = O_PATH | O_CLOEXEC,
+			.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+		};
 		SMB_STRUCT_STAT cur_st;
-		char *tmp_file = NULL;
-		tmp_file = get_snapshot_path(handle->conn, handle->conn->connectpath,
-					     snapshots->mountpoint,
-					     fsp->fsp_name->base_name,
-					     mpoffset, entry, sens);
+		char *snapname = NULL;
+		int fd;
 
-		if (tmp_file == NULL) {
-			DBG_ERR("get_snapshot_path() failed for snapshot: %s\n",
-				entry->name);
+		/*
+		 * Snapshots taken in one second share a label, and a
+		 * timewarp at that label opens the first of them: list it
+		 * once, for that one.
+		 */
+		if ((entry != snapshots->entries) &&
+		    (entry->prev->nt_time == entry->nt_time)) {
 			continue;
 		}
 
-		DBG_INFO("snapshot[%d]: ts: %ld, gmt: %s, name: %s, "
-			 "createtxg: %ld, path: %s\n",
-			 idx, entry->cr_time, entry->label, entry->name,
-			 entry->createtxg, tmp_file);
+		snapname = talloc_asprintf(talloc_tos(), "%s%s%s", entry->name,
+					   (rel[0] == '\0') ? "" : "/", rel);
+		if (snapname == NULL) {
+			break;
+		}
+		DBG_INFO("snapshot[%d]: ts: %ld, gmt: %s, name: %s\n",
+			 idx, entry->cr_time, entry->label, snapname);
 
-		rv = sys_stat(tmp_file, &cur_st, false);
-		if (rv != 0) {
-			DBG_INFO("%s: stat() failed for [%s] in mp [%s] snap [%s]: %s\n",
-				 tmp_file, fsp_str_dbg(fsp), snapshots->mountpoint, entry->name,
+		fd = openat2(snapdir_fd, snapname, &how, sizeof(how));
+		if (fd == -1) {
+			DBG_INFO("%s/%s: %s\n", snapshots->mountpoint, snapname,
 				 strerror(errno));
-			TALLOC_FREE(tmp_file);
+			TALLOC_FREE(snapname);
 			continue;
 		}
-		TALLOC_FREE(tmp_file);
-		if (config->filter->ignore_empty_snaps && !S_ISDIR(cur_st.st_ex_mode) &&
-		    (timespec_compare(&cur_st.st_ex_mtime, &prev_st.st_ex_mtime) == 0)) {
+		TALLOC_FREE(snapname);
+		rv = sys_fstat(fd, &cur_st, false);
+		close(fd);
+		if (rv != 0) {
+			continue;
+		}
+		if (config->ignore_empty_snaps && !S_ISDIR(cur_st.st_ex_mode) &&
+		    shadow_copy_zfs_same_version(&cur_st, &prev_st)) {
 			continue;
 		}
 		if (labels) {
@@ -1463,46 +1669,11 @@ static int shadow_copy_zfs_get_shadow_copy_zfs_data(vfs_handle_struct *handle,
 		idx++;
 		prev_st = cur_st;
 	}
+	close(snapdir_fd);
+	TALLOC_FREE(rel);
 
 	shadow_copy_zfs_data->num_volumes = idx;
 	return 0;
-}
-
-static int shadow_copy_zfs_mkdirat(vfs_handle_struct *handle,
-				   struct files_struct *dirfsp,
-				   const struct smb_filename *smb_fname,
-				   mode_t mode)
-{
-	if (shadow_copy_zfs_match_name(handle, smb_fname)) {
-		errno = EROFS;
-		return -1;
-	}
-	return SMB_VFS_NEXT_MKDIRAT(handle, dirfsp, smb_fname, mode);
-}
-
-static int shadow_copy_zfs_fchflags(vfs_handle_struct *handle,
-				    struct files_struct *fsp,
-				    unsigned int flags)
-{
-	if (shadow_copy_zfs_match_name(handle, fsp->fsp_name)) {
-		errno = EROFS;
-		return -1;
-	}
-	return SMB_VFS_NEXT_FCHFLAGS(handle, fsp, flags);
-}
-
-static int shadow_copy_zfs_fsetxattr(struct vfs_handle_struct *handle,
-				     struct files_struct *fsp,
-				     const char *aname,
-				     const void *value,
-				     size_t size,
-				     int flags)
-{
-	if (shadow_copy_zfs_match_name(handle, fsp->fsp_name)) {
-		errno = EROFS;
-		return -1;
-	}
-	return SMB_VFS_NEXT_FSETXATTR(handle, fsp, aname, value, size, flags);
 }
 
 static NTSTATUS shadow_copy_zfs_get_real_filename_at(
@@ -1512,55 +1683,79 @@ static NTSTATUS shadow_copy_zfs_get_real_filename_at(
         TALLOC_CTX *mem_ctx,
         char **found_name)
 {
-	char *conv = NULL;
 	NTSTATUS status;
-	struct smb_filename *conv_fname = NULL;
+	struct smb_filename *snap_fname = NULL;
 
-	if (!shadow_copy_zfs_match_name(handle, dirfsp->fsp_name)) {
+	if (!shadow_copy_zfs_match_fsp(handle, dirfsp)) {
 		return SMB_VFS_NEXT_GET_REAL_FILENAME_AT(handle, dirfsp, path,
 							 mem_ctx, found_name);
 	}
 
-	conv = convert_shadow_zfs_name(handle, dirfsp->fsp_name);
-	if (conv == NULL) {
-		status = map_nt_error_from_unix(errno);
-		DBG_DEBUG("%s: convert_shadow_zfs_name() failed: %s\n",
+	/*
+	 * dirfsp has a timewarp token but was not opened through us: open
+	 * it again by its name, which the open above checks, and scan that.
+	 */
+	status = synthetic_pathref(talloc_tos(),
+				   dirfsp->conn->cwd_fsp,
+				   dirfsp->fsp_name->base_name,
+				   NULL,
+				   NULL,
+				   dirfsp->fsp_name->twrp,
+				   dirfsp->fsp_name->flags,
+				   &snap_fname);
+	if (!NT_STATUS_IS_OK(status)) {
+		DBG_DEBUG("%s: open in the snapshot failed: %s\n",
 			  fsp_str_dbg(dirfsp), nt_errstr(status));
 		return status;
 	}
 
-	status = synthetic_pathref(
-		talloc_tos(),
-		dirfsp->conn->cwd_fsp,
-		conv,
-		NULL,
-		NULL,
-		0,
-		0,
-		&conv_fname);
-	if (!NT_STATUS_IS_OK(status)) {
-		DBG_ERR("%s: failed to create synthetic pathref: %s\n",
-			conv, nt_errstr(status));
-		TALLOC_FREE(conv);
-		return status;
+	status = get_real_filename_at(snap_fname->fsp, path, mem_ctx,
+				      found_name);
+	DBG_DEBUG("Scan [%s] for [%s]: %s\n",
+		  fsp_str_dbg(dirfsp), path, nt_errstr(status));
+	TALLOC_FREE(snap_fname);
+	return status;
+}
+
+/*
+ * A name with a timewarp token for the path-based calls that the modules
+ * below answer from the stat of the name (zfs_core: its mount ID): the
+ * converted path with the stat of what it resolves to in the snapshot, so
+ * that nothing is looked up by path again.
+ */
+static struct smb_filename *shadow_copy_zfs_resolved_fname(
+	vfs_handle_struct *handle,
+	const struct smb_filename *smb_fname)
+{
+	struct smb_filename *ret = NULL;
+	struct snapdir_pin *pin = NULL;
+	SMB_STRUCT_STAT st;
+	char *conv = NULL;
+	int saved_errno;
+	int fd = -1;
+	int rc;
+
+	conv = shadow_copy_zfs_convert_checked(handle, smb_fname, false, &pin,
+					       &fd);
+	if (conv == NULL) {
+		return NULL;
 	}
-
-	status = get_real_filename_at(
-		conv_fname->fsp, path, mem_ctx, found_name);
-
-	TALLOC_FREE(conv_fname);
-	if (!NT_STATUS_IS_OK(status)) {
-		DBG_DEBUG("Scan [%s] for [%s] failed\n",
-			  conv, path);
+	rc = sys_fstat(fd, &st, false);
+	saved_errno = errno;
+	close(fd);
+	snapdir_pin_put(pin);
+	if (rc != 0) {
 		TALLOC_FREE(conv);
-		return status;
+		errno = saved_errno;
+		return NULL;
 	}
-
-	DBG_DEBUG("Scan [%s] for [%s] returned [%s]\n",
-		  conv, path, *found_name);
-
+	ret = synthetic_smb_fname(talloc_tos(), conv, NULL, &st, 0,
+				  smb_fname->flags);
 	TALLOC_FREE(conv);
-	return NT_STATUS_OK;
+	if (ret == NULL) {
+		errno = ENOMEM;
+	}
+	return ret;
 }
 
 static uint64_t shadow_copy_zfs_disk_free(vfs_handle_struct *handle,
@@ -1569,68 +1764,46 @@ static uint64_t shadow_copy_zfs_disk_free(vfs_handle_struct *handle,
 				uint64_t *dfree,
 				uint64_t *dsize)
 {
-	uint64_t ret = (uint64_t)-1;
-	char *conv = NULL;
-	struct smb_filename *conv_smb_fname = NULL;
+	struct smb_filename *resolved = NULL;
+	uint64_t ret;
 
-	if (shadow_copy_zfs_match_name(handle, smb_fname)) {
-		conv = convert_shadow_zfs_name(handle, smb_fname);
-		if (conv == NULL) {
-			return (uint64_t)-1;
-		}
-		conv_smb_fname = synthetic_smb_fname(talloc_tos(),
-						conv,
-						NULL,
-						NULL,
-						0,
-						smb_fname->flags);
-		if (conv_smb_fname == NULL) {
-			TALLOC_FREE(conv);
-			return -1;
-		}
-
-		ret = SMB_VFS_NEXT_DISK_FREE(handle, conv_smb_fname, bsize, dfree, dsize);
-		TALLOC_FREE(conv);
-		TALLOC_FREE(conv_smb_fname);
-		return ret;
+	if (!shadow_copy_zfs_match_name(smb_fname)) {
+		return SMB_VFS_NEXT_DISK_FREE(handle, smb_fname, bsize, dfree,
+					      dsize);
 	}
-	return SMB_VFS_NEXT_DISK_FREE(handle, smb_fname, bsize, dfree,
-				      dsize);
+	resolved = shadow_copy_zfs_resolved_fname(handle, smb_fname);
+	if (resolved == NULL) {
+		return (uint64_t)-1;
+	}
+	ret = SMB_VFS_NEXT_DISK_FREE(handle, resolved, bsize, dfree, dsize);
+	TALLOC_FREE(resolved);
+	return ret;
 }
 
-static int shadow_copy_zfs_get_quota(vfs_handle_struct *handle, const struct smb_filename *smb_fname,
-				  enum SMB_QUOTA_TYPE qtype, unid_t id,
-				  SMB_DISK_QUOTA *dq)
+static int shadow_copy_zfs_get_quota(vfs_handle_struct *handle,
+				     const struct smb_filename *smb_fname,
+				     enum SMB_QUOTA_TYPE qtype, unid_t id,
+				     SMB_DISK_QUOTA *dq)
 {
+	struct smb_filename *resolved = NULL;
 	int ret;
-	char *conv = NULL;
-	struct smb_filename *conv_smb_fname = NULL;
 
-	if (shadow_copy_zfs_match_name(handle, smb_fname)) {
-		conv = convert_shadow_zfs_name(handle, smb_fname);
-		if (conv == NULL) {
-			return -1;
-		}
-		conv_smb_fname = synthetic_smb_fname(talloc_tos(),
-						conv,
-						NULL,
-						NULL,
-						0,
-						smb_fname->flags);
-		if (conv_smb_fname == NULL) {
-			TALLOC_FREE(conv);
-			return -1;
-		}
-
-		ret = SMB_VFS_NEXT_GET_QUOTA(handle, conv_smb_fname, qtype, id, dq);
-		TALLOC_FREE(conv);
-		TALLOC_FREE(conv_smb_fname);
-		return ret;
-	} else {
+	if (!shadow_copy_zfs_match_name(smb_fname)) {
 		return SMB_VFS_NEXT_GET_QUOTA(handle, smb_fname, qtype, id, dq);
 	}
+	resolved = shadow_copy_zfs_resolved_fname(handle, smb_fname);
+	if (resolved == NULL) {
+		return -1;
+	}
+	ret = SMB_VFS_NEXT_GET_QUOTA(handle, resolved, qtype, id, dq);
+	TALLOC_FREE(resolved);
+	return ret;
 }
 
+/*
+ * The parent of the root of a dataset is in another dataset, which may have
+ * no snapshot at the time of the name: then use the live parent.
+ */
 static NTSTATUS zfs_parent_pathname(struct vfs_handle_struct *handle,
 				    TALLOC_CTX *mem_ctx,
 				    const struct smb_filename *smb_fname_in,
@@ -1647,29 +1820,31 @@ static NTSTATUS zfs_parent_pathname(struct vfs_handle_struct *handle,
 		atname_out
 	);
 
-	/*
-	 * 34 is a special inode number on ZFS indicating a dataset
-	 * mountpoint.
-	 */
 	if (!NT_STATUS_IS_OK(status) ||
-            (smb_fname_in->st.st_ex_ino != 34) ||
-	    !shadow_copy_zfs_match_name(handle, smb_fname_in)) {
+	    !VALID_STAT(smb_fname_in->st) ||
+	    !(smb_fname_in->st.st_ex_flags & ST_EX_ATTR_MOUNT_ROOT) ||
+	    !shadow_copy_zfs_match_name(smb_fname_in)) {
 		return status;
 	}
 
 	fname_ref = *parent_dir_out;
 
-	tmp_fname = convert_shadow_zfs_name(handle, fname_ref);
-	if (tmp_fname == NULL) {
-		if (errno != ENOENT) {
-			status = map_nt_error_from_unix(errno);
-		}
-		fname_ref->twrp = 0;
-	} else {
+	tmp_fname = shadow_copy_zfs_convert(handle, fname_ref, NULL);
+	if (tmp_fname != NULL) {
 		TALLOC_FREE(tmp_fname);
+		return NT_STATUS_OK;
 	}
-
-	return status;
+	if (errno != ENOENT) {
+		status = map_nt_error_from_unix(errno);
+		/* the atname is allocated under the parent */
+		TALLOC_FREE(*parent_dir_out);
+		if (atname_out != NULL) {
+			*atname_out = NULL;
+		}
+		return status;
+	}
+	fname_ref->twrp = 0;
+	return NT_STATUS_OK;
 }
 
 static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
@@ -1679,7 +1854,6 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 	const char **exclusions = NULL;
 	const char **inclusions = NULL;
 	int ret, saved_errno;
-	int memcache_sz;
 
 	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
 	if (ret < 0) {
@@ -1738,25 +1912,14 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 		}
 	}
 
-	config->filter->ignore_empty_snaps = lp_parm_bool(SNUM(handle->conn), "shadow",
-						"ignore_empty_snaps", true);
+	/* skip file versions with the same data as the next newer one */
+	config->ignore_empty_snaps = lp_parm_bool(SNUM(handle->conn), "shadow",
+						  "ignore_empty_snaps", true);
 
 	config->no_dataset_traversal = lp_parm_bool(SNUM(handle->conn), "shadow",
 						     "no_dataset_traversal", false);
 	if (config->no_dataset_traversal) {
 		handle->conn->internal_tcon_flags |= TCON_FLAG_NOXDEV;
-	}
-
-	config->timedelta = lp_parm_int(SNUM(handle->conn),
-					"shadow", "snap_timedelta", 30);
-
-	memcache_sz = lp_parm_int(SNUM(handle->conn),
-				  "shadow", "cache_size", 512);
-
-	config->zcache = memcache_init(handle->conn, (memcache_sz * 1024));
-	if (config->zcache == NULL) {
-		DBG_ERR("memcache_init() failed\n");
-		goto disconnect_out;
 	}
 
 	SMB_VFS_HANDLE_SET_DATA(handle, config, NULL,
@@ -1767,8 +1930,8 @@ static int shadow_copy_zfs_connect(struct vfs_handle_struct *handle,
 
 disconnect_out:
 
-	TALLOC_FREE(config);
 	saved_errno = errno;
+	TALLOC_FREE(config);
 	SMB_VFS_NEXT_DISCONNECT(handle);
 	errno = saved_errno;
 	return -1;
@@ -1784,20 +1947,16 @@ static struct vfs_fn_pointers vfs_shadow_copy_zfs_fns = {
 	.stat_fn = shadow_copy_zfs_stat,
 	.lstat_fn = shadow_copy_zfs_lstat,
 	.fstat_fn = shadow_copy_zfs_fstat,
+	.fstatat_fn = shadow_copy_zfs_fstatat,
+	.batch_attr_submit_fn = shadow_copy_zfs_batch_attr_submit,
 	.openat_fn = shadow_copy_zfs_open,
 	.unlinkat_fn = shadow_copy_zfs_unlinkat,
-	.fchmod_fn = shadow_copy_zfs_fchmod,
-	.fchown_fn = shadow_copy_zfs_fchown,
 	.lchown_fn = shadow_copy_zfs_lchown,
-	.chdir_fn = shadow_copy_zfs_chdir,
-	.fntimes_fn = shadow_copy_zfs_fntimes,
 	.readlinkat_fn = shadow_copy_zfs_readlinkat,
 	.mknodat_fn = shadow_copy_zfs_mknodat,
 	.realpath_fn = shadow_copy_zfs_realpath,
 	.get_shadow_copy_data_fn = shadow_copy_zfs_get_shadow_copy_zfs_data,
 	.mkdirat_fn = shadow_copy_zfs_mkdirat,
-	.fsetxattr_fn = shadow_copy_zfs_fsetxattr,
-	.fchflags_fn = shadow_copy_zfs_fchflags,
 	.get_real_filename_at_fn = shadow_copy_zfs_get_real_filename_at,
 	.parent_pathname_fn = zfs_parent_pathname,
 };

@@ -42,6 +42,9 @@
 #include "torture/smbtorture.h"
 #include "torture/smb2/proto.h"
 #include "torture/truenas/proto.h"
+#ifdef HAVE_LIBZFS
+#include "source3/modules/smb_libzfs.h"
+#endif
 
 /* Length of an SMB shadow-copy @GMT- token: "@GMT-YYYY.MM.DD-HH.MM.SS". */
 #define TN_GMT_LEN 24
@@ -1465,6 +1468,1628 @@ done:
 	return ret;
 }
 
+#ifdef HAVE_LIBZFS
+/*
+ * The listing cache tests take and destroy snapshots of the share dataset
+ * through smb_libzfs, so smbtorture has to run as root on the server, with
+ * torture:sc_mp set to the mountpoint of the dataset of the share root.
+ * Without it they skip.
+ */
+static bool truenas_sc_take(const struct zfs_dataset *zds, const char *name)
+{
+	return smb_zfs_snapshot(zds->mnt_id, name, false) == 0;
+}
+
+/* destroying a snapshot that does not exist is not an error in ZFS */
+static bool truenas_sc_destroy(const struct zfs_dataset *zds,
+			       const char *name)
+{
+	struct snapshot_list l = { .num_entries = 1 };
+	struct snapshot_entry e = { 0 };
+
+	strlcpy(l.dataset_name, zds->dataset_name, sizeof(l.dataset_name));
+	strlcpy(e.name, name, sizeof(e.name));
+	l.entries = &e;
+	return smb_zfs_delete_snapshots(&l) == 0;
+}
+
+/*
+ * The @GMT- label and timewarp token of a snapshot of the dataset, from
+ * smb_zfs_list_snapshots() (checked against the snapshot calls by
+ * local.smb_libzfs.snapshot_list). ptwrp may be NULL.
+ */
+static bool truenas_sc_find(struct torture_context *tctx,
+			    const struct zfs_dataset *zds,
+			    const char *name,
+			    char label[TN_GMT_LEN + 1],
+			    NTTIME *ptwrp)
+{
+	struct snapshot_list *l = NULL;
+	const struct snapshot_entry *e = NULL;
+
+	l = smb_zfs_list_snapshots(tctx, zds->mnt_id, NULL);
+	if (l == NULL) {
+		return false;
+	}
+	for (e = l->entries; e != NULL; e = e->next) {
+		if (strcmp(e->name, name) == 0) {
+			strlcpy(label, e->label, TN_GMT_LEN + 1);
+			if (ptwrp != NULL) {
+				*ptwrp = e->nt_time;
+			}
+			break;
+		}
+	}
+	TALLOC_FREE(l);
+	return e != NULL;
+}
+
+#define truenas_sc_label(tctx, zds, name, label) \
+	truenas_sc_find(tctx, zds, name, label, NULL)
+
+/*
+ * Take snapshot name of zds in a second no snapshot of the dataset was
+ * taken in, so that it has an @GMT- label of its own: snapshots taken in
+ * one second share a label, which the server lists once, for the first of
+ * them. ZFS stamps the creation time when the snapshot syncs, from the
+ * clock time() reads, so the second after the newest snapshot is enough.
+ */
+static bool truenas_sc_take_alone(struct torture_context *tctx,
+				  const struct zfs_dataset *zds,
+				  const char *name)
+{
+	struct snapshot_list *l = NULL;
+	time_t newest = 0;
+	bool ok;
+
+	l = smb_zfs_list_snapshots(tctx, zds->mnt_id, NULL);
+	if (l == NULL) {
+		return false;
+	}
+	if (l->entries != NULL) {
+		newest = l->entries->cr_time;	/* newest first */
+	}
+	TALLOC_FREE(l);
+	while (time(NULL) <= newest) {
+		usleep(10000);
+	}
+	if (!truenas_sc_take(zds, name)) {
+		return false;
+	}
+
+	/* the newest, and the only one of its second */
+	l = smb_zfs_list_snapshots(tctx, zds->mnt_id, NULL);
+	if (l == NULL) {
+		return false;
+	}
+	ok = (l->entries != NULL) &&
+	     (strcmp(l->entries->name, name) == 0) &&
+	     ((l->entries->next == NULL) ||
+	      (l->entries->next->cr_time < l->entries->cr_time));
+	if (!ok) {
+		torture_comment(tctx, "%s: not the newest snapshot, or not "
+				"alone in its second\n", name);
+	}
+	TALLOC_FREE(l);
+	return ok;
+}
+
+/* Open fname for reading at the timewarp token twrp. */
+static NTSTATUS truenas_sc_open_at(struct smb2_tree *tree,
+				   TALLOC_CTX *mem_ctx,
+				   const char *fname,
+				   NTTIME twrp,
+				   struct smb2_handle *h)
+{
+	struct smb2_create cr;
+	NTSTATUS status;
+
+	ZERO_STRUCT(cr);
+	cr.in.desired_access = SEC_FILE_READ_DATA | SEC_FILE_READ_ATTRIBUTE;
+	cr.in.create_disposition = NTCREATEX_DISP_OPEN;
+	cr.in.share_access = NTCREATEX_SHARE_ACCESS_MASK;
+	cr.in.fname = fname;
+	cr.in.timewarp = twrp;
+	status = smb2_create(tree, mem_ctx, &cr);
+	if (NT_STATUS_IS_OK(status)) {
+		*h = cr.out.file.handle;
+	}
+	return status;
+}
+
+/*
+ * The @GMT- labels FSCTL_SRV_ENUM_SNAPS returns for fname ("" for the share
+ * root), in the order of the server: newest first. Each label takes a
+ * SHADOW_COPY_LABEL slot of 25 UTF-16 units after the 12 byte header.
+ */
+static bool truenas_sc_enum(struct torture_context *tctx,
+			    struct smb2_tree *tree,
+			    const char *fname,
+			    char ***plabels,
+			    uint32_t *pn)
+{
+	NTSTATUS status;
+	bool ret = true;
+	struct smb2_handle h = {{0}};
+	struct smb2_create cr;
+	union smb_ioctl io;
+	uint32_t nsnaps, arr_size, i, j;
+	const uint8_t *sp = NULL;
+	char **labels = NULL;
+
+	*plabels = NULL;
+	*pn = 0;
+
+	ZERO_STRUCT(cr);
+	cr.in.desired_access = SEC_FILE_READ_DATA | SEC_FILE_READ_ATTRIBUTE;
+	cr.in.create_disposition = NTCREATEX_DISP_OPEN;
+	cr.in.share_access = NTCREATEX_SHARE_ACCESS_MASK;
+	cr.in.fname = fname;
+	status = smb2_create(tree, tctx, &cr);
+	torture_assert_ntstatus_ok(tctx, status, "open for ENUM_SNAPS");
+	h = cr.out.file.handle;
+
+	ZERO_STRUCT(io);
+	io.smb2.level = RAW_IOCTL_SMB2;
+	io.smb2.in.file.handle = h;
+	io.smb2.in.function = FSCTL_SRV_ENUM_SNAPS;
+	io.smb2.in.max_output_response = 16;
+	io.smb2.in.flags = SMB2_IOCTL_FLAG_IS_FSCTL;
+	status = smb2_ioctl(tree, tctx, &io.smb2);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"FSCTL_SRV_ENUM_SNAPS (header)");
+	torture_assert_goto(tctx, io.smb2.out.out.length >= 12, ret, done,
+			    "short ENUM_SNAPS header");
+	nsnaps = IVAL(io.smb2.out.out.data, 0);
+	arr_size = IVAL(io.smb2.out.out.data, 8);
+	if (nsnaps == 0) {
+		goto done;
+	}
+
+	ZERO_STRUCT(io);
+	io.smb2.level = RAW_IOCTL_SMB2;
+	io.smb2.in.file.handle = h;
+	io.smb2.in.function = FSCTL_SRV_ENUM_SNAPS;
+	io.smb2.in.max_output_response = 12 + arr_size;
+	io.smb2.in.flags = SMB2_IOCTL_FLAG_IS_FSCTL;
+	status = smb2_ioctl(tree, tctx, &io.smb2);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"FSCTL_SRV_ENUM_SNAPS (data)");
+	/* the list may have changed between the two calls; it must not */
+	torture_assert_int_equal_goto(tctx, IVAL(io.smb2.out.out.data, 4),
+				      nsnaps, ret, done,
+				      "labels returned");
+	torture_assert_goto(tctx,
+			    io.smb2.out.out.length >=
+			    12 + nsnaps * (TN_GMT_LEN + 1) * 2,
+			    ret, done, "short ENUM_SNAPS data");
+
+	labels = talloc_array(tctx, char *, nsnaps);
+	torture_assert_goto(tctx, labels != NULL, ret, done, "talloc");
+	for (i = 0; i < nsnaps; i++) {
+		labels[i] = talloc_zero_array(labels, char, TN_GMT_LEN + 1);
+		torture_assert_goto(tctx, labels[i] != NULL, ret, done,
+				    "talloc");
+		sp = (const uint8_t *)io.smb2.out.out.data + 12 +
+		     i * (TN_GMT_LEN + 1) * 2;
+		/* pure ASCII: the low byte of each UTF-16LE unit */
+		for (j = 0; j < TN_GMT_LEN; j++) {
+			labels[i][j] = (char)sp[j * 2];
+		}
+	}
+	*plabels = labels;
+	*pn = nsnaps;
+
+done:
+	smb2_util_close(tree, h);
+	return ret;
+}
+
+static bool truenas_sc_has_label(char **labels, uint32_t n,
+				 const char *label)
+{
+	uint32_t i;
+
+	for (i = 0; i < n; i++) {
+		if (strcmp(labels[i], label) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * The share dataset for a listing cache test, or NULL (with the test
+ * marked skipped) where the test cannot run. False on a failure.
+ */
+static bool truenas_sc_cache_setup(struct torture_context *tctx,
+				   struct smb2_tree *tree,
+				   const struct zfs_dataset **pzds)
+{
+	const char *mp = torture_setting_string(tctx, "sc_mp", NULL);
+	const struct zfs_dataset *zds = NULL;
+	struct smb2_handle h;
+	union smb_ioctl io;
+	NTSTATUS status;
+
+	*pzds = NULL;
+
+	if (mp == NULL) {
+		torture_result(tctx, TORTURE_SKIP,
+			       "no torture:sc_mp (mountpoint of the share "
+			       "dataset)");
+		return true;
+	}
+	if (geteuid() != 0) {
+		torture_result(tctx, TORTURE_SKIP,
+			       "taking snapshots needs root");
+		return true;
+	}
+	/* the share root may have no snapshot yet: probe support only */
+	status = smb2_util_roothandle(tree, &h);
+	torture_assert_ntstatus_ok(tctx, status, "open share root");
+	ZERO_STRUCT(io);
+	io.smb2.level = RAW_IOCTL_SMB2;
+	io.smb2.in.file.handle = h;
+	io.smb2.in.function = FSCTL_SRV_ENUM_SNAPS;
+	io.smb2.in.max_output_response = 16;
+	io.smb2.in.flags = SMB2_IOCTL_FLAG_IS_FSCTL;
+	status = smb2_ioctl(tree, tctx, &io.smb2);
+	smb2_util_close(tree, h);
+	if (NT_STATUS_EQUAL(status, NT_STATUS_NOT_SUPPORTED) ||
+	    NT_STATUS_EQUAL(status, NT_STATUS_INVALID_DEVICE_REQUEST)) {
+		torture_result(tctx, TORTURE_SKIP,
+			       "FSCTL_SRV_ENUM_SNAPS unsupported "
+			       "(no shadow_copy_zfs)");
+		return true;
+	}
+	torture_assert_ntstatus_ok(tctx, status, "FSCTL_SRV_ENUM_SNAPS");
+	torture_assert_int_equal(tctx, conn_zfs_init(mp, &zds), 0,
+				 "conn_zfs_init");
+	torture_assert(tctx, zds != NULL, "share dataset");
+
+	*pzds = zds;
+	return true;
+}
+
+/*
+ * A snapshot taken or destroyed while a connection holds the snapshot list
+ * of the dataset shows in the next enumeration on that connection: the
+ * list is checked against the .zfs/snapshot directory on every use, not
+ * kept for a time. The share root is a directory, which every snapshot
+ * lists.
+ */
+static bool test_truenas_shadow_copy_cache_change(struct torture_context *tctx,
+						  struct smb2_tree *tree)
+{
+	bool ret = true;
+	const struct zfs_dataset *zds = NULL;
+	const char *snap = "tn_sc_cache";
+	char **labels = NULL;
+	uint32_t n0, n;
+	char label[TN_GMT_LEN + 1];
+	bool taken = false;
+
+	if (!truenas_sc_cache_setup(tctx, tree, &zds)) {
+		return false;
+	}
+	if (zds == NULL) {
+		return true;
+	}
+	truenas_sc_destroy(zds, snap);
+
+	/* fill the cache of this connection */
+	torture_assert(tctx, truenas_sc_enum(tctx, tree, "", &labels, &n0),
+		       "enumerate");
+
+	torture_assert(tctx, truenas_sc_take_alone(tctx, zds, snap),
+		       "snapshot");
+	taken = true;
+	torture_assert_goto(tctx, truenas_sc_label(tctx, zds, snap, label),
+			    ret, done, "label of the snapshot");
+
+	torture_assert_goto(tctx, truenas_sc_enum(tctx, tree, "", &labels, &n),
+			    ret, done, "enumerate after snapshot");
+	torture_assert_int_equal_goto(tctx, n, n0 + 1, ret, done,
+				      "new snapshot listed at once");
+	torture_assert_goto(tctx, truenas_sc_has_label(labels, n, label),
+			    ret, done, "label of the new snapshot");
+
+	/* a listing that did not change is served from the cache */
+	torture_assert_goto(tctx, truenas_sc_enum(tctx, tree, "", &labels, &n),
+			    ret, done, "enumerate again");
+	torture_assert_int_equal_goto(tctx, n, n0 + 1, ret, done,
+				      "same list");
+
+	torture_assert_goto(tctx, truenas_sc_destroy(zds, snap), ret, done,
+			    "destroy");
+	taken = false;
+
+	torture_assert_goto(tctx, truenas_sc_enum(tctx, tree, "", &labels, &n),
+			    ret, done, "enumerate after destroy");
+	torture_assert_int_equal_goto(tctx, n, n0, ret, done,
+				      "destroyed snapshot gone at once");
+	torture_assert_goto(tctx, !truenas_sc_has_label(labels, n, label),
+			    ret, done, "label of the destroyed snapshot");
+
+done:
+	if (taken) {
+		truenas_sc_destroy(zds, snap);
+	}
+	return ret;
+}
+
+static bool truenas_sc_write(struct torture_context *tctx,
+			     struct smb2_tree *tree,
+			     const char *fname,
+			     const char *data)
+{
+	NTSTATUS status;
+	struct smb2_create cr;
+	struct smb2_handle h;
+
+	ZERO_STRUCT(cr);
+	cr.in.desired_access = SEC_FILE_WRITE_DATA | SEC_FILE_READ_ATTRIBUTE;
+	cr.in.file_attributes = FILE_ATTRIBUTE_NORMAL;
+	cr.in.create_disposition = NTCREATEX_DISP_OVERWRITE_IF;
+	cr.in.share_access = NTCREATEX_SHARE_ACCESS_MASK;
+	cr.in.fname = fname;
+	status = smb2_create(tree, tctx, &cr);
+	torture_assert_ntstatus_ok(tctx, status, "create");
+	h = cr.out.file.handle;
+
+	status = smb2_util_write(tree, h, data, 0, strlen(data));
+	smb2_util_close(tree, h);
+	torture_assert_ntstatus_ok(tctx, status, "write");
+	return true;
+}
+
+/*
+ * A file version is listed only when it differs from the next newer one:
+ * the same inode, generation and change cookie mean the same data. With
+ * the file written before snapshots a and b, unchanged for c, and written
+ * again after c, the versions are c (b holds the same data) and a.
+ */
+static bool test_truenas_shadow_copy_same_version(struct torture_context *tctx,
+						  struct smb2_tree *tree)
+{
+	bool ret = true;
+	const struct zfs_dataset *zds = NULL;
+	const char *fname = "tn_sc_version";
+	const char *snaps[] = { "tn_sc_va", "tn_sc_vb", "tn_sc_vc" };
+	char label_a[TN_GMT_LEN + 1];
+	char label_c[TN_GMT_LEN + 1];
+	char **labels = NULL;
+	uint32_t n;
+	size_t i, taken = 0;
+
+	if (!truenas_sc_cache_setup(tctx, tree, &zds)) {
+		return false;
+	}
+	if (zds == NULL) {
+		return true;
+	}
+	for (i = 0; i < ARRAY_SIZE(snaps); i++) {
+		truenas_sc_destroy(zds, snaps[i]);
+	}
+
+	torture_assert_goto(tctx, truenas_sc_write(tctx, tree, fname, "v1"),
+			    ret, done, "write v1");
+	torture_assert_goto(tctx, truenas_sc_take_alone(tctx, zds, snaps[0]),
+			    ret, done, "snapshot a");
+	taken = 1;
+	torture_assert_goto(tctx, truenas_sc_write(tctx, tree, fname, "v2"),
+			    ret, done, "write v2");
+	torture_assert_goto(tctx, truenas_sc_take_alone(tctx, zds, snaps[1]),
+			    ret, done, "snapshot b");
+	taken = 2;
+	torture_assert_goto(tctx, truenas_sc_take_alone(tctx, zds, snaps[2]),
+			    ret, done, "snapshot c");
+	taken = 3;
+	torture_assert_goto(tctx, truenas_sc_write(tctx, tree, fname, "v3"),
+			    ret, done, "write v3");
+
+	torture_assert_goto(tctx,
+			    truenas_sc_label(tctx, zds, snaps[0], label_a) &&
+			    truenas_sc_label(tctx, zds, snaps[2], label_c),
+			    ret, done, "labels of the snapshots");
+
+	torture_assert_goto(tctx,
+			    truenas_sc_enum(tctx, tree, fname, &labels, &n),
+			    ret, done, "enumerate file versions");
+	for (i = 0; i < n; i++) {
+		torture_comment(tctx, "version %zu: %s\n", i, labels[i]);
+	}
+	torture_assert_int_equal_goto(tctx, n, 2, ret, done,
+				      "versions c and a only");
+	torture_assert_str_equal_goto(tctx, labels[0], label_c, ret, done,
+				      "newest version is snapshot c");
+	torture_assert_str_equal_goto(tctx, labels[1], label_a, ret, done,
+				      "older version is snapshot a");
+
+done:
+	for (i = 0; i < taken; i++) {
+		truenas_sc_destroy(zds, snaps[i]);
+	}
+	smb2_util_unlink(tree, fname);
+	return ret;
+}
+
+/*
+ * A symlink inside a snapshot is refused like one in the live share: the
+ * open of a path through it at the timewarp token of the snapshot must not
+ * reach the target outside the share. The share has "wide links = no".
+ */
+static bool test_truenas_shadow_copy_symlink(struct torture_context *tctx,
+					     struct smb2_tree *tree)
+{
+	bool ret = true;
+	const struct zfs_dataset *zds = NULL;
+	const char *snap = "tn_sc_link";
+	const char *mp = torture_setting_string(tctx, "sc_mp", NULL);
+	char outside[] = "/tmp/tn_sc_outsideXXXXXX";
+	char *secret = NULL;
+	char *link = NULL;
+	char label[TN_GMT_LEN + 1];
+	struct smb2_handle h = {{0}};
+	NTSTATUS status;
+	NTTIME twrp;
+	bool taken = false;
+	bool linked = false;
+	int fd;
+
+	if (!truenas_sc_cache_setup(tctx, tree, &zds)) {
+		return false;
+	}
+	if (zds == NULL) {
+		return true;
+	}
+	truenas_sc_destroy(zds, snap);
+
+	/* a readable file outside the share, and a symlink to its dir */
+	torture_assert(tctx, mkdtemp(outside) != NULL, "mkdtemp");
+	torture_assert_goto(tctx, chmod(outside, 0755) == 0, ret, done,
+			    "chmod");
+	secret = talloc_asprintf(tctx, "%s/secret", outside);
+	link = talloc_asprintf(tctx, "%s/%s", mp, snap);
+	torture_assert_goto(tctx, (secret != NULL) && (link != NULL), ret, done,
+			    "talloc");
+	fd = open(secret, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+	torture_assert_goto(tctx, fd != -1, ret, done, "create secret");
+	torture_assert_goto(tctx, write(fd, "secret", 6) == 6, ret, done,
+			    "write secret");
+	close(fd);
+	unlink(link);
+	torture_assert_goto(tctx, symlink(outside, link) == 0, ret, done,
+			    "symlink");
+	linked = true;
+
+	torture_assert_goto(tctx, truenas_sc_take_alone(tctx, zds, snap),
+			    ret, done, "snapshot");
+	taken = true;
+	torture_assert_goto(tctx, truenas_sc_find(tctx, zds, snap, label, &twrp),
+			    ret, done, "timewarp of the snapshot");
+	/* only the snapshot has the link now */
+	unlink(link);
+	linked = false;
+
+	status = truenas_sc_open_at(tree, tctx, "tn_sc_link\\secret", twrp, &h);
+	torture_comment(tctx, "open through the snapshot symlink: %s\n",
+			nt_errstr(status));
+	if (NT_STATUS_IS_OK(status)) {
+		smb2_util_close(tree, h);
+	}
+	torture_assert_goto(tctx, !NT_STATUS_IS_OK(status), ret, done,
+			    "symlink in a snapshot followed out of the share");
+
+done:
+	if (taken) {
+		truenas_sc_destroy(zds, snap);
+	}
+	if (linked) {
+		unlink(link);
+	}
+	if (secret != NULL) {
+		unlink(secret);
+	}
+	rmdir(outside);
+	return ret;
+}
+
+/*
+ * A timewarp token on a name that itself goes through .zfs/snapshot is an
+ * ordinary name in the snapshot, not a path into the snapshot directory:
+ * it may fail, but smbd must survive it.
+ */
+static bool test_truenas_shadow_copy_ctldir_name(struct torture_context *tctx,
+						 struct smb2_tree *tree)
+{
+	bool ret = true;
+	const struct zfs_dataset *zds = NULL;
+	const char *snap = "tn_sc_ctldir";
+	char *fname = NULL;
+	char label[TN_GMT_LEN + 1];
+	struct smb2_handle h = {{0}};
+	NTSTATUS status;
+	NTTIME twrp;
+
+	if (!truenas_sc_cache_setup(tctx, tree, &zds)) {
+		return false;
+	}
+	if (zds == NULL) {
+		return true;
+	}
+	truenas_sc_destroy(zds, snap);
+	torture_assert(tctx, truenas_sc_take_alone(tctx, zds, snap),
+		       "snapshot");
+	torture_assert_goto(tctx, truenas_sc_find(tctx, zds, snap, label, &twrp),
+			    ret, done, "timewarp of the snapshot");
+
+	fname = talloc_asprintf(tctx, ".zfs\\snapshot\\%s", snap);
+	torture_assert_goto(tctx, fname != NULL, ret, done, "talloc");
+	status = truenas_sc_open_at(tree, tctx, fname, twrp, &h);
+	torture_comment(tctx, "open %s at its own timewarp: %s\n", fname,
+			nt_errstr(status));
+	if (NT_STATUS_IS_OK(status)) {
+		smb2_util_close(tree, h);
+	}
+
+	/* the connection is still served */
+	status = smb2_util_roothandle(tree, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"open the share root afterwards");
+	smb2_util_close(tree, h);
+
+done:
+	truenas_sc_destroy(zds, snap);
+	return ret;
+}
+
+/*
+ * Files open in a snapshot hold its automount, and closing the last of
+ * them lets go: after handles in two snapshots, one of them opened twice,
+ * are closed, both snapshots can be destroyed (a snapshot still mounted
+ * and in use cannot).
+ */
+static bool test_truenas_shadow_copy_pins(struct torture_context *tctx,
+					  struct smb2_tree *tree)
+{
+	bool ret = true;
+	const struct zfs_dataset *zds = NULL;
+	const char *fname = "tn_sc_pin";
+	const char *snaps[] = { "tn_sc_pa", "tn_sc_pb" };
+	char label[TN_GMT_LEN + 1];
+	struct smb2_handle h[3];
+	NTTIME twrp[2];
+	NTSTATUS status;
+	size_t i, nopen = 0, taken = 0;
+
+	if (!truenas_sc_cache_setup(tctx, tree, &zds)) {
+		return false;
+	}
+	if (zds == NULL) {
+		return true;
+	}
+	for (i = 0; i < ARRAY_SIZE(snaps); i++) {
+		truenas_sc_destroy(zds, snaps[i]);
+	}
+
+	torture_assert_goto(tctx, truenas_sc_write(tctx, tree, fname, "pin"),
+			    ret, done, "write");
+	for (i = 0; i < ARRAY_SIZE(snaps); i++) {
+		torture_assert_goto(tctx,
+				    truenas_sc_take_alone(tctx, zds, snaps[i]),
+				    ret, done, "snapshot");
+		taken = i + 1;
+		torture_assert_goto(tctx,
+				    truenas_sc_find(tctx, zds, snaps[i], label,
+						    &twrp[i]),
+				    ret, done, "timewarp of the snapshot");
+	}
+
+	/* a, b, then a again: a is no longer the newest pin */
+	for (i = 0; i < ARRAY_SIZE(h); i++) {
+		status = truenas_sc_open_at(tree, tctx, fname,
+					    twrp[i == 1 ? 1 : 0], &h[i]);
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						"open in a snapshot");
+		nopen = i + 1;
+	}
+	for (i = 0; i < nopen; i++) {
+		smb2_util_close(tree, h[i]);
+	}
+	nopen = 0;
+
+	for (i = 0; i < ARRAY_SIZE(snaps); i++) {
+		torture_assert_goto(tctx, truenas_sc_destroy(zds, snaps[i]),
+				    ret, done,
+				    "destroy after the last close");
+		torture_assert_goto(tctx,
+				    !truenas_sc_label(tctx, zds, snaps[i],
+						      label),
+				    ret, done, "snapshot gone");
+	}
+	taken = 0;
+
+done:
+	for (i = 0; i < nopen; i++) {
+		smb2_util_close(tree, h[i]);
+	}
+	for (i = 0; i < taken; i++) {
+		truenas_sc_destroy(zds, snaps[i]);
+	}
+	smb2_util_unlink(tree, fname);
+	return ret;
+}
+
+/*
+ * Snapshots taken in one second share an @GMT- label, and a timewarp at
+ * that label opens one of them: the enumeration lists the label once.
+ */
+static bool test_truenas_shadow_copy_same_second(struct torture_context *tctx,
+						 struct smb2_tree *tree)
+{
+	bool ret = true;
+	const struct zfs_dataset *zds = NULL;
+	const char *snaps[] = { "tn_sc_s1", "tn_sc_s2" };
+	char label1[TN_GMT_LEN + 1];
+	char label2[TN_GMT_LEN + 1];
+	char **labels = NULL;
+	uint32_t n, i, count;
+	size_t k;
+	int attempt;
+	bool same = false;
+
+	if (!truenas_sc_cache_setup(tctx, tree, &zds)) {
+		return false;
+	}
+	if (zds == NULL) {
+		return true;
+	}
+
+	/*
+	 * Start on a second boundary and take both at once. A slow
+	 * transaction sync can still push the second one into the next
+	 * second, so try a few times.
+	 */
+	for (attempt = 0; attempt < 3; attempt++) {
+		time_t t;
+
+		for (k = 0; k < ARRAY_SIZE(snaps); k++) {
+			truenas_sc_destroy(zds, snaps[k]);
+		}
+		t = time(NULL);
+		while (time(NULL) == t) {
+			usleep(10000);
+		}
+		torture_assert_goto(tctx, truenas_sc_take(zds, snaps[0]) &&
+				    truenas_sc_take(zds, snaps[1]),
+				    ret, done, "snapshots");
+		torture_assert_goto(tctx,
+				    truenas_sc_label(tctx, zds, snaps[0],
+						     label1) &&
+				    truenas_sc_label(tctx, zds, snaps[1],
+						     label2),
+				    ret, done, "labels of the snapshots");
+		if (strcmp(label1, label2) == 0) {
+			same = true;
+			break;
+		}
+		torture_comment(tctx, "snapshots fell in two seconds, again\n");
+		sleep(1);
+	}
+	torture_assert_goto(tctx, same, ret, done,
+			    "two snapshots in one second");
+
+	/* the share root is a directory, which every snapshot lists */
+	torture_assert_goto(tctx, truenas_sc_enum(tctx, tree, "", &labels, &n),
+			    ret, done, "enumerate");
+	for (i = 0, count = 0; i < n; i++) {
+		if (strcmp(labels[i], label1) == 0) {
+			count++;
+		}
+	}
+	torture_assert_int_equal_goto(tctx, count, 1, ret, done,
+				      "label of the second listed once");
+
+done:
+	for (k = 0; k < ARRAY_SIZE(snaps); k++) {
+		truenas_sc_destroy(zds, snaps[k]);
+	}
+	return ret;
+}
+
+/*
+ * Snapshot snap of the datasets a and b in one second, so that one timewarp
+ * names both. Up to three tries: a slow sync can push b into the next one.
+ */
+static bool truenas_sc_take_pair(struct torture_context *tctx,
+				 const struct zfs_dataset *a,
+				 const struct zfs_dataset *b,
+				 const char *snap,
+				 NTTIME *ptwrp)
+{
+	char label[TN_GMT_LEN + 1];
+	NTTIME ta, tb;
+	int attempt;
+
+	for (attempt = 0; attempt < 3; attempt++) {
+		time_t t = time(NULL);
+
+		truenas_sc_destroy(a, snap);
+		truenas_sc_destroy(b, snap);
+		while (time(NULL) == t) {
+			usleep(10000);
+		}
+		if (!truenas_sc_take(a, snap) || !truenas_sc_take(b, snap) ||
+		    !truenas_sc_find(tctx, a, snap, label, &ta) ||
+		    !truenas_sc_find(tctx, b, snap, label, &tb)) {
+			break;
+		}
+		if (ta == tb) {
+			*ptwrp = ta;
+			return true;
+		}
+		torture_comment(tctx, "snapshots fell in two seconds, again\n");
+	}
+	truenas_sc_destroy(a, snap);
+	truenas_sc_destroy(b, snap);
+	return false;
+}
+
+/* Write data to the local file path, as root on the server. */
+static bool truenas_sc_local_write(const char *path, const char *data)
+{
+	size_t len = strlen(data);
+	int fd;
+	bool ok;
+
+	fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+	if (fd == -1) {
+		return false;
+	}
+	ok = (write(fd, data, len) == (ssize_t)len);
+	close(fd);
+	return ok;
+}
+
+/* Open fname at twrp and require its content to be expect. */
+static bool truenas_sc_expect_at(struct torture_context *tctx,
+				 struct smb2_tree *tree,
+				 const char *fname,
+				 NTTIME twrp,
+				 const char *expect)
+{
+	struct smb2_handle h = {{0}};
+	struct smb2_read rd;
+	size_t elen = strlen(expect);
+	NTSTATUS status;
+	bool ret = true;
+
+	status = truenas_sc_open_at(tree, tctx, fname, twrp, &h);
+	torture_assert_ntstatus_ok(tctx, status,
+				   talloc_asprintf(tctx, "open %s at its "
+						   "snapshot", fname));
+	ZERO_STRUCT(rd);
+	rd.in.file.handle = h;
+	rd.in.length = elen + 16;
+	status = smb2_read(tree, tctx, &rd);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "read");
+	torture_assert_int_equal_goto(tctx, rd.out.data.length, elen, ret, done,
+				      "length of the version");
+	torture_assert_mem_equal_goto(tctx, rd.out.data.data, expect, elen,
+				      ret, done, "content of the version");
+done:
+	smb2_util_close(tree, h);
+	return ret;
+}
+
+/* Open the directory dname at twrp, for a listing. */
+static NTSTATUS truenas_sc_open_dir_at(struct smb2_tree *tree,
+				       TALLOC_CTX *mem_ctx,
+				       const char *dname,
+				       NTTIME twrp,
+				       struct smb2_handle *h)
+{
+	struct smb2_create cr;
+	NTSTATUS status;
+
+	ZERO_STRUCT(cr);
+	cr.in.desired_access = SEC_DIR_LIST | SEC_DIR_READ_ATTRIBUTE;
+	cr.in.file_attributes = FILE_ATTRIBUTE_DIRECTORY;
+	cr.in.create_disposition = NTCREATEX_DISP_OPEN;
+	cr.in.share_access = NTCREATEX_SHARE_ACCESS_MASK;
+	cr.in.create_options = NTCREATEX_OPTIONS_DIRECTORY;
+	cr.in.fname = dname;
+	cr.in.timewarp = twrp;
+	status = smb2_create(tree, mem_ctx, &cr);
+	if (NT_STATUS_IS_OK(status)) {
+		*h = cr.out.file.handle;
+	}
+	return status;
+}
+
+/* The names a FIND of the open directory h for pattern returns. */
+static bool truenas_sc_dir_names(struct torture_context *tctx,
+				 struct smb2_tree *tree,
+				 struct smb2_handle h,
+				 const char *pattern,
+				 char ***pnames,
+				 uint32_t *pn)
+{
+	struct smb2_find f;
+	union smb_search_data *d = NULL;
+	unsigned int count, i;
+	char **names = NULL;
+	uint32_t n = 0;
+	NTSTATUS status;
+
+	*pnames = NULL;
+	*pn = 0;
+	ZERO_STRUCT(f);
+	f.in.file.handle = h;
+	f.in.pattern = pattern;
+	f.in.max_response_size = 0x10000;
+	f.in.level = SMB2_FIND_BOTH_DIRECTORY_INFO;
+	do {
+		status = smb2_find_level(tree, tctx, &f, &count, &d);
+		if (NT_STATUS_EQUAL(status, STATUS_NO_MORE_FILES) ||
+		    ((n == 0) &&
+		     NT_STATUS_EQUAL(status, NT_STATUS_NO_SUCH_FILE))) {
+			break;
+		}
+		torture_assert_ntstatus_ok(tctx, status,
+					   "find in snapshot directory");
+		names = talloc_realloc(tctx, names, char *, n + count);
+		torture_assert(tctx, names != NULL, "talloc");
+		for (i = 0; i < count; i++) {
+			names[n] = talloc_strdup(
+				names, d[i].both_directory_info.name.s);
+			torture_assert(tctx, names[n] != NULL, "talloc");
+			n++;
+		}
+	} while (count > 0);
+	*pnames = names;
+	*pn = n;
+	return true;
+}
+
+/* Whether a FIND of the directory dname at twrp for pattern returns name. */
+static bool truenas_sc_search(struct torture_context *tctx,
+			      struct smb2_tree *tree,
+			      const char *dname,
+			      NTTIME twrp,
+			      const char *pattern,
+			      const char *name,
+			      bool *plisted)
+{
+	struct smb2_handle h = {{0}};
+	char **names = NULL;
+	uint32_t n;
+	NTSTATUS status;
+	bool ret;
+
+	*plisted = false;
+	status = truenas_sc_open_dir_at(tree, tctx, dname, twrp, &h);
+	torture_assert_ntstatus_ok(tctx, status, "open directory at snapshot");
+	ret = truenas_sc_dir_names(tctx, tree, h, pattern, &names, &n);
+	smb2_util_close(tree, h);
+	if (ret) {
+		*plisted = truenas_sc_has_label(names, n, name);
+	}
+	return ret;
+}
+
+/* Whether the directory dname at twrp lists name. */
+static bool truenas_sc_lists(struct torture_context *tctx,
+			     struct smb2_tree *tree,
+			     const char *dname,
+			     NTTIME twrp,
+			     const char *name,
+			     bool *plisted)
+{
+	return truenas_sc_search(tctx, tree, dname, twrp, "*", name, plisted);
+}
+
+/*
+ * With shadow:no_dataset_traversal a child dataset is refused live
+ * (RESOLVE_NO_XDEV), and so in snapshots: a file in a snapshot of the
+ * child dataset torture:sc_child opens on a share without the option
+ * and not on one with it (torture:sc_noxdev), where the root of the
+ * child is not found either. A file in a snapshot of the share dataset
+ * opens on both.
+ *
+ * In the snapshot of the share dataset the mountpoint of the child is an
+ * empty directory. Listed at that time, the share root shows it as the
+ * root of the child's own snapshot of the same time, or not at all with
+ * the option, as live. A search for its name alone, which stats it
+ * before any open, answers the same.
+ */
+static bool test_truenas_shadow_copy_child_dataset(struct torture_context *tctx,
+						   struct smb2_tree *tree)
+{
+	bool ret = true;
+	const struct zfs_dataset *zds = NULL;
+	const struct zfs_dataset *czds = NULL;
+	const char *mp = torture_setting_string(tctx, "sc_mp", NULL);
+	const char *child = torture_setting_string(tctx, "sc_child", NULL);
+	bool noxdev = torture_setting_bool(tctx, "sc_noxdev", false);
+	const char *snap = "tn_sc_child";
+	const char *fname = "tn_sc_childfile";
+	char *cmp = NULL;
+	char *ppath = NULL;
+	char *cpath = NULL;
+	char *cname = NULL;
+	struct smb2_handle h = {{0}};
+	NTTIME twrp;
+	NTSTATUS status;
+	bool ptaken = false, ctaken = false;
+	bool listed, found;
+	int fd;
+
+	if (!truenas_sc_cache_setup(tctx, tree, &zds)) {
+		return false;
+	}
+	if (zds == NULL) {
+		return true;
+	}
+	if (child == NULL) {
+		torture_skip(tctx, "no torture:sc_child (child dataset of the "
+			     "share root)");
+	}
+
+	cmp = talloc_asprintf(tctx, "%s/%s", mp, child);
+	ppath = talloc_asprintf(tctx, "%s/%s", mp, fname);
+	cpath = talloc_asprintf(tctx, "%s/%s", cmp, fname);
+	cname = talloc_asprintf(tctx, "%s\\%s", child, fname);
+	torture_assert(tctx, (cmp != NULL) && (ppath != NULL) &&
+		       (cpath != NULL) && (cname != NULL), "talloc");
+	torture_assert_int_equal(tctx, conn_zfs_init(cmp, &czds), 0,
+				 "conn_zfs_init of the child");
+	torture_assert(tctx, (czds != NULL) && (czds->mnt_id != zds->mnt_id),
+		       "sc_child is a dataset of its own");
+	truenas_sc_destroy(zds, snap);
+	truenas_sc_destroy(czds, snap);
+
+	/* the live child is not reachable on a noxdev share: write locally */
+	fd = open(ppath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+	torture_assert_goto(tctx, fd != -1, ret, done, "create parent file");
+	close(fd);
+	fd = open(cpath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+	torture_assert_goto(tctx, fd != -1, ret, done, "create child file");
+	close(fd);
+
+	ptaken = ctaken = true;
+	torture_assert_goto(tctx,
+			    truenas_sc_take_pair(tctx, zds, czds, snap, &twrp),
+			    ret, done, "snapshots in one second");
+
+	status = truenas_sc_open_at(tree, tctx, fname, twrp, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"open in the share dataset snapshot");
+	smb2_util_close(tree, h);
+
+	status = truenas_sc_open_at(tree, tctx, cname, twrp, &h);
+	torture_comment(tctx, "open %s in the child snapshot (noxdev %d): "
+			"%s\n", cname, noxdev, nt_errstr(status));
+	if (NT_STATUS_IS_OK(status)) {
+		smb2_util_close(tree, h);
+	}
+	if (noxdev) {
+		torture_assert_goto(tctx, !NT_STATUS_IS_OK(status), ret, done,
+				    "child dataset opened in a snapshot "
+				    "with no_dataset_traversal");
+	} else {
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						"open in the child snapshot");
+	}
+
+	/* the root of the child itself: not there with the option */
+	status = truenas_sc_open_dir_at(tree, tctx, child, twrp, &h);
+	torture_comment(tctx, "open %s in the snapshot (noxdev %d): %s\n",
+			child, noxdev, nt_errstr(status));
+	if (NT_STATUS_IS_OK(status)) {
+		smb2_util_close(tree, h);
+	}
+	if (noxdev) {
+		torture_assert_ntstatus_equal_goto(
+			tctx, status, NT_STATUS_OBJECT_NAME_NOT_FOUND, ret,
+			done, "child dataset root in a snapshot with "
+			"no_dataset_traversal");
+	} else {
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						"open the root of the child in "
+						"its snapshot");
+	}
+
+	torture_assert_goto(tctx,
+			    truenas_sc_lists(tctx, tree, "", twrp, child,
+					     &listed),
+			    ret, done, "list the share root in the snapshot");
+	torture_comment(tctx, "%s in the listing (noxdev %d): %d\n", child,
+			noxdev, listed);
+	if (noxdev) {
+		torture_assert_goto(tctx, !listed, ret, done,
+				    "child dataset listed with "
+				    "no_dataset_traversal");
+	} else {
+		torture_assert_goto(tctx, listed, ret, done,
+				    "child dataset not listed as the root of "
+				    "its snapshot");
+		/*
+		 * In its own snapshot, ".." of the root of the child is the
+		 * directory above it as it was at that time: in the
+		 * snapshot of the share dataset, not in the snapshot
+		 * directory the mount sits in.
+		 */
+		torture_assert_goto(tctx,
+				    truenas_sc_lists(tctx, tree, child, twrp,
+						     "..", &listed),
+				    ret, done,
+				    "list the root of the child in its "
+				    "snapshot");
+		torture_assert_goto(tctx, listed, ret, done,
+				    "\"..\" of the root of the child dataset");
+	}
+
+	torture_assert_goto(tctx,
+			    truenas_sc_search(tctx, tree, "", twrp, child,
+					      child, &found),
+			    ret, done, "search the share root in the snapshot "
+			    "for the child");
+	torture_comment(tctx, "%s found by name (noxdev %d): %d\n", child,
+			noxdev, found);
+	torture_assert_int_equal_goto(tctx, found, !noxdev, ret, done,
+				      "child dataset found by name");
+
+done:
+	if (ctaken) {
+		truenas_sc_destroy(czds, snap);
+	}
+	if (ptaken) {
+		truenas_sc_destroy(zds, snap);
+	}
+	unlink(cpath);
+	unlink(ppath);
+	return ret;
+}
+
+/*
+ * A share rooted in a directory of its dataset, as /pool/ds/share of the
+ * dataset /pool/ds, maps a timewarp to that directory in the snapshot of
+ * the dataset, and nothing leads above it: not "..", not a symlink inside
+ * the snapshot to a sibling of the share in the same snapshot. A dataset
+ * mounted below the share root still has its own snapshots.
+ *
+ * Run on a share whose root is torture:sc_subdir below torture:sc_mp,
+ * with a child dataset mounted at <share root>/inner and the directory
+ * <sc_mp>/sc_outside next to the share root. The share of
+ * truenas.shadow_copy is rooted at the mountpoint, so this test is in a
+ * suite of its own.
+ */
+static bool test_truenas_shadow_copy_subdir_share(struct torture_context *tctx,
+						  struct smb2_tree *tree)
+{
+	bool ret = true;
+	const struct zfs_dataset *zds = NULL;
+	const struct zfs_dataset *izds = NULL;
+	const char *mp = torture_setting_string(tctx, "sc_mp", NULL);
+	const char *sub = torture_setting_string(tctx, "sc_subdir", NULL);
+	const char *snap = "tn_sc_sub";
+	char *root = NULL, *inner = NULL, *outside = NULL;
+	char *subfile = NULL, *innerfile = NULL, *secret = NULL, *up = NULL;
+	char label[TN_GMT_LEN + 1];
+	struct smb2_handle h = {{0}};
+	NTTIME twrp, itwrp;
+	NTSTATUS status;
+	bool listed;
+	bool taken = false;
+
+	if (!truenas_sc_cache_setup(tctx, tree, &zds)) {
+		return false;
+	}
+	if (zds == NULL) {
+		return true;
+	}
+	if (sub == NULL) {
+		torture_skip(tctx, "no torture:sc_subdir (share root below "
+			     "sc_mp)");
+	}
+
+	root = talloc_asprintf(tctx, "%s/%s", mp, sub);
+	inner = talloc_asprintf(tctx, "%s/inner", root);
+	outside = talloc_asprintf(tctx, "%s/sc_outside", mp);
+	subfile = talloc_asprintf(tctx, "%s/tn_sc_subfile", root);
+	innerfile = talloc_asprintf(tctx, "%s/tn_sc_innerfile", inner);
+	secret = talloc_asprintf(tctx, "%s/secret", outside);
+	up = talloc_asprintf(tctx, "%s/tn_sc_up", root);
+	torture_assert(tctx, (up != NULL) && (secret != NULL) &&
+		       (innerfile != NULL) && (subfile != NULL), "talloc");
+	torture_assert_int_equal(tctx, conn_zfs_init(inner, &izds), 0,
+				 "conn_zfs_init of the inner dataset");
+	torture_assert(tctx, (izds != NULL) && (izds->mnt_id != zds->mnt_id),
+		       "inner is a dataset of its own");
+	truenas_sc_destroy(izds, snap);
+	truenas_sc_destroy(zds, snap);
+
+	mkdir(outside, 0755);
+	unlink(up);
+	torture_assert_goto(tctx,
+			    truenas_sc_local_write(subfile, "sub-version") &&
+			    truenas_sc_local_write(innerfile, "inner-version") &&
+			    truenas_sc_local_write(secret, "secret") &&
+			    (symlink("../sc_outside", up) == 0),
+			    ret, done, "files");
+
+	taken = true;
+	torture_assert_goto(tctx, truenas_sc_take_alone(tctx, zds, snap) &&
+			    truenas_sc_take_alone(tctx, izds, snap),
+			    ret, done, "snapshots");
+	torture_assert_goto(tctx,
+			    truenas_sc_find(tctx, zds, snap, label, &twrp) &&
+			    truenas_sc_find(tctx, izds, snap, label, &itwrp),
+			    ret, done, "timewarps of the snapshots");
+	torture_assert_goto(tctx,
+			    truenas_sc_local_write(subfile, "live") &&
+			    truenas_sc_local_write(innerfile, "live"),
+			    ret, done, "live versions");
+
+	/* the share root in the snapshot is the directory of the share */
+	torture_assert_goto(tctx,
+			    truenas_sc_expect_at(tctx, tree, "tn_sc_subfile",
+						 twrp, "sub-version"),
+			    ret, done, "file of the share in the snapshot");
+	torture_assert_goto(tctx,
+			    truenas_sc_lists(tctx, tree, "", twrp,
+					     "tn_sc_subfile", &listed) &&
+			    listed,
+			    ret, done, "share root lists its file");
+	torture_assert_goto(tctx,
+			    truenas_sc_lists(tctx, tree, "", twrp,
+					     "sc_outside", &listed) &&
+			    !listed,
+			    ret, done, "share root is not the dataset root");
+
+	/* nothing above the share root */
+	status = truenas_sc_open_at(tree, tctx, "tn_sc_up\\secret", twrp, &h);
+	torture_comment(tctx, "open through a symlink to a sibling: %s\n",
+			nt_errstr(status));
+	if (NT_STATUS_IS_OK(status)) {
+		smb2_util_close(tree, h);
+	}
+	torture_assert_goto(tctx, !NT_STATUS_IS_OK(status), ret, done,
+			    "symlink in the snapshot led above the share");
+	status = truenas_sc_open_at(tree, tctx, "..\\sc_outside\\secret", twrp,
+				    &h);
+	torture_comment(tctx, "open of ..\\sc_outside: %s\n",
+			nt_errstr(status));
+	if (NT_STATUS_IS_OK(status)) {
+		smb2_util_close(tree, h);
+	}
+	torture_assert_goto(tctx, !NT_STATUS_IS_OK(status), ret, done,
+			    ".. led above the share");
+
+	/* the nested dataset, in its own snapshot */
+	torture_assert_goto(tctx,
+			    truenas_sc_expect_at(tctx, tree,
+						 "inner\\tn_sc_innerfile",
+						 itwrp, "inner-version"),
+			    ret, done, "file of the nested dataset");
+
+done:
+	if (taken) {
+		truenas_sc_destroy(izds, snap);
+		truenas_sc_destroy(zds, snap);
+	}
+	unlink(up);
+	unlink(subfile);
+	unlink(innerfile);
+	unlink(secret);
+	rmdir(outside);
+	return ret;
+}
+
+/*
+ * The path of a dataset mounted below a plain directory goes stale when a
+ * user renames that directory. A symlink put in its place must not lead
+ * the server into the snapshots by the old path, though it ends at the
+ * same dataset: snapshots are reached only through the snapshot directory
+ * of the mount itself. Uses the dataset mounted at <sc_mp>/<sc_nest>,
+ * whose parent directory is not a mountpoint.
+ *
+ * The share dataset is snapshotted in the same second, so that the parent
+ * directory exists at the timewarp too: smbd then walks the name one
+ * component at a time after the first refusal, and each component must
+ * be refused on its own.
+ */
+static bool test_truenas_shadow_copy_stale_mountpoint(
+	struct torture_context *tctx,
+	struct smb2_tree *tree)
+{
+	bool ret = true;
+	const struct zfs_dataset *zds = NULL;
+	const struct zfs_dataset *nzds = NULL;
+	const char *mp = torture_setting_string(tctx, "sc_mp", NULL);
+	const char *nest = torture_setting_string(tctx, "sc_nest", NULL);
+	const char *snap = "tn_sc_stale";
+	char *nmp = NULL, *dir = NULL, *moved = NULL, *file = NULL;
+	char *fname = NULL;
+	char *slash = NULL;
+	struct smb2_handle h = {{0}};
+	NTTIME twrp;
+	NTSTATUS status;
+	bool taken = false, renamed = false, linked = false;
+
+	if (!truenas_sc_cache_setup(tctx, tree, &zds)) {
+		return false;
+	}
+	if (zds == NULL) {
+		return true;
+	}
+	if (nest == NULL) {
+		torture_skip(tctx, "no torture:sc_nest (dataset below a plain "
+			     "directory of the share)");
+	}
+
+	nmp = talloc_asprintf(tctx, "%s/%s", mp, nest);
+	dir = talloc_strdup(tctx, nmp);
+	torture_assert(tctx, (nmp != NULL) && (dir != NULL), "talloc");
+	slash = strrchr(dir, '/');
+	torture_assert(tctx, slash != NULL, "parent of sc_nest");
+	*slash = '\0';
+	moved = talloc_asprintf(tctx, "%s_moved", dir);
+	file = talloc_asprintf(tctx, "%s/tn_sc_stalefile", nmp);
+	fname = talloc_asprintf(tctx, "%s\\tn_sc_stalefile", nest);
+	torture_assert(tctx, (moved != NULL) && (file != NULL) &&
+		       (fname != NULL), "talloc");
+	all_string_sub(fname, "/", "\\", 0);
+
+	torture_assert_int_equal(tctx, conn_zfs_init(nmp, &nzds), 0,
+				 "conn_zfs_init of the nested dataset");
+	torture_assert(tctx, nzds != NULL, "nested dataset");
+	torture_assert(tctx, truenas_sc_local_write(file, "stale-version"),
+		       "file");
+	taken = true;
+	torture_assert_goto(tctx, truenas_sc_take_pair(tctx, zds, nzds, snap,
+						       &twrp),
+			    ret, done, "snapshots in one second");
+
+	/* this also has the server resolve the dataset and keep its path */
+	torture_assert_goto(tctx,
+			    truenas_sc_expect_at(tctx, tree, fname, twrp,
+						 "stale-version"),
+			    ret, done, "file in the snapshot before the rename");
+
+	torture_assert_goto(tctx, rename(dir, moved) == 0, ret, done,
+			    "rename the directory above the dataset");
+	renamed = true;
+	torture_assert_goto(tctx, symlink(moved, dir) == 0, ret, done,
+			    "symlink in its place");
+	linked = true;
+
+	status = truenas_sc_open_at(tree, tctx, fname, twrp, &h);
+	torture_comment(tctx, "open by the stale path: %s\n",
+			nt_errstr(status));
+	if (NT_STATUS_IS_OK(status)) {
+		smb2_util_close(tree, h);
+	}
+	torture_assert_goto(tctx, !NT_STATUS_IS_OK(status), ret, done,
+			    "snapshot reached through a symlink in the path "
+			    "of the dataset");
+
+	/* with the directory back, the path is good again */
+	torture_assert_goto(tctx, unlink(dir) == 0, ret, done, "unlink");
+	linked = false;
+	torture_assert_goto(tctx, rename(moved, dir) == 0, ret, done,
+			    "rename back");
+	renamed = false;
+	torture_assert_goto(tctx,
+			    truenas_sc_expect_at(tctx, tree, fname, twrp,
+						 "stale-version"),
+			    ret, done, "file in the snapshot after the rename "
+			    "back");
+
+done:
+	if (linked) {
+		unlink(dir);
+	}
+	if (renamed && (rename(moved, dir) != 0)) {
+		torture_comment(tctx, "rename %s back failed: %s\n", moved,
+				strerror(errno));
+		ret = false;
+	}
+	if (taken) {
+		truenas_sc_destroy(nzds, snap);
+		truenas_sc_destroy(zds, snap);
+	}
+	unlink(file);
+	return ret;
+}
+
+/* FSCTL_SRV_ENUM_SNAPS on h for the count only: its status, and *pn. */
+static NTSTATUS truenas_sc_enum_status(struct smb2_tree *tree,
+				       TALLOC_CTX *mem_ctx,
+				       struct smb2_handle h,
+				       uint32_t *pn)
+{
+	union smb_ioctl io;
+	NTSTATUS status;
+
+	*pn = 0;
+	ZERO_STRUCT(io);
+	io.smb2.level = RAW_IOCTL_SMB2;
+	io.smb2.in.file.handle = h;
+	io.smb2.in.function = FSCTL_SRV_ENUM_SNAPS;
+	io.smb2.in.max_output_response = 16;
+	io.smb2.in.flags = SMB2_IOCTL_FLAG_IS_FSCTL;
+	status = smb2_ioctl(tree, mem_ctx, &io.smb2);
+	if (NT_STATUS_IS_OK(status) && (io.smb2.out.out.length >= 12)) {
+		*pn = IVAL(io.smb2.out.out.data, 0);
+	}
+	return status;
+}
+
+/*
+ * The versions of an open file are found through the snapshot directory
+ * of its dataset, by the path the dataset had when the server resolved
+ * it. With the directory above the dataset renamed, and ordinary
+ * directories named .zfs/snapshot/<snap> with a file in them put at that
+ * path, the enumeration must not offer that file as a version: it fails,
+ * and the client is told the name does not exist. The enumeration before
+ * the rename has the server resolve the dataset, and is the control.
+ */
+static bool test_truenas_shadow_copy_stale_enum(struct torture_context *tctx,
+						struct smb2_tree *tree)
+{
+	bool ret = true;
+	const struct zfs_dataset *zds = NULL;
+	const struct zfs_dataset *nzds = NULL;
+	const char *mp = torture_setting_string(tctx, "sc_mp", NULL);
+	const char *nest = torture_setting_string(tctx, "sc_nest", NULL);
+	const char *snap = "tn_sc_senum";
+	const char *leaf = "tn_sc_senumfile";
+	char *nmp = NULL, *dir = NULL, *moved = NULL, *file = NULL;
+	char *fname = NULL, *fakefile = NULL;
+	char *fake[5] = { NULL };
+	char *slash = NULL;
+	struct smb2_create cr;
+	struct smb2_handle h = {{0}};
+	NTSTATUS status;
+	uint32_t n;
+	size_t i, nfake = 0;
+	bool opened = false, taken = false, renamed = false;
+
+	if (!truenas_sc_cache_setup(tctx, tree, &zds)) {
+		return false;
+	}
+	if (zds == NULL) {
+		return true;
+	}
+	if (nest == NULL) {
+		torture_skip(tctx, "no torture:sc_nest (dataset below a plain "
+			     "directory of the share)");
+	}
+
+	nmp = talloc_asprintf(tctx, "%s/%s", mp, nest);
+	dir = talloc_strdup(tctx, nmp);
+	torture_assert(tctx, (nmp != NULL) && (dir != NULL), "talloc");
+	slash = strrchr(dir, '/');
+	torture_assert(tctx, slash != NULL, "parent of sc_nest");
+	*slash = '\0';
+	moved = talloc_asprintf(tctx, "%s_moved", dir);
+	file = talloc_asprintf(tctx, "%s/%s", nmp, leaf);
+	fname = talloc_asprintf(tctx, "%s\\%s", nest, leaf);
+	fake[0] = dir;
+	fake[1] = nmp;
+	fake[2] = talloc_asprintf(tctx, "%s/.zfs", nmp);
+	fake[3] = talloc_asprintf(tctx, "%s/.zfs/snapshot", nmp);
+	fake[4] = talloc_asprintf(tctx, "%s/.zfs/snapshot/%s", nmp, snap);
+	fakefile = talloc_asprintf(tctx, "%s/%s", fake[4], leaf);
+	torture_assert(tctx, (moved != NULL) && (file != NULL) &&
+		       (fname != NULL) && (fake[2] != NULL) &&
+		       (fake[3] != NULL) && (fake[4] != NULL) &&
+		       (fakefile != NULL), "talloc");
+	all_string_sub(fname, "/", "\\", 0);
+
+	torture_assert_int_equal(tctx, conn_zfs_init(nmp, &nzds), 0,
+				 "conn_zfs_init of the nested dataset");
+	torture_assert(tctx, nzds != NULL, "nested dataset");
+	truenas_sc_destroy(nzds, snap);
+
+	/* a version in the snapshot: the file changes after it */
+	torture_assert(tctx, truenas_sc_local_write(file, "version"), "file");
+	torture_assert_goto(tctx, truenas_sc_take_alone(tctx, nzds, snap),
+			    ret, done, "snapshot");
+	taken = true;
+	torture_assert_goto(tctx, truenas_sc_local_write(file, "live"), ret,
+			    done, "live version");
+
+	ZERO_STRUCT(cr);
+	cr.in.desired_access = SEC_FILE_READ_DATA | SEC_FILE_READ_ATTRIBUTE;
+	cr.in.create_disposition = NTCREATEX_DISP_OPEN;
+	cr.in.share_access = NTCREATEX_SHARE_ACCESS_MASK;
+	cr.in.fname = fname;
+	status = smb2_create(tree, tctx, &cr);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"open the live file");
+	h = cr.out.file.handle;
+	opened = true;
+
+	status = truenas_sc_enum_status(tree, tctx, h, &n);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"enumerate before the rename");
+	torture_assert_goto(tctx, n >= 1, ret, done,
+			    "the snapshot is a version before the rename");
+
+	torture_assert_goto(tctx, rename(dir, moved) == 0, ret, done,
+			    "rename the directory above the dataset");
+	renamed = true;
+	for (i = 0; i < ARRAY_SIZE(fake); i++) {
+		torture_assert_goto(tctx, mkdir(fake[i], 0755) == 0, ret, done,
+				    "fake snapshot directory");
+		nfake = i + 1;
+	}
+	torture_assert_goto(tctx, truenas_sc_local_write(fakefile, "fake"),
+			    ret, done, "fake version");
+
+	status = truenas_sc_enum_status(tree, tctx, h, &n);
+	torture_comment(tctx, "enumerate by the stale path: %s, %u\n",
+			nt_errstr(status), n);
+	torture_assert_ntstatus_equal_goto(tctx, status,
+					   NT_STATUS_OBJECT_NAME_NOT_FOUND,
+					   ret, done,
+					   "fake snapshot directory refused");
+
+done:
+	if (opened) {
+		smb2_util_close(tree, h);
+	}
+	unlink(fakefile);
+	for (i = nfake; i > 0; i--) {
+		rmdir(fake[i - 1]);
+	}
+	if (renamed && (rename(moved, dir) != 0)) {
+		torture_comment(tctx, "rename %s back failed: %s\n", moved,
+				strerror(errno));
+		ret = false;
+	}
+	if (taken) {
+		truenas_sc_destroy(nzds, snap);
+	}
+	unlink(file);
+	return ret;
+}
+
+/*
+ * A directory open in a snapshot lists its entries from its own fd, and
+ * the listing holds up when the path of its dataset goes stale: with the
+ * directory above the dataset renamed, and ordinary directories of the
+ * same names put at the old path, a subdirectory in the snapshot is still
+ * listed from the snapshot, not mistaken for the root of another dataset
+ * because the live path of its name now leads elsewhere. The handle is
+ * opened before the rename, as a client's would be.
+ */
+static bool test_truenas_shadow_copy_stale_listing(struct torture_context *tctx,
+						   struct smb2_tree *tree)
+{
+	bool ret = true;
+	const struct zfs_dataset *zds = NULL;
+	const struct zfs_dataset *nzds = NULL;
+	const char *mp = torture_setting_string(tctx, "sc_mp", NULL);
+	const char *nest = torture_setting_string(tctx, "sc_nest", NULL);
+	const char *snap = "tn_sc_slist";
+	const char *subname = "tn_sc_slsub";
+	char *nmp = NULL, *dir = NULL, *moved = NULL;
+	char *sub = NULL, *subd = NULL, *subf = NULL, *dname = NULL;
+	char *fake[4] = { NULL };
+	char *slash = NULL;
+	char **names = NULL;
+	char label[TN_GMT_LEN + 1];
+	struct smb2_handle h = {{0}};
+	NTSTATUS status;
+	NTTIME twrp;
+	uint32_t n;
+	size_t i, nfake = 0;
+	bool opened = false, taken = false, renamed = false;
+
+	if (!truenas_sc_cache_setup(tctx, tree, &zds)) {
+		return false;
+	}
+	if (zds == NULL) {
+		return true;
+	}
+	if (nest == NULL) {
+		torture_skip(tctx, "no torture:sc_nest (dataset below a plain "
+			     "directory of the share)");
+	}
+
+	nmp = talloc_asprintf(tctx, "%s/%s", mp, nest);
+	dir = talloc_strdup(tctx, nmp);
+	torture_assert(tctx, (nmp != NULL) && (dir != NULL), "talloc");
+	slash = strrchr(dir, '/');
+	torture_assert(tctx, slash != NULL, "parent of sc_nest");
+	*slash = '\0';
+	moved = talloc_asprintf(tctx, "%s_moved", dir);
+	sub = talloc_asprintf(tctx, "%s/%s", nmp, subname);
+	subd = talloc_asprintf(tctx, "%s/d", sub);
+	subf = talloc_asprintf(tctx, "%s/f", sub);
+	dname = talloc_asprintf(tctx, "%s\\%s", nest, subname);
+	torture_assert(tctx, (moved != NULL) && (sub != NULL) &&
+		       (subd != NULL) && (subf != NULL) && (dname != NULL),
+		       "talloc");
+	all_string_sub(dname, "/", "\\", 0);
+	fake[0] = dir;
+	fake[1] = nmp;
+	fake[2] = sub;
+	fake[3] = subd;
+
+	torture_assert_int_equal(tctx, conn_zfs_init(nmp, &nzds), 0,
+				 "conn_zfs_init of the nested dataset");
+	torture_assert(tctx, nzds != NULL, "nested dataset");
+	truenas_sc_destroy(nzds, snap);
+
+	torture_assert(tctx, (mkdir(sub, 0755) == 0) || (errno == EEXIST),
+		       "subdirectory");
+	torture_assert(tctx, (mkdir(subd, 0755) == 0) || (errno == EEXIST),
+		       "directory in it");
+	torture_assert(tctx, truenas_sc_local_write(subf, "version"),
+		       "file in it");
+	torture_assert_goto(tctx, truenas_sc_take_alone(tctx, nzds, snap),
+			    ret, done, "snapshot");
+	taken = true;
+	torture_assert_goto(tctx, truenas_sc_find(tctx, nzds, snap, label,
+						  &twrp),
+			    ret, done, "timewarp of the snapshot");
+
+	status = truenas_sc_open_dir_at(tree, tctx, dname, twrp, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"open the directory in the snapshot");
+	opened = true;
+
+	torture_assert_goto(tctx, rename(dir, moved) == 0, ret, done,
+			    "rename the directory above the dataset");
+	renamed = true;
+	for (i = 0; i < ARRAY_SIZE(fake); i++) {
+		torture_assert_goto(tctx, mkdir(fake[i], 0755) == 0, ret, done,
+				    "directory at the stale path");
+		nfake = i + 1;
+	}
+
+	torture_assert_goto(tctx,
+			    truenas_sc_dir_names(tctx, tree, h, "*", &names,
+						 &n),
+			    ret, done, "list the open directory");
+	for (i = 0; i < n; i++) {
+		torture_comment(tctx, "listed: %s\n", names[i]);
+	}
+	torture_assert_goto(tctx, truenas_sc_has_label(names, n, "f"), ret,
+			    done, "file in the snapshot listed");
+	torture_assert_goto(tctx, truenas_sc_has_label(names, n, "d"), ret,
+			    done, "directory in the snapshot listed");
+
+done:
+	if (opened) {
+		smb2_util_close(tree, h);
+	}
+	for (i = nfake; i > 0; i--) {
+		rmdir(fake[i - 1]);
+	}
+	if (renamed && (rename(moved, dir) != 0)) {
+		torture_comment(tctx, "rename %s back failed: %s\n", moved,
+				strerror(errno));
+		ret = false;
+	}
+	if (taken) {
+		truenas_sc_destroy(nzds, snap);
+	}
+	unlink(subf);
+	rmdir(subd);
+	rmdir(sub);
+	return ret;
+}
+
+#endif /* HAVE_LIBZFS */
+
 NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 {
 	struct torture_suite *suite = torture_suite_create(ctx, "truenas");
@@ -1474,6 +3099,8 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 		torture_suite_create(suite, "streams");
 	struct torture_suite *sc_suite =
 		torture_suite_create(suite, "shadow_copy");
+	struct torture_suite *sc_subdir_suite =
+		torture_suite_create(suite, "shadow_copy_subdir");
 	struct torture_suite *fruit_suite =
 		torture_suite_create(suite, "fruit");
 
@@ -1499,11 +3126,36 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 				     test_truenas_shadow_copy_readonly);
 	torture_suite_add_1smb2_test(sc_suite, "listdir",
 				     test_truenas_shadow_copy_listdir);
+#ifdef HAVE_LIBZFS
+	torture_suite_add_1smb2_test(sc_suite, "cache_change",
+				     test_truenas_shadow_copy_cache_change);
+	torture_suite_add_1smb2_test(sc_suite, "same_version",
+				     test_truenas_shadow_copy_same_version);
+	torture_suite_add_1smb2_test(sc_suite, "symlink",
+				     test_truenas_shadow_copy_symlink);
+	torture_suite_add_1smb2_test(sc_suite, "ctldir_name",
+				     test_truenas_shadow_copy_ctldir_name);
+	torture_suite_add_1smb2_test(sc_suite, "pins",
+				     test_truenas_shadow_copy_pins);
+	torture_suite_add_1smb2_test(sc_suite, "child_dataset",
+				     test_truenas_shadow_copy_child_dataset);
+	torture_suite_add_1smb2_test(sc_suite, "same_second",
+				     test_truenas_shadow_copy_same_second);
+	torture_suite_add_1smb2_test(sc_subdir_suite, "subdir_share",
+				     test_truenas_shadow_copy_subdir_share);
+	torture_suite_add_1smb2_test(sc_suite, "stale_mountpoint",
+				     test_truenas_shadow_copy_stale_mountpoint);
+	torture_suite_add_1smb2_test(sc_suite, "stale_enum",
+				     test_truenas_shadow_copy_stale_enum);
+	torture_suite_add_1smb2_test(sc_suite, "stale_listing",
+				     test_truenas_shadow_copy_stale_listing);
+#endif
 
 	torture_suite_add_suite(suite, rename_suite);
 	torture_suite_add_suite(suite, streams_suite);
 	torture_suite_add_suite(suite, fruit_suite);
 	torture_suite_add_suite(suite, sc_suite);
+	torture_suite_add_suite(suite, sc_subdir_suite);
 
 	/* ACL <-> Security-Descriptor mapping subtests (truenas_acl.c) */
 	torture_truenas_acl_suite(suite);
