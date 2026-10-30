@@ -2309,10 +2309,11 @@ static NTSTATUS truenas_sc_open_dir_at(struct smb2_tree *tree,
 	return status;
 }
 
-/* The names one FIND of the open directory h returns. */
+/* The names a FIND of the open directory h for pattern returns. */
 static bool truenas_sc_dir_names(struct torture_context *tctx,
 				 struct smb2_tree *tree,
 				 struct smb2_handle h,
+				 const char *pattern,
 				 char ***pnames,
 				 uint32_t *pn)
 {
@@ -2327,12 +2328,14 @@ static bool truenas_sc_dir_names(struct torture_context *tctx,
 	*pn = 0;
 	ZERO_STRUCT(f);
 	f.in.file.handle = h;
-	f.in.pattern = "*";
+	f.in.pattern = pattern;
 	f.in.max_response_size = 0x10000;
 	f.in.level = SMB2_FIND_BOTH_DIRECTORY_INFO;
 	do {
 		status = smb2_find_level(tree, tctx, &f, &count, &d);
-		if (NT_STATUS_EQUAL(status, STATUS_NO_MORE_FILES)) {
+		if (NT_STATUS_EQUAL(status, STATUS_NO_MORE_FILES) ||
+		    ((n == 0) &&
+		     NT_STATUS_EQUAL(status, NT_STATUS_NO_SUCH_FILE))) {
 			break;
 		}
 		torture_assert_ntstatus_ok(tctx, status,
@@ -2351,13 +2354,14 @@ static bool truenas_sc_dir_names(struct torture_context *tctx,
 	return true;
 }
 
-/* Whether the directory dname at twrp lists name. */
-static bool truenas_sc_lists(struct torture_context *tctx,
-			     struct smb2_tree *tree,
-			     const char *dname,
-			     NTTIME twrp,
-			     const char *name,
-			     bool *plisted)
+/* Whether a FIND of the directory dname at twrp for pattern returns name. */
+static bool truenas_sc_search(struct torture_context *tctx,
+			      struct smb2_tree *tree,
+			      const char *dname,
+			      NTTIME twrp,
+			      const char *pattern,
+			      const char *name,
+			      bool *plisted)
 {
 	struct smb2_handle h = {{0}};
 	char **names = NULL;
@@ -2368,7 +2372,7 @@ static bool truenas_sc_lists(struct torture_context *tctx,
 	*plisted = false;
 	status = truenas_sc_open_dir_at(tree, tctx, dname, twrp, &h);
 	torture_assert_ntstatus_ok(tctx, status, "open directory at snapshot");
-	ret = truenas_sc_dir_names(tctx, tree, h, &names, &n);
+	ret = truenas_sc_dir_names(tctx, tree, h, pattern, &names, &n);
 	smb2_util_close(tree, h);
 	if (ret) {
 		*plisted = truenas_sc_has_label(names, n, name);
@@ -2376,17 +2380,30 @@ static bool truenas_sc_lists(struct torture_context *tctx,
 	return ret;
 }
 
+/* Whether the directory dname at twrp lists name. */
+static bool truenas_sc_lists(struct torture_context *tctx,
+			     struct smb2_tree *tree,
+			     const char *dname,
+			     NTTIME twrp,
+			     const char *name,
+			     bool *plisted)
+{
+	return truenas_sc_search(tctx, tree, dname, twrp, "*", name, plisted);
+}
+
 /*
  * With shadow:no_dataset_traversal a child dataset is refused live
  * (RESOLVE_NO_XDEV), and so in snapshots: a file in a snapshot of the
  * child dataset torture:sc_child opens on a share without the option
- * and not on one with it (torture:sc_noxdev). A file in a snapshot of
- * the share dataset opens on both.
+ * and not on one with it (torture:sc_noxdev), where the root of the
+ * child is not found either. A file in a snapshot of the share dataset
+ * opens on both.
  *
  * In the snapshot of the share dataset the mountpoint of the child is an
  * empty directory. Listed at that time, the share root shows it as the
  * root of the child's own snapshot of the same time, or not at all with
- * the option, as live.
+ * the option, as live. A search for its name alone, which stats it
+ * before any open, answers the same.
  */
 static bool test_truenas_shadow_copy_child_dataset(struct torture_context *tctx,
 						   struct smb2_tree *tree)
@@ -2407,7 +2424,7 @@ static bool test_truenas_shadow_copy_child_dataset(struct torture_context *tctx,
 	NTTIME twrp;
 	NTSTATUS status;
 	bool ptaken = false, ctaken = false;
-	bool listed;
+	bool listed, found;
 	int fd;
 
 	if (!truenas_sc_cache_setup(tctx, tree, &zds)) {
@@ -2467,6 +2484,24 @@ static bool test_truenas_shadow_copy_child_dataset(struct torture_context *tctx,
 						"open in the child snapshot");
 	}
 
+	/* the root of the child itself: not there with the option */
+	status = truenas_sc_open_dir_at(tree, tctx, child, twrp, &h);
+	torture_comment(tctx, "open %s in the snapshot (noxdev %d): %s\n",
+			child, noxdev, nt_errstr(status));
+	if (NT_STATUS_IS_OK(status)) {
+		smb2_util_close(tree, h);
+	}
+	if (noxdev) {
+		torture_assert_ntstatus_equal_goto(
+			tctx, status, NT_STATUS_OBJECT_NAME_NOT_FOUND, ret,
+			done, "child dataset root in a snapshot with "
+			"no_dataset_traversal");
+	} else {
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						"open the root of the child in "
+						"its snapshot");
+	}
+
 	torture_assert_goto(tctx,
 			    truenas_sc_lists(tctx, tree, "", twrp, child,
 					     &listed),
@@ -2496,6 +2531,16 @@ static bool test_truenas_shadow_copy_child_dataset(struct torture_context *tctx,
 		torture_assert_goto(tctx, listed, ret, done,
 				    "\"..\" of the root of the child dataset");
 	}
+
+	torture_assert_goto(tctx,
+			    truenas_sc_search(tctx, tree, "", twrp, child,
+					      child, &found),
+			    ret, done, "search the share root in the snapshot "
+			    "for the child");
+	torture_comment(tctx, "%s found by name (noxdev %d): %d\n", child,
+			noxdev, found);
+	torture_assert_int_equal_goto(tctx, found, !noxdev, ret, done,
+				      "child dataset found by name");
 
 done:
 	if (ctaken) {
@@ -3010,8 +3055,9 @@ static bool test_truenas_shadow_copy_stale_listing(struct torture_context *tctx,
 		nfake = i + 1;
 	}
 
-	torture_assert_goto(tctx, truenas_sc_dir_names(tctx, tree, h, &names,
-						       &n),
+	torture_assert_goto(tctx,
+			    truenas_sc_dir_names(tctx, tree, h, "*", &names,
+						 &n),
 			    ret, done, "list the open directory");
 	for (i = 0; i < n; i++) {
 		torture_comment(tctx, "listed: %s\n", names[i]);

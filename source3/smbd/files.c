@@ -1704,6 +1704,15 @@ NTSTATUS openat_pathref_fsp_lcomp(struct files_struct *dirfsp,
 			       fsp,
 			       &how);
 
+	/*
+	 * Nothing here asks for RESOLVE_NO_XDEV: EXDEV comes from a module
+	 * that did, for a mount the share does not traverse into. For the
+	 * share the name is not there, unlike a special file that exists
+	 * and cannot be opened, which is stat'ed by name below.
+	 */
+	if ((fd == -1) && (errno == EXDEV)) {
+		errno = ENOENT;
+	}
 	if ((fd == -1) &&
 	    ((errno == ENOENT) || (errno == EACCES) || (errno == EPERM))) {
 		status = map_nt_error_from_unix(errno);

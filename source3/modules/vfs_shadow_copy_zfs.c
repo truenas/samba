@@ -1344,6 +1344,97 @@ out:
 	return ret;
 }
 
+/*
+ * A stat by name takes the rules of openat_fn, or the modules below would
+ * answer for the name as it is in the snapshot of the directory. smbd
+ * stats an entry of a listing by name when its open failed with other
+ * than ENOENT, EACCES, EPERM or EXDEV (openat_pathref_fsp_lcomp()), and a
+ * search for one name before any open (dptr_ReadDirName()). A single
+ * name below a directory open in a snapshot is stat'ed in it from its
+ * fd; the root of a child dataset has previous versions of its own, and
+ * none here with shadow:no_dataset_traversal, like any name on the full
+ * path.
+ */
+static int shadow_copy_zfs_fstatat(vfs_handle_struct *handle,
+				   const struct files_struct *dirfsp,
+				   const struct smb_filename *smb_fname_in,
+				   SMB_STRUCT_STAT *sbuf,
+				   int flags)
+{
+	struct shadow_fsp_ext *dir_ext = NULL;
+	struct smb_filename *smb_fname = NULL;
+	int saved_errno;
+	int ret;
+
+	if (!shadow_copy_zfs_match_name(smb_fname_in)) {
+		return SMB_VFS_NEXT_FSTATAT(handle, dirfsp, smb_fname_in,
+					    sbuf, flags);
+	}
+
+	if (dirfsp != NULL) {
+		dir_ext = VFS_FETCH_FSP_EXTENSION(handle, dirfsp);
+	}
+	if ((dir_ext != NULL) && (dir_ext->pin != NULL) &&
+	    (dir_ext->pin->twrp == smb_fname_in->twrp) &&
+	    (strchr(smb_fname_in->base_name, '/') == NULL) &&
+	    !ISDOTDOT(smb_fname_in->base_name)) {
+		ret = SMB_VFS_NEXT_FSTATAT(handle, dirfsp, smb_fname_in,
+					   sbuf, flags);
+		if (ret != 0) {
+			return ret;
+		}
+		if (sbuf->st_ex_dev != dir_ext->pin->dev) {
+			DBG_ERR("%s/%s: not in the snapshot %s\n",
+				fsp_str_dbg(dirfsp), smb_fname_in->base_name,
+				dir_ext->pin->name);
+			errno = ENOENT;
+			return -1;
+		}
+		if (!S_ISDIR(sbuf->st_ex_mode) ||
+		    ISDOT(smb_fname_in->base_name) ||
+		    !shadow_copy_zfs_live_elsewhere(handle, dirfsp,
+						    smb_fname_in,
+						    dir_ext->pin->mnt_id)) {
+			return 0;
+		}
+	}
+
+	smb_fname = full_path_from_dirfsp_atname(talloc_tos(), dirfsp,
+						 smb_fname_in);
+	if (smb_fname == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	ret = shadow_copy_zfs_stat_common(handle, smb_fname,
+					  (flags & AT_SYMLINK_NOFOLLOW) != 0);
+	if (ret == 0) {
+		*sbuf = smb_fname->st;
+	}
+	saved_errno = errno;
+	TALLOC_FREE(smb_fname);
+	errno = saved_errno;
+	return ret;
+}
+
+/*
+ * A batch stat of entries of dirfsp goes down with the names as they
+ * are. None in a snapshot, where an entry may need the conversion of
+ * fstatat_fn: each is then stat'ed through it.
+ */
+static int shadow_copy_zfs_batch_attr_submit(vfs_handle_struct *handle,
+					     const struct files_struct *dirfsp,
+					     struct vfs_attr_entry *ents,
+					     size_t count,
+					     uint32_t want)
+{
+	if ((dirfsp->fsp_name->twrp != 0) || fsp_in_snapshot(handle, dirfsp)) {
+		errno = ENOSYS;
+		return -1;
+	}
+	return SMB_VFS_NEXT_BATCH_ATTR_SUBMIT(handle, dirfsp, ents, count,
+					      want);
+}
+
 static int shadow_copy_zfs_readlinkat(vfs_handle_struct *handle,
 				      const struct files_struct *dirfsp,
 				      const struct smb_filename *smb_fname,
@@ -1856,6 +1947,8 @@ static struct vfs_fn_pointers vfs_shadow_copy_zfs_fns = {
 	.stat_fn = shadow_copy_zfs_stat,
 	.lstat_fn = shadow_copy_zfs_lstat,
 	.fstat_fn = shadow_copy_zfs_fstat,
+	.fstatat_fn = shadow_copy_zfs_fstatat,
+	.batch_attr_submit_fn = shadow_copy_zfs_batch_attr_submit,
 	.openat_fn = shadow_copy_zfs_open,
 	.unlinkat_fn = shadow_copy_zfs_unlinkat,
 	.lchown_fn = shadow_copy_zfs_lchown,
