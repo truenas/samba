@@ -172,12 +172,18 @@ echo "=========================================="
 #                        them as \040 for /proc/self/mounts; statmount
 #                        unescapes, so sb_source must arrive intact and be
 #                        usable by zfs_open()
+#   tank/libtest/nest/inner
+#                        mounted below a plain directory (nest has
+#                        canmount=off): the stale-mountpoint test renames
+#                        that directory
 # The auto-creation test additionally creates and destroys tn_ac_* datasets
 # below tank/libtest as it runs.
 zfs create -o casesensitivity=sensitive -o atime=off tank/libtest
 zfs create -o casesensitivity=insensitive -o atime=off tank/libtest/ci
 zfs create -o mountpoint=legacy tank/libtest/legacy
 zfs create -o casesensitivity=sensitive -o atime=off 'tank/libtest/with space'
+zfs create -o canmount=off tank/libtest/nest
+zfs create -o atime=off tank/libtest/nest/inner
 mkdir -p /mnt/libtest-legacy
 mount -t zfs tank/libtest/legacy /mnt/libtest-legacy
 zfs snapshot tank/libtest@libtest-snap
@@ -244,6 +250,20 @@ cat > /etc/smb4.conf <<CONF
 [zsc]
     # snapshot browsing via shadow_copy_zfs (@GMT- previous versions)
     path = $SHARE
+    read only = no
+    vfs objects = shadow_copy_zfs zfs_core
+
+[zscnx]
+    # zsc that does not step into child datasets, live or in snapshots
+    path = $SHARE
+    read only = no
+    vfs objects = shadow_copy_zfs zfs_core
+    shadow:no_dataset_traversal = yes
+
+[zscsub]
+    # zsc rooted in a plain directory of its dataset, with a dataset
+    # mounted below it (tank/share/sc_nest has canmount=off)
+    path = $SHARE/sc_nest
     read only = no
     vfs objects = shadow_copy_zfs zfs_core
 
@@ -568,6 +588,7 @@ if "$SMBTORTURE" ncalrpc:localhost -U% \
      --option='torture:tn_mount_space_mp=/tank/libtest/with space' \
      --option='torture:tn_mount_snap_name=libtest-snap' \
      --option='torture:tn_mount_snap_path=/tank/libtest/.zfs/snapshot/libtest-snap' \
+     --option='torture:tn_mount_nest_mp=/tank/libtest/nest/inner' \
      local.smb_libzfs local.truenas_mount; then
   echo "local library test suites PASSED"
 else
@@ -628,9 +649,19 @@ echo "Snapshot browsing via shadow_copy_zfs"
 echo "=========================================="
 # Write old content, snapshot, then overwrite the live file. The test
 # enumerates the snapshot over SMB (FSCTL_SRV_ENUM_SNAPS) and opens the file at
-# the server's own @GMT- label, so nothing is computed here.
+# the server's own @GMT- label, so nothing is computed here. The listing cache
+# tests (cache_change, same_version, ...) take and destroy their own snapshots
+# of the share dataset through smb_libzfs: sc_mp names its mountpoint, and
+# sc_child a child dataset for child_dataset, created after sc1 so that the
+# other tests see no change in it. sc_nest/inner is mounted below a plain
+# directory: stale_mountpoint renames that directory, and it is the root of
+# zscsub, which subdir_share runs on.
 printf 'snapshot-version' > "$SHARE/sc_canary"
 zfs snapshot tank/share@sc1
+zfs create tank/share/sc_child
+zfs create -o canmount=off tank/share/sc_nest
+zfs create tank/share/sc_nest/inner
+chmod 0777 "$SHARE/sc_nest" "$SHARE/sc_nest/inner"
 printf 'live-version' > "$SHARE/sc_canary"
 # Probe the snapshot at the FS level first -- this isolates a ZFS snapshot
 # automount problem (.zfs/snapshot/<snap> not accessible) from an SMB-layer
@@ -645,6 +676,9 @@ fi
 if tn_torture //127.0.0.1/zsc -U 'smbtest%testpass123' \
      --option='torture:sc_file=sc_canary' \
      --option='torture:sc_expect=snapshot-version' \
+     --option="torture:sc_mp=$SHARE" \
+     --option='torture:sc_child=sc_child' \
+     --option='torture:sc_nest=sc_nest/inner' \
      truenas.shadow_copy; then
   echo "shadow_copy browse PASSED"
 else
@@ -653,6 +687,28 @@ else
   grep -iE "shadowzfs|get_snapshot_path|do_convert|\.zfs/snapshot|sc_canary|snapdir|open_snapdir|openat.*zfs|No such|OBJECT_PATH|EXDEV|NOT_SAME" /var/log/samba4/smbd.log | tail -50
   exit 1
 fi
+if tn_torture //127.0.0.1/zscnx -U 'smbtest%testpass123' \
+     --option="torture:sc_mp=$SHARE" \
+     --option='torture:sc_child=sc_child' \
+     --option='torture:sc_noxdev=yes' \
+     truenas.shadow_copy.child_dataset; then
+  echo "shadow_copy no_dataset_traversal PASSED"
+else
+  echo "ERROR: shadow_copy no_dataset_traversal FAILED"
+  exit 1
+fi
+if tn_torture //127.0.0.1/zscsub -U 'smbtest%testpass123' \
+     --option="torture:sc_mp=$SHARE" \
+     --option='torture:sc_subdir=sc_nest' \
+     truenas.shadow_copy.subdir_share; then
+  echo "shadow_copy subdirectory share PASSED"
+else
+  echo "ERROR: shadow_copy subdirectory share FAILED"
+  exit 1
+fi
+zfs destroy -r tank/share/sc_child
+zfs destroy -r tank/share/sc_nest
+rmdir "$SHARE/sc_nest" 2>/dev/null || true
 
 echo "=========================================="
 echo "Time Machine auto-snapshot via tmprotect"

@@ -26,6 +26,10 @@
  */
 
 #include <fcntl.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <linux/openat2.h>
 #include <talloc.h>
 #include <sys/stat.h>
 #include <stdint.h>
@@ -62,6 +66,7 @@ char *hasmntopt (const struct mntent *__mnt,
 #include "lib/util/memcache.h"
 #include "lib/util/memory.h"
 #include "lib/util/unix_match.h"
+#include "lib/util/tsort.h"
 #include "smb_macros.h"
 #include "modules/smb_libzfs.h"
 #include "lib/truenas_mount.h"
@@ -72,9 +77,10 @@ char *hasmntopt (const struct mntent *__mnt,
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof(a[0]))
 #endif
 
-#ifndef ZFSCTL_INO_ROOT
-#define ZFSCTL_INO_ROOT     0x0000FFFFFFFFFFFFULL
-#endif /* ZFSCTL_INO_ROOT */
+/* inode number of <mountpoint>/.zfs/snapshot on Linux */
+#ifndef ZFSCTL_INO_SNAPDIR
+#define ZFSCTL_INO_SNAPDIR	0x0000FFFFFFFFFFFDULL
+#endif
 
 /*
  * Bound for the mount ID alias cache. Entries are a pair of mount IDs, so
@@ -138,12 +144,6 @@ static libzfs_handle_t *g_libzfs_handle;
 static uint32_t g_refcount;
 static struct memcache *global_zcache;
 static struct memcache *global_alias_cache;
-
-struct snap_cb
-{
-	struct snapshot_list *snapshots;
-	struct snap_filter *iter_info;
-};
 
 static void global_handle_decref()
 {
@@ -451,11 +451,6 @@ static int entry_resolve_base(TALLOC_CTX *mem_ctx,
 	TALLOC_FREE(*pentry);
 	*pentry = parent;
 	return 0;
-}
-
-bool inode_is_ctldir(ino_t ino)
-{
-	return ino == ZFSCTL_INO_ROOT ? true : false;
 }
 
 /*
@@ -1256,216 +1251,302 @@ static bool check_pattern(char **pattern, const char *snap_name)
 	return match;
 }
 
-static bool
-shadow_copy_zfs_is_snapshot_included(struct snap_filter *info,
-    const char *snap_name)
+static bool snapshot_is_included(const struct snap_filter *filter,
+				 const char *snap_name)
 {
-	bool is_match;
-
-	if (info->inclusions != NULL) {
-		is_match = check_pattern(info->inclusions, snap_name);
-		if (!is_match) {
-			DBG_INFO("smb_zfs_add_snapshot: snapshot %s "
-				 "not in inclusion list\n", snap_name);
-			return false;
-		}
+	if (filter == NULL) {
+		return true;
 	}
 
-	if (info->exclusions != NULL) {
-		is_match = check_pattern(info->exclusions, snap_name);
-		if (is_match) {
-			DBG_INFO("smb_zfs_add_snapshot: snapshot %s "
-				 "in exclusion list\n", snap_name);
-			return false;
-		}
+	if ((filter->inclusions != NULL) &&
+	    !check_pattern(filter->inclusions, snap_name)) {
+		DBG_INFO("snapshot %s not in inclusion list\n", snap_name);
+		return false;
+	}
+
+	if ((filter->exclusions != NULL) &&
+	    check_pattern(filter->exclusions, snap_name)) {
+		DBG_INFO("snapshot %s in exclusion list\n", snap_name);
+		return false;
 	}
 
 	return true;
 }
 
-static int
-smb_zfs_add_snapshot(zfs_handle_t *snap, void *data)
+static int snapdir_path(const char *mountpoint, char *buf, size_t bufsz)
 {
-	struct snap_cb *state = NULL;
-	struct snapshot_entry *entry = NULL;
-	const char *snap_name;
-	time_t cr_time;
-	struct tm timestamp;
-	int rc, used;
-	uint64_t createtxg;
-	size_t req_mem, name_len;
-	bool included;
+	int len;
 
-	state = talloc_get_type_abort(data, struct snap_cb);
-	if (state == NULL) {
-		DBG_ERR("failed to get snap_cb private data\n");
-		zfs_close(snap);
-		errno = ENOMEM;
+	/* A dataset mounted at "/" has no path component of its own. */
+	if (strcmp(mountpoint, "/") == 0) {
+		mountpoint = "";
+	}
+	len = snprintf(buf, bufsz, "%s/.zfs/snapshot", mountpoint);
+	if ((len < 0) || ((size_t)len >= bufsz)) {
+		errno = ENAMETOOLONG;
 		return -1;
 	}
-
-	/* ignore excluded snapshots */
-	snap_name = strchr(zfs_get_name(snap), '@') + 1;
-
-	included = shadow_copy_zfs_is_snapshot_included(state->iter_info,
-							snap_name);
-	if (!included) {
-		goto done;
-	}
-
-	createtxg = zfs_prop_get_int(snap, ZFS_PROP_CREATETXG);
-	if (state->iter_info->start_txg == createtxg) {
-		goto done;
-	}
-
-	/* ignore snapshots with zero bytes written */
-	used = zfs_prop_get_int(snap, ZFS_PROP_WRITTEN);
-	if (used == 0 && state->iter_info->ignore_empty_snaps) {
-		goto done;
-	}
-
-	/* ignore snapshots outside the specified time range */
-	cr_time = zfs_prop_get_int(snap, ZFS_PROP_CREATION);
-	if (state->iter_info->start && state->iter_info->start > cr_time) {
-		goto done;
-	}
-	if (state->iter_info->end && state->iter_info->end < cr_time) {
-		goto done;
-	}
-
-	entry = talloc_zero(state->snapshots, struct snapshot_entry);
-	if (entry == NULL) {
-		errno = ENOMEM;
-		return -1;
-	}
-
-	gmtime_r(&cr_time, &timestamp);
-	strftime(entry->label, sizeof(entry->label), SHADOW_COPY_ZFS_GMT_FORMAT,
-		 &timestamp);
-
-	entry->cr_time = cr_time;
-	unix_to_nt_time(&entry->nt_time, cr_time);
-	strlcpy(entry->name, snap_name, sizeof(entry->name));
-	entry->createtxg = createtxg;
-
-	DLIST_ADD(state->snapshots->entries, entry);
-	state->snapshots->num_entries++;
-	state->snapshots->last = entry;
-done:
-	zfs_close(snap);
 	return 0;
 }
 
-struct
-snapshot_list *smb_zfs_list_snapshots(TALLOC_CTX *mem_ctx,
-				      uint64_t mnt_id,
-				      struct snap_filter *iter_info)
+/*
+ * Whether stx is the .zfs/snapshot directory of the mount mnt_id. The
+ * mountpoint of a dataset is the one it had when it was first resolved:
+ * a directory above it renamed since leaves a path that may name
+ * anything, including a tree of ordinary directories of that name.
+ */
+static bool stx_is_snapdir(const struct statx *stx, uint64_t mnt_id)
+{
+	const uint32_t need = STATX_INO | STATX_MNT_ID_UNIQUE;
+
+	return ((stx->stx_mask & need) == need) &&
+	       (stx->stx_ino == ZFSCTL_INO_SNAPDIR) &&
+	       (stx->stx_mnt_id == mnt_id);
+}
+
+int smb_zfs_open_snapdir(const char *mountpoint, uint64_t mnt_id)
+{
+	struct open_how how = {
+		.flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+		/* a mount table path has no symlinks in it */
+		.resolve = RESOLVE_NO_SYMLINKS,
+	};
+	char path[PATH_MAX];
+	struct statx stx;
+	int fd, saved_errno;
+
+	if (snapdir_path(mountpoint, path, sizeof(path)) != 0) {
+		return -1;
+	}
+	fd = syscall(SYS_openat2, AT_FDCWD, path, &how, sizeof(how));
+	if (fd == -1) {
+		DBG_ERR("%s: openat2() failed: %s\n", path, strerror(errno));
+		return -1;
+	}
+	if (statx(fd, "", AT_EMPTY_PATH, STATX_INO | STATX_MNT_ID_UNIQUE,
+		  &stx) != 0) {
+		saved_errno = errno;
+		DBG_ERR("%s: statx() failed: %s\n", path, strerror(errno));
+		close(fd);
+		errno = saved_errno;
+		return -1;
+	}
+	if (!stx_is_snapdir(&stx, mnt_id)) {
+		DBG_ERR("%s: not the snapshot directory of mount ID %" PRIu64
+			"\n", path, mnt_id);
+		close(fd);
+		errno = ESTALE;
+		return -1;
+	}
+	return fd;
+}
+
+/*
+ * Newest first. Creation times have a resolution of one second, which
+ * cannot order snapshots taken in the same second: their names do.
+ */
+static int snapshot_entry_cmp(struct snapshot_entry * const *pa,
+			      struct snapshot_entry * const *pb)
+{
+	const struct snapshot_entry *a = *pa;
+	const struct snapshot_entry *b = *pb;
+
+	if (a->cr_time != b->cr_time) {
+		return (a->cr_time < b->cr_time) ? 1 : -1;
+	}
+	return strcmp(a->name, b->name);
+}
+
+struct snapshot_list *smb_zfs_list_snapshots(TALLOC_CTX *mem_ctx,
+					     uint64_t mnt_id,
+					     const struct snap_filter *filter)
 {
 	TALLOC_CTX *tmp_ctx = NULL;
-	struct snap_cb *state = NULL;
 	struct snapshot_list *snapshots = NULL;
-	int rc;
-	zfs_handle_t *zfs = NULL;
+	struct snapshot_entry **sorted = NULL;
+	struct snapshot_entry *entry = NULL;
 	dataset_t *dsentry = NULL;
+	char path[PATH_MAX];
+	struct dirent *de = NULL;
+	struct stat st;
+	DIR *dir = NULL;
+	size_t i, n = 0;
+	int fd, err, saved_errno;
 
 	dsentry = mntid_get_entry(mnt_id);
 	if (dsentry == NULL) {
 		return NULL;
 	}
-	/* The cache opens the dataset on its first use. */
-	zfs = entry_get_zhandle(dsentry);
-	if (zfs == NULL) {
-		return NULL;
-	}
 
 	tmp_ctx = talloc_new(mem_ctx);
 	if (tmp_ctx == NULL) {
-		DBG_ERR("talloc() failed\n");
+		errno = ENOMEM;
 		return NULL;
 	}
 
-	state = talloc_zero(tmp_ctx, struct snap_cb);
-	if (state == NULL) {
-		DBG_ERR("smb_zfs_list_snapshots: out of memory");
-		goto done;
-	}
-
-	snapshots = talloc_zero(mem_ctx, struct snapshot_list);
+	snapshots = talloc_zero(tmp_ctx, struct snapshot_list);
 	if (snapshots == NULL) {
-		DBG_ERR("talloc() failed\n");
-		goto done;
+		errno = ENOMEM;
+		goto fail;
 	}
-
-	state->snapshots = snapshots;
-
-	/* name and mountpoint are already known to the cache */
+	snapshots->mnt_id = dsentry->ds->mnt_id;
 	strlcpy(snapshots->dataset_name, dsentry->ds->dataset_name,
 		sizeof(snapshots->dataset_name));
 	strlcpy(snapshots->mountpoint, dsentry->ds->mountpoint,
 		sizeof(snapshots->mountpoint));
 
-	state->iter_info = iter_info;
-
-	rc = zfs_iter_snapshots_sorted(zfs, smb_zfs_add_snapshot, state,
-				       iter_info->start_txg, iter_info->end_txg);
-
-	if (rc != 0) {
-		DBG_ERR("smb_zfs_list_snapshots: error getting "
-			"snapshots for '%s': %s\n",
-			snapshots->dataset_name, strerror(errno));
-		goto error;
+	if (snapdir_path(snapshots->mountpoint, path, sizeof(path)) != 0) {
+		goto fail;
+	}
+	fd = smb_zfs_open_snapdir(snapshots->mountpoint, snapshots->mnt_id);
+	if (fd == -1) {
+		goto fail;
 	}
 
-	time(&snapshots->timestamp);
-	state->snapshots = NULL;
-done:
+	/*
+	 * Before the read: a snapshot that appears between the two only
+	 * makes the list look out of date, never current when it is not.
+	 */
+	if (fstat(fd, &st) != 0) {
+		DBG_ERR("%s: fstat() failed: %s\n", path, strerror(errno));
+		close(fd);
+		goto fail;
+	}
+	snapshots->snapdir_mtime = st.st_mtim;
+	snapshots->snapdir_nlink = st.st_nlink;
+
+	dir = fdopendir(fd);
+	if (dir == NULL) {
+		DBG_ERR("%s: fdopendir() failed: %s\n", path, strerror(errno));
+		close(fd);
+		goto fail;
+	}
+
+	sorted = talloc_array(tmp_ctx, struct snapshot_entry *,
+			      st.st_nlink > 2 ? st.st_nlink - 2 : 0);
+	if (sorted == NULL) {
+		errno = ENOMEM;
+		goto fail;
+	}
+
+	while ((errno = 0, de = readdir(dir)) != NULL) {
+		struct statx stx;
+		struct tm timestamp;
+
+		if ((strcmp(de->d_name, ".") == 0) ||
+		    (strcmp(de->d_name, "..") == 0)) {
+			continue;
+		}
+		if (!snapshot_is_included(filter, de->d_name)) {
+			continue;
+		}
+
+		/*
+		 * The birth time of the entry is the creation time of the
+		 * snapshot, mounted or not. AT_NO_AUTOMOUNT keeps a listing
+		 * from mounting every snapshot.
+		 */
+		err = statx(dirfd(dir), de->d_name,
+			    AT_NO_AUTOMOUNT | AT_SYMLINK_NOFOLLOW,
+			    STATX_BTIME, &stx);
+		if (err != 0) {
+			if (errno == ENOENT) {
+				/* destroyed since the read of its name */
+				DBG_INFO("%s/%s: destroyed while listed\n",
+					 path, de->d_name);
+			} else {
+				DBG_ERR("%s/%s: statx() failed, snapshot not "
+					"listed: %s\n",
+					path, de->d_name, strerror(errno));
+			}
+			continue;
+		}
+		if (!(stx.stx_mask & STATX_BTIME)) {
+			DBG_ERR("%s/%s: no birth time; the ZFS module does "
+				"not report snapshot creation times\n",
+				path, de->d_name);
+			errno = ENOTSUP;
+			goto fail;
+		}
+
+		entry = talloc_zero(snapshots, struct snapshot_entry);
+		if (entry == NULL) {
+			errno = ENOMEM;
+			goto fail;
+		}
+		strlcpy(entry->name, de->d_name, sizeof(entry->name));
+		entry->cr_time = stx.stx_btime.tv_sec;
+		unix_to_nt_time(&entry->nt_time, entry->cr_time);
+		gmtime_r(&entry->cr_time, &timestamp);
+		strftime(entry->label, sizeof(entry->label),
+			 SHADOW_COPY_ZFS_GMT_FORMAT, &timestamp);
+
+		if (n == talloc_array_length(sorted)) {
+			sorted = talloc_realloc(tmp_ctx, sorted,
+						struct snapshot_entry *,
+						2 * n + 16);
+			if (sorted == NULL) {
+				errno = ENOMEM;
+				goto fail;
+			}
+		}
+		sorted[n++] = entry;
+	}
+	if (errno != 0) {
+		DBG_ERR("%s: readdir() failed: %s\n", path, strerror(errno));
+		goto fail;
+	}
+	closedir(dir);
+	dir = NULL;
+
+	TYPESAFE_QSORT(sorted, n, snapshot_entry_cmp);
+	for (i = 0; i < n; i++) {
+		DLIST_ADD_END(snapshots->entries, sorted[i]);
+	}
+	snapshots->num_entries = n;
+
+	talloc_steal(mem_ctx, snapshots);
 	TALLOC_FREE(tmp_ctx);
 	return snapshots;
 
-error:
+fail:
+	saved_errno = errno;
+	if (dir != NULL) {
+		closedir(dir);
+	}
 	TALLOC_FREE(tmp_ctx);
-	TALLOC_FREE(snapshots);
+	errno = saved_errno;
 	return NULL;
 }
 
-bool update_snapshot_list(uint64_t mnt_id,
-			  struct snapshot_list *snaps,
-			  struct snap_filter *iter_info)
+bool smb_zfs_snapshot_list_current(const struct snapshot_list *snaps)
 {
-	struct snap_cb *state = NULL;
-	TALLOC_CTX *tmp_ctx = NULL;
-	zfs_handle_t *zfs = NULL;
-	int rc;
+	char path[PATH_MAX];
+	struct statx stx;
 
-	tmp_ctx = talloc_new(snaps);
-	if (tmp_ctx == NULL) {
-		errno = ENOMEM;
+	if (snapdir_path(snaps->mountpoint, path, sizeof(path)) != 0) {
+		return false;
+	}
+	/*
+	 * Symlinks are followed here, but anything other than the snapshot
+	 * directory of the mount reads as a change, and the next listing
+	 * refuses it.
+	 */
+	if (statx(AT_FDCWD, path, AT_NO_AUTOMOUNT,
+		  STATX_INO | STATX_MNT_ID_UNIQUE | STATX_MTIME | STATX_NLINK,
+		  &stx) != 0) {
+		DBG_INFO("%s: statx() failed: %s\n", path, strerror(errno));
+		return false;
+	}
+	if (!stx_is_snapdir(&stx, snaps->mnt_id) ||
+	    ((stx.stx_mask & (STATX_MTIME | STATX_NLINK)) !=
+	     (STATX_MTIME | STATX_NLINK))) {
 		return false;
 	}
 
-	state = talloc_zero(tmp_ctx, struct snap_cb);
-	if (state == NULL) {
-		errno = ENOMEM;
-		TALLOC_FREE(tmp_ctx);
-		return false;
-	}
-
-	zfs = mntid_get_zhandle_cached(mnt_id);
-	if (zfs == NULL) {
-		TALLOC_FREE(tmp_ctx);
-		return false;
-	}
-
-	state->iter_info = iter_info;
-	state->snapshots = snaps;
-	state->iter_info->start_txg = snaps->last->createtxg;
-
-	rc = zfs_iter_snapshots_sorted(zfs, smb_zfs_add_snapshot,
-				       state, snaps->last->createtxg, 0);
-
-	time(&snaps->timestamp);
-	TALLOC_FREE(tmp_ctx);
-	return true;
+	return (stx.stx_mtime.tv_sec == snaps->snapdir_mtime.tv_sec) &&
+	       (stx.stx_mtime.tv_nsec == snaps->snapdir_mtime.tv_nsec) &&
+	       ((uint64_t)stx.stx_nlink == snaps->snapdir_nlink);
 }
 
 /*
