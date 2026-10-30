@@ -1527,6 +1527,53 @@ static bool truenas_sc_find(struct torture_context *tctx,
 #define truenas_sc_label(tctx, zds, name, label) \
 	truenas_sc_find(tctx, zds, name, label, NULL)
 
+/*
+ * Take snapshot name of zds in a second no snapshot of the dataset was
+ * taken in, so that it has an @GMT- label of its own: snapshots taken in
+ * one second share a label, which the server lists once, for the first of
+ * them. ZFS stamps the creation time when the snapshot syncs, from the
+ * clock time() reads, so the second after the newest snapshot is enough.
+ */
+static bool truenas_sc_take_alone(struct torture_context *tctx,
+				  const struct zfs_dataset *zds,
+				  const char *name)
+{
+	struct snapshot_list *l = NULL;
+	time_t newest = 0;
+	bool ok;
+
+	l = smb_zfs_list_snapshots(tctx, zds->mnt_id, NULL);
+	if (l == NULL) {
+		return false;
+	}
+	if (l->entries != NULL) {
+		newest = l->entries->cr_time;	/* newest first */
+	}
+	TALLOC_FREE(l);
+	while (time(NULL) <= newest) {
+		usleep(10000);
+	}
+	if (!truenas_sc_take(zds, name)) {
+		return false;
+	}
+
+	/* the newest, and the only one of its second */
+	l = smb_zfs_list_snapshots(tctx, zds->mnt_id, NULL);
+	if (l == NULL) {
+		return false;
+	}
+	ok = (l->entries != NULL) &&
+	     (strcmp(l->entries->name, name) == 0) &&
+	     ((l->entries->next == NULL) ||
+	      (l->entries->next->cr_time < l->entries->cr_time));
+	if (!ok) {
+		torture_comment(tctx, "%s: not the newest snapshot, or not "
+				"alone in its second\n", name);
+	}
+	TALLOC_FREE(l);
+	return ok;
+}
+
 /* Open fname for reading at the timewarp token twrp. */
 static NTSTATUS truenas_sc_open_at(struct smb2_tree *tree,
 				   TALLOC_CTX *mem_ctx,
@@ -1735,7 +1782,8 @@ static bool test_truenas_shadow_copy_cache_change(struct torture_context *tctx,
 	torture_assert(tctx, truenas_sc_enum(tctx, tree, "", &labels, &n0),
 		       "enumerate");
 
-	torture_assert(tctx, truenas_sc_take(zds, snap), "snapshot");
+	torture_assert(tctx, truenas_sc_take_alone(tctx, zds, snap),
+		       "snapshot");
 	taken = true;
 	torture_assert_goto(tctx, truenas_sc_label(tctx, zds, snap, label),
 			    ret, done, "label of the snapshot");
@@ -1825,24 +1873,18 @@ static bool test_truenas_shadow_copy_same_version(struct torture_context *tctx,
 		truenas_sc_destroy(zds, snaps[i]);
 	}
 
-	/*
-	 * A second between the snapshots gives each its own @GMT- label,
-	 * which has a resolution of one second.
-	 */
 	torture_assert_goto(tctx, truenas_sc_write(tctx, tree, fname, "v1"),
 			    ret, done, "write v1");
-	torture_assert_goto(tctx, truenas_sc_take(zds, snaps[0]), ret, done,
-			    "snapshot a");
+	torture_assert_goto(tctx, truenas_sc_take_alone(tctx, zds, snaps[0]),
+			    ret, done, "snapshot a");
 	taken = 1;
-	sleep(1);
 	torture_assert_goto(tctx, truenas_sc_write(tctx, tree, fname, "v2"),
 			    ret, done, "write v2");
-	torture_assert_goto(tctx, truenas_sc_take(zds, snaps[1]), ret, done,
-			    "snapshot b");
+	torture_assert_goto(tctx, truenas_sc_take_alone(tctx, zds, snaps[1]),
+			    ret, done, "snapshot b");
 	taken = 2;
-	sleep(1);
-	torture_assert_goto(tctx, truenas_sc_take(zds, snaps[2]), ret, done,
-			    "snapshot c");
+	torture_assert_goto(tctx, truenas_sc_take_alone(tctx, zds, snaps[2]),
+			    ret, done, "snapshot c");
 	taken = 3;
 	torture_assert_goto(tctx, truenas_sc_write(tctx, tree, fname, "v3"),
 			    ret, done, "write v3");
@@ -1922,8 +1964,8 @@ static bool test_truenas_shadow_copy_symlink(struct torture_context *tctx,
 			    "symlink");
 	linked = true;
 
-	torture_assert_goto(tctx, truenas_sc_take(zds, snap), ret, done,
-			    "snapshot");
+	torture_assert_goto(tctx, truenas_sc_take_alone(tctx, zds, snap),
+			    ret, done, "snapshot");
 	taken = true;
 	torture_assert_goto(tctx, truenas_sc_find(tctx, zds, snap, label, &twrp),
 			    ret, done, "timewarp of the snapshot");
@@ -1978,7 +2020,8 @@ static bool test_truenas_shadow_copy_ctldir_name(struct torture_context *tctx,
 		return true;
 	}
 	truenas_sc_destroy(zds, snap);
-	torture_assert(tctx, truenas_sc_take(zds, snap), "snapshot");
+	torture_assert(tctx, truenas_sc_take_alone(tctx, zds, snap),
+		       "snapshot");
 	torture_assert_goto(tctx, truenas_sc_find(tctx, zds, snap, label, &twrp),
 			    ret, done, "timewarp of the snapshot");
 
@@ -2034,10 +2077,8 @@ static bool test_truenas_shadow_copy_pins(struct torture_context *tctx,
 	torture_assert_goto(tctx, truenas_sc_write(tctx, tree, fname, "pin"),
 			    ret, done, "write");
 	for (i = 0; i < ARRAY_SIZE(snaps); i++) {
-		if (i > 0) {
-			sleep(1);	/* a label of its own */
-		}
-		torture_assert_goto(tctx, truenas_sc_take(zds, snaps[i]),
+		torture_assert_goto(tctx,
+				    truenas_sc_take_alone(tctx, zds, snaps[i]),
 				    ret, done, "snapshot");
 		taken = i + 1;
 		torture_assert_goto(tctx,
@@ -2534,8 +2575,8 @@ static bool test_truenas_shadow_copy_subdir_share(struct torture_context *tctx,
 			    ret, done, "files");
 
 	taken = true;
-	torture_assert_goto(tctx, truenas_sc_take(zds, snap) &&
-			    truenas_sc_take(izds, snap),
+	torture_assert_goto(tctx, truenas_sc_take_alone(tctx, zds, snap) &&
+			    truenas_sc_take_alone(tctx, izds, snap),
 			    ret, done, "snapshots");
 	torture_assert_goto(tctx,
 			    truenas_sc_find(tctx, zds, snap, label, &twrp) &&
@@ -2810,8 +2851,8 @@ static bool test_truenas_shadow_copy_stale_enum(struct torture_context *tctx,
 
 	/* a version in the snapshot: the file changes after it */
 	torture_assert(tctx, truenas_sc_local_write(file, "version"), "file");
-	torture_assert_goto(tctx, truenas_sc_take(nzds, snap), ret, done,
-			    "snapshot");
+	torture_assert_goto(tctx, truenas_sc_take_alone(tctx, nzds, snap),
+			    ret, done, "snapshot");
 	taken = true;
 	torture_assert_goto(tctx, truenas_sc_local_write(file, "live"), ret,
 			    done, "live version");
@@ -2946,8 +2987,8 @@ static bool test_truenas_shadow_copy_stale_listing(struct torture_context *tctx,
 		       "directory in it");
 	torture_assert(tctx, truenas_sc_local_write(subf, "version"),
 		       "file in it");
-	torture_assert_goto(tctx, truenas_sc_take(nzds, snap), ret, done,
-			    "snapshot");
+	torture_assert_goto(tctx, truenas_sc_take_alone(tctx, nzds, snap),
+			    ret, done, "snapshot");
 	taken = true;
 	torture_assert_goto(tctx, truenas_sc_find(tctx, nzds, snap, label,
 						  &twrp),
