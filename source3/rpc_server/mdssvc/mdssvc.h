@@ -134,6 +134,12 @@ struct mds_ctx {
 };
 
 struct mdssvc_backend {
+	/*
+	 * The backend does the access checks and gives the stat and item ID
+	 * of each result to mds_add_checked_result(). mdssvc does not connect
+	 * to the VFS, change directory or become the user.
+	 */
+	bool no_vfs_conn;
 	bool (*init)(struct mdssvc_ctx *mdssvc_ctx);
 	bool (*connect)(struct mds_ctx *mds_ctx);
 	bool (*search_map)(struct sl_query *slq);
@@ -164,5 +170,9 @@ extern bool mds_dispatch(struct mds_ctx *mds_ctx,
 			 struct mdssvc_blob *response_blob,
 			 size_t max_fragment_size);
 bool mds_add_result(struct sl_query *slq, const char *path);
+bool mds_add_checked_result(struct sl_query *slq,
+			    const char *path,
+			    uint64_t ino64,
+			    struct stat_ex *sb);
 
 #endif /* _MDSSVC_H */

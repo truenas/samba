@@ -1,0 +1,14 @@
+<samba:parameter name="truesearch:socket"
+                 context="S"
+                 type="string"
+                 xmlns:samba="http://www.samba.org/samba/DTD/samba-doc">
+  <description>
+    <para>
+      Specifies the unix socket of truesearchd for the truesearch
+      Spotlight backend.
+    </para>
+  </description>
+
+  <value type="default">/run/truesearchd/mdssvc.sock</value>
+  <value type="example">/run/truesearchd/test.sock</value>
+</samba:parameter>

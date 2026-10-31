@@ -443,6 +443,7 @@ static const struct enum_list enum_spotlight_backend[] = {
 	{SPOTLIGHT_BACKEND_NOINDEX, "noindex"},
 	{SPOTLIGHT_BACKEND_TRACKER, "tracker"},
 	{SPOTLIGHT_BACKEND_ES, "elasticsearch"},
+	{SPOTLIGHT_BACKEND_TRUESEARCH, "truesearch"},
 	{-1, NULL}
 };
 

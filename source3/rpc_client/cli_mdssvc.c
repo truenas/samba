@@ -343,7 +343,9 @@ struct tevent_req *mdscli_search_send(TALLOC_CTX *mem_ctx,
 				      struct mdscli_ctx *mdscli_ctx,
 				      const char *mds_query,
 				      const char *path_scope_in,
-				      bool live)
+				      bool live,
+				      const uint64_t *item_ids,
+				      size_t num_item_ids)
 {
 	struct tevent_req *req = NULL;
 	struct mdscli_search_state *state = NULL;
@@ -384,6 +386,16 @@ struct tevent_req *mdscli_search_send(TALLOC_CTX *mem_ctx,
 	};
 	if (tevent_req_nomem(search->mds_query, req)) {
 		return tevent_req_post(req, ev);
+	}
+
+	if (num_item_ids > 0) {
+		search->item_ids = talloc_memdup(search,
+						 item_ids,
+						 num_item_ids * sizeof(uint64_t));
+		if (tevent_req_nomem(search->item_ids, req)) {
+			return tevent_req_post(req, ev);
+		}
+		search->num_item_ids = num_item_ids;
 	}
 
 	*state = (struct mdscli_search_state) {
@@ -497,6 +509,8 @@ NTSTATUS mdscli_search(TALLOC_CTX *mem_ctx,
 		       const char *mds_query,
 		       const char *path_scope,
 		       bool live,
+		       const uint64_t *item_ids,
+		       size_t num_item_ids,
 		       struct mdscli_search_ctx **search)
 {
 	TALLOC_CTX *frame = talloc_stackframe();
@@ -519,7 +533,9 @@ NTSTATUS mdscli_search(TALLOC_CTX *mem_ctx,
 				 mdscli_ctx,
 				 mds_query,
 				 path_scope,
-				 live);
+				 live,
+				 item_ids,
+				 num_item_ids);
 	if (req == NULL) {
 		goto fail;
 	}
@@ -713,6 +729,15 @@ static void mdscli_get_results_cmd_done(struct tevent_req *subreq)
 	ncnids = dalloc_size(cnids->ca_cnids);
 	if (ncnids == 0 && !search_in_progress) {
 		tevent_req_nterror(req, NT_STATUS_NO_MORE_MATCHES);
+		return;
+	}
+	if (ncnids == 0 && search_in_progress) {
+		/*
+		 * The search continues. A reply without CNIDs has no
+		 * unkn1/context tag, and the checks below refuse it. Poll
+		 * again.
+		 */
+		tevent_req_nterror(req, NT_STATUS_PENDING);
 		return;
 	}
 

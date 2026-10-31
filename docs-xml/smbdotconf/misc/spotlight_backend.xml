@@ -23,6 +23,10 @@
 	a backend that uses JSON and REST over HTTP(s) to query an
 	Elasticsearch server.
 	</para></listitem>
+
+	<listitem><para><constant>truesearch</constant> -
+	a backend that queries the TrueNAS truesearchd server.
+	</para></listitem>
 	</itemizedlist>
 	</para>
 </description>

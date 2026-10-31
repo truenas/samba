@@ -33,6 +33,9 @@
 #ifdef HAVE_SPOTLIGHT_BACKEND_ES
 #include "mdssvc_es.h"
 #endif
+#ifdef HAVE_SPOTLIGHT_BACKEND_TRUESEARCH
+#include "mdssvc_truesearch.h"
+#endif
 #include "lib/global_contexts.h"
 
 #undef DBGC_CLASS
@@ -545,14 +548,9 @@ static bool inode_map_add(struct sl_query *slq,
 bool mds_add_result(struct sl_query *slq, const char *path)
 {
 	struct smb_filename *smb_fname = NULL;
-	const char *relative = NULL;
-	char *fake_path = NULL;
 	struct stat_ex sb;
 	uint64_t ino64;
-	int result;
 	NTSTATUS status;
-	bool sub;
-	bool ok;
 
 	/*
 	 * We're in a tevent callback which means in the case of
@@ -610,6 +608,26 @@ bool mds_add_result(struct sl_query *slq, const char *path)
 
 	ino64 = SMB_VFS_FS_FILE_ID(slq->mds_ctx->conn, &sb);
 
+	return mds_add_checked_result(slq, path, ino64, &sb);
+}
+
+/**
+ * Add a result that the caller has checked
+ *
+ * The caller gives the stat and the item ID (CNID) of path. This applies
+ * the CNID filter of the client and adds the result to the query.
+ **/
+bool mds_add_checked_result(struct sl_query *slq,
+			    const char *path,
+			    uint64_t ino64,
+			    struct stat_ex *sb)
+{
+	const char *relative = NULL;
+	char *fake_path = NULL;
+	int result;
+	bool sub;
+	bool ok;
+
 	if (slq->cnids) {
 		bool found;
 
@@ -665,7 +683,7 @@ bool mds_add_result(struct sl_query *slq, const char *path)
 			  slq->reqinfo,
 			  slq->query_results->fm_array,
 			  fake_path,
-			  &sb);
+			  sb);
 	if (!ok) {
 		DBG_ERR("add_filemeta error\n");
 		TALLOC_FREE(fake_path);
@@ -673,7 +691,7 @@ bool mds_add_result(struct sl_query *slq, const char *path)
 		return false;
 	}
 
-	ok = inode_map_add(slq, ino64, fake_path, &sb);
+	ok = inode_map_add(slq, ino64, fake_path, sb);
 	TALLOC_FREE(fake_path);
 	if (!ok) {
 		DEBUG(1, ("inode_map_add error\n"));
@@ -682,6 +700,52 @@ bool mds_add_result(struct sl_query *slq, const char *path)
 	}
 
 	slq->query_results->num_results++;
+	return true;
+}
+
+/*
+ * Get the volume UUID of the share: a UUID version 8 (RFC 9562) that holds
+ * the fsid of the file system of the share path. ZFS keeps the fsid of a
+ * dataset in the pool, so the UUID is the same after a reboot and a
+ * failover. All shares on one dataset have one UUID, as all shares on one
+ * volume of a macOS server do. Bytes 0-7 are a fixed prefix with the
+ * version. Bytes 8-15 are the fsid, big-endian, with the variant in the
+ * top 2 bits. A ZFS fsid has 56 bits, so the variant hides none of it.
+ */
+static bool mds_volume_uuid(struct mds_ctx *mds_ctx, sl_uuid_t *uuid)
+{
+	static const uint8_t prefix[8] = {
+		'T', 'N', 'M', 'D', 'S', 'V', 0x80, 0x00,
+	};
+	const uint8_t *u = uuid->sl_uuid;
+	struct statfs sfs;
+	uint64_t fsid;
+	int ret;
+	int err;
+
+	become_root();
+	ret = statfs(mds_ctx->spath, &sfs);
+	err = errno;
+	unbecome_root();
+	if (ret != 0) {
+		DBG_NOTICE("statfs of share path [%s]: %s\n",
+			   mds_ctx->spath,
+			   strerror(err));
+		return false;
+	}
+	fsid = ((uint64_t)(uint32_t)sfs.f_fsid.__val[1] << 32) |
+	       (uint32_t)sfs.f_fsid.__val[0];
+
+	memcpy(uuid->sl_uuid, prefix, sizeof(prefix));
+	RSBVAL(uuid->sl_uuid, 8, fsid);
+	uuid->sl_uuid[8] = (uuid->sl_uuid[8] & 0x3f) | 0x80;
+
+	DBG_DEBUG("share [%s] volume uuid "
+		  "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+		  "%02x%02x%02x%02x%02x%02x\n",
+		  mds_ctx->sharename,
+		  u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+		  u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
 	return true;
 }
 
@@ -749,12 +813,14 @@ static bool slrpc_fetch_properties(struct mds_ctx *mds_ctx,
 		return false;
 	}
 
-	/* kMDSVolumeUUID = uuid */
+	/* kMDSVolumeUUID = the fsid of the share path (mds_volume_uuid()) */
 	result = dalloc_stradd(dict, "kMDSVolumeUUID");
 	if (result != 0) {
 		return false;
 	}
-	memcpy(uuid.sl_uuid, "fakeuuidfakeuuid", sizeof(uuid.sl_uuid));
+	if (!mds_volume_uuid(mds_ctx, &uuid)) {
+		memcpy(uuid.sl_uuid, "fakeuuidfakeuuid", sizeof(uuid.sl_uuid));
+	}
 	result = dalloc_add_copy(dict, &uuid, sl_uuid_t);
 	if (result != 0) {
 		return false;
@@ -1039,7 +1105,7 @@ static bool slrpc_open_query(struct mds_ctx *mds_ctx,
 	cnids = dalloc_value_for_key(query, "DALLOC_CTX", 0,
 				     "DALLOC_CTX", 1,
 				     "kMDQueryItemArray",
-				     "sl_array_t");
+				     "sl_cnids_t");
 	if (cnids) {
 		ok = sort_cnids(slq, cnids->ca_cnids);
 		if (!ok) {
@@ -1563,6 +1629,15 @@ static struct mdssvc_ctx *mdssvc_init(struct tevent_context *ev)
 	}
 #endif
 
+#ifdef HAVE_SPOTLIGHT_BACKEND_TRUESEARCH
+	ok = mdsscv_backend_truesearch.init(mdssvc_ctx);
+	if (!ok) {
+		DBG_ERR("backend init failed\n");
+		TALLOC_FREE(mdssvc_ctx);
+		return NULL;
+	}
+#endif
+
 	return mdssvc_ctx;
 }
 
@@ -1592,6 +1667,13 @@ bool mds_shutdown(void)
 
 #ifdef HAVE_SPOTLIGHT_BACKEND_ES
 	ok = mdsscv_backend_es.shutdown(mdssvc_ctx);
+	if (!ok) {
+		goto fail;
+	}
+#endif
+
+#ifdef HAVE_SPOTLIGHT_BACKEND_TRUESEARCH
+	ok = mdsscv_backend_truesearch.shutdown(mdssvc_ctx);
 	if (!ok) {
 		goto fail;
 	}
@@ -1689,6 +1771,12 @@ NTSTATUS mds_init_ctx(TALLOC_CTX *mem_ctx,
 		break;
 #endif
 
+#ifdef HAVE_SPOTLIGHT_BACKEND_TRUESEARCH
+	case SPOTLIGHT_BACKEND_TRUESEARCH:
+		mds_ctx->backend = &mdsscv_backend_truesearch;
+		break;
+#endif
+
 	default:
 		DBG_ERR("Unknown backend %d\n", backend);
 		TALLOC_FREE(mdssvc_ctx);
@@ -1746,29 +1834,32 @@ NTSTATUS mds_init_ctx(TALLOC_CTX *mem_ctx,
 		goto error;
 	}
 
-	status = create_conn_struct_cwd(mds_ctx,
-					ev,
-					msg_ctx,
-					session_info,
-					snum,
-					lp_path(talloc_tos(), lp_sub, snum),
-					&mds_ctx->conn);
-	if (!NT_STATUS_IS_OK(status)) {
-		DBG_ERR("failed to create conn for vfs: %s\n",
-			nt_errstr(status));
-		goto error;
-	}
+	/* A backend that does the access checks needs no VFS connection */
+	if (!mds_ctx->backend->no_vfs_conn) {
+		status = create_conn_struct_cwd(mds_ctx,
+						ev,
+						msg_ctx,
+						session_info,
+						snum,
+						lp_path(talloc_tos(), lp_sub, snum),
+						&mds_ctx->conn);
+		if (!NT_STATUS_IS_OK(status)) {
+			DBG_ERR("failed to create conn for vfs: %s\n",
+				nt_errstr(status));
+			goto error;
+		}
 
-	conn_basedir = (struct smb_filename) {
-		.base_name = mds_ctx->conn->connectpath,
-	};
+		conn_basedir = (struct smb_filename) {
+			.base_name = mds_ctx->conn->connectpath,
+		};
 
-	ret = vfs_ChDir(mds_ctx->conn, &conn_basedir);
-	if (ret != 0) {
-		DBG_ERR("vfs_ChDir [%s] failed: %s\n",
-			conn_basedir.base_name, strerror(errno));
-		status = map_nt_error_from_unix(errno);
-		goto error;
+		ret = vfs_ChDir(mds_ctx->conn, &conn_basedir);
+		if (ret != 0) {
+			DBG_ERR("vfs_ChDir [%s] failed: %s\n",
+				conn_basedir.base_name, strerror(errno));
+			status = map_nt_error_from_unix(errno);
+			goto error;
+		}
 	}
 
 	ok = mds_ctx->backend->connect(mds_ctx);
@@ -1807,9 +1898,6 @@ bool mds_dispatch(struct mds_ctx *mds_ctx,
 	DALLOC_CTX *reply = NULL;
 	char *rpccmd;
 	const struct slrpc_cmd *slcmd;
-	const struct smb_filename conn_basedir = {
-		.base_name = mds_ctx->conn->connectpath,
-	};
 	NTSTATUS status;
 
 	if (CHECK_DEBUGLVL(10)) {
@@ -1862,12 +1950,18 @@ bool mds_dispatch(struct mds_ctx *mds_ctx,
 		goto cleanup;
 	}
 
-	ret = vfs_ChDir(mds_ctx->conn, &conn_basedir);
-	if (ret != 0) {
-		DBG_ERR("vfs_ChDir [%s] failed: %s\n",
-			conn_basedir.base_name, strerror(errno));
-		ok = false;
-		goto cleanup;
+	if (mds_ctx->conn != NULL) {
+		const struct smb_filename conn_basedir = {
+			.base_name = mds_ctx->conn->connectpath,
+		};
+
+		ret = vfs_ChDir(mds_ctx->conn, &conn_basedir);
+		if (ret != 0) {
+			DBG_ERR("vfs_ChDir [%s] failed: %s\n",
+				conn_basedir.base_name, strerror(errno));
+			ok = false;
+			goto cleanup;
+		}
 	}
 
 	ok = slcmd->function(mds_ctx, query, reply);

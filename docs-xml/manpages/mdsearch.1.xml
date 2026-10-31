@@ -112,6 +112,16 @@
 	<listitem><para>Query remains running.</para></listitem>
       </varlistentry>
 
+      <varlistentry>
+	<term>--item-ids=ID[,ID...]</term>
+	<listitem>
+	  <para>Return only the items with these IDs (CNIDs). An ID is
+	  decimal, or hexadecimal with a leading <emphasis>0x</emphasis>.
+	  mdsearch sends the IDs in
+	  <emphasis>kMDQueryItemArray</emphasis>.</para>
+	</listitem>
+      </varlistentry>
+
       &popt.autohelp;
       &cmdline.common.samba.client;
       &cmdline.common.credentials;

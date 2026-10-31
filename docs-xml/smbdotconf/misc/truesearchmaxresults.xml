@@ -1,0 +1,15 @@
+<samba:parameter name="truesearch:max results"
+                 context="S"
+                 type="integer"
+                 xmlns:samba="http://www.samba.org/samba/DTD/samba-doc">
+  <description>
+    <para>
+      Specifies the maximum number of results of a Spotlight query with
+      the truesearch backend. The limit of truesearchd also applies. A
+      value of 0 means the limit of truesearchd.
+    </para>
+  </description>
+
+  <value type="default">100</value>
+  <value type="example">10</value>
+</samba:parameter>

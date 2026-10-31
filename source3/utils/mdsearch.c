@@ -28,9 +28,56 @@
 #include "rpc_client/cli_pipe.h"
 #include "rpc_client/cli_mdssvc.h"
 #include "librpc/gen_ndr/ndr_mdssvc_c.h"
+#include "lib/util/smb_strtox.h"
 
 static char *opt_path;
 static int opt_live;
+static char *opt_item_ids;
+
+/* Parse "ID[,ID...]". An ID is decimal, or hexadecimal with 0x. */
+static bool parse_item_ids(TALLOC_CTX *mem_ctx,
+			   const char *str,
+			   uint64_t **pids,
+			   size_t *pnum)
+{
+	char **list = NULL;
+	uint64_t *ids = NULL;
+	size_t num;
+	size_t i;
+	int err = 0;
+
+	list = str_list_make(mem_ctx, str, ",");
+	if (list == NULL) {
+		return false;
+	}
+	num = str_list_length((const char * const *)list);
+	if (num == 0) {
+		TALLOC_FREE(list);
+		return false;
+	}
+	ids = talloc_array(mem_ctx, uint64_t, num);
+	if (ids == NULL) {
+		TALLOC_FREE(list);
+		return false;
+	}
+	for (i = 0; i < num; i++) {
+		ids[i] = smb_strtoull(list[i],
+				      NULL,
+				      0,
+				      &err,
+				      SMB_STR_FULL_STR_CONV);
+		if (err != 0) {
+			TALLOC_FREE(ids);
+			TALLOC_FREE(list);
+			return false;
+		}
+	}
+	TALLOC_FREE(list);
+
+	*pids = ids;
+	*pnum = num;
+	return true;
+}
 
 int main(int argc, char **argv)
 {
@@ -50,6 +97,8 @@ int main(int argc, char **argv)
 	uint32_t flags = CLI_FULL_CONNECTION_IPC;
 	uint64_t *cnids = NULL;
 	size_t ncnids;
+	uint64_t *item_ids = NULL;
+	size_t num_item_ids = 0;
 	size_t i;
 	int opt;
 	poptContext pc;
@@ -71,6 +120,13 @@ int main(int argc, char **argv)
 			.argInfo   = POPT_ARG_NONE,
 			.arg       = &opt_live,
 			.descrip   = "live query",
+		},
+		{
+			.longName  = "item-ids",
+			.argInfo   = POPT_ARG_STRING,
+			.arg       = &opt_item_ids,
+			.descrip   = "Only the items with these IDs (CNIDs)",
+			.argDescrip = "ID[,ID...]",
 		},
 		POPT_COMMON_SAMBA
 		POPT_COMMON_CREDENTIALS
@@ -117,6 +173,17 @@ int main(int argc, char **argv)
 	if (server == NULL || mds_query == NULL) {
 		poptPrintHelp(pc, stderr, 0);
 		goto fail;
+	}
+
+	if (opt_item_ids != NULL) {
+		ok = parse_item_ids(frame,
+				    opt_item_ids,
+				    &item_ids,
+				    &num_item_ids);
+		if (!ok) {
+			fprintf(stderr, "Invalid item IDs: %s\n", opt_item_ids);
+			goto fail;
+		}
 	}
 
 	samba_cmdline_burn(argc, argv);
@@ -183,6 +250,8 @@ int main(int argc, char **argv)
 			       mds_query,
 			       basepath,
 			       opt_live == 1 ? true : false,
+			       item_ids,
+			       num_item_ids,
 			       &search);
 	if (!NT_STATUS_IS_OK(status)) {
 		printf("mdscli_search failed\n");
