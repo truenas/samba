@@ -1796,6 +1796,48 @@ static void smbd_smb2_create_before_exec(struct tevent_req *req)
 	}
 }
 
+/*
+ * The QFid volume id is the fsid of the file system of fsp. The fsid of a
+ * ZFS dataset stays the same over a reboot and a failover, a device number
+ * does not. A mount id is not used again in a boot, so it keys the cache.
+ * The cache holds a few mounts, so opens that alternate between datasets
+ * do not call fstatfs() each time.
+ */
+static uint64_t smbd_smb2_qfid_volume_id(struct files_struct *fsp)
+{
+	static struct {
+		uint64_t mnt_id;
+		uint64_t fsid;
+	} cache[8];
+	static size_t next;
+	const SMB_STRUCT_STAT *st = &fsp->fsp_name->st;
+	struct statfs sfs;
+	uint64_t fsid;
+	size_t i;
+
+	if (st->st_ex_mnt_id != 0) {
+		for (i = 0; i < ARRAY_SIZE(cache); i++) {
+			if (cache[i].mnt_id == st->st_ex_mnt_id) {
+				return cache[i].fsid;
+			}
+		}
+	}
+	if (fstatfs(fsp_get_pathref_fd(fsp), &sfs) != 0) {
+		return st->st_ex_dev;
+	}
+	fsid = ((uint64_t)(uint32_t)sfs.f_fsid.__val[1] << 32) |
+	       (uint32_t)sfs.f_fsid.__val[0];
+	if (fsid == 0) {
+		return st->st_ex_dev;
+	}
+	if (st->st_ex_mnt_id != 0) {
+		cache[next].mnt_id = st->st_ex_mnt_id;
+		cache[next].fsid = fsid;
+		next = (next + 1) % ARRAY_SIZE(cache);
+	}
+	return fsid;
+}
+
 static void smbd_smb2_create_after_exec(struct tevent_req *req)
 {
 	struct smbd_smb2_create_state *state = tevent_req_data(
@@ -1995,9 +2037,9 @@ static void smbd_smb2_create_after_exec(struct tevent_req *req)
 
 	if (state->qfid != NULL) {
 		uint8_t p[32];
-		SMB_STRUCT_STAT *base_sp = state->result->base_fsp ?
-			&state->result->base_fsp->fsp_name->st :
-			&state->result->fsp_name->st;
+		struct files_struct *qfid_fsp = state->result->base_fsp ?
+			state->result->base_fsp : state->result;
+		SMB_STRUCT_STAT *base_sp = &qfid_fsp->fsp_name->st;
 		uint64_t file_id = SMB_VFS_FS_FILE_ID(conn, base_sp);
 		DATA_BLOB blob = data_blob_const(p, sizeof(p));
 
@@ -2005,10 +2047,9 @@ static void smbd_smb2_create_after_exec(struct tevent_req *req)
 
 		/* From conversations with Microsoft engineers at
 		   the MS plugfest. The first 8 bytes are the "volume index"
-		   == inode, the second 8 bytes are the "volume id",
-		   == dev. This will be updated in the SMB2 doc. */
+		   == inode, the second 8 bytes are the "volume id". */
 		SBVAL(p, 0, file_id);
-		SIVAL(p, 8, base_sp->st_ex_dev);/* FileIndexHigh */
+		SBVAL(p, 8, smbd_smb2_qfid_volume_id(qfid_fsp));
 
 		status = smb2_create_blob_add(state->out_context_blobs,
 					      state->out_context_blobs,

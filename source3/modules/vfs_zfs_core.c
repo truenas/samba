@@ -811,23 +811,31 @@ disconnect_out:
 }
 
 /*
- * Off the share's dataset, the file id is the objsetid of the dataset above
- * the object number of the file. An objsetid is unique in the pool, never
- * 0, and does not change. A device minor can change at a failover.
+ * The low 40 bits of a file id are the object number of the file. Bits 40
+ * to 62 are:
+ * - On the share's dataset, the low 23 bits of the inode generation, the
+ *   txg in which ZFS created the object. Bit 63 is set. ZFS gives a freed
+ *   object number to a new file only in a later txg, so the new file gets
+ *   a different file id, unless the two txgs differ by a multiple of 2^23.
+ * - Off the share's dataset, the objsetid of the dataset. Bit 63 is clear.
+ *   An objsetid is unique in the pool, never 0, and does not change. A
+ *   device minor can change at a failover.
  *
  * In ZFS both numbers can use 48 bits (DN_MAX_OBJECT_SHIFT), so no split of
- * 64 bits holds every pair. The split is 24 bits for the objsetid and 40
+ * 64 bits holds every pair. The split is 23 bits for the objsetid and 40
  * bits for the object number:
  * - An objsetid is an object number in the MOS of the pool. It grows with
  *   the history of dataset and snapshot creation. Real pools have
- *   objsetids above 2^16, for example 138,892. 2^24 is 16.7 million.
+ *   objsetids above 2^16, for example 138,892. 2^23 is 8.4 million.
  * - The object number of a file follows the peak file count of its
  *   dataset, times the dnode slots of a file. 2^40 is 1.1 trillion.
  * Above these limits, the file id is the default of vfs_default, which can
  * change at a failover. smbd logs a warning for such a dataset.
  */
 #define ZC_FILE_ID_OBJ_BITS 40
-#define ZC_FILE_ID_SET_BITS (64 - ZC_FILE_ID_OBJ_BITS)
+#define ZC_FILE_ID_SET_BITS (63 - ZC_FILE_ID_OBJ_BITS)
+#define ZC_FILE_ID_GEN_MASK ((1ULL << ZC_FILE_ID_SET_BITS) - 1)
+#define ZC_FILE_ID_SHARE_DS (1ULL << 63)
 
 static uint64_t zfs_core_fs_file_id(struct vfs_handle_struct *handle,
 				    const SMB_STRUCT_STAT *psbuf)
@@ -836,10 +844,17 @@ static uint64_t zfs_core_fs_file_id(struct vfs_handle_struct *handle,
 	const struct zfs_dataset *ds = NULL;
 	const struct zfs_dataset_prop *props = NULL;
 
-	if ((psbuf->st_ex_dev == handle->conn->base_share_dev) ||
-	    !(psbuf->st_ex_iflags & ST_EX_IFLAG_HAS_GEN) ||
-	    (psbuf->st_ex_mnt_id == 0) ||
+	if (!(psbuf->st_ex_iflags & ST_EX_IFLAG_HAS_GEN) ||
 	    ((psbuf->st_ex_ino >> ZC_FILE_ID_OBJ_BITS) != 0)) {
+		return SMB_VFS_NEXT_FS_FILE_ID(handle, psbuf);
+	}
+	if (psbuf->st_ex_dev == handle->conn->base_share_dev) {
+		return ZC_FILE_ID_SHARE_DS |
+		       ((psbuf->st_ex_gen & ZC_FILE_ID_GEN_MASK)
+			<< ZC_FILE_ID_OBJ_BITS) |
+		       psbuf->st_ex_ino;
+	}
+	if (psbuf->st_ex_mnt_id == 0) {
 		return SMB_VFS_NEXT_FS_FILE_ID(handle, psbuf);
 	}
 	SMB_VFS_HANDLE_GET_DATA(handle,
