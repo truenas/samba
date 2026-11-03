@@ -130,6 +130,12 @@ jobs:
       timeout-minutes: 30
       run: bash .github/workflows/scripts/qemu-4.5-smbhad.sh
 
+    - name: Spotlight truesearch backend against a mock truesearchd
+      timeout-minutes: 15
+      env:
+        TRAIN: ${{ steps.train.outputs.train }}
+      run: bash .github/workflows/scripts/qemu-4.7-spotlight.sh
+
     # Runs last against the VM: it ends with a crash of the VM through sysrq.
     - name: Durable handles across failovers, smbd restarts and a VM crash
       timeout-minutes: 60

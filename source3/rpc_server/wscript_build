@@ -261,6 +261,32 @@ if bld.env.spotlight_backend_es:
     bld.INSTALL_FILES(bld.env.SAMBA_DATADIR,
                       'mdssvc/elasticsearch_mappings.json')
 
+if bld.env.spotlight_backend_truesearch:
+    # mdssvc/truenas_truesearch.x is a copy of the truesearchd protocol
+    # file. Make the XDR code as source3/modules does for nfs41acl.x.
+    xdr_buf_hack = r'sed -e "s@^\([ \t]*register int32_t \*buf\);@\\1 = buf;@"'
+
+    bld.SAMBA_GENERATOR('truenas_truesearch-h',
+                        source='mdssvc/truenas_truesearch.x',
+                        target='mdssvc/truenas_truesearch.h',
+                        rule='rpcgen -h ${SRC} > ${TGT}')
+
+    bld.SAMBA_GENERATOR('truenas_truesearch-xdr-c',
+                        source='mdssvc/truenas_truesearch.x',
+                        target='mdssvc/truenas_truesearch_xdr.c',
+                        rule='cp -f ${SRC} ${TGT[0].parent} && rpcgen -c ' \
+                             '${TGT[0].path_from(tsk.get_cwd())[:-len(tsk.outputs[0].name)] + tsk.inputs[0].name} | ' + \
+                             xdr_buf_hack + ' > ${TGT}')
+
+    bld.SAMBA3_SUBSYSTEM('MDSSVC_TRUESEARCH_XDR',
+                         source='mdssvc/truenas_truesearch_xdr.c',
+                         deps='tirpc')
+
+    rpc_mdssvc_sources += '''
+                          mdssvc/mdssvc_truesearch.c
+                          '''
+    rpc_mdssvc_deps += ' MDSSVC_TRUESEARCH_XDR tirpc util_tsock truenas_mount'
+
 bld.SAMBA3_BINARY('rpcd_mdssvc',
                   source='rpcd_mdssvc.c ' + rpc_mdssvc_sources,
                   deps='''

@@ -48,7 +48,9 @@ struct tevent_req *mdscli_search_send(TALLOC_CTX *mem_ctx,
 				      struct mdscli_ctx *mdscli_ctx,
 				      const char *mds_query,
 				      const char *path_scope,
-				      bool live);
+				      bool live,
+				      const uint64_t *item_ids,
+				      size_t num_item_ids);
 NTSTATUS mdscli_search_recv(struct tevent_req *req,
 			    TALLOC_CTX *mem_ctx,
 			    struct mdscli_search_ctx **search);
@@ -57,6 +59,8 @@ NTSTATUS mdscli_search(TALLOC_CTX *mem_ctx,
 		       const char *mds_query,
 		       const char *path_scope,
 		       bool live,
+		       const uint64_t *item_ids,
+		       size_t num_item_ids,
 		       struct mdscli_search_ctx **search);
 
 struct tevent_req *mdscli_get_results_send(

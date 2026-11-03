@@ -105,6 +105,10 @@ override_dh_auto_configure:
 	# package with no io_uring module at all.
 	grep -q '^#define HAVE_LIBURING 1' bin/default/include/config.h || \
 	  { echo "FATAL: configure did not pick up the staged liburing"; exit 1; }
+	# The same for the truesearch Spotlight backend. configure only warns
+	# when rpc/xdr.h (libtirpc-dev) or rpcgen is missing.
+	grep -q '^#define HAVE_SPOTLIGHT_BACKEND_TRUESEARCH 1' bin/default/include/config.h || \
+	  { echo "FATAL: configure did not enable the truesearch Spotlight backend"; exit 1; }
 
 override_dh_auto_clean:
 	rm -rf debian/liburing

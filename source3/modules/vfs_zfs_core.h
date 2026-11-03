@@ -74,9 +74,12 @@ struct zfs_core_config_data {
 	const char *dataset_auto_quota;
 	uint64_t base_user_quota;
 	const zc_offload_ops_t *offload_ops;
-	/* TrueNAS: the last dataset of zfs_core_fs_file_id() */
+	/*
+	 * TrueNAS: the last dataset of zfs_core_fs_file_id() and the high 24
+	 * bits of its file ids (zfs_core_file_id.h). 0 means the default.
+	 */
 	uint64_t fid_mnt_id;
-	uint64_t fid_objsetid;
+	uint64_t fid_set;
 };
 
 /* vfs_zfs_core_fsctl.c */
