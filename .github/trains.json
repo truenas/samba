@@ -1,10 +1,10 @@
 {
   "docs": [
     "Branch -> TrueNAS train mapping.  Builds and tests use the",
-    "truenas/zfs and truenas/linux <train>-nightly releases of the",
-    "branch's train (for a PR, the base branch's), or of default_train",
-    "if the branch is not listed.  Pushes to a listed branch also",
-    "publish this repo's <train>-nightly release.",
+    "truenas/zfs, truenas/linux and truenas/truenas_pyos <train>-nightly",
+    "releases of the branch's train (for a PR, the base branch's), or of",
+    "default_train if the branch is not listed.  Pushes to a listed",
+    "branch also publish this repo's <train>-nightly release.",
     "",
     "Each branch reads its own copy of this file.  on: in",
     "workflows/publish-debs.yml cannot read it; keep its push branches",

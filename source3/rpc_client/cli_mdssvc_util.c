@@ -108,8 +108,10 @@ NTSTATUS mdscli_blob_search(TALLOC_CTX *mem_ctx,
 	sl_dict_t *query_dict = NULL;
 	sl_array_t *attr_array = NULL;
 	sl_array_t *scope_array = NULL;
+	sl_cnids_t *cnids = NULL;
 	double dval;
 	uint64_t uint64val;
+	size_t i;
 	NTSTATUS status;
 	int ret;
 
@@ -275,6 +277,39 @@ NTSTATUS mdscli_blob_search(TALLOC_CTX *mem_ctx,
 	if (ret != 0) {
 		TALLOC_FREE(d);
 		return NT_STATUS_NO_MEMORY;
+	}
+
+	if (search->num_item_ids > 0) {
+		ret = dalloc_stradd(query_dict, "kMDQueryItemArray");
+		if (ret != 0) {
+			TALLOC_FREE(d);
+			return NT_STATUS_NO_MEMORY;
+		}
+		cnids = talloc_zero(query_dict, sl_cnids_t);
+		if (cnids == NULL) {
+			TALLOC_FREE(d);
+			return NT_STATUS_NO_MEMORY;
+		}
+		cnids->ca_unkn1 = 0xadd;
+		cnids->ca_cnids = dalloc_new(cnids);
+		if (cnids->ca_cnids == NULL) {
+			TALLOC_FREE(d);
+			return NT_STATUS_NO_MEMORY;
+		}
+		for (i = 0; i < search->num_item_ids; i++) {
+			ret = dalloc_add_copy(cnids->ca_cnids,
+					      &search->item_ids[i],
+					      uint64_t);
+			if (ret != 0) {
+				TALLOC_FREE(d);
+				return NT_STATUS_NO_MEMORY;
+			}
+		}
+		ret = dalloc_add(query_dict, cnids, sl_cnids_t);
+		if (ret != 0) {
+			TALLOC_FREE(d);
+			return NT_STATUS_NO_MEMORY;
+		}
 	}
 
 	status = sl_pack_alloc(mem_ctx, d, blob, ctx->max_fragment_size);
