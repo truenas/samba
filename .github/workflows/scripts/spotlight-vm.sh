@@ -36,8 +36,13 @@
 # To run outside the VM, set SPOTLIGHT_DATASET (empty: no ZFS),
 # SPOTLIGHT_DIR, SPOTLIGHT_WORK, SPOTLIGHT_SOCKET, SPOTLIGHT_CREDS,
 # SPOTLIGHT_PORT, SPOTLIGHT_LOGDIR, SPOTLIGHT_INCLUDE (included at the end
-# of [global]), SMBD, MDSEARCH, TESTPARM, SHARESEC, SMBCLIENT_CFLAGS (for
-# the FileId reader) and PYTHONPATH (for samba.samba3.mdscli).
+# of [global]), SMBD, MDSEARCH, TESTPARM, SHARESEC, SMBPASSWD,
+# SMBCLIENT_CFLAGS (for the FileId reader) and PYTHONPATH (for
+# samba.samba3.mdscli).
+#
+# The smbd of this step keeps its Samba state (passdb, secrets, caches,
+# share ACLs, open records) under WORK. The later steps start from the
+# state that the earlier steps left.
 ######################################################################
 
 set -eu
@@ -55,6 +60,7 @@ SMBD="${SMBD:-/usr/sbin/smbd}"
 MDSEARCH="${MDSEARCH:-/usr/bin/mdsearch}"
 TESTPARM="${TESTPARM:-/usr/bin/testparm}"
 SHARESEC="${SHARESEC:-/usr/bin/sharesec}"
+SMBPASSWD="${SMBPASSWD:-/usr/bin/smbpasswd}"
 SMBCLIENT_CFLAGS="${SMBCLIENT_CFLAGS:--I/usr/include/samba-4.0 -lsmbclient}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 USER_NAME="${CREDS%%%*}"
@@ -179,7 +185,8 @@ echo "Spotlight truesearch backend: setup"
 echo "=========================================="
 stop
 rm -rf "$WORK"
-mkdir -p "$WORK/run" "$LOGDIR"
+mkdir -p "$WORK/run" "$WORK/private" "$WORK/lock" "$WORK/state" \
+	"$WORK/cache" "$WORK/ncalrpc" "$LOGDIR"
 if [ -n "$DATASET" ]; then
 	# Left by an earlier run of section 14
 	zpool destroy "$OTHER_POOL" 2> /dev/null || true
@@ -229,6 +236,11 @@ cat > "$CONF" <<CONF
     disable spoolss = yes
     smb ports = $PORT
     pid directory = $WORK/run
+    private dir = $WORK/private
+    lock directory = $WORK/lock
+    state directory = $WORK/state
+    cache directory = $WORK/cache
+    ncalrpc dir = $WORK/ncalrpc
     log level = 1 rpc_srv:10
     max log size = 0
     spotlight = yes
@@ -369,6 +381,10 @@ cc -Wno-deprecated-declarations -o "$WORK/smb-fileid" \
 start_mock "$SOCKET" "$RECORD"
 start_mock "$SMALL" "$SMALL_RECORD" --max-page 7 \
 	--hello-faults refuse,version,drop
+
+# The test user, in the passdb of this configuration
+printf '%s\n%s\n' "${CREDS#*%}" "${CREDS#*%}" |
+	"$SMBPASSWD" -c "$CONF" -s -a "$USER_NAME" > /dev/null
 
 RPC_START=$(stat -c %s "$RPCLOG" 2> /dev/null || echo 0)
 SMBD_START=$(stat -c %s "$LOGDIR/log.smbd" 2> /dev/null || echo 0)

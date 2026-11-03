@@ -102,8 +102,12 @@ void _mdssvc_open(struct pipes_struct *p, struct mdssvc_open *r)
 	 * Apply the share's "hosts allow" and "hosts deny". The pipe arrives
 	 * on IPC$, so a tree connect's own check of these lists has not run
 	 * for this share. spoolss checks them the same way at printer open.
+	 * Most shares set neither list; then nothing runs. With "hostname
+	 * lookups = no", the default, get_remote_hostname() does no DNS
+	 * lookup.
 	 */
-	{
+	if (str_list_length(lp_hosts_allow(snum)) != 0 ||
+	    str_list_length(lp_hosts_deny(snum)) != 0) {
 		struct dcesrv_call_state *dce_call = p->dce_call;
 		const struct tsocket_address *remote_address =
 			dcesrv_connection_get_remote_address(dce_call->conn);
