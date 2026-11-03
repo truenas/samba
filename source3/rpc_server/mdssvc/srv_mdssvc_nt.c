@@ -30,6 +30,7 @@
 #include "smbd/globals.h"
 
 #include "librpc/rpc/dcesrv_core.h"
+#include "lib/tsocket/tsocket.h"
 #include "librpc/gen_ndr/ndr_mdssvc.h"
 #include "librpc/gen_ndr/ndr_mdssvc_scompat.h"
 #include "lib/global_contexts.h"
@@ -95,6 +96,48 @@ void _mdssvc_open(struct pipes_struct *p, struct mdssvc_open *r)
 	snum = lp_servicenumber(r->in.share_name);
 	if (!VALID_SNUM(snum)) {
 		return;
+	}
+
+	/*
+	 * Apply the share's "hosts allow" and "hosts deny". The pipe arrives
+	 * on IPC$, so a tree connect's own check of these lists has not run
+	 * for this share. spoolss checks them the same way at printer open.
+	 * Most shares set neither list; then nothing runs. With "hostname
+	 * lookups = no", the default, get_remote_hostname() does no DNS
+	 * lookup.
+	 */
+	if (str_list_length(lp_hosts_allow(snum)) != 0 ||
+	    str_list_length(lp_hosts_deny(snum)) != 0) {
+		struct dcesrv_call_state *dce_call = p->dce_call;
+		const struct tsocket_address *remote_address =
+			dcesrv_connection_get_remote_address(dce_call->conn);
+		char *raddr = NULL;
+		char *rhost = NULL;
+		int rc;
+
+		raddr = tsocket_address_inet_addr_string(remote_address,
+							 p->mem_ctx);
+		if (raddr == NULL) {
+			p->fault_state = DCERPC_FAULT_CANT_PERFORM;
+			return;
+		}
+		rc = get_remote_hostname(remote_address, &rhost, p->mem_ctx);
+		if (rc < 0) {
+			p->fault_state = DCERPC_FAULT_CANT_PERFORM;
+			return;
+		}
+		if (strequal(rhost, "UNKNOWN")) {
+			rhost = raddr;
+		}
+		if (!allow_access(lp_hosts_deny(snum),
+				  lp_hosts_allow(snum),
+				  rhost,
+				  raddr)) {
+			DBG_NOTICE("search of share [%s] denied by "
+				   "hosts allow/deny for %s\n",
+				   r->in.share_name, raddr);
+			return;
+		}
 	}
 
 	path = lp_path(talloc_tos(), lp_sub, snum);

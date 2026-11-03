@@ -69,6 +69,9 @@ struct mdscli_search_ctx {
 	bool live;
 	char *path_scope;
 	char *mds_query;
+	/* Item IDs (CNIDs) for kMDQueryItemArray */
+	uint64_t *item_ids;
+	size_t num_item_ids;
 };
 
 #endif /* _MDSCLI_PRIVATE_H_ */

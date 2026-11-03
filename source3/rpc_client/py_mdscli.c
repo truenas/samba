@@ -354,7 +354,9 @@ static PyObject *conn_search(PyObject *self,
 				 ctx,
 				 query,
 				 basepath,
-				 false);
+				 false,
+				 NULL,
+				 0);
 	if (req == NULL) {
 		PyErr_NoMemory();
 		goto fail;

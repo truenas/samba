@@ -1863,8 +1863,20 @@ int main(void) {
             backends.append('elasticsearch')
             conf.DEFINE('HAVE_SPOTLIGHT_BACKEND_ES', '1')
 
+        # The truesearch backend needs rpc/xdr.h and rpcgen.
+        if not conf.CONFIG_SET('HAVE_RPC_XDR_H'):
+            conf.CHECK_HEADERS('rpc/types.h rpc/xdr.h', together=True, lib='tirpc')
+        conf.find_program('rpcgen', var='RPCGEN')
+        if conf.CONFIG_SET('HAVE_RPC_XDR_H') and conf.env['RPCGEN']:
+            conf.env.spotlight_backend_truesearch = True
+            backends.append('truesearch')
+            conf.DEFINE('HAVE_SPOTLIGHT_BACKEND_TRUESEARCH', '1')
+        else:
+            Logs.warn('Missing rpc/xdr.h or rpcgen for Spotlight backend "truesearch"')
+
         if (Options.options.with_spotlight is True
-            and not conf.env.spotlight_backend_es):
+            and not conf.env.spotlight_backend_es
+            and not conf.env.spotlight_backend_truesearch):
             conf.fatal("Unmet dependencies for Spotlight backends")
 
         Logs.info("Building with Spotlight support, available backends: %s" % ', '.join(backends))
