@@ -871,16 +871,18 @@ fn a_hung_primary_recovers_and_protects_again() {
     a.signal("-STOP");
     std::thread::sleep(Duration::from_millis(LINK_TIMEOUT_MS * 3));
     a.signal("-CONT");
+    // Until A fences the stalled session, it reports the protection it had
+    // before the stop. Wait for the fence, then for the new protection.
+    assert!(
+        wait_for(Duration::from_secs(10), || lab.epoch() > before),
+        "the stalled session was fenced and replaced"
+    );
     a.wait_protected();
     let mut smbd = a.smbd(Client::Worker, 100);
     let s = smbd
         .put(vec![record(1, smbd.owner, 10)], SyncLevel::Remote)
         .unwrap();
     assert_eq!(s.protection, Protection::Protected);
-    assert!(
-        lab.epoch() > before,
-        "the stalled session was fenced and replaced"
-    );
     assert!(
         b.log().contains("went silent") || b.log().contains("closed"),
         "{}",
