@@ -711,6 +711,9 @@ bool mds_add_checked_result(struct sl_query *slq,
  * volume of a macOS server do. Bytes 0-7 are a fixed prefix with the
  * version. Bytes 8-15 are the fsid, big-endian, with the variant in the
  * top 2 bits. A ZFS fsid has 56 bits, so the variant hides none of it.
+ *
+ * mds_init_ctx() calls this once for each context, as the user, after the
+ * user reached the share path.
  */
 static bool mds_volume_uuid(struct mds_ctx *mds_ctx, sl_uuid_t *uuid)
 {
@@ -721,16 +724,12 @@ static bool mds_volume_uuid(struct mds_ctx *mds_ctx, sl_uuid_t *uuid)
 	struct statfs sfs;
 	uint64_t fsid;
 	int ret;
-	int err;
 
-	become_root();
 	ret = statfs(mds_ctx->spath, &sfs);
-	err = errno;
-	unbecome_root();
 	if (ret != 0) {
 		DBG_NOTICE("statfs of share path [%s]: %s\n",
 			   mds_ctx->spath,
-			   strerror(err));
+			   strerror(errno));
 		return false;
 	}
 	fsid = ((uint64_t)(uint32_t)sfs.f_fsid.__val[1] << 32) |
@@ -818,10 +817,7 @@ static bool slrpc_fetch_properties(struct mds_ctx *mds_ctx,
 	if (result != 0) {
 		return false;
 	}
-	if (!mds_volume_uuid(mds_ctx, &uuid)) {
-		memcpy(uuid.sl_uuid, "fakeuuidfakeuuid", sizeof(uuid.sl_uuid));
-	}
-	result = dalloc_add_copy(dict, &uuid, sl_uuid_t);
+	result = dalloc_add_copy(dict, &mds_ctx->volume_uuid, sl_uuid_t);
 	if (result != 0) {
 		return false;
 	}
@@ -1867,6 +1863,13 @@ NTSTATUS mds_init_ctx(TALLOC_CTX *mem_ctx,
 		DBG_ERR("backend connect failed\n");
 		status = NT_STATUS_CONNECTION_RESET;
 		goto error;
+	}
+
+	ok = mds_volume_uuid(mds_ctx, &mds_ctx->volume_uuid);
+	if (!ok) {
+		memcpy(mds_ctx->volume_uuid.sl_uuid,
+		       "fakeuuidfakeuuid",
+		       sizeof(mds_ctx->volume_uuid.sl_uuid));
 	}
 
 	*_mds_ctx = mds_ctx;

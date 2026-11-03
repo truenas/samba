@@ -481,7 +481,7 @@ got=$(search ts-slash "$Q" -p notes)
 start=$(stat -c %s "$RPCLOG")
 got=$(search ts-gone "$Q")
 ! echo "$got" | grep -q report &&
-	log_from "$start" | grep -q "mount of share path \[$WORK/gone\]: No such" &&
+	log_from "$start" | grep -q "reach share path \[$WORK/gone\]: No such" &&
 	ok S5e "a share whose path is gone: refused, logged" ||
 	bad S5e "$(echo $got)"
 

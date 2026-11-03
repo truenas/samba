@@ -1282,7 +1282,7 @@ static bool mdssvc_truesearch_shutdown(struct mdssvc_ctx *mdssvc_ctx)
 /*
  * Check that the user can read the share, as for a tree connect: the guest
  * rules, "valid users", "invalid users" and the share security descriptor.
- * The RPC call runs as the user. Only root can read the share database.
+ * Run as root: only root can read the share database.
  */
 static bool mds_truesearch_share_allowed(struct mds_ctx *mds_ctx)
 {
@@ -1313,24 +1313,20 @@ static bool mds_truesearch_share_allowed(struct mds_ctx *mds_ctx)
 		return false;
 	}
 
-	become_root();
 	ok = user_ok_token(si->unix_info->unix_name,
 			   si->info->domain_name,
 			   si->security_token,
 			   mds_ctx->snum);
-	unbecome_root();
 	if (!ok) {
 		DBG_NOTICE("user [%s] may not use share [%s]\n",
 			   si->unix_info->unix_name, share);
 		return false;
 	}
 
-	become_root();
 	ok = share_access_check(si->security_token,
 				share,
 				FILE_READ_DATA,
 				NULL);
-	unbecome_root();
 	if (!ok) {
 		DBG_NOTICE("user [%s] may not read share [%s]\n",
 			   si->unix_info->unix_name, share);
@@ -1341,68 +1337,68 @@ static bool mds_truesearch_share_allowed(struct mds_ctx *mds_ctx)
 }
 
 /*
- * Check that the user can reach the share root. truesearchd trims from the
- * share root down, so it does not check the directories above it. A tree
- * connect changes into the share path as the user, which needs search on
- * every directory above the root. Open the share path as the user with the
- * same requirement (O_PATH does not need read on the root itself).
+ * Find the share root for RIX_OPEN in one walk of the share path, as the
+ * user: the RPC dispatch impersonates the pipe user. The open is also the
+ * reach check. truesearchd trims from the share root down, so it does not
+ * check the directories above it. A tree connect changes into the share
+ * path as the user, which needs search on every directory above the root.
+ * The open needs the same (O_PATH does not need read on the root itself).
+ * The dataset is the source of the mount of the open directory, found by
+ * its unique mount ID. The path in the dataset is the mount root, then the
+ * part of the real path (/proc/self/fd) under the mount point.
  */
-static bool mds_truesearch_can_reach(struct mds_ctx *mds_ctx)
+static bool mds_truesearch_locate(struct mds_truesearch_ctx *tctx)
 {
+	struct mds_ctx *mds_ctx = tctx->mds_ctx;
 	const struct auth_session_info *si = mds_ctx->pipe_session_info;
-	const char *share = lp_const_servicename(mds_ctx->snum);
-	int fd;
+	struct sys_proc_fd_path_buf buf;
+	struct tn_mount_entry *entry = NULL;
+	struct statx stx = {};
+	char real[PATH_MAX];
+	const char *in_mount = NULL;
+	const char *in_root = NULL;
+	const char *sep = NULL;
+	ssize_t len = -1;
+	int ret;
 	int err;
+	int fd;
 
-	if (!become_authenticated_pipe_user(mds_ctx->pipe_session_info)) {
-		DBG_ERR("share [%s]: cannot become the session user\n", share);
-		return false;
-	}
 	fd = open(mds_ctx->spath, O_PATH | O_DIRECTORY | O_CLOEXEC);
-	err = errno;
-	unbecome_authenticated_pipe_user();
 	if (fd == -1) {
 		DBG_NOTICE("user [%s] cannot reach share path [%s]: %s\n",
 			   si->unix_info->unix_name,
 			   mds_ctx->spath,
-			   strerror(err));
+			   strerror(errno));
 		return false;
 	}
-	close(fd);
-	return true;
-}
-
-/*
- * Find the share root for RIX_OPEN. The dataset is the source of the mount
- * of the real path. The path in the dataset is the mount root, then the
- * part of the real path under the mount point. Run as root, because the
- * user cannot always access all directories in the path.
- */
-static bool mds_truesearch_locate(struct mds_truesearch_ctx *tctx,
-				  const char *path)
-{
-	struct tn_mount_entry *entry = NULL;
-	const char *in_mount = NULL;
-	const char *in_root = NULL;
-	const char *sep = NULL;
-	char *real = NULL;
-	int ret = -1;
-	int err = 0;
-
-	become_root();
-	real = realpath(path, NULL);
-	if (real != NULL) {
-		ret = tn_mount_entry_get_path(tctx, real, &entry);
+	ret = statx(fd, "", AT_EMPTY_PATH, STATX_MNT_ID_UNIQUE, &stx);
+	if (ret == 0 && (stx.stx_mask & STATX_MNT_ID_UNIQUE) == 0) {
+		errno = ENOSYS;
+		ret = -1;
+	}
+	if (ret == 0) {
+		ret = tn_mount_entry_get(tctx, stx.stx_mnt_id, &entry);
+	}
+	if (ret == 0) {
+		len = readlink(sys_proc_fd_path(fd, &buf), real, sizeof(real));
+		if (len == (ssize_t)sizeof(real)) {
+			errno = ENAMETOOLONG;
+		}
+		if (len == -1 || len == (ssize_t)sizeof(real)) {
+			ret = -1;
+		}
 	}
 	err = errno;
-	unbecome_root();
+	close(fd);
 	if (ret != 0) {
 		DBG_ERR("cannot find the mount of share path [%s]: %s\n",
-			path,
+			mds_ctx->spath,
 			strerror(err));
-		SAFE_FREE(real);
+		TALLOC_FREE(entry);
 		return false;
 	}
+	real[len] = '\0';
+
 	if (entry->sb_source == NULL || entry->mnt_point == NULL ||
 	    entry->mnt_root == NULL ||
 	    !subdir_of(entry->mnt_point,
@@ -1413,7 +1409,6 @@ static bool mds_truesearch_locate(struct mds_truesearch_ctx *tctx,
 			"root\n",
 			real);
 		TALLOC_FREE(entry);
-		SAFE_FREE(real);
 		return false;
 	}
 	in_root = entry->mnt_root;
@@ -1424,7 +1419,6 @@ static bool mds_truesearch_locate(struct mds_truesearch_ctx *tctx,
 	tctx->dataset = talloc_strdup(tctx, entry->sb_source);
 	tctx->share = talloc_asprintf(tctx, "%s%s%s", in_root, sep, in_mount);
 	TALLOC_FREE(entry);
-	SAFE_FREE(real);
 	return tctx->dataset != NULL && tctx->share != NULL;
 }
 
@@ -1436,11 +1430,6 @@ static bool mds_truesearch_connect_ctx(struct mds_ctx *mds_ctx)
 	size_t len;
 	int max;
 	bool ok;
-
-	ok = mds_truesearch_share_allowed(mds_ctx);
-	if (!ok) {
-		return false;
-	}
 
 	tctx = talloc_zero(mds_ctx, struct mds_truesearch_ctx);
 	if (tctx == NULL) {
@@ -1492,11 +1481,15 @@ static bool mds_truesearch_connect_ctx(struct mds_ctx *mds_ctx)
 		TALLOC_FREE(tctx);
 		return false;
 	}
-	if (!mds_truesearch_locate(tctx, root)) {
-		TALLOC_FREE(tctx);
-		return false;
-	}
-	if (!mds_truesearch_can_reach(mds_ctx)) {
+
+	/*
+	 * Only root can read the share database. The walk of the share path
+	 * runs as the user (mds_truesearch_locate()).
+	 */
+	become_root();
+	ok = mds_truesearch_share_allowed(mds_ctx);
+	unbecome_root();
+	if (!ok || !mds_truesearch_locate(tctx)) {
 		TALLOC_FREE(tctx);
 		return false;
 	}
