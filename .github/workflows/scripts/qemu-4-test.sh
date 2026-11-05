@@ -754,22 +754,21 @@ if python3 -c "import os; os.getxattr('/tank/acl', 'system.nfs4_acl_xdr')" 2>/de
   # truenas.acl.fixture_scope needs the fixture below.
   if tn_torture //127.0.0.1/zacl -U 'smbtest%testpass123' \
        --option='torture:acl_nfs4=yes' truenas.acl.get_sd_nfs4 \
-       truenas.acl.perm_bits truenas.acl.null_dacl truenas.acl.special_demote \
+       truenas.acl.perm_bits truenas.acl.null_dacl truenas.acl.special_advertise \
        truenas.acl.create_ctx_open_everyone truenas.acl.owner_full_escalate; then
     echo "truenas.acl mapping suite PASSED"
   else
     echo "ERROR: truenas.acl mapping suite FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
   fi
 
-  # ---- Advertisement-only proof: SMB demotes group@, on-disk (NFS view) ACL is
-  # left untouched. ixnas strips WRITE_ACL/WRITE_OWNER from group@ in the SD it
-  # reports (a group member cannot convey them there), while owner@, everyone@
-  # and named entries keep them. truenas_setfacl lays down a fixture carrying
-  # them on disk; truenas.acl.fixture_scope checks the SMB view; and
-  # truenas_getfacl before/after proves the GET never rewrote the stored ACL.
+  # ---- On-disk fixtures (truenas_pyos). ixnas reports WRITE_ACL/WRITE_OWNER as
+  # stored on owner@, group@, everyone@ and named entries: truenas_setfacl lays
+  # down a fixture carrying them on disk; truenas.acl.fixture_scope checks the
+  # SMB view; and truenas_getfacl before/after proves the GET never rewrote the
+  # stored ACL.
   # Best-effort: truenas_pyos builds a C extension (needs gcc + libbsd-dev), so
   # skip without failing the run if it cannot be installed.
-  echo "--- ixnas demote: on-disk ACL untouched (truenas_pyos) ---"
+  echo "--- ixnas ACL fixtures: on-disk ACL untouched, WRITE_ACL via group@ (truenas_pyos) ---"
   # truenas_pyos builds a C extension and is pip-installed from git, so it needs
   # pip + Python headers + libbsd-dev (gcc/git are already present from the
   # ZFS/Samba build). Trixie ships no pip by default -- without python3-pip the
@@ -800,7 +799,7 @@ assert "WRITE_ACL" in o and "WRITE_OWNER" in o, \
     if tn_torture //127.0.0.1/zacl -U 'smbtest%testpass123' \
          --option='torture:acl_nfs4=yes' --option='torture:acl_fixture=pyfix' \
          truenas.acl.fixture_scope; then
-      echo "truenas.acl.fixture_scope PASSED (SMB demotes group@, keeps owner@/everyone@/named)"
+      echo "truenas.acl.fixture_scope PASSED (SMB keeps WRITE_DAC/WRITE_OWNER on owner@/group@/everyone@/named)"
     else
       echo "ERROR: truenas.acl.fixture_scope FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
     fi
@@ -808,8 +807,23 @@ assert "WRITE_ACL" in o and "WRITE_OWNER" in o, \
       || { echo "ERROR: SMB GET mutated the on-disk ACL (owner@ lost WRITE_ACL/WRITE_OWNER)"; exit 1; }
     echo "on-disk ACL unchanged by SMB GET -- advertisement-only confirmed"
     rm -f "$FIX"
+
+    # smbtest is in group smbtest but does not own this fixture (root does).
+    # group@ gets everything but WRITE_OWNER: WRITE_ACL without full control.
+    GFIX=/tank/acl/grpfix
+    : > "$GFIX"; chown root:smbtest "$GFIX"
+    truenas_setfacl -m 'owner@:full_set::allow,group@:rwxpDdaARWcCs::allow,everyone@:read_set::allow' "$GFIX"
+    echo "on-disk ACL (WRITE_ACL via group@ fixture):"; truenas_getfacl -n "$GFIX" || true
+    if tn_torture //127.0.0.1/zacl -U 'smbtest%testpass123' \
+         --option='torture:acl_nfs4=yes' --option='torture:acl_group_fixture=grpfix' \
+         truenas.acl.group_write_acl_escalate; then
+      echo "truenas.acl.group_write_acl_escalate PASSED (owning-group member rewrote the ACL via group@)"
+    else
+      echo "ERROR: truenas.acl.group_write_acl_escalate FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
+    fi
+    rm -f "$GFIX"
   else
-    echo "WARN: truenas_pyos unavailable; skipping on-disk advertisement-only check"
+    echo "WARN: truenas_pyos unavailable; skipping on-disk ACL fixture checks (fixture_scope, group_write_acl_escalate)"
     tail -3 /tmp/pyos-install.log 2>/dev/null || true
   fi
 else
