@@ -71,10 +71,10 @@ static NTSTATUS truenas_acl_open(struct smb2_tree *tree,
 	ZERO_STRUCT(cr);
 	/*
 	 * WRITE_DAC suffices to install a DACL, and the owner is granted it
-	 * implicitly. Deliberately do NOT request WRITE_OWNER: ixnas demotes it
-	 * out of owner@/group@/everyone@ in the advertised SD and the owner has no
+	 * implicitly. Deliberately do NOT request WRITE_OWNER: the owner has no
 	 * implicit WRITE_OWNER, so requesting it would make the open itself
-	 * ACCESS_DENIED once a handle is reopened against an existing object.
+	 * ACCESS_DENIED once a handle is reopened against an existing object
+	 * whose ACL does not grant it.
 	 */
 	cr.in.desired_access = SEC_STD_READ_CONTROL | SEC_STD_WRITE_DAC |
 			       SEC_FILE_READ_DATA;
@@ -171,13 +171,6 @@ done:
  * entries with WRITE_DATA), so the data/attribute bits are asserted as a
  * superset of what was set, never an exact match. Mirrors the per-bit walk in
  * middleware test_427_smb_acl.py::test_003_test_perms (util_sd.py ACLPerms).
- *
- * WRITE_DAC and WRITE_OWNER: the trustee here is the owner, so it stores as
- * owner@. ixnas demotes only group@ now, so the owner ACE keeps both bits (the
- * owner may manage its own ACL, completed under privilege by ixnas). They are
- * asserted PRESENT on the returned owner ACE -- see
- * test_truenas_acl_special_demote for the full owner@/group@/everyone@ vs
- * named-entry contract.
  */
 static bool test_truenas_acl_perm_bits(struct torture_context *tctx,
 				       struct smb2_tree *tree)
@@ -206,7 +199,6 @@ static bool test_truenas_acl_perm_bits(struct torture_context *tctx,
 		{ "WRITE_ATTRIBUTE", SEC_FILE_WRITE_ATTRIBUTE, true },
 		{ "DELETE",          SEC_STD_DELETE,          true },
 		{ "READ_CONTROL",    SEC_STD_READ_CONTROL,    true },
-		/* owner@ keeps these now -- ixnas demotes only group@ */
 		{ "WRITE_DAC",       SEC_STD_WRITE_DAC,       true },
 		{ "WRITE_OWNER",     SEC_STD_WRITE_OWNER,     true },
 	};
@@ -342,16 +334,13 @@ static NTSTATUS truenas_acl_open_existing(struct smb2_tree *tree,
 }
 
 /*
- * The advertisement contract after ixnas's group@-only demote: the group@ ALLOW
- * ACE returns WITHOUT WRITE_DAC/WRITE_OWNER, while owner@ and everyone@ keep
- * them (the owner may manage its ACL; a fully-open everyone@ has no protection).
- * owner@/group@/everyone@ map back to the owner SID, the owning-group SID and
- * Everyone. With want_named, also require a named ALLOW ACE that carries both
- * bits -- proof the demote is scoped to group@ and is not a blanket strip.
+ * ixnas reports WRITE_DAC/WRITE_OWNER as stored on owner@, group@ and everyone@,
+ * which map back to the owner SID, the owning-group SID and Everyone. With
+ * want_named, also require a named ALLOW ACE that carries both bits.
  */
-static bool truenas_acl_assert_demote(struct torture_context *tctx,
-				      const struct security_descriptor *sd,
-				      bool want_named)
+static bool truenas_acl_assert_advertised(struct torture_context *tctx,
+					  const struct security_descriptor *sd,
+					  bool want_named)
 {
 	const uint32_t wc = SEC_STD_WRITE_DAC | SEC_STD_WRITE_OWNER;
 	bool saw_owner = false, saw_group = false, saw_world = false;
@@ -370,9 +359,8 @@ static bool truenas_acl_assert_demote(struct torture_context *tctx,
 		if (sd->group_sid != NULL &&
 		    dom_sid_equal(&ace->trustee, sd->group_sid)) {
 			saw_group = true;
-			torture_assert(tctx, (ace->access_mask & wc) == 0,
-				       "group@ still advertises "
-				       "WRITE_DAC/WRITE_OWNER");
+			torture_assert(tctx, (ace->access_mask & wc) == wc,
+				       "group@ lost WRITE_DAC/WRITE_OWNER");
 		} else if (sd->owner_sid != NULL &&
 			   dom_sid_equal(&ace->trustee, sd->owner_sid)) {
 			saw_owner = true;
@@ -398,19 +386,18 @@ static bool truenas_acl_assert_demote(struct torture_context *tctx,
 
 /*
  * Core contract over pure SMB: set Full Control (including WRITE_DAC/WRITE_OWNER)
- * on owner@, group@ and everyone@, read the SD back, and require group@ to
- * return without those two bits while owner@ and everyone@ keep them. No fixture
- * needed.
+ * on owner@, group@ and everyone@, read the SD back, and require all three to
+ * return with those two bits. No fixture needed.
  */
-static bool test_truenas_acl_special_demote(struct torture_context *tctx,
-					    struct smb2_tree *tree)
+static bool test_truenas_acl_special_advertise(struct torture_context *tctx,
+					       struct smb2_tree *tree)
 {
 	NTSTATUS status;
 	bool ret = true;
 	struct smb2_handle h = {{0}};
 	struct security_descriptor *sd0 = NULL, *sd = NULL, *got = NULL;
 	const char *owner = NULL, *group = NULL, *world = NULL;
-	const char *fname = "acl_special_demote";
+	const char *fname = "acl_special_advertise";
 	const uint32_t full = SEC_STD_ALL | SEC_FILE_ALL;
 
 	if (!truenas_acl_enabled(tctx)) {
@@ -452,7 +439,7 @@ static bool test_truenas_acl_special_demote(struct torture_context *tctx,
 				 &got);
 	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "get back ACL");
 
-	ret = truenas_acl_assert_demote(tctx, got, false);
+	ret = truenas_acl_assert_advertised(tctx, got, false);
 
 done:
 	smb2_util_close(tree, h);
@@ -463,10 +450,10 @@ done:
 /*
  * Same contract against an out-of-band fixture (laid down on disk by
  * truenas_setfacl in the CI runner) that also carries a named user/group with
- * Full Control: the special identities must be demoted while the named entry
- * keeps WRITE_DAC/WRITE_OWNER. The runner brackets this with truenas_getfacl to
- * prove the on-disk ACL is left untouched (advertisement-only). Self-skips
- * unless given the fixture path.
+ * Full Control: the special identities and the named entry must all keep
+ * WRITE_DAC/WRITE_OWNER. The runner brackets this with truenas_getfacl to prove
+ * the GET leaves the on-disk ACL untouched. Self-skips unless given the fixture
+ * path.
  */
 static bool test_truenas_acl_fixture_scope(struct torture_context *tctx,
 					   struct smb2_tree *tree)
@@ -494,7 +481,7 @@ static bool test_truenas_acl_fixture_scope(struct torture_context *tctx,
 				 &got);
 	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "get fixture ACL");
 
-	ret = truenas_acl_assert_demote(tctx, got, true);
+	ret = truenas_acl_assert_advertised(tctx, got, true);
 
 done:
 	smb2_util_close(tree, h);
@@ -683,6 +670,111 @@ done:
 	return ret;
 }
 
+/*
+ * A member of the owning group may rewrite the ACL of a file that grants
+ * WRITE_ACL through group@ -- which ZFS otherwise refuses (group@ does not
+ * convey WRITE_ACL, and on a non-trivial ACL only CAP_FOWNER may write it).
+ * This is what ACLs migrated from TrueNAS CORE, and ACLs that Samba wrote (it
+ * maps an ACE for the owning group to group@), rely on to let e.g. Domain
+ * Admins manage files they do not own.
+ *
+ * Needs a fixture that the connecting user does not own but whose owning group
+ * they belong to, with a group@ entry that carries WRITE_ACL but not full
+ * control (no WRITE_OWNER), so that it exercises more than the full-control
+ * case; the runner lays it down with truenas_setfacl as root:<user's group>.
+ *
+ * NOTE: the retry only fires on a TrueNAS-patched enforcing kernel; on a stock
+ * CI runner the set succeeds without it (the open still validates the mapping).
+ */
+static bool test_truenas_acl_group_write_acl_escalate(
+	struct torture_context *tctx,
+	struct smb2_tree *tree)
+{
+	NTSTATUS status;
+	bool ret = true;
+	struct smb2_handle h = {{0}};
+	struct smb2_create cr;
+	struct security_descriptor *sd0 = NULL, *sd = NULL, *got = NULL;
+	const char *owner = NULL, *group = NULL;
+	const char *fname = torture_setting_string(tctx, "acl_group_fixture",
+						   NULL);
+	const uint32_t full = SEC_STD_ALL | SEC_FILE_ALL;
+	const uint32_t manage = full & ~SEC_STD_WRITE_OWNER;
+	uint32_t i;
+	bool saw_group_manage = false;
+
+	if (!truenas_acl_enabled(tctx)) {
+		torture_skip(tctx, "requires an ixnas NFSv4-ACL share "
+				   "(--option=torture:acl_nfs4=yes)");
+	}
+	if (fname == NULL) {
+		torture_skip(tctx, "requires --option=torture:acl_group_fixture="
+				   "<path> (owned by another user, in the "
+				   "connecting user's group, WRITE_ACL via group@)");
+	}
+
+	/* The fixture must exist: creating it would make us its owner. */
+	ZERO_STRUCT(cr);
+	cr.in.desired_access = SEC_STD_READ_CONTROL | SEC_STD_WRITE_DAC;
+	cr.in.file_attributes = FILE_ATTRIBUTE_NORMAL;
+	cr.in.create_disposition = NTCREATEX_DISP_OPEN;
+	cr.in.share_access = NTCREATEX_SHARE_ACCESS_MASK;
+	cr.in.fname = fname;
+	status = smb2_create(tree, tctx, &cr);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"open fixture with WRITE_DAC through group@");
+	h = cr.out.file.handle;
+
+	status = truenas_acl_get(tree, tctx, h,
+				 SECINFO_OWNER | SECINFO_GROUP, &sd0);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "get owner/group");
+	torture_assert_goto(tctx,
+			    sd0->owner_sid != NULL && sd0->group_sid != NULL,
+			    ret, done, "missing owner/group sid");
+	owner = dom_sid_string(tctx, sd0->owner_sid);
+	group = dom_sid_string(tctx, sd0->group_sid);
+
+	/*
+	 * Rewrite the non-trivial ACL, dropping the fixture's everyone@ entry
+	 * and keeping group@ with WRITE_DAC but without WRITE_OWNER.
+	 */
+	sd = security_descriptor_dacl_create(tctx, 0, NULL, NULL,
+			owner, SEC_ACE_TYPE_ACCESS_ALLOWED, full, 0,
+			group, SEC_ACE_TYPE_ACCESS_ALLOWED, manage, 0,
+			NULL);
+	torture_assert_goto(tctx, sd != NULL, ret, done, "build dacl");
+	status = truenas_acl_set(tree, h, sd);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"rewrite ACL as a member of the owning group");
+
+	status = truenas_acl_get(tree, tctx, h,
+				 SECINFO_OWNER | SECINFO_GROUP | SECINFO_DACL,
+				 &got);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "get back ACL");
+	torture_assert_goto(tctx, got->dacl != NULL, ret, done,
+			    "unexpected NULL DACL");
+	for (i = 0; i < got->dacl->num_aces; i++) {
+		const struct security_ace *ace = &got->dacl->aces[i];
+
+		if (ace->type != SEC_ACE_TYPE_ACCESS_ALLOWED) {
+			continue;
+		}
+		torture_assert_goto(tctx,
+			!dom_sid_equal(&ace->trustee, &global_sid_World),
+			ret, done, "Everyone ACE survived the rewrite");
+		if (dom_sid_equal(&ace->trustee, got->group_sid) &&
+		    ((ace->access_mask & manage) == manage)) {
+			saw_group_manage = true;
+		}
+	}
+	torture_assert_goto(tctx, saw_group_manage, ret, done,
+			    "group@ WRITE_DAC missing after the rewrite");
+
+done:
+	smb2_util_close(tree, h);
+	return ret;
+}
+
 void torture_truenas_acl_suite(struct torture_suite *suite)
 {
 	struct torture_suite *acl = torture_suite_create(suite, "acl");
@@ -693,14 +785,16 @@ void torture_truenas_acl_suite(struct torture_suite *suite)
 				     test_truenas_acl_perm_bits);
 	torture_suite_add_1smb2_test(acl, "null_dacl",
 				     test_truenas_acl_null_dacl);
-	torture_suite_add_1smb2_test(acl, "special_demote",
-				     test_truenas_acl_special_demote);
+	torture_suite_add_1smb2_test(acl, "special_advertise",
+				     test_truenas_acl_special_advertise);
 	torture_suite_add_1smb2_test(acl, "fixture_scope",
 				     test_truenas_acl_fixture_scope);
 	torture_suite_add_1smb2_test(acl, "create_ctx_open_everyone",
 				     test_truenas_acl_create_ctx_open_everyone);
 	torture_suite_add_1smb2_test(acl, "owner_full_escalate",
 				     test_truenas_acl_owner_full_escalate);
+	torture_suite_add_1smb2_test(acl, "group_write_acl_escalate",
+				     test_truenas_acl_group_write_acl_escalate);
 
 	torture_suite_add_suite(suite, acl);
 }
