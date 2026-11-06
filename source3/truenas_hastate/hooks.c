@@ -53,7 +53,7 @@
  * replaces the copy with the records that it received after the first
  * page.
  *
- * truenas_smbhad/client has the protocol, the record format, the durable
+ * truenas_rust/smbhad/client has the protocol, the record format, the durable
  * cookie of vfs_zfs_core and the fence through the epoch file.
  *
  * The daemon sends the origin of the copy and the node (A or B) that wrote

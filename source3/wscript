@@ -1886,14 +1886,14 @@ int main(void) {
     if not conf.CONFIG_SET('HAVE_RPC_XDR_H'):
         conf.CHECK_HEADERS('rpc/types.h rpc/xdr.h', together=True, lib='tirpc')
     # TrueNAS: smbd links the client of truenas_smbhad, a static library.
-    # truenas_smbhad/build.sh builds it before waf runs.
-    smbhad = os.path.join(conf.srcnode.abspath(), 'truenas_smbhad')
-    smbhad_lib = os.path.join(smbhad, 'target', 'release')
+    # truenas_rust/build.sh builds it before waf runs.
+    rust = os.path.join(conf.srcnode.abspath(), 'truenas_rust')
+    smbhad_lib = os.path.join(rust, 'target', 'release')
     if not os.path.exists(os.path.join(smbhad_lib,
                                        'libtruenas_smbhad_client.a')):
         conf.fatal('libtruenas_smbhad_client.a not found: '
-                   'run truenas_smbhad/build.sh')
-    conf.ADD_EXTRA_INCLUDES('#truenas_smbhad/client/include')
+                   'run truenas_rust/build.sh')
+    conf.ADD_EXTRA_INCLUDES('#truenas_rust/smbhad/client/include')
     conf.env.STLIBPATH_TRUENAS_SMBHAD_CLIENT = [smbhad_lib]
     conf.env.STLIB_TRUENAS_SMBHAD_CLIENT = ['truenas_smbhad_client']
     conf.env.LIB_TRUENAS_SMBHAD_CLIENT = ['gcc_s', 'util', 'rt', 'pthread',
