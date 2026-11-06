@@ -97,7 +97,7 @@ endif
 override_dh_auto_configure:
 	debian/build-liburing.sh
 	# smbd links the client library of truenas_smbhad
-	truenas_smbhad/build.sh
+	truenas_rust/build.sh
 	PKG_CONFIG_PATH="$(LIBURING_PKG_CONFIG_PATH):$(PKG_CONFIG_PATH)" ./configure $(conf_args)
 	# source3/wscript only adds vfs_io_uring to the default module set when
 	# configure found liburing, and a miss there is not fatal to configure --
@@ -112,7 +112,7 @@ override_dh_auto_configure:
 
 override_dh_auto_clean:
 	rm -rf debian/liburing
-	rm -rf truenas_smbhad/target
+	rm -rf truenas_rust/target
 	dh_auto_clean
 
 override_dh_auto_build:
@@ -154,7 +154,7 @@ ifeq ($(DEB_HOST_ARCH_OS), linux)
 	  $(DESTDIR)/lib/systemd/system/smbd.service \
 	  $(DESTDIR)/lib/systemd/system/winbind.service
 	# truenas_smbhad and its systemd unit
-	truenas_smbhad/build.sh $(DESTDIR)
+	truenas_rust/build.sh $(DESTDIR)
 endif
 
 override_dh_installdocs-arch:

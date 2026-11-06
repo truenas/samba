@@ -1,7 +1,7 @@
 # Copyright (C) iXsystems, Inc. 2026
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# Installed by truenas_smbhad/build.sh. The daemon runs on both controllers
+# Installed by truenas_rust/build.sh. The daemon runs on both controllers
 # of an HA system. On a system that is not HA, it detects no HA heartbeat
 # address and does nothing. smbd restores durable handles from it at start.
 [Unit]

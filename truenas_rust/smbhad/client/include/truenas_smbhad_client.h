@@ -1,5 +1,5 @@
 /*
- * The client of truenas_smbhad in smbd, see truenas_smbhad/client.
+ * The client of truenas_smbhad in smbd, see truenas_rust/smbhad/client.
  *
  * Copyright (C) iXsystems, Inc. 2026
  * SPDX-License-Identifier: GPL-3.0-or-later

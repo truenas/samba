@@ -126,9 +126,9 @@ jobs:
       timeout-minutes: 60
       run: bash .github/workflows/scripts/qemu-4-test.sh
 
-    - name: truenas_smbhad tests
+    - name: truenas_rust tests
       timeout-minutes: 30
-      run: bash .github/workflows/scripts/qemu-4.5-smbhad.sh
+      run: bash .github/workflows/scripts/qemu-4.5-rust.sh
 
     - name: Spotlight truesearch backend against a mock truesearchd
       timeout-minutes: 15
