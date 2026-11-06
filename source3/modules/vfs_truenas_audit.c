@@ -349,6 +349,7 @@ static bool tn_audit_backend_init(vfs_handle_struct *handle,
 
 	if (!enabled) {
 		config->audit_fn = tn_audit_do_noop;
+		config->disabled = true;
 	}
 
 	return true;
