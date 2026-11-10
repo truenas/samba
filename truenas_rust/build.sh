@@ -3,18 +3,19 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 ######################################################################
-# Build truenas_smbhad for the Debian package.
+# Build the TrueNAS Rust workspace for the Debian package.
 #
-# truenas_smbhad is a Cargo workspace in the Samba tree: the daemon, and the
-# client library that smbd links (target/release/libtruenas_smbhad_client.a,
-# see source3/wscript).  debian/rules runs this script before configure, and
-# again with DESTDIR to install the daemon.  The truenas_ros crates need Rust 1.98.1 or newer.  Debian packages an
-# older Rust.  Build-Depends cannot supply the compiler.  The script uses
-# `cargo` from PATH if it is new enough.  If not, the script installs Rust
-# 1.98.1 with rustup.  debian/build-liburing.sh uses the same method: a
-# pinned version, downloaded at build time, with retries.
+# truenas_rust is a Cargo workspace in the Samba tree.  It has the daemon
+# truenas_smbhad and the client library that smbd links
+# (target/release/libtruenas_smbhad_client.a, see source3/wscript).
+# debian/rules runs this script before configure, and again with DESTDIR to
+# install the daemon.  The truenas_ros crates need Rust 1.98.1 or newer.
+# Debian packages an older Rust.  Build-Depends cannot supply the compiler.
+# The script uses `cargo` from PATH if it is new enough.  If not, the script
+# installs Rust 1.98.1 with rustup.  debian/build-liburing.sh uses the same
+# method: a pinned version, downloaded at build time, with retries.
 #
-# Usage: truenas_smbhad/build.sh [DESTDIR]
+# Usage: truenas_rust/build.sh [DESTDIR]
 #   Builds with --release --locked.  With DESTDIR, also installs
 #   DESTDIR/usr/sbin/truenas_smbhad and
 #   DESTDIR/lib/systemd/system/truenas-smbhad.service.
@@ -26,7 +27,7 @@
 #                     host with network access).
 #
 # The script installs its toolchain in target/debian/.
-# `rm -rf truenas_smbhad/target` removes all build output.  The script does
+# `rm -rf truenas_rust/target` removes all build output.  The script does
 # not change the environment for a cargo from PATH.  A rustup proxy needs
 # that environment to find its toolchains.
 ######################################################################
@@ -118,7 +119,7 @@ BIN="$HERE/target/release/truenas_smbhad"
 
 if [ $# -ge 1 ]; then
     install -D -m 0755 "$BIN" "$1/usr/sbin/truenas_smbhad"
-    install -D -m 0644 "$HERE/truenas-smbhad.service" \
+    install -D -m 0644 "$HERE/smbhad/truenas-smbhad.service" \
         "$1/lib/systemd/system/truenas-smbhad.service"
     echo "Installed truenas_smbhad into $1"
 fi
