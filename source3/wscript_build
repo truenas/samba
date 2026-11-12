@@ -658,6 +658,7 @@ bld.SAMBA3_LIBRARY('smbd_base',
                           smbd/server_reload.c
                           smbd/files.c
                           smbd/truenas_mdcache.c
+                          smbd/truenas_session_revalidate.c
                           truenas_hastate/conn.c
                           truenas_hastate/hooks.c
                           truenas_hastate/record.c

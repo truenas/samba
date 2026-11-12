@@ -3175,6 +3175,9 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 	/* durable handle subtests (truenas_durable.c) */
 	torture_truenas_durable_suite(suite);
 
+	/* Kerberos session subtests (truenas_session.c) */
+	torture_truenas_session_suite(suite);
+
 	suite->description = talloc_strdup(suite,
 		"TrueNAS VFS stack tests (zfs_core, truenas_streams_xattr, "
 		"shadow_copy_zfs, ixnas, truenas_audit)");
