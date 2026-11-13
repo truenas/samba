@@ -344,4 +344,279 @@ out:
 	return status;
 }
 
+/*
+ * Make an AP-REQ with the ticket in creds, with the GSS-API checksum that
+ * ads_krb5_mk_req() also sends. The function calls only the Kerberos
+ * library and malloc().
+ */
+static krb5_error_code s4u2self_mk_req(krb5_context ctx,
+				       krb5_creds *creds,
+				       uint8_t **_ap_req,
+				       size_t *_ap_req_len)
+{
+	krb5_auth_context auth_ctx = NULL;
+#ifdef HAVE_KRB5_AUTH_CON_SET_REQ_CKSUMTYPE
+	/* Length of the channel bindings, no channel bindings, no flags */
+	uint8_t gss_cksum[4 + 16 + 4] = { 0 };
+#endif
+	krb5_data in_data;
+	krb5_data out;
+	krb5_error_code ret;
+
+	ZERO_STRUCT(in_data);
+	ZERO_STRUCT(out);
+
+	ret = krb5_auth_con_init(ctx, &auth_ctx);
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = krb5_auth_con_setaddrs(ctx, auth_ctx, NULL, NULL);
+	if (ret != 0) {
+		goto out;
+	}
+
+#ifdef HAVE_KRB5_AUTH_CON_SET_REQ_CKSUMTYPE
+	SIVAL(gss_cksum, 0, 16);
+	in_data.data = (char *)gss_cksum;
+	in_data.length = sizeof(gss_cksum);
+
+	ret = krb5_auth_con_set_req_cksumtype(ctx, auth_ctx, 0x8003);
+	if (ret != 0) {
+		goto out;
+	}
+#endif
+
+	ret = krb5_mk_req_extended(ctx,
+				   &auth_ctx,
+				   AP_OPTS_USE_SUBKEY,
+				   &in_data,
+				   creds,
+				   &out);
+	if (ret != 0) {
+		goto out;
+	}
+
+	*_ap_req = malloc(out.length);
+	if (*_ap_req == NULL) {
+		ret = ENOMEM;
+		goto out;
+	}
+	memcpy(*_ap_req, out.data, out.length);
+	*_ap_req_len = out.length;
+
+out:
+	smb_krb5_free_data_contents(ctx, &out);
+	krb5_auth_con_free(ctx, auth_ctx);
+	return ret;
+}
+
+/*
+ * Ask the KDC if the account of a user can log on to this server.
+ *
+ * The machine account asks the KDC for a ticket for the user to this
+ * server (S4U2Self). The user does not take part. The function does
+ * network I/O and can block.
+ *
+ * A thread of a thread pool can call this function. For that reason the
+ * function calls only the Kerberos library. talloc_tos(), DEBUG and the
+ * lp_*() functions are not safe in a second thread.
+ *
+ * machine_princ is the principal of the machine account. machine_pass is
+ * its password. user_princ is the principal of the user.
+ *
+ * On KERBEROS_S4U2SELF_OK, *_endtime is the end time of the ticket.
+ * *_ap_req is an AP-REQ with the ticket, for kerberos_ap_req_pac(). The
+ * caller frees *_ap_req with free(). *_krb5_error is the Kerberos error
+ * code, or 0.
+ */
+enum kerberos_s4u2self_result kerberos_s4u2self_check(
+	const char *machine_princ,
+	const char *machine_pass,
+	const char *user_princ,
+	time_t *_endtime,
+	uint8_t **_ap_req,
+	size_t *_ap_req_len,
+	int *_krb5_error)
+{
+	enum kerberos_s4u2self_result result = KERBEROS_S4U2SELF_UNAVAILABLE;
+	krb5_context ctx = NULL;
+	krb5_ccache cc = NULL;
+	krb5_principal me = NULL;
+	krb5_principal client = NULL;
+	krb5_principal user = NULL;
+	krb5_creds *creds = NULL;
+	krb5_error_code ret;
+
+	*_endtime = 0;
+	*_ap_req = NULL;
+	*_ap_req_len = 0;
+	*_krb5_error = 0;
+
+	ret = krb5_init_context(&ctx);
+	if (ret != 0) {
+		goto out;
+	}
+
+	ret = krb5_parse_name(ctx, machine_princ, &me);
+	if (ret != 0) {
+		goto out;
+	}
+
+	ret = krb5_parse_name(ctx, user_princ, &user);
+	if (ret != 0) {
+		goto out;
+	}
+
+	ret = krb5_cc_new_unique(ctx, "MEMORY", NULL, &cc);
+	if (ret != 0) {
+		goto out;
+	}
+
+	/* Get a TGT for the machine account. */
+	ret = smb_krb5_kinit_password_ccache(
+		ctx, cc, me, machine_pass, NULL, NULL, NULL, NULL);
+	if (ret != 0) {
+		goto out;
+	}
+
+	/* The name of the machine account as the KDC returned it */
+	ret = krb5_cc_get_principal(ctx, cc, &client);
+	if (ret != 0) {
+		goto out;
+	}
+
+	/* The service is the machine account. */
+	ret = smb_krb5_get_credentials(ctx, cc, client, client, user, &creds);
+	if (ret == 0) {
+		ret = s4u2self_mk_req(ctx, creds, _ap_req, _ap_req_len);
+		if (ret == 0) {
+			*_endtime = creds->times.endtime;
+			result = KERBEROS_S4U2SELF_OK;
+		}
+		goto out;
+	}
+
+	switch (ret) {
+	case KRB5KDC_ERR_C_PRINCIPAL_UNKNOWN:
+	case KRB5KDC_ERR_CLIENT_REVOKED:
+	case KRB5KDC_ERR_NAME_EXP:
+	case KRB5KDC_ERR_CLIENT_NOTYET:
+#if defined(KRB5KDC_ERR_KEY_EXP) /* MIT */
+	case KRB5KDC_ERR_KEY_EXP:
+#else /* Heimdal */
+	case KRB5KDC_ERR_KEY_EXPIRED:
+#endif
+	case KRB5KDC_ERR_POLICY:
+		/* These answers are about the account of the user. */
+		result = KERBEROS_S4U2SELF_REFUSED;
+		break;
+	default:
+		break;
+	}
+
+out:
+	*_krb5_error = ret;
+	if (creds != NULL) {
+		krb5_free_creds(ctx, creds);
+	}
+	if (client != NULL) {
+		krb5_free_principal(ctx, client);
+	}
+	if (user != NULL) {
+		krb5_free_principal(ctx, user);
+	}
+	if (me != NULL) {
+		krb5_free_principal(ctx, me);
+	}
+	if (cc != NULL) {
+		krb5_cc_destroy(ctx, cc);
+	}
+	if (ctx != NULL) {
+		krb5_free_context(ctx);
+	}
+	return result;
+}
+
+/*
+ * Accept an AP-REQ from kerberos_s4u2self_check() in the same way as the
+ * ticket of a session setup, and return the PAC of the ticket. The steps
+ * are the same as at the end of kerberos_return_pac(). Only the main
+ * thread can call this function.
+ */
+NTSTATUS kerberos_ap_req_pac(TALLOC_CTX *mem_ctx,
+			     const uint8_t *ap_req,
+			     size_t ap_req_len,
+			     struct PAC_DATA_CTR **_pac_data_ctr)
+{
+	TALLOC_CTX *frame = talloc_stackframe();
+	DATA_BLOB ticket = data_blob_const(ap_req, ap_req_len);
+	DATA_BLOB tkt_wrapped;
+	DATA_BLOB ap_rep = data_blob_null;
+	struct auth4_context *auth_context = NULL;
+	struct loadparm_context *lp_ctx = NULL;
+	struct gensec_settings *gensec_settings = NULL;
+	const struct gensec_security_ops **backends = NULL;
+	struct gensec_security *gensec = NULL;
+	struct auth_session_info *session_info = NULL;
+	NTSTATUS status = NT_STATUS_NO_MEMORY;
+
+	tkt_wrapped = spnego_gen_krb5_wrap(frame, ticket, TOK_ID_KRB_AP_REQ);
+	auth_context = auth4_context_for_PAC_DATA_CTR(frame);
+	lp_ctx = loadparm_init_s3(frame, loadparm_s3_helpers());
+	if (tkt_wrapped.data == NULL || auth_context == NULL || lp_ctx == NULL) {
+		goto out;
+	}
+	gensec_settings = lpcfg_gensec_settings(frame, lp_ctx);
+	if (gensec_settings == NULL) {
+		goto out;
+	}
+	backends = talloc_zero_array(gensec_settings,
+				     const struct gensec_security_ops *,
+				     2);
+	if (backends == NULL) {
+		goto out;
+	}
+	backends[0] = gensec_gse_security_by_oid(GENSEC_OID_KERBEROS5);
+	gensec_settings->backends = backends;
+
+	gensec_init();
+
+	status = gensec_server_start(frame,
+				     gensec_settings,
+				     auth_context,
+				     &gensec);
+	if (!NT_STATUS_IS_OK(status)) {
+		goto out;
+	}
+	/* gensec has references to these now */
+	talloc_unlink(frame, lp_ctx);
+	talloc_unlink(frame, gensec_settings);
+	talloc_unlink(frame, auth_context);
+
+	gensec_want_feature(gensec, GENSEC_FEATURE_NO_AUTHZ_LOG);
+
+	status = gensec_start_mech_by_oid(gensec, GENSEC_OID_KERBEROS5);
+	if (!NT_STATUS_IS_OK(status)) {
+		goto out;
+	}
+	status = gensec_update(gensec, frame, tkt_wrapped, &ap_rep);
+	if (!NT_STATUS_IS_OK(status)) {
+		goto out;
+	}
+
+	/* The session info is empty. The auth context keeps the PAC. */
+	status = gensec_session_info(gensec, frame, &session_info);
+	if (!NT_STATUS_IS_OK(status)) {
+		goto out;
+	}
+	*_pac_data_ctr = auth4_context_get_PAC_DATA_CTR(auth_context, mem_ctx);
+	if (*_pac_data_ctr == NULL) {
+		status = NT_STATUS_INVALID_PARAMETER;
+	}
+out:
+	TALLOC_FREE(frame);
+	return status;
+}
+
 #endif

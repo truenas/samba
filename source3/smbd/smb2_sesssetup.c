@@ -23,6 +23,7 @@
 #include "smbd/smbd.h"
 #include "smbd/globals.h"
 #include "source3/smbd/smbXsrv_session.h"
+#include "source3/smbd/truenas_session_revalidate.h"
 #include "../libcli/smb/smb_common.h"
 #include "../auth/gensec/gensec.h"
 #include "auth.h"
@@ -445,6 +446,7 @@ static NTSTATUS smbd_smb2_auth_generic_return(struct smbXsrv_session *session,
 	}
 	session->global->auth_time = timeval_to_nttime(&smb2req->request_time);
 	session->global->expiration_time = gensec_expire_time(auth->gensec);
+	truenas_session_revalidate_setup(session);
 
 	if (!session_claim(session)) {
 		DEBUG(1, ("smb2: Failed to claim session "
@@ -527,6 +529,7 @@ static NTSTATUS smbd_smb2_reauth_generic_return(struct smbXsrv_session *session,
 	}
 	session->global->auth_time = timeval_to_nttime(&smb2req->request_time);
 	session->global->expiration_time = gensec_expire_time(auth->gensec);
+	truenas_session_revalidate_setup(session);
 
 	TALLOC_FREE(auth);
 	status = smbXsrv_session_update(session);
