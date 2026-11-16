@@ -136,6 +136,10 @@ jobs:
         TRAIN: ${{ steps.train.outputs.train }}
       run: bash .github/workflows/scripts/qemu-4.7-spotlight.sh
 
+    - name: Kerberos session revalidation against a Samba AD DC
+      timeout-minutes: 20
+      run: bash .github/workflows/scripts/qemu-4.8-kerberos.sh
+
     # Runs last against the VM: it ends with a crash of the VM through sysrq.
     - name: Durable handles across failovers, smbd restarts and a VM crash
       timeout-minutes: 60
