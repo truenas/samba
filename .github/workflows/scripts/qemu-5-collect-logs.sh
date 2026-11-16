@@ -33,6 +33,10 @@ ssh debian@$VM_IP "sudo sh -c 'tail -n +1 /var/tmp/pyctdb-test/node.*/log.ctdb'"
 ssh debian@$VM_IP "sudo sh -c 'cd /var/tmp && tar czf - --exclude=secret durable'" \
   > "$LOG_DIR/durable.tar.gz" 2>/dev/null || true
 ssh debian@$VM_IP "sudo journalctl -u truenas-smbhad --no-pager" > "$LOG_DIR/truenas-smbhad.log" 2>/dev/null || true
+# Kerberos session tests (qemu-4.8-kerberos.sh): daemon logs, smbtorture
+# output and configurations, without the DC and the secrets of the join.
+ssh debian@$VM_IP "sudo sh -c 'cd /var/tmp && tar czf - --exclude=dc --exclude=nas kerberos'" \
+  > "$LOG_DIR/kerberos.tar.gz" 2>/dev/null || true
 # Listing of the built debs (handy when a build/packaging step failed).
 ssh debian@$VM_IP "ls -l ~/*.deb /tmp/*.deb 2>/dev/null" > "$LOG_DIR/built-debs.txt" 2>/dev/null || true
 
