@@ -316,7 +316,7 @@ if bld.CONFIG_SET('HAVE_LIBZFS'):
     TORTURE_TRUENAS_DEPS += ' smb_libzfs'
 
 bld.SAMBA_MODULE('TORTURE_TRUENAS',
-	source='truenas/truenas.c truenas/truenas_acl.c truenas/truenas_audit.c truenas/truenas_mdcache.c truenas/truenas_durable.c truenas/truenas_dosmode.c truenas/truenas_worm.c',
+	source='truenas/truenas.c truenas/truenas_acl.c truenas/truenas_audit.c truenas/truenas_mdcache.c truenas/truenas_durable.c truenas/truenas_dosmode.c truenas/truenas_worm.c truenas/truenas_session.c',
 	subsystem='smbtorture',
 	deps=TORTURE_TRUENAS_DEPS,
 	internal_module=True,
