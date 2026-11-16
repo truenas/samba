@@ -30,6 +30,9 @@ struct fd_handle *fd_handle_create(TALLOC_CTX *mem_ctx);
 size_t fh_get_refcount(struct fd_handle *fh);
 void fh_set_refcount(struct fd_handle *fh, size_t ref_count);
 
+void fh_set_position_source(struct fd_handle *fh,
+			    bool (*take)(void *private_data, uint64_t *pos),
+			    void *private_data);
 uint64_t fh_get_position_information(struct fd_handle *fh);
 void fh_set_position_information(struct fd_handle *fh, uint64_t posinfo);
 

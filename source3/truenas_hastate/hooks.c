@@ -426,6 +426,12 @@ void truenas_hastate_fsp_freed(struct files_struct *fsp)
 	tn_unlink_pending(p);
 }
 
+/* True if smbd records the state of durable handles for an HA failover. */
+bool truenas_hastate_enabled(void)
+{
+	return tn_durable_enabled();
+}
+
 /*
  * smbd calls this before it changes the file of fsp, and again before the
  * reply. Until the next flush, a crash can lose the change. The client can

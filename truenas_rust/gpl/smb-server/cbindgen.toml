@@ -1,0 +1,45 @@
+# This command makes include/truenas_smb_server.h from src/.
+#   cbindgen --config cbindgen.toml --output include/truenas_smb_server.h
+# The header is in git. The package build does not run cbindgen. The test
+# header_is_current checks that the header is current.
+language = "C"
+style = "tag"
+include_guard = "TRUENAS_SMB_SERVER_H"
+header = """/*
+ * Copyright (C) iXsystems, Inc. 2026
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * truenas_smb_server is the layer of smbd on the reactors of
+ * truenas_smbros.h. The reactors sign, check, encrypt and
+ * decrypt PDUs with the functions and keys of the caller. They do the file
+ * I/O of the SMB2 READ, WRITE and FLUSH requests that the caller gives
+ * them.
+ */"""
+autogen_warning = "/* Made by cbindgen from src/. Do not edit. */"
+sys_includes = ["stdbool.h", "stddef.h", "stdint.h", "sys/uio.h"]
+includes = ["truenas_smbros.h"]
+no_includes = true
+usize_is_size_t = true
+documentation_style = "doxy"
+tab_width = 8
+
+[parse]
+parse_deps = false
+
+[export]
+# truenas_smbros.h and sys/uio.h have these
+exclude = ["Conn", "Ctx", "iovec"]
+
+[export.rename]
+"Conn" = "struct tn_smbros_conn"
+"Ctx" = "struct tn_smbros_ctx"
+"iovec" = "struct iovec"
+"OpenFile" = "tn_smbsrv_file"
+"Hold" = "tn_smbsrv_hold"
+"Keys" = "tn_smbsrv_keys"
+"Io" = "tn_smbsrv_io"
+"SignPart" = "tn_smbsrv_sign_part"
+"CryptoOps" = "tn_smbsrv_crypto"
+
+[fn]
+args = "vertical"

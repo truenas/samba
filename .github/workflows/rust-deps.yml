@@ -1,0 +1,87 @@
+name: Rust dependency check
+
+# cargo-deny checks the crates of truenas_rust. It finds RustSec
+# advisories, crates from unknown sources, dependencies without a version
+# and licenses that are not allowed. truenas_rust/deny.toml has the rules.
+# nightly.yml calls this workflow each day. The nightly run finds new
+# advisories for crates that did not change. On a pull request,
+# dependency-review also checks the dependencies that the pull request
+# adds.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "(optional) Branch to check (default: the branch of the caller)"
+        type: string
+        required: false
+        default: ""
+  push:
+    branches:
+      - 'truenas/**'
+      - 'SCALE-**'
+      - 'stable/**'
+    paths:
+      - 'truenas_rust/**/Cargo.toml'
+      - 'truenas_rust/Cargo.lock'
+      - 'truenas_rust/deny.toml'
+      - '.github/workflows/rust-deps.yml'
+  pull_request:
+    paths:
+      - 'truenas_rust/**/Cargo.toml'
+      - 'truenas_rust/Cargo.lock'
+      - 'truenas_rust/deny.toml'
+      - '.github/workflows/rust-deps.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # The downloaded release archive must match DENY_SHA256.
+      - name: Install cargo-deny
+        env:
+          DENY_VERSION: 0.20.2
+          DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+        run: |
+          name="cargo-deny-$DENY_VERSION-x86_64-unknown-linux-musl"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/$name.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/$DENY_VERSION/$name.tar.gz"
+          echo "$DENY_SHA256  $RUNNER_TEMP/$name.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/cargo-deny"
+          tar -xzf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP/cargo-deny" \
+            --strip-components=1
+          install -m 0755 "$RUNNER_TEMP/cargo-deny/cargo-deny" \
+            "$HOME/.cargo/bin/cargo-deny"
+          cargo deny --version
+
+      # Since cargo-deny 0.20, --config is an option of cargo-deny itself.
+      # It comes before the check subcommand.
+      - name: Check the dependencies
+        run: |
+          cargo deny --manifest-path truenas_rust/Cargo.toml --locked \
+            --config truenas_rust/deny.toml check
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate

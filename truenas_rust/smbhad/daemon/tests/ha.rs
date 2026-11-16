@@ -263,7 +263,7 @@ fn a_cut_link_fences_and_the_stale_replica_is_not_restored() {
     let mut parent = b.smbd(Client::Parent, 1);
     let (page, records) = parent.rehydrate_all(1 << 20);
     assert_eq!(page.origin, Origin::None);
-    assert!(records.is_empty());
+    assert_eq!(records, Vec::new());
     assert!(b.log().contains("does not match"), "{}", b.log());
 }
 
@@ -624,7 +624,7 @@ fn an_smbd_fence_makes_the_primary_drop_its_copy() {
     let mut parent = a.smbd(Client::Parent, 1);
     let (page, records) = parent.rehydrate_all(1 << 20);
     assert_eq!(page.origin, Origin::None);
-    assert!(records.is_empty());
+    assert_eq!(records, Vec::new());
     parent.done();
 }
 

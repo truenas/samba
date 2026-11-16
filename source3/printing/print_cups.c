@@ -91,7 +91,7 @@ static void gotalarm_sig(int signum)
         gotalarm = 1;
 }
 
-extern userdom_struct current_user_info;
+extern __thread userdom_struct current_user_info;
 
 /*
  * 'cups_passwd_cb()' - The CUPS password callback...

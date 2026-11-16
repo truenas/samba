@@ -710,6 +710,8 @@ bld.SAMBA3_LIBRARY('smbd_base',
                           smbd/file_access.c
                           smbd/dnsregister.c smbd/globals.c
                           smbd/smb2_server.c
+                          smbd/smb2_server_ros.c
+                          smbd/smb2_server_ros_inline.c
                           smbd/smb2_glue.c
                           smbd/smb2_negprot.c
                           smbd/smb2_sesssetup.c

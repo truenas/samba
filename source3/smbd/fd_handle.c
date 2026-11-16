@@ -38,6 +38,9 @@ struct fd_handle {
 	int opened_fd;
 	int opened_flags;
 	uint64_t gen_id;
+	/* TrueNAS: see fh_set_position_source(). */
+	bool (*take_position)(void *private_data, uint64_t *pos);
+	void *take_position_private;
 };
 
 static int fd_handle_destructor(struct fd_handle *fh)
@@ -71,13 +74,42 @@ void fh_set_refcount(struct fd_handle *fh, size_t ref_count)
 	fh->ref_count = ref_count;
 }
 
+/*
+ * TrueNAS: a truenas_ros reactor that reads the file records the
+ * position after its last read. take() moves that position to *pos. It
+ * returns false if the reactor has no position. A NULL take removes the
+ * source.
+ */
+void fh_set_position_source(struct fd_handle *fh,
+			    bool (*take)(void *private_data, uint64_t *pos),
+			    void *private_data)
+{
+	fh->take_position = take;
+	fh->take_position_private = private_data;
+}
+
 uint64_t fh_get_position_information(struct fd_handle *fh)
 {
+	uint64_t pos;
+
+	if (fh->take_position != NULL &&
+	    fh->take_position(fh->take_position_private, &pos))
+	{
+		/* aio_pread_smb2_done() sets both too. */
+		fh->pos = pos;
+		fh->position_information = pos;
+	}
 	return fh->position_information;
 }
 
 void fh_set_position_information(struct fd_handle *fh, uint64_t posinfo)
 {
+	uint64_t older;
+
+	if (fh->take_position != NULL) {
+		/* Drop the position of the reactor. posinfo is newer. */
+		(void)fh->take_position(fh->take_position_private, &older);
+	}
 	fh->position_information = posinfo;
 }
 

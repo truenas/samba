@@ -816,6 +816,12 @@ NTSTATUS fd_close(files_struct *fsp)
 		return NT_STATUS_OK;
 	}
 
+	/*
+	 * TrueNAS: the truenas_ros reactors can use the descriptor
+	 * until here. This call waits for their I/O before the stat below.
+	 */
+	smbd_smb2_ros_file_close(fsp);
+
 	if (fsp->fsp_flags.fstat_before_close) {
 		/*
 		 * capture status, if failure

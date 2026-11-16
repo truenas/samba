@@ -924,6 +924,7 @@ NTSTATUS smbd_smb2_request_process_negprot(struct smbd_smb2_request *req)
 	tevent_req_set_callback(subreq,
 				smbd_smb2_request_process_negprot_mc_done,
 				state);
+	req->xconn->smb2.negprot_mc_pending = true;
 	return NT_STATUS_OK;
 }
 
@@ -935,6 +936,8 @@ static void smbd_smb2_request_process_negprot_mc_done(struct tevent_req *subreq)
 	struct smbd_smb2_request *req = state->req;
 	struct smbXsrv_connection *xconn = req->xconn;
 	NTSTATUS status;
+
+	xconn->smb2.negprot_mc_pending = false;
 
 	status = smb2srv_client_mc_negprot_recv(subreq);
 	TALLOC_FREE(subreq);

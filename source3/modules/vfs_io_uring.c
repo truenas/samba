@@ -52,22 +52,12 @@ struct open_how;
 #define	IO_URING_ASYNC_WRITE	0x02
 #define	IO_URING_ASYNC_FSYNC	0x04
 
-#define	VFS_URING_WRITEQ_DEFAULT	10
-#define	VFS_URING_READQ_DEFAULT		20
-
 static int vfs_io_uring_debug_level = DBGC_VFS;
 
 #undef	DBGC_CLASS
 #define	DBGC_CLASS vfs_io_uring_debug_level
 
 struct vfs_io_uring_request;
-
-struct vfs_io_uring_queue_config {
-	int queue_sz;
-	uint op_cnt;
-	uint sync_cnt;
-	uint async_cnt;
-};
 
 struct vfs_io_uring_batch {
 	struct vfs_attr_entry *ents;	/* the caller's, filled at the wait */
@@ -85,8 +75,6 @@ struct vfs_io_uring_config {
 	int async_ops;
 	struct vfs_io_uring_request *queue;
 	struct vfs_io_uring_request *pending;
-	struct vfs_io_uring_queue_config writeq;
-	struct vfs_io_uring_queue_config readq;
 
 	/* the batch ops' ring; their completions stay out of fde's */
 	struct io_uring batch;
@@ -281,30 +269,6 @@ static int vfs_io_uring_connect(vfs_handle_struct *handle, const char *service,
 				       false);
 	if (force_aio_write) {
 		config->async_ops |= IO_URING_ASYNC_WRITE;
-	}
-
-	config->writeq.queue_sz = lp_parm_int(SNUM(handle->conn),
-						   "io_uring",
-						   "write_queue_sz",
-						   VFS_URING_WRITEQ_DEFAULT);
-	if (config->writeq.queue_sz <= 0) {
-		DBG_ERR("%d: write_queue_sz parameter must be greater than 0. "
-			"setting to default of %d\n",
-			config->writeq.queue_sz,
-			VFS_URING_WRITEQ_DEFAULT);
-		config->writeq.queue_sz = VFS_URING_WRITEQ_DEFAULT;
-	}
-
-	config->readq.queue_sz = lp_parm_int(SNUM(handle->conn),
-						  "io_uring",
-						  "read_queue_sz",
-						  VFS_URING_READQ_DEFAULT);
-	if (config->readq.queue_sz <= 0) {
-		DBG_ERR("%d: read_queue_sz parameter must be greater than 0. "
-			"setting to default of %d\n",
-			config->readq.queue_sz,
-			VFS_URING_READQ_DEFAULT);
-		config->readq.queue_sz = VFS_URING_READQ_DEFAULT;
 	}
 
 	config->fake_dctime =
@@ -539,7 +503,6 @@ struct vfs_io_uring_pread_state {
 	struct iovec iov;
 	size_t nread;
 	struct vfs_io_uring_request ur;
-	bool is_sync_read;
 };
 
 static void vfs_io_uring_pread_submit(struct vfs_io_uring_pread_state *state);
@@ -576,33 +539,6 @@ static struct tevent_req *vfs_io_uring_pread_send(struct vfs_handle_struct *hand
 		return NULL;
 	}
 
-	/*
-	 * Apply backpressure to client by performing synchronous read
-	 */
-	if (config->readq.op_cnt > config->readq.queue_sz) {
-		ssize_t nread;
-		ok = sys_valid_io_range(offset, n);
-		if (!ok) {
-			tevent_req_error(req, EINVAL);
-			return tevent_req_post(req, ev);
-		}
-
-		config->readq.sync_cnt++;
-		state->is_sync_read = true;
-
-		nread = sys_pread_full(fsp_get_io_fd(fsp), data, n, offset);
-		if (nread == -1) {
-			DBG_ERR("%s: read from file failed with error: %s\n",
-				fsp_str_dbg(fsp), strerror(errno));
-			tevent_req_error(req, errno);
-			return tevent_req_post(req, ev);
-		}
-
-		state->nread = nread;
-		tevent_req_done(req);
-		return tevent_req_post(req, ev);
-	}
-
 	if (config->async_ops & IO_URING_ASYNC_READ) {
 		state->ur.sqe_flags |= IOSQE_ASYNC;
 	}
@@ -610,11 +546,6 @@ static struct tevent_req *vfs_io_uring_pread_send(struct vfs_handle_struct *hand
 	state->ur.req = req;
 	state->ur.completion_fn = vfs_io_uring_pread_completion;
 	state->ur.destructor_fn = vfs_io_uring_pread_destructor;
-
-	// Increment because at this point we'll hit the receive_fn
-	// which decrements the op_cnt
-	config->readq.op_cnt++;
-	config->readq.async_cnt++;
 
 	SMBPROFILE_BYTES_ASYNC_START(syscall_asys_pread, profile_p,
 				     state->ur.profile_bytes, n);
@@ -711,25 +642,9 @@ static ssize_t vfs_io_uring_pread_recv(struct tevent_req *req,
 		req, struct vfs_io_uring_pread_state);
 	ssize_t ret;
 
-	if (state->is_sync_read) {
-		if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
-			tevent_req_received(req);
-			return -1;
-		}
-		vfs_aio_state->error = 0;
-		ret = state->nread;
-
-		tevent_req_received(req);
-		return ret;
-	}
-
 	SMBPROFILE_BYTES_ASYNC_END(state->ur.profile_bytes);
 	vfs_aio_state->duration = nsec_time_diff(&state->ur.end_time,
 						 &state->ur.start_time);
-
-	SMB_ASSERT(state->ur.config != NULL);
-	SMB_ASSERT(state->ur.config->readq.op_cnt > 0);
-	state->ur.config->readq.op_cnt--;
 
 	if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
 		tevent_req_received(req);
@@ -749,7 +664,6 @@ struct vfs_io_uring_pwrite_state {
 	struct iovec iov;
 	size_t nwritten;
 	struct vfs_io_uring_request ur;
-	bool is_sync_write;
 };
 
 static void vfs_io_uring_pwrite_submit(struct vfs_io_uring_pwrite_state *state);
@@ -786,31 +700,6 @@ static struct tevent_req *vfs_io_uring_pwrite_send(struct vfs_handle_struct *han
 		return NULL;
 	}
 
-	/*
-	 * Apply backpressure to client by performing synchronous write
-	 *
-	 */
-	if (config->writeq.op_cnt > config->writeq.queue_sz) {
-		ok = sys_valid_io_range(offset, n);
-		if (!ok) {
-			tevent_req_error(req, EINVAL);
-			return tevent_req_post(req, ev);
-		}
-
-		config->writeq.sync_cnt++;
-		state->is_sync_write = true;
-		state->nwritten = sys_pwrite_full(fsp_get_io_fd(fsp), data, n, offset);
-		if (state->nwritten == -1) {
-			DBG_ERR("%s: write to file failed with error: %s\n",
-				fsp_str_dbg(fsp), strerror(errno));
-			tevent_req_error(req, errno);
-			return tevent_req_post(req, ev);
-		}
-
-		tevent_req_done(req);
-		return tevent_req_post(req, ev);
-	}
-
 	if (config->async_ops & IO_URING_ASYNC_WRITE) {
 		state->ur.sqe_flags |= IOSQE_ASYNC;
 	}
@@ -818,11 +707,6 @@ static struct tevent_req *vfs_io_uring_pwrite_send(struct vfs_handle_struct *han
 	state->ur.req = req;
 	state->ur.completion_fn = vfs_io_uring_pwrite_completion;
 	state->ur.destructor_fn = vfs_io_uring_pwrite_destructor;
-
-	// Increment because at this point we'll hit the receive_fn
-	// which decrements the op_cnt
-	config->writeq.op_cnt++;
-	config->writeq.async_cnt++;
 
 	SMBPROFILE_BYTES_ASYNC_START(syscall_asys_pwrite, profile_p,
 				     state->ur.profile_bytes, n);
@@ -933,26 +817,9 @@ static ssize_t vfs_io_uring_pwrite_recv(struct tevent_req *req,
 		req, struct vfs_io_uring_pwrite_state);
 	ssize_t ret;
 
-	if (state->is_sync_write) {
-		if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
-			tevent_req_received(req);
-			return -1;
-		}
-
-		vfs_aio_state->error = 0;
-		ret = state->nwritten;
-
-		tevent_req_received(req);
-		return ret;
-	}
-
 	SMBPROFILE_BYTES_ASYNC_END(state->ur.profile_bytes);
 	vfs_aio_state->duration = nsec_time_diff(&state->ur.end_time,
 						 &state->ur.start_time);
-
-	SMB_ASSERT(state->ur.config != NULL);
-	SMB_ASSERT(state->ur.config->writeq.op_cnt > 0);
-	state->ur.config->writeq.op_cnt--;
 
 	if (tevent_req_is_unix_error(req, &vfs_aio_state->error)) {
 		tevent_req_received(req);
@@ -1070,26 +937,6 @@ static int vfs_io_uring_fsync_recv(struct tevent_req *req,
 	return 0;
 }
 
-static void vfs_io_uring_disconnect(vfs_handle_struct *handle)
-{
-	struct vfs_io_uring_config *config = NULL;
-
-	SMB_VFS_NEXT_DISCONNECT(handle);
-
-	SMB_VFS_HANDLE_GET_DATA(handle, config,
-				struct vfs_io_uring_config,
-				smb_panic(__location__));
-
-	// optional logging for performance team to check whether
-	// we hit sync fallback during torture run.
-	if (config->writeq.sync_cnt || config->readq.sync_cnt) {
-		DBG_NOTICE("Performed %u synchronous writes and %u async "
-			   "writes, and %u synchronous reads and %u async "
-			   "reads.\n",
-			   config->writeq.sync_cnt, config->writeq.async_cnt,
-			   config->readq.sync_cnt, config->readq.async_cnt);
-	}
-}
 
 #define VFS_IO_URING_BATCH_ENTRIES 256
 /* Stats a worker runs in a row without going back to the queue lock */
@@ -1342,7 +1189,6 @@ static int vfs_io_uring_batch_attr_wait(struct vfs_handle_struct *handle,
 static struct vfs_fn_pointers vfs_io_uring_fns = {
 	.connect_fn = vfs_io_uring_connect,
 	.openat_fn = vfs_io_uring_openat,
-	.disconnect_fn = vfs_io_uring_disconnect,
 	.pread_send_fn = vfs_io_uring_pread_send,
 	.pread_recv_fn = vfs_io_uring_pread_recv,
 	.pwrite_send_fn = vfs_io_uring_pwrite_send,

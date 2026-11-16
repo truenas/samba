@@ -1,0 +1,11 @@
+[package]
+name = "truenas_smb_vfs"
+description = "The file system work of smbd on the reactor rings (a stub)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

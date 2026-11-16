@@ -24,7 +24,7 @@
 #include "smbd/proto.h"
 #include "source3/lib/substitute.h"
 
-extern userdom_struct current_user_info;
+extern __thread userdom_struct current_user_info;
 
 /****************************************************************************
  Run a given print command

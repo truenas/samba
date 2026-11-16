@@ -1,0 +1,46 @@
+# This command makes include/truenas_smbros.h from src/.
+#   cbindgen --config cbindgen.toml --output include/truenas_smbros.h
+# The header is in git. The package build does not run cbindgen. The test
+# header_is_current checks the header.
+language = "C"
+style = "tag"
+include_guard = "TRUENAS_SMBROS_H"
+header = """/*
+ * Copyright (C) iXsystems, Inc. 2026
+ * SPDX-License-Identifier: MIT
+ *
+ * truenas_smbros is a shim between an SMB server and truenas_ros. Each
+ * adopted connection gets a reactor. A reactor is a
+ * thread with its own io_uring ring. The reactor reads whole PDUs and
+ * queues them for the thread of the caller. It sends the PDUs that the
+ * caller gives it. The caller polls one eventfd per process for the queue.
+ *
+ * The shim knows the framing of a PDU and nothing of its content. A layer
+ * above the shim can see each PDU first and give jobs to the reactors.
+ * truenas_smb_server.h is that layer for smbd.
+ */"""
+autogen_warning = "/* Made by cbindgen from src/. Do not edit. */"
+sys_includes = ["stdbool.h", "stddef.h", "stdint.h", "sys/uio.h"]
+no_includes = true
+usize_is_size_t = true
+documentation_style = "doxy"
+tab_width = 8
+
+[parse]
+parse_deps = false
+
+[export]
+include = ["TnSmbrosEvent", "InlineFn"]
+# NBT_HDR_SIZE and PLACE_MIN are for Rust callers only. The header
+# includes sys/uio.h for struct iovec.
+exclude = ["NBT_HDR_SIZE", "PLACE_MIN", "iovec"]
+
+[export.rename]
+"Ctx" = "tn_smbros_ctx"
+"Conn" = "tn_smbros_conn"
+"TnSmbrosEvent" = "tn_smbros_event"
+"InlineFn" = "tn_smbros_inline_fn"
+"iovec" = "struct iovec"
+
+[fn]
+args = "vertical"

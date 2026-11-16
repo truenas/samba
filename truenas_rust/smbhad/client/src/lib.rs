@@ -12,3 +12,8 @@ pub mod ffi;
 pub mod record;
 
 pub use conn::{Batch, Connection, Error};
+// smbd calls the tn_smbros_*() and tn_smbsrv_*() functions of these
+// crates.
+pub use truenas_smb_server;
+pub use truenas_smb_vfs;
+pub use truenas_smbros;

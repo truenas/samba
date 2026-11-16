@@ -32,7 +32,7 @@
 static char local_machine[MACHINE_NAME_SIZE];
 static char remote_machine[MACHINE_NAME_SIZE];
 
-userdom_struct current_user_info;
+__thread userdom_struct current_user_info;
 static fstring remote_proto="UNKNOWN";
 
 void set_remote_proto(const char *proto)
@@ -157,9 +157,10 @@ void sub_set_socket_ids(const char *peeraddr, const char *peername,
 void set_current_user_info(const char *smb_name, const char *unix_name,
 			   const char *domain)
 {
-	static const void *last_smb_name;
-	static const void *last_unix_name;
-	static const void *last_domain;
+	/* TrueNAS: per thread, like current_user_info. */
+	static __thread const void *last_smb_name;
+	static __thread const void *last_unix_name;
+	static __thread const void *last_domain;
 
 	if (likely(last_smb_name == smb_name &&
 	    last_unix_name == unix_name &&
