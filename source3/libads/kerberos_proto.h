@@ -118,6 +118,30 @@ NTSTATUS kerberos_return_pac(TALLOC_CTX *mem_ctx,
 			     char **_canon_realm,
 			     struct PAC_DATA_CTR **pac_data_ctr);
 
+/* The answer to kerberos_s4u2self_check(). */
+enum kerberos_s4u2self_result {
+	/* The KDC gave a ticket for the user. */
+	KERBEROS_S4U2SELF_OK = 0,
+	/* The KDC refused. The account of the user cannot log on. */
+	KERBEROS_S4U2SELF_REFUSED = 1,
+	/* There is no answer about the account of the user. */
+	KERBEROS_S4U2SELF_UNAVAILABLE = 2,
+};
+
+enum kerberos_s4u2self_result kerberos_s4u2self_check(
+	const char *machine_princ,
+	const char *machine_pass,
+	const char *user_princ,
+	time_t *_endtime,
+	uint8_t **_ap_req,
+	size_t *_ap_req_len,
+	int *_krb5_error);
+
+NTSTATUS kerberos_ap_req_pac(TALLOC_CTX *mem_ctx,
+			     const uint8_t *ap_req,
+			     size_t ap_req_len,
+			     struct PAC_DATA_CTR **_pac_data_ctr);
+
 /* The following definitions come from libads/krb5_setpw.c  */
 
 ADS_STATUS ads_krb5_set_password(const char *princ,
