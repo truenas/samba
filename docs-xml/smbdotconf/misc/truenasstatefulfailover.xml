@@ -21,6 +21,12 @@
 	<value type="example">yes</value>. Durable handles survive an HA
 	failover. A restart of smbd or of the controller restores no handles.
 	</para>
+
+	<para>A handle with changes that the client did not flush survives
+	only a planned failover. Before it, the controller blocks SMB
+	traffic, syncs its pools and runs
+	<command>truenas_smbhad mark-synced</command>.
+	</para>
 </description>
 <value type="default">no</value>
 </samba:parameter>

@@ -19,16 +19,22 @@ pub struct Header {
     pub writer_node: Node,
     /// The boot of that node.
     pub writer_boot: BootId,
+    /// On the standby, the primary marked the replica as synced
+    /// (`Op::Synced`), and the mark is still valid, see `Standby`. A primary
+    /// that serves the replica reports it in each rehydration page.
+    pub synced: bool,
 }
 
 impl Header {
-    /// Returns a header with generation 0, tag 0 and the given writer.
+    /// Returns a header with generation 0, tag 0, no synced mark and the
+    /// given writer.
     pub fn empty(writer_node: Node, writer_boot: BootId) -> Header {
         Header {
             generation: 0,
             tag: 0,
             writer_node,
             writer_boot,
+            synced: false,
         }
     }
 }
@@ -61,6 +67,8 @@ impl Store {
                     self.bytes -= charge(&old);
                 }
             }
+            // A mark for the header of the standby, see `Standby`.
+            Op::Synced => {}
         }
     }
 
