@@ -10,6 +10,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod control;
 pub mod daemon;
 pub use truenas_smbhad_proto::epoch;
 pub mod ids;

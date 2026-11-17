@@ -9,6 +9,14 @@ the copy.
 smbd uses the daemon if smb.conf has `truenas stateful failover = yes`. The
 smbd side is in source3/truenas_hastate/.
 
+A failover drops each handle that has changes the client did not flush,
+unless it is a planned failover. Before middleware resets the active
+controller, it blocks SMB traffic both ways, syncs the pools and runs
+`truenas_smbhad mark-synced`. The daemon marks the standby's copy as
+synced and exits with 0 once the standby has the mark. The standby voids
+the mark on any later change to the copy, or if the primary still runs
+10 s after it.
+
 ## Layout
 
 - `proto`: the messages of smbd and the daemon, and the epoch file.
