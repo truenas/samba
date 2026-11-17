@@ -85,7 +85,104 @@ fn failover_restores_the_standbys_replica() {
         "written by A"
     );
     assert_eq!(sorted(records), want);
+    assert!(!page.synced, "no mark: unflushed handles are dropped");
     assert_eq!(parent.done(), 1);
+}
+
+/// Runs `truenas_smbhad mark-synced` against `node`. Returns its exit
+/// status and its output.
+fn mark_synced(node: &Node) -> (bool, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_truenas_smbhad"))
+        .env_remove("JOURNAL_STREAM")
+        .arg("--config")
+        .arg(node.config_path())
+        .arg("mark-synced")
+        .arg("--timeout-ms")
+        .arg("2000")
+        .output()
+        .expect("run mark-synced");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned()
+        + &String::from_utf8_lossy(&out.stderr);
+    (out.status.success(), text)
+}
+
+#[test]
+fn a_planned_failover_restores_the_replica_as_synced() {
+    let lab = Lab::new();
+    let (mut a, mut b) = pair(&lab);
+    let mut smbd = a.smbd(Client::Worker, 100);
+    let want: Vec<Record> =
+        (1..=20u64).map(|i| record(i, smbd.owner, 300)).collect();
+    smbd.put(want.clone(), SyncLevel::Remote);
+    let (ok, text) = mark_synced(&a);
+    assert!(ok, "{text}\n{}", a.log());
+    assert!(text.starts_with("marked"), "{text}");
+
+    a.kill();
+    promote(&mut b);
+    let mut parent = b.smbd(Client::Parent, 1);
+    let (page, records) = parent.rehydrate_all(64 << 10);
+    assert_eq!(page.origin, Origin::Replica);
+    assert!(page.synced, "{}", b.log());
+    assert_eq!(sorted(records), want);
+    parent.done();
+    let (page, _) = parent.rehydrate_all(64 << 10);
+    assert!(!page.synced, "the mark ends with the rehydration");
+}
+
+#[test]
+fn a_change_after_the_mark_voids_it() {
+    let lab = Lab::new();
+    let (mut a, mut b) = pair(&lab);
+    let mut smbd = a.smbd(Client::Worker, 100);
+    smbd.put(vec![record(1, smbd.owner, 10)], SyncLevel::Remote);
+    assert!(mark_synced(&a).0);
+    smbd.put(vec![record(2, smbd.owner, 10)], SyncLevel::Remote);
+
+    a.kill();
+    promote(&mut b);
+    let mut parent = b.smbd(Client::Parent, 1);
+    let (page, records) = parent.rehydrate_all(64 << 10);
+    assert_eq!(records.len(), 2);
+    assert!(!page.synced);
+}
+
+#[test]
+fn only_the_control_client_marks_and_only_when_protected() {
+    let lab = Lab::new();
+    let mut a = lab.node("a", 0xa, A, B);
+    a.start("primary");
+    let (ok, text) = mark_synced(&a);
+    assert!(!ok);
+    assert!(text.starts_with("not marked"), "no standby: {text}");
+
+    let mut worker = a.smbd(Client::Worker, 100);
+    match worker.request(&Request::MarkSynced) {
+        Reply::Error(f) => assert_eq!(f.code, libc::EACCES),
+        other => panic!("a worker marked: {other:?}"),
+    }
+    let mut control = a.smbd(Client::Control, 101);
+    match control.request(&Request::Rehydrate(
+        truenas_smbhad::proto::local::Rehydrate {
+            cursor: 0,
+            max_bytes: 1 << 16,
+        },
+    )) {
+        Reply::Error(f) => assert_eq!(f.code, libc::EACCES),
+        other => panic!("the control client rehydrated: {other:?}"),
+    }
+    // smbd cannot submit the mark itself.
+    let mut worker = a.smbd(Client::Worker, 102);
+    send(
+        &mut worker.stream,
+        &Request::Submit(truenas_smbhad::proto::local::Submit {
+            sync: SyncLevel::Local,
+            ops: vec![Op::Synced],
+        }),
+    )
+    .unwrap();
+    assert!(recv(&mut worker.stream).is_err(), "the daemon closes it");
+    assert!(a.try_hello().is_some(), "the daemon runs on");
 }
 
 #[test]

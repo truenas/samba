@@ -135,7 +135,7 @@ impl Node {
         self.root.join("run/smbd.sock")
     }
 
-    fn config_path(&self) -> PathBuf {
+    pub fn config_path(&self) -> PathBuf {
         self.root.join("smbhad.conf")
     }
 

@@ -6,12 +6,15 @@
 //! smbd sends a `Request`. The daemon replies with a `Reply`. A connection
 //! has at most one request that waits for a reply. The daemon does not reply
 //! to a `Submit` with `SyncLevel::None` or to a `ForgetOwner`.
+//!
+//! `truenas_smbhad mark-synced` connects as `Client::Control` and sends
+//! `MarkSynced`.
 
 use super::{BootId, Node, Op, Owner, Protection, Record, SyncLevel};
 use serde::{Deserialize, Serialize};
 use truenas_xdr::{XdrEnum, XdrUnion};
 
-/// The kind of smbd process that opens a connection.
+/// The kind of process that opens a connection.
 #[derive(XdrEnum, Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum Client {
@@ -23,6 +26,9 @@ pub enum Client {
     Cleanupd = 3,
     /// The scavenger. It removes expired disconnected handles.
     Scavenger = 4,
+    /// `truenas_smbhad mark-synced`, before a planned failover. It can only
+    /// send `MarkSynced`.
+    Control = 5,
 }
 
 /// The first request on each connection.
@@ -70,6 +76,13 @@ pub enum Request {
     Rehydrate(Rehydrate) = 4,
     /// Ends the rehydration. The next generation becomes the copy.
     Done = 5,
+    /// Only from `Client::Control`. The sender blocked SMB replies, synced
+    /// the pools of this controller, and resets the controller next. The
+    /// daemon marks the copy as synced (`Op::Synced`). The reply is
+    /// `Synced`: `Protection::Protected` once the standby has the mark. Any
+    /// other protection: the standby does not have it, and the failover
+    /// drops the handles with unflushed changes.
+    MarkSynced = 6,
 }
 
 /// The reply to `Hello`.
@@ -127,6 +140,10 @@ pub struct RehydratePage {
     pub next_cursor: u64,
     /// This is the last page.
     pub last: bool,
+    /// The copy is a replica that its writer marked as synced right before
+    /// its controller stopped (`Request::MarkSynced`). smbd can restore the
+    /// handles with unflushed changes.
+    pub synced: bool,
     /// The page's records, in id order.
     pub records: Vec<Record>,
 }
@@ -183,7 +200,7 @@ mod tests {
         #[rustfmt::skip]
         let want: &[u8] = &[
             0, 0, 0, 1,                                     // hello
-            0, 0, 0, 1,                                     // version
+            0, 0, 0, 2,                                     // version
             0, 0, 0, 1,                                     // worker
             0, 0, 0x10, 0x92,                               // pid 4242
             0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, // unique_id
@@ -195,6 +212,12 @@ mod tests {
     #[test]
     fn done_is_a_bare_discriminant() {
         assert_eq!(to_bytes(&Request::Done).unwrap(), [0, 0, 0, 5]);
+    }
+
+    #[test]
+    fn mark_synced_is_a_bare_discriminant() {
+        assert_eq!(to_bytes(&Request::MarkSynced).unwrap(), [0, 0, 0, 6]);
+        assert_eq!(to_bytes(&Client::Control).unwrap(), [0, 0, 0, 5]);
     }
 
     #[test]
@@ -215,6 +238,7 @@ mod tests {
                 cursor: 17,
                 max_bytes: 1 << 20,
             }),
+            Request::MarkSynced,
         ];
         for r in requests {
             assert_eq!(
@@ -242,6 +266,7 @@ mod tests {
                 writer_boot: [2; 16].into(),
                 next_cursor: 0,
                 last: true,
+                synced: true,
                 records: vec![crate::tests::record(3, 0, b"body")],
             }),
             Reply::DoneOk(2),

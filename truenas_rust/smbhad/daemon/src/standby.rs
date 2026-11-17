@@ -6,6 +6,13 @@
 //! `Standby` keeps the replica. `run` connects to the primary over the
 //! internal link and sends polls. The primary holds each poll until it has
 //! data or a heartbeat is due.
+//!
+//! Before a planned failover, the primary marks the replica as synced
+//! (`Op::Synced`) and its controller resets right after. A failover then
+//! restores the handles with unflushed changes. The mark is valid only for
+//! that reset. The standby voids it on any later operation, on a new
+//! connection, and on any reply that arrives `MARK_GRACE` after the mark:
+//! that primary did not reset, and its smbd may serve clients again.
 
 use crate::auth::{self, LinkKey, Nonce, Side, Transcript};
 use crate::config::Config;
@@ -26,6 +33,10 @@ use truenas_ros::net::server::{
 };
 use truenas_xdr::FixedOpaque;
 
+/// A primary that still replies this long after its synced mark did not
+/// reset its controller. Middleware resets it at once after the mark.
+pub const MARK_GRACE: Duration = Duration::from_secs(10);
+
 #[derive(Debug)]
 enum Stage {
     Idle,
@@ -45,6 +56,8 @@ pub struct Standby {
     header: Header,
     applied: u64,
     stage: Stage,
+    /// When the synced mark of `header` arrived.
+    marked_at: Option<Instant>,
     log: Logger,
 }
 
@@ -69,13 +82,16 @@ impl Standby {
             header,
             applied: 0,
             stage: Stage::Idle,
+            marked_at: None,
             log,
         }
     }
 
     /// Returns the first request of a new connection. Every connection
-    /// starts with a full resync. `applied` starts again at 0.
+    /// starts with a full resync. `applied` starts again at 0. A primary
+    /// accepted the connection: it runs, so a synced mark is void.
     pub fn start(&mut self) -> ReplRequest {
+        self.void_mark("a new connection to the primary");
         let mut nonce = [0u8; 32];
         (self.random)(&mut nonce);
         let nonce = FixedOpaque(nonce);
@@ -89,17 +105,38 @@ impl Standby {
         })
     }
 
-    /// Applies a reply from the primary. Returns the next request.
+    /// Applies a reply from the primary that arrives now. See
+    /// `on_reply_at`.
+    ///
+    /// # Errors
+    ///
+    /// As `on_reply_at`.
+    pub fn on_reply(
+        &mut self,
+        reply: ReplReply,
+    ) -> Result<ReplRequest, String> {
+        self.on_reply_at(reply, Instant::now())
+    }
+
+    /// Applies a reply from the primary that arrived at `now`. Returns the
+    /// next request.
     ///
     /// # Errors
     ///
     /// The primary failed authentication or did not follow the protocol.
     /// The caller must close the connection.
     #[allow(clippy::too_many_lines)]
-    pub fn on_reply(
+    pub fn on_reply_at(
         &mut self,
         reply: ReplReply,
+        now: Instant,
     ) -> Result<ReplRequest, String> {
+        if self
+            .marked_at
+            .is_some_and(|t| now.duration_since(t) >= MARK_GRACE)
+        {
+            self.void_mark("the primary still runs");
+        }
         match (std::mem::replace(&mut self.stage, Stage::Idle), reply) {
             (Stage::Hello { nonce }, ReplReply::Challenge(c)) => {
                 if !(MIN_VERSION..=VERSION).contains(&c.version) {
@@ -151,7 +188,9 @@ impl Standby {
                         tag: 0,
                         writer_node: s.writer_node,
                         writer_boot: s.writer_boot,
+                        synced: false,
                     };
+                    self.marked_at = None;
                 } else if !in_snapshot || s.seq != snap_seq {
                     return Err("a snapshot chunk out of order".to_owned());
                 }
@@ -195,7 +234,7 @@ impl Standby {
                 }
                 self.applied += b.ops.len() as u64;
                 for op in b.ops {
-                    self.store.apply(op);
+                    self.apply(op, now);
                 }
                 self.stage = Stage::Stream {
                     in_snapshot: false,
@@ -230,6 +269,43 @@ impl Standby {
                 Err(format!("unexpected {} in {stage:?}", reply_name(&reply)))
             }
         }
+    }
+
+    /// Applies an operation of a batch. A mark makes the replica synced.
+    /// Any other operation voids the mark: the primary changed the copy
+    /// after its pools were synced.
+    fn apply(&mut self, op: Op, now: Instant) {
+        if matches!(op, Op::Synced) {
+            self.header.synced = true;
+            self.marked_at = Some(now);
+            truenas_ros::log!(
+                self.log,
+                Level::Notice,
+                "the primary synced its pools: a failover restores the \
+                 handles with unflushed changes"
+            );
+            return;
+        }
+        self.void_mark("a change after it");
+        self.store.apply(op);
+    }
+
+    fn void_mark(&mut self, why: &str) {
+        if !self.header.synced {
+            return;
+        }
+        self.header.synced = false;
+        self.marked_at = None;
+        truenas_ros::log!(
+            self.log,
+            Level::Warning,
+            "the synced mark of the primary is void: {why}"
+        );
+    }
+
+    /// Returns true if the replica has a valid synced mark.
+    pub fn synced(&self) -> bool {
+        self.header.synced
     }
 
     /// Returns the tag of the replica, or 0 while the replica is incomplete.
@@ -649,6 +725,74 @@ mod tests {
             }))
             .unwrap_err();
         assert!(err.contains("node B too"), "{err}");
+    }
+
+    fn batch(first_seq: u64, ops: Vec<Op>) -> ReplReply {
+        ReplReply::Batch(Batch { first_seq, ops })
+    }
+
+    /// A standby with a complete replica at sequence 5 that got the mark at
+    /// 6, at `at`.
+    fn marked(at: Instant) -> Standby {
+        let mut sb = standby_with(&[]);
+        welcomed(&mut sb);
+        sb.on_reply_at(snap(true, true, 5, &[1]), at).unwrap();
+        assert!(!sb.synced());
+        assert_eq!(
+            sb.on_reply_at(batch(6, vec![Op::Synced]), at).unwrap(),
+            ReplRequest::Poll(6)
+        );
+        assert!(sb.synced());
+        assert_eq!(sb.records(), 1, "the mark changes no record");
+        sb
+    }
+
+    #[test]
+    fn a_mark_survives_the_grace_and_goes_with_the_replica() {
+        let t0 = Instant::now();
+        let mut sb = marked(t0);
+        let inside = t0 + MARK_GRACE.saturating_sub(Duration::from_millis(1));
+        sb.on_reply_at(ReplReply::Heartbeat(6), inside).unwrap();
+        assert!(sb.synced(), "the primary can still be resetting");
+        let (store, header) = sb.into_copy();
+        assert_eq!((store.len(), header.tag, header.synced), (1, 9, true));
+    }
+
+    #[test]
+    fn a_primary_that_still_runs_after_the_grace_voids_its_mark() {
+        let t0 = Instant::now();
+        let mut sb = marked(t0);
+        sb.on_reply_at(ReplReply::Heartbeat(6), t0 + MARK_GRACE)
+            .unwrap();
+        assert!(!sb.synced());
+        assert!(!sb.into_copy().1.synced);
+    }
+
+    #[test]
+    fn a_change_after_the_mark_voids_it() {
+        let t0 = Instant::now();
+        let mut sb = marked(t0);
+        sb.on_reply_at(batch(7, vec![Op::Del(1)]), t0).unwrap();
+        assert!(!sb.synced());
+        // In one batch, the order decides.
+        sb.on_reply_at(batch(8, vec![Op::Synced, Op::Put(rec(2))]), t0)
+            .unwrap();
+        assert!(!sb.synced());
+        sb.on_reply_at(batch(10, vec![Op::Put(rec(3)), Op::Synced]), t0)
+            .unwrap();
+        assert!(sb.synced());
+        assert_eq!(sb.applied(), 11);
+    }
+
+    #[test]
+    fn a_new_connection_or_snapshot_voids_the_mark() {
+        let t0 = Instant::now();
+        let mut sb = marked(t0);
+        let _ = sb.start();
+        assert!(!sb.synced(), "the primary accepted a new connection");
+        let mut sb = marked(t0);
+        sb.on_reply_at(snap(true, true, 20, &[1]), t0).unwrap();
+        assert!(!sb.synced(), "a resync replaces the replica");
     }
 
     #[test]

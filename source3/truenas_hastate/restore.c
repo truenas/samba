@@ -79,6 +79,11 @@ static const char *tn_result_str[TN_NUM_RESULTS] = {
 struct tn_restore_ctx {
 	struct messaging_context *msg_ctx;
 	enum tn_durable_case how;
+	/*
+	 * The writer synced its pools right before its controller stopped
+	 * (a planned failover, see "truenas_smbhad mark-synced").
+	 */
+	bool synced;
 	time_t now;
 	unsigned int counts[TN_NUM_RESULTS];
 };
@@ -549,7 +554,10 @@ static bool tn_same_lease(const struct tn_entry *a, const struct tn_entry *b)
  * - A marker: the file has delete on close. Drop all records.
  * - A lease gets the states of its records with the highest epoch.
  * - After a reboot or a failover, the file can lack a change that a client
- *   cached. Drop the records of the client of a dirty record.
+ *   cached. Drop the records of the client of a dirty record, unless the
+ *   writer synced its pools before a planned failover. tn_restore_open()
+ *   then skips the cookie check of a dirty record and marks its handle
+ *   dirty again.
  * - Write caching excludes other leases and oplocks. Drop all records if
  *   one has write caching and other leases or oplocks remain.
  * - A disconnect keeps the byte range locks of one handle only. Drop the
@@ -602,7 +610,7 @@ static void tn_check_file(struct tn_restore_ctx *ctx,
 	}
 
 	for (i = 0; i < n; i++) {
-		if (!(e[i].flags & TRUENAS_DURABLE_DIRTY)) {
+		if (ctx->synced || !(e[i].flags & TRUENAS_DURABLE_DIRTY)) {
 			continue;
 		}
 		for (j = 0; j < n; j++) {
@@ -892,8 +900,13 @@ void truenas_hastate_restore(struct messaging_context *msg_ctx)
 		if (first) {
 			ctx.how = tn_restore_case(page->origin,
 						  page->writer_node);
-			DBG_WARNING("durable handles: %s\n",
-				    tn_case_str(ctx.how));
+			ctx.synced = page->synced &&
+				     (ctx.how == TN_DURABLE_FAILOVER);
+			DBG_WARNING("durable handles: %s%s\n",
+				    tn_case_str(ctx.how),
+				    ctx.synced ? ", the pools were synced: "
+						 "unflushed handles are kept" :
+						 "");
 			first = false;
 		}
 		if (ctx.how != TN_DURABLE_FAILOVER) {

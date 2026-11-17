@@ -15,7 +15,9 @@ use crate::proto::local::{HelloOk, Origin, RehydratePage, Reply, Synced};
 use crate::proto::repl::{
     Batch, Challenge, ReplHello, ReplReply, ReplRequest, Snapshot,
 };
-use crate::proto::{self, BootId, Node, Op, Owner, Protection, VERSION};
+use crate::proto::{
+    self, BootId, Node, Op, Owner, Protection, SYNCED_VERSION, VERSION,
+};
 use crate::store::{self, Header, Store};
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -148,6 +150,8 @@ struct Challenged {
 struct Session<W> {
     conn: u64,
     stage: Stage,
+    /// The version of the session, once it authenticated.
+    version: u32,
     tag: u64,
     snap_seq: u64,
     acked: u64,
@@ -211,6 +215,7 @@ fn op_charge(op: &Op) -> usize {
     match op {
         Op::Put(r) => store::charge(r),
         Op::Del(_) => 12,
+        Op::Synced => 4,
     }
 }
 
@@ -379,6 +384,7 @@ impl<W: Waiter> Primary<W> {
             writer_boot: self.header.writer_boot,
             next_cursor,
             last,
+            synced: self.origin == Origin::Replica && self.header.synced,
             records,
         }
     }
@@ -396,6 +402,7 @@ impl<W: Waiter> Primary<W> {
         self.header.tag = 0;
         self.header.writer_node = self.s.node;
         self.header.writer_boot = self.s.boot;
+        self.header.synced = false;
         self.origin = Origin::Own;
         if self.session.is_some() {
             self.lose_standby("the copy was replaced after a rehydration");
@@ -501,6 +508,30 @@ impl<W: Waiter> Primary<W> {
         }
     }
 
+    /// Marks the copy as synced for a `MarkSynced` and replies to `w`:
+    /// `Protected` once the standby has the mark, as `sync_remote`. Replies
+    /// `Unprotected` at once if no standby can restore with the mark: the
+    /// replica is not protected, a rehydration runs, or the standby speaks
+    /// a version without `Op::Synced`.
+    pub fn mark_synced(&mut self, w: W, now: Instant) {
+        let version = self.session.as_ref().map_or(0, |s| s.version);
+        if self.protection() != Protection::Protected
+            || version < SYNCED_VERSION
+        {
+            self.reply_synced(w, Protection::Unprotected);
+            return;
+        }
+        truenas_ros::log!(
+            self.log,
+            Level::Notice,
+            "marking the replica as synced at {}",
+            self.seq + 1
+        );
+        self.apply(Op::Synced);
+        self.after_apply(now);
+        self.sync_remote(w);
+    }
+
     fn release_acked(&mut self, acked: u64) {
         while self.waiters.front().is_some_and(|(t, _)| *t <= acked) {
             if let Some((_, w)) = self.waiters.pop_front() {
@@ -520,7 +551,7 @@ impl<W: Waiter> Primary<W> {
             next.apply(op);
             return;
         }
-        if self.origin == Origin::None {
+        if self.origin == Origin::None && !matches!(op, Op::Synced) {
             // Nothing was restorable at start. The first operation makes the
             // copy `Origin::Own`. The writer becomes this node and boot.
             self.origin = Origin::Own;
@@ -590,6 +621,7 @@ impl<W: Waiter> Primary<W> {
         self.pending = Some(Session {
             conn,
             stage: Stage::Hello,
+            version: 0,
             tag: 0,
             snap_seq: 0,
             acked: 0,
@@ -766,6 +798,7 @@ impl<W: Waiter> Primary<W> {
                 if self.session.is_some() {
                     self.lose_standby("a new standby connection replaced it");
                 }
+                p.version = c.version;
                 p.stage = Stage::Ready;
                 p.deadline = Some(now + link_timeout);
                 self.session = Some(p);
@@ -1126,7 +1159,7 @@ mod tests {
     use super::*;
     use crate::proto::local::Reply;
     use crate::proto::{Record, SyncLevel};
-    use crate::standby::Standby;
+    use crate::standby::{MARK_GRACE, Standby};
     use std::cell::RefCell;
     use std::rc::Rc;
     use truenas_xdr::VarOpaque;
@@ -1375,7 +1408,7 @@ mod tests {
                         let reply: ReplReply = decode(&bytes);
                         let last =
                             matches!(&reply, ReplReply::Snapshot(s) if s.last);
-                        let next = self.sb.on_reply(reply)?;
+                        let next = self.sb.on_reply_at(reply, self.now)?;
                         if last {
                             self.completed += 1;
                         }
@@ -1420,6 +1453,101 @@ mod tests {
         pair.pump().unwrap();
         assert_eq!(pair.p.state(), State::Protected);
         pair
+    }
+
+    fn mark(pair: &mut Pair) -> Slot {
+        let (w, slot) = waiter();
+        pair.p.mark_synced(w, pair.now);
+        pair.effects();
+        slot
+    }
+
+    #[test]
+    fn a_mark_waits_for_the_standby_and_a_later_change_voids_it() {
+        let mut pair = protected_pair(&[rec(1, 10, b"a")]);
+        let slot = mark(&mut pair);
+        assert_eq!(synced(&slot), None, "waits for the standby");
+        pair.pump().unwrap();
+        assert_eq!(synced(&slot), Some(Protection::Protected));
+        assert!(pair.sb.synced());
+        assert_eq!(pair.sb.records(), 1);
+        pair.submit(vec![Op::Put(rec(2, 10, b"b"))], SyncLevel::None);
+        pair.pump().unwrap();
+        assert!(!pair.sb.synced());
+    }
+
+    #[test]
+    fn a_mark_is_void_if_the_primary_runs_past_the_grace() {
+        let mut pair = protected_pair(&[rec(1, 10, b"a")]);
+        let slot = mark(&mut pair);
+        pair.pump().unwrap();
+        assert_eq!(synced(&slot), Some(Protection::Protected));
+        let marked = pair.now;
+        let step = Duration::from_millis(100);
+        while pair.now + step < marked + MARK_GRACE {
+            pair.advance(step);
+            pair.pump().unwrap();
+            assert!(pair.sb.synced(), "heartbeats inside the grace");
+        }
+        pair.advance(2 * step);
+        pair.pump().unwrap();
+        assert!(!pair.sb.synced(), "a heartbeat after the grace");
+        assert_eq!(pair.p.state(), State::Protected);
+    }
+
+    #[test]
+    fn no_mark_without_a_standby_that_can_keep_it() {
+        let mut pair = Pair::new(&[rec(1, 10, b"a")], b"secret");
+        let seq = pair.p.seq();
+        let slot = mark(&mut pair);
+        assert_eq!(synced(&slot), Some(Protection::Unprotected));
+        assert_eq!(pair.p.seq(), seq, "no standby: no mark");
+
+        let mut pair = protected_pair(&[rec(1, 10, b"a")]);
+        if let Some(s) = pair.p.session.as_mut() {
+            s.version = SYNCED_VERSION - 1;
+        }
+        let seq = pair.p.seq();
+        let slot = mark(&mut pair);
+        assert_eq!(synced(&slot), Some(Protection::Unprotected));
+        assert_eq!(pair.p.seq(), seq, "an older standby: no mark");
+
+        let mut pair = protected_pair(&[rec(1, 10, b"a")]);
+        let _ = pair.p.rehydrate(0, 1 << 20, 1);
+        let slot = mark(&mut pair);
+        assert_eq!(synced(&slot), Some(Protection::Unprotected));
+        assert_eq!(pair.p.state(), State::Protected, "the standby stays");
+    }
+
+    #[test]
+    fn a_replica_with_a_mark_restores_synced_until_done() {
+        let mut header = Header::empty(SNODE, SB);
+        header.tag = 3;
+        header.synced = true;
+        let mut store = Store::default();
+        store.apply(Op::Put(rec(1, 0, b"a")));
+        let mut p: Primary<TestWaiter> = Primary::new(
+            settings(),
+            None,
+            store,
+            header,
+            Origin::Replica,
+            4,
+            Logger::silent(),
+        );
+        assert!(p.rehydrate(0, 1 << 20, 1).synced);
+        p.done();
+        assert!(!p.rehydrate(0, 1 << 20, 1).synced, "the copy is own now");
+        let mut p: Primary<TestWaiter> = Primary::new(
+            settings(),
+            None,
+            Store::default(),
+            header,
+            Origin::Own,
+            4,
+            Logger::silent(),
+        );
+        assert!(!p.rehydrate(0, 1 << 20, 1).synced, "only a replica");
     }
 
     #[test]
