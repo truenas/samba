@@ -53,6 +53,12 @@
  * replaces the copy with the records that it received after the first
  * page.
  *
+ * A planned failover keeps the dirty handles. Before it resets this
+ * controller, middleware blocks SMB traffic both ways, syncs the pools
+ * and runs "truenas_smbhad mark-synced", which marks the standby's copy
+ * as synced. tn_check_file() then keeps the dirty records. Any change to
+ * the copy after the mark voids it.
+ *
  * truenas_rust/smbhad/client has the protocol, the record format, the durable
  * cookie of vfs_zfs_core and the fence through the epoch file.
  *

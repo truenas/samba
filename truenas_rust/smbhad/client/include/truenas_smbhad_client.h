@@ -374,6 +374,11 @@ struct smbhad_page {
          */
         bool last;
         /**
+         * The writer synced its pools right before its controller stopped:
+         * the handles with unflushed changes are restorable
+         */
+        bool synced;
+        /**
          * The number of records
          */
         size_t num_records;

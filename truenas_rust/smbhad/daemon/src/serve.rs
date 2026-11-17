@@ -21,7 +21,7 @@ use crate::primary::{AdvanceError, Effect, Primary, Settings, Waiter};
 use crate::proto::local::{Client, Failure, Hello, Origin, Reply, Request};
 use crate::proto::repl::ReplRequest;
 use crate::proto::{
-    BootId, MAX_FRAME, MAX_RECORD_BYTES, Node, Owner, SyncLevel, VERSION,
+    BootId, MAX_FRAME, MAX_RECORD_BYTES, Node, Op, Owner, SyncLevel, VERSION,
     encode,
 };
 use crate::role;
@@ -809,9 +809,14 @@ fn local(
         (None, Request::Hello(h)) => {
             if h.version == VERSION {
                 let ok = c.hello();
-                locals
-                    .borrow_mut()
-                    .hello(id, h.owner, start_time(h.owner.pid));
+                if h.role != Client::Control {
+                    // The control client holds no handles.
+                    locals.borrow_mut().hello(
+                        id,
+                        h.owner,
+                        start_time(h.owner.pid),
+                    );
+                }
                 *hello = Some(h);
                 reply(&Reply::HelloOk(ok))
             } else {
@@ -828,6 +833,32 @@ fn local(
             }
         }
         (None, _) | (Some(_), Request::Hello(_)) => Response::Close,
+        (Some(h), Request::MarkSynced) => {
+            if h.role == Client::Control {
+                let (deferred, permit) = responder.defer();
+                c.mark_synced(deferred, now);
+                Response::Defer(permit)
+            } else {
+                refuse(
+                    truenas_ros::Errno::EACCES as i32,
+                    "only the control client marks the copy as synced",
+                )
+            }
+        }
+        (Some(h), _) if h.role == Client::Control => refuse(
+            truenas_ros::Errno::EACCES as i32,
+            "the control client can only mark the copy as synced",
+        ),
+        (Some(_), Request::Submit(sub))
+            if sub.ops.iter().any(|op| matches!(op, Op::Synced)) =>
+        {
+            truenas_ros::log!(
+                log,
+                Level::Warning,
+                "smbd submitted a synced mark; closing its connection"
+            );
+            Response::Close
+        }
         (Some(_), Request::Submit(_)) if locals.borrow().gone.contains(&id) => {
             truenas_ros::log!(
                 log,

@@ -16,7 +16,12 @@ use serde::{Deserialize, Serialize};
 use truenas_xdr::{FixedOpaque, VarOpaque, XdrEnum, XdrUnion};
 
 /// Version of both protocols. Each side sends it in its first message.
-pub const VERSION: u32 = 1;
+/// Version 2 adds `Op::Synced`, `local::Client::Control`,
+/// `local::Request::MarkSynced` and `local::RehydratePage::synced`.
+pub const VERSION: u32 = 2;
+
+/// The first replication version with `Op::Synced`.
+pub const SYNCED_VERSION: u32 = 2;
 
 /// The oldest replication version that a daemon accepts. The primary uses
 /// the lower version of the two daemons, so the controllers of an HA pair
@@ -112,6 +117,10 @@ pub enum Op {
     Put(Record) = 1,
     /// Removes the record with this id.
     Del(u64) = 2,
+    /// The writer blocked SMB replies and synced its pools. Changes no
+    /// record. Only the daemon adds it, for `local::Request::MarkSynced`.
+    /// smbd does not send it.
+    Synced = 3,
 }
 
 /// When the daemon replies to a `Submit`.
@@ -203,6 +212,13 @@ pub(crate) mod tests {
     fn a_delete_is_its_discriminant_then_the_id() {
         let bytes = to_bytes(&Op::Del(5)).unwrap();
         assert_eq!(bytes, [0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5]);
+    }
+
+    #[test]
+    fn a_synced_mark_is_a_bare_discriminant() {
+        let bytes = to_bytes(&Op::Synced).unwrap();
+        assert_eq!(bytes, [0, 0, 0, 3]);
+        assert_eq!(from_bytes::<Op>(&bytes).unwrap(), Op::Synced);
     }
 
     #[test]

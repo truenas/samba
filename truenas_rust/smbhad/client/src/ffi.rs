@@ -209,6 +209,9 @@ pub struct Page {
     pub next_cursor: u64,
     /// This is the last page
     pub last: bool,
+    /// The writer synced its pools right before its controller stopped:
+    /// the handles with unflushed changes are restorable
+    pub synced: bool,
     /// The number of records
     pub num_records: usize,
     /// The records, in id order
@@ -774,6 +777,7 @@ pub unsafe extern "C" fn smbhad_rehydrate(
                 writer_node: node_value(page.writer_node),
                 next_cursor: page.next_cursor,
                 last: page.last,
+                synced: page.synced,
                 num_records: puts.len(),
                 records: puts.as_ptr(),
             },
