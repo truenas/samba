@@ -1,0 +1,8 @@
+# rustup uses this toolchain for each cargo command in this directory.
+# build.sh builds the Debian package with exactly this version. When CI
+# passes with a new Rust release, raise this version and rust-version in
+# Cargo.toml together.
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

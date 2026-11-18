@@ -1,0 +1,50 @@
+# fstests-vm.sh runs these fstests through cifs.ko against smbd. Each line
+# names one test. The Samba wiki (Xfstesting-cifs) reports that these
+# "quick" tests pass against Samba without SMB3 POSIX extensions. The list
+# omits tests of the stress tools (fsstress, fsx, aio-stress, looptest)
+# and of xattrs. It has only tests of server-side copy, fallocate and
+# holes, SEEK_DATA and SEEK_HOLE, renames, links, truncation, times,
+# O_DIRECT, mmap and locks.
+# A test that TrueNAS fails has "known" and the reason after its name.
+# generic/169, 420 and 528 are not in the list. They run "xfs_io stat".
+# On cifs, xfs_io 6.13 of Debian trixie prints a FS_IOC_GETXATTR error
+# there, and the output then differs. xfsprogs 6.14 and later do not.
+
+generic/002  # Check the link count of a regular file
+generic/005  # Check that deep and looping symlinks fail with ELOOP
+generic/006  # Create 4096 files with permuted names, in 1 and in 4 processes
+generic/007  # Check the errors of random create, unlink and stat (nametest)
+generic/023  # Check renameat2 syscall without flags
+generic/024  # Check renameat2 syscall with RENAME_NOREPLACE flag
+generic/028  # Check that getcwd(2) returns the right path during renames
+generic/080  # Check that a write to mmap-ed pages updates mtime
+generic/084  # Check hard links to a file that is open but unlinked
+generic/086  # Check that writes into fallocated space lose no data
+generic/098  # Check that the size after a truncate into a hole persists
+generic/124  # Check a data pattern in a preallocated file, 100 times
+generic/141  # Check an mmap read of part of a file
+generic/207  # Check that stat returns the new size after AIO direct writes
+generic/210  # Check the length of an AIO direct read of a short last block
+generic/212  # Check io_setup with a context pointer that is not writable
+generic/214  # Run basic sanity checks of unwritten extents
+generic/221  # Check that futimens without UTIME_OMIT for mtime updates ctime
+generic/228  # Check that fallocate respects RLIMIT_FSIZE
+generic/245  # Check that directory renames onto non-empty targets fail
+generic/246  # Check that truncation after failed writes does not zero too much
+generic/247  # Check a race between direct I/O and mmap
+generic/248  # Check that pwrite from an mmap of the same page does not hang
+generic/249  # Copy 32 MiB with sendfile(2) and compare the files
+generic/257  # Check that readdir returns unique, seekable d_off values
+generic/315  # Check that a truncate frees space from FALLOC_FL_KEEP_SIZE
+generic/360  # Check a symlink to a very long path
+generic/394  # Check that the file system honors RLIMIT_FSIZE
+generic/422  # Check the block count of stat(2) with delayed allocation
+generic/436  # Run more sanity checks of SEEK_DATA and SEEK_HOLE
+generic/439  # Check the data after a punch hole and writes into the hole
+generic/445  # Run another sanity check of SEEK_DATA and SEEK_HOLE
+generic/448  # Check SEEK_HOLE and SEEK_DATA with negative offsets
+generic/452  # Run a program from the mount before and after a read-only remount
+generic/504  # Check that /proc/locks shows a flock(1) lock
+generic/532  # Check that statx sets no attribute flags outside attributes_mask
+generic/565  # Check copy_file_range() across devices
+generic/591  # Check that splice() can read from pipes

@@ -456,6 +456,53 @@ static bool smbd_smb2_read_cancel(struct tevent_req *req)
 	return cancel_smb2_aio(state->smbreq);
 }
 
+/*
+ * TrueNAS: the truenas_ros reactor of the channel reads the file
+ * and sends the reply. smbd builds the reply for in_length bytes without
+ * a data buffer. smbd_smb2_request_reply() then leaves out the data, as it
+ * does for sendfile.
+ */
+static NTSTATUS smbd_smb2_read_delegate(struct smbd_smb2_read_state *state)
+{
+	files_struct *fsp = state->fsp;
+	struct lock_struct lock;
+	NTSTATUS status;
+
+	if (!smbd_smb2_ros_delegable(state->smb2req) ||
+	    state->in_length == 0 ||
+	    fsp_is_alternate_stream(fsp) ||
+	    fsp->op == NULL ||
+	    !vfs_valid_pread_range(state->in_offset, state->in_length))
+	{
+		return NT_STATUS_RETRY;
+	}
+
+	init_strict_lock_struct(fsp,
+				fsp->op->global->open_persistent_id,
+				state->in_offset,
+				state->in_length,
+				READ_LOCK,
+				&lock);
+	if (!SMB_VFS_STRICT_LOCK_CHECK(fsp->conn, fsp, &lock)) {
+		return NT_STATUS_FILE_LOCK_CONFLICT;
+	}
+
+	status = smbd_smb2_ros_delegate(state->smb2req,
+					fsp,
+					SMB2_OP_READ,
+					state->in_offset,
+					state->in_length,
+					state->in_minimum,
+					NULL);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+
+	state->out_data = data_blob_const(NULL, state->in_length);
+	state->out_remaining = 0;
+	return NT_STATUS_OK;
+}
+
 static struct tevent_req *smbd_smb2_read_send(TALLOC_CTX *mem_ctx,
 					      struct tevent_context *ev,
 					      struct smbd_smb2_request *smb2req,
@@ -549,6 +596,14 @@ static struct tevent_req *smbd_smb2_read_send(TALLOC_CTX *mem_ctx,
 
 	if (!CHECK_READ_SMB2(fsp)) {
 		tevent_req_nterror(req, NT_STATUS_ACCESS_DENIED);
+		return tevent_req_post(req, ev);
+	}
+
+	status = smbd_smb2_read_delegate(state);
+	if (!NT_STATUS_EQUAL(status, NT_STATUS_RETRY)) {
+		if (!tevent_req_nterror(req, status)) {
+			tevent_req_done(req);
+		}
 		return tevent_req_post(req, ev);
 	}
 

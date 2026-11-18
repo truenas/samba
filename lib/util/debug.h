@@ -177,6 +177,12 @@ bool dbgsetclass(int level, int cls);
 
 int debuglevel_get_class(size_t idx);
 void debuglevel_set_class(size_t idx, int level);
+/*
+ * Set or clear the quiet mode of the calling thread. Return the old mode.
+ * A quiet thread logs nothing. Two threads must not log at the same time.
+ * For example, each thread logs only while it has one shared lock.
+ */
+bool debug_thread_set_quiet(bool quiet);
 
 #define CHECK_DEBUGLVL( level ) \
   ( ((level) <= MAX_DEBUG_LEVEL) && \

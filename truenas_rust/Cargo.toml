@@ -7,25 +7,38 @@
 # - smbhad/client: the client in smbd, with the record of a durable handle and
 #   the durable cookie of vfs_zfs_core. A static library with a C header that
 #   smbd links.
+# The workspace also has the truenas_ros reactors of smbd. See README.md.
+# - mit/smbros: a shim between an SMB server and truenas_ros
+# - gpl/smb-server, gpl/smb-vfs: the layer of smbd above the shim
 # build.sh builds the workspace before waf builds Samba. Cargo.lock is in
 # git. `rev` pins each git dependency to a commit. A package build is
 # reproducible.
 [workspace]
 resolver = "3"
-members = ["smbhad/proto", "smbhad/daemon", "smbhad/client"]
+members = [
+    "smbhad/proto",
+    "smbhad/daemon",
+    "smbhad/client",
+    "mit/smbros",
+    "gpl/smb-server",
+    "gpl/smb-vfs",
+]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.98.1"
+rust-version = "1.100.0"
 license = "GPL-3.0-or-later"
 publish = false
 
 [workspace.dependencies]
-truenas_ros = { git = "https://github.com/truenas/truenas_ros", rev = "933e5192778ac9cb70cdc1bdfb896f2f0718c4fb", default-features = false }
+truenas_ros = { git = "https://github.com/truenas/truenas_ros", rev = "e96e6cd14662cf8165310299e8162c262343aea6", default-features = false }
 truenas_xdr = { git = "https://github.com/truenas/truenas_ros_utils", rev = "0c3bf46bb3e4bdac62d1688ae87815e9b6b4bea8" }
 truenas_smbhad_proto = { path = "smbhad/proto" }
 truenas_smbhad_client = { path = "smbhad/client" }
+truenas_smbros = { path = "mit/smbros" }
+truenas_smb_server = { path = "gpl/smb-server" }
+truenas_smb_vfs = { path = "gpl/smb-vfs" }
 serde = { version = "1", features = ["derive"] }
 libc = "0.2"
 # OpenSSL (libcrypto) for the link handshake: HKDF, HMAC and the random

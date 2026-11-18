@@ -46,7 +46,7 @@
 #define CACHE_LAST_SCAN_TIME "CACHE"
 #define MSG_PENDING_TIME "MSG_PENDING"
 
-extern userdom_struct current_user_info;
+extern __thread userdom_struct current_user_info;
 
 /* Current printer interface */
 static bool remove_from_jobs_added(const char* sharename, uint32_t jobid);

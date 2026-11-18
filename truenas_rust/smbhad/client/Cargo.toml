@@ -16,6 +16,10 @@ truenas_smbhad_proto.workspace = true
 truenas_xdr.workspace = true
 serde.workspace = true
 libc.workspace = true
+# smbd links these crates through this static library.
+truenas_smbros.workspace = true
+truenas_smb_server.workspace = true
+truenas_smb_vfs.workspace = true
 
 [lints]
 workspace = true

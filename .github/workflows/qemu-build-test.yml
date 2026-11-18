@@ -140,6 +140,10 @@ jobs:
       timeout-minutes: 20
       run: bash .github/workflows/scripts/qemu-4.8-kerberos.sh
 
+    - name: fstests through the kernel SMB client
+      timeout-minutes: 45
+      run: bash .github/workflows/scripts/qemu-4.9-fstests.sh
+
     # Runs last against the VM: it ends with a crash of the VM through sysrq.
     - name: Durable handles across failovers, smbd restarts and a VM crash
       timeout-minutes: 60

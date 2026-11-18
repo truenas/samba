@@ -878,6 +878,12 @@ static NTSTATUS close_normal_file(struct smb_request *req, files_struct *fsp,
 	if (is_durable) {
 		DATA_BLOB new_cookie = data_blob_null;
 
+		/*
+		 * TrueNAS: the cookie records the state of the file.
+		 * So smbd waits for the file I/O of the reactors first.
+		 */
+		smbd_smb2_ros_file_close(fsp);
+
 		tmp = SMB_VFS_DURABLE_DISCONNECT(fsp,
 					fsp->op->global->backend_cookie,
 					fsp->op,

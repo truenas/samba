@@ -30,7 +30,7 @@
 #include "source3/lib/substitute.h"
 
 /* what user is current? */
-extern struct current_user current_user;
+extern __thread struct current_user current_user;
 
 /****************************************************************************
  Become the guest user without changing the security context stack.
@@ -713,7 +713,7 @@ bool smbd_unbecome_authenticated_pipe_user(void)
 static void push_conn_ctx(void)
 {
 	struct conn_ctx *ctx_p;
-	extern userdom_struct current_user_info;
+	extern __thread userdom_struct current_user_info;
 
 	/* Check we don't overflow our stack */
 

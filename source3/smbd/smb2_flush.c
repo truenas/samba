@@ -118,6 +118,37 @@ struct smbd_smb2_flush_state {
 
 static void smbd_smb2_flush_done(struct tevent_req *subreq);
 
+/*
+ * TrueNAS: the truenas_ros reactor of the channel syncs the file
+ * and sends the reply. smbd builds a success reply. The reactor changes
+ * it to an error response if the fsync fails.
+ */
+static NTSTATUS smbd_smb2_flush_delegate(struct smbd_smb2_flush_state *state)
+{
+	files_struct *fsp = state->fsp;
+
+	/*
+	 * The reactor calls fsync(2) on the descriptor. That must do what
+	 * SMB_VFS_FSYNC_SEND() does. With HA state, smbd flushes the file
+	 * itself because smbd_smb2_flush_done() records the flush.
+	 */
+	if (!smbd_smb2_ros_delegable(state->smb2req) ||
+	    fsp_is_alternate_stream(fsp) ||
+	    !smbd_vfs_plain_fsync(fsp->conn) ||
+	    truenas_hastate_enabled())
+	{
+		return NT_STATUS_RETRY;
+	}
+
+	return smbd_smb2_ros_delegate(state->smb2req,
+				      fsp,
+				      SMB2_OP_FLUSH,
+				      0,
+				      0,
+				      0,
+				      NULL);
+}
+
 static struct tevent_req *smbd_smb2_flush_send(TALLOC_CTX *mem_ctx,
 					       struct tevent_context *ev,
 					       struct smbd_smb2_request *smb2req,
@@ -191,6 +222,14 @@ static struct tevent_req *smbd_smb2_flush_send(TALLOC_CTX *mem_ctx,
 		 * anything here.
 		 */
 		tevent_req_done(req);
+		return tevent_req_post(req, ev);
+	}
+
+	status = smbd_smb2_flush_delegate(state);
+	if (!NT_STATUS_EQUAL(status, NT_STATUS_RETRY)) {
+		if (!tevent_req_nterror(req, status)) {
+			tevent_req_done(req);
+		}
 		return tevent_req_post(req, ev);
 	}
 

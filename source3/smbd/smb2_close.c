@@ -276,6 +276,7 @@ static struct tevent_req *smbd_smb2_close_send(TALLOC_CTX *mem_ctx,
 	const char *fsp_name_str = NULL;
 	const char *fsp_fnum_str = NULL;
 	unsigned i;
+	bool ros_busy;
 	NTSTATUS status;
 
 	if (CHECK_DEBUGLVL(DBGLVL_INFO)) {
@@ -305,7 +306,10 @@ static struct tevent_req *smbd_smb2_close_send(TALLOC_CTX *mem_ctx,
 		i += 1;
 	}
 
-	if (in_fsp->num_aio_requests != 0) {
+	/* TrueNAS: a CLOSE also waits for file I/O of the reactors. */
+	ros_busy = smbd_smb2_ros_file_busy(in_fsp);
+
+	if (in_fsp->num_aio_requests != 0 || ros_busy) {
 		struct tevent_req *subreq;
 
 		state->wait_queue = tevent_queue_create(state,
@@ -313,18 +317,29 @@ static struct tevent_req *smbd_smb2_close_send(TALLOC_CTX *mem_ctx,
 		if (tevent_req_nomem(state->wait_queue, req)) {
 			return tevent_req_post(req, ev);
 		}
-		/*
-		 * Now wait until all aio requests on this fsp are
-		 * finished.
-		 *
-		 * We don't set a callback, as we just want to block the
-		 * wait queue and the talloc_free() of fsp->aio_request
-		 * will remove the item from the wait queue.
-		 */
-		subreq = tevent_queue_wait_send(in_fsp->aio_requests,
-					smb2req->sconn->ev_ctx,
-					state->wait_queue);
-		if (tevent_req_nomem(subreq, req)) {
+		if (in_fsp->num_aio_requests != 0) {
+			/*
+			 * Now wait until all aio requests on this fsp are
+			 * finished.
+			 *
+			 * We don't set a callback, as we just want to block
+			 * the wait queue and the talloc_free() of
+			 * fsp->aio_request will remove the item from the wait
+			 * queue.
+			 */
+			subreq = tevent_queue_wait_send(in_fsp->aio_requests,
+						smb2req->sconn->ev_ctx,
+						state->wait_queue);
+			if (tevent_req_nomem(subreq, req)) {
+				return tevent_req_post(req, ev);
+			}
+		}
+
+		if (ros_busy &&
+		    !smbd_smb2_ros_file_block(in_fsp,
+					      smb2req->sconn->ev_ctx,
+					      state->wait_queue)) {
+			tevent_req_nterror(req, NT_STATUS_NO_MEMORY);
 			return tevent_req_post(req, ev);
 		}
 

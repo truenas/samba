@@ -56,8 +56,8 @@ struct smb_trans_enc_state *srv_trans_enc_ctx = NULL;
 
 /* A stack of security contexts.  We include the current context as being
    the first one, so there is room for another MAX_SEC_CTX_DEPTH more. */
-struct sec_ctx sec_ctx_stack[MAX_SEC_CTX_DEPTH + 1];
-int sec_ctx_stack_ndx = 0;
+__thread struct sec_ctx sec_ctx_stack[MAX_SEC_CTX_DEPTH + 1];
+__thread int sec_ctx_stack_ndx = 0;
 bool become_uid_done = false;
 bool become_gid_done = false;
 
@@ -66,8 +66,8 @@ uint32_t global_client_caps = 0;
 uint16_t fnf_handle = 257;
 
 /* A stack of current_user connection contexts. */
-struct conn_ctx conn_ctx_stack[MAX_SEC_CTX_DEPTH];
-int conn_ctx_stack_ndx = 0;
+__thread struct conn_ctx conn_ctx_stack[MAX_SEC_CTX_DEPTH];
+__thread int conn_ctx_stack_ndx = 0;
 
 struct vfs_init_function_entry *backends = NULL;
 char *sparse_buf = NULL;

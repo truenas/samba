@@ -360,12 +360,25 @@ dependencies = [
 [[package]]
 name = "truenas_ros"
 version = "0.1.0"
-source = "git+https://github.com/truenas/truenas_ros?rev=933e5192778ac9cb70cdc1bdfb896f2f0718c4fb#933e5192778ac9cb70cdc1bdfb896f2f0718c4fb"
+source = "git+https://github.com/truenas/truenas_ros?rev=e96e6cd14662cf8165310299e8162c262343aea6#e96e6cd14662cf8165310299e8162c262343aea6"
 dependencies = [
  "bitflags",
  "libc",
  "loom",
 ]
+
+[[package]]
+name = "truenas_smb_server"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "truenas_ros",
+ "truenas_smbros",
+]
+
+[[package]]
+name = "truenas_smb_vfs"
+version = "0.1.0"
 
 [[package]]
 name = "truenas_smbhad"
@@ -386,7 +399,10 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "serde",
+ "truenas_smb_server",
+ "truenas_smb_vfs",
  "truenas_smbhad_proto",
+ "truenas_smbros",
  "truenas_xdr",
 ]
 
@@ -398,6 +414,14 @@ dependencies = [
  "serde",
  "truenas_ros",
  "truenas_xdr",
+]
+
+[[package]]
+name = "truenas_smbros"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "truenas_ros",
 ]
 
 [[package]]

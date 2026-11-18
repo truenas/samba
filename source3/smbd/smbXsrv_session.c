@@ -1880,6 +1880,10 @@ NTSTATUS smbXsrv_session_logoff(struct smbXsrv_session *session)
 	table = session->table;
 	session->table = NULL;
 
+	/* TrueNAS: the reactors drop the keys of this session. */
+	smbd_smb2_ros_keys_drop(session->client,
+				session->global->session_wire_id);
+
 	sconn = session->client->sconn;
 	session->client = NULL;
 	session->status = NT_STATUS_USER_SESSION_DELETED;
