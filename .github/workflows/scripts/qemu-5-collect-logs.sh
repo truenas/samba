@@ -37,6 +37,10 @@ ssh debian@$VM_IP "sudo journalctl -u truenas-smbhad --no-pager" > "$LOG_DIR/tru
 # output and configurations, without the DC and the secrets of the join.
 ssh debian@$VM_IP "sudo sh -c 'cd /var/tmp && tar czf - --exclude=dc --exclude=nas kerberos'" \
   > "$LOG_DIR/kerberos.tar.gz" 2>/dev/null || true
+# Collect the output of check, the results of each test and the smbd logs
+# of fstests (qemu-4.9-fstests.sh).
+ssh debian@$VM_IP "sudo sh -c 'cd /var/tmp && tar czf - fstests'" \
+  > "$LOG_DIR/fstests.tar.gz" 2>/dev/null || true
 # Listing of the built debs (handy when a build/packaging step failed).
 ssh debian@$VM_IP "ls -l ~/*.deb /tmp/*.deb 2>/dev/null" > "$LOG_DIR/built-debs.txt" 2>/dev/null || true
 

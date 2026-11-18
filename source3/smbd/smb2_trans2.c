@@ -4071,6 +4071,21 @@ NTSTATUS smb_set_file_size(connection_struct *conn,
 		return NT_STATUS_OK;
 	}
 
+	if (fsp != NULL && fsp->fsp_flags.is_fsa) {
+		/*
+		 * A stat open of the client has no descriptor for I/O and
+		 * never has FILE_WRITE_DATA. SMB_VFS_CREATE_FILE() below uses
+		 * the fsp of smb_fname for its open, and that is this handle.
+		 * The close after the open frees a handle that the client
+		 * still uses.
+		 */
+		status = check_any_access_fsp(fsp, FILE_WRITE_DATA);
+		if (NT_STATUS_IS_OK(status)) {
+			status = NT_STATUS_INVALID_PARAMETER;
+		}
+		return status;
+	}
+
         status = SMB_VFS_CREATE_FILE(
 		conn,					/* conn */
 		req,					/* req */
@@ -4868,6 +4883,15 @@ static NTSTATUS smb_set_file_allocation_info(connection_struct *conn,
 		}
 		trigger_write_time_update_immediate(fsp, false, true);
 		return NT_STATUS_OK;
+	}
+
+	if (fsp->fsp_flags.is_fsa) {
+		/* A stat open of the client. See smb_set_file_size(). */
+		status = check_any_access_fsp(fsp, FILE_WRITE_DATA);
+		if (NT_STATUS_IS_OK(status)) {
+			status = NT_STATUS_INVALID_PARAMETER;
+		}
+		return status;
 	}
 
 	/* Pathname or stat or directory file. */

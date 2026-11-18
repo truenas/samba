@@ -37,6 +37,9 @@ bld.SAMBA_MODULE('TORTURE_SMB2',
         read_write.c
         rename.c
         replay.c
+        ros_abuse.c
+        ros_inline.c
+        ros_inline_abuse.c
         scan.c
         secleak.c
         session.c

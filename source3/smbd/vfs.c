@@ -404,6 +404,85 @@ bool smbd_vfs_init(connection_struct *conn)
 	return True;
 }
 
+/*
+ * TrueNAS: a truenas_ros reactor does file I/O on the descriptor
+ * without the VFS modules. The modules in passthrough[] do not change the
+ * I/O of a file that is not a stream. If another module hooks an I/O
+ * call, smbd does that I/O itself.
+ */
+#define SMBD_VFS_PLAIN_KNOWN 0x1
+#define SMBD_VFS_PLAIN_RW 0x2
+#define SMBD_VFS_PLAIN_FSYNC 0x4
+
+static bool smbd_vfs_fns_passthrough(const struct vfs_fn_pointers *fns)
+{
+	static const char * const passthrough[] = {
+		DEFAULT_VFS_MODULE_NAME,
+		"io_uring",
+		"fruit",
+		"catia",
+		"streams_xattr",
+		"truenas_streams_xattr",
+	};
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(passthrough); i++) {
+		struct vfs_init_function_entry *entry =
+			vfs_find_backend_entry(passthrough[i]);
+
+		if (entry != NULL && entry->fns == fns) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static uint8_t smbd_vfs_plain(connection_struct *conn)
+{
+	struct vfs_handle_struct *handle = NULL;
+	uint8_t plain = SMBD_VFS_PLAIN_KNOWN |
+			SMBD_VFS_PLAIN_RW |
+			SMBD_VFS_PLAIN_FSYNC;
+
+	if (conn->truenas_plain != 0) {
+		return conn->truenas_plain;
+	}
+
+	for (handle = conn->vfs_handles; handle != NULL; handle = handle->next) {
+		const struct vfs_fn_pointers *fns = handle->fns;
+		bool rw = (fns->pread_fn != NULL ||
+			   fns->pwrite_fn != NULL ||
+			   fns->pread_send_fn != NULL ||
+			   fns->pwrite_send_fn != NULL);
+		bool fsync = (fns->fsync_send_fn != NULL);
+
+		if ((!rw && !fsync) || smbd_vfs_fns_passthrough(fns)) {
+			continue;
+		}
+		if (rw) {
+			plain &= ~SMBD_VFS_PLAIN_RW;
+		}
+		if (fsync) {
+			plain &= ~SMBD_VFS_PLAIN_FSYNC;
+		}
+	}
+
+	conn->truenas_plain = plain;
+	return plain;
+}
+
+/* True if pread(2) and pwrite(2) do what the VFS read and write calls do. */
+bool smbd_vfs_plain_rw(connection_struct *conn)
+{
+	return (smbd_vfs_plain(conn) & SMBD_VFS_PLAIN_RW) != 0;
+}
+
+/* True if fsync(2) does what SMB_VFS_FSYNC_SEND() does. */
+bool smbd_vfs_plain_fsync(connection_struct *conn)
+{
+	return (smbd_vfs_plain(conn) & SMBD_VFS_PLAIN_FSYNC) != 0;
+}
+
 bool vfs_valid_pread_range(off_t offset, size_t length)
 {
 	return sys_valid_io_range(offset, length);

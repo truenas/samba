@@ -68,14 +68,19 @@ extern uint32_t common_flags2;
 extern struct smb_trans_enc_state *partial_srv_trans_enc_ctx;
 extern struct smb_trans_enc_state *srv_trans_enc_ctx;
 
+/*
+ * TrueNAS: smbd sets credentials per thread. So sec_ctx_stack,
+ * conn_ctx_stack, current_user and current_user_info are per thread too.
+ * A truenas_ros reactor that runs smbd code has its own copies.
+ */
 struct sec_ctx {
 	struct security_unix_token ut;
 	struct security_token *token;
 };
 /* A stack of security contexts.  We include the current context as being
    the first one, so there is room for another MAX_SEC_CTX_DEPTH more. */
-extern struct sec_ctx sec_ctx_stack[MAX_SEC_CTX_DEPTH + 1];
-extern int sec_ctx_stack_ndx;
+extern __thread struct sec_ctx sec_ctx_stack[MAX_SEC_CTX_DEPTH + 1];
+extern __thread int sec_ctx_stack_ndx;
 extern bool become_uid_done;
 extern bool become_gid_done;
 
@@ -89,8 +94,8 @@ struct conn_ctx {
 	userdom_struct user_info;
 };
 /* A stack of current_user connection contexts. */
-extern struct conn_ctx conn_ctx_stack[MAX_SEC_CTX_DEPTH];
-extern int conn_ctx_stack_ndx;
+extern __thread struct conn_ctx conn_ctx_stack[MAX_SEC_CTX_DEPTH];
+extern __thread int conn_ctx_stack_ndx;
 
 struct vfs_init_function_entry;
 extern struct vfs_init_function_entry *backends;
@@ -255,6 +260,26 @@ NTSTATUS smbd_smb2_send_lease_break(struct smbXsrv_client *client,
 NTSTATUS smbd_smb2_request_pending_queue(struct smbd_smb2_request *req,
 					 struct tevent_req *subreq,
 					 uint32_t defer_time);
+
+bool smbd_smb2_ros_delegable(struct smbd_smb2_request *req);
+NTSTATUS smbd_smb2_ros_delegate(struct smbd_smb2_request *req,
+				struct files_struct *fsp,
+				uint16_t opcode,
+				uint64_t offset,
+				uint32_t count,
+				uint32_t minimum,
+				const uint8_t *data);
+bool smbd_vfs_plain_rw(struct connection_struct *conn);
+bool smbd_vfs_plain_fsync(struct connection_struct *conn);
+bool smbd_smb2_ros_file_busy(struct files_struct *fsp);
+bool smbd_smb2_ros_file_block(struct files_struct *fsp,
+			      struct tevent_context *ev,
+			      struct tevent_queue *queue);
+void smbd_smb2_ros_file_close(struct files_struct *fsp);
+void smbd_smb2_ros_keys_drop(struct smbXsrv_client *client,
+			     uint64_t session_id);
+void smbd_smb2_ros_wait_begin(struct smbd_server_connection *sconn);
+void smbd_smb2_ros_wait_end(struct smbd_server_connection *sconn);
 
 struct smb_request *smbd_smb2_fake_smb_request(struct smbd_smb2_request *req,
 					       struct files_struct *fsp);
@@ -451,6 +476,26 @@ struct smbXsrv_connection {
 		struct smbd_smb2_send_queue *send_queue;
 		size_t send_queue_len;
 
+		/*
+		 * TrueNAS: a multichannel negprot can pass the
+		 * socket to another process. A reactor does not adopt the
+		 * socket while the negprot is pending.
+		 */
+		bool negprot_mc_pending;
+
+		/*
+		 * TrueNAS: a truenas_ros reactor reads and sends
+		 * for this channel.
+		 */
+		struct {
+			bool enabled;
+			struct tn_smbros_conn *conn;
+			/* The session keys that the reactor has. */
+			struct smbd_smb2_ros_keys *keys;
+			/* The identities that the ring of the reactor has. */
+			struct smbd_smb2_ros_identity *identities;
+		} ros;
+
 		struct {
 			/*
 			 * seq_low is the lowest sequence number
@@ -606,6 +651,25 @@ struct smbd_smb2_send_queue {
 		uint64_t required_acked_bytes;
 	} ack;
 
+	/*
+	 * TrueNAS: if lent is true, a reactor sends from this memory
+	 * until TN_SMBROS_SENT. acked_bytes is xconn->ack.unacked_bytes after
+	 * this entry.
+	 */
+	struct {
+		bool lent;
+		uint64_t acked_bytes;
+		/*
+		 * The connection of a lent entry. NULL after smbd frees the
+		 * owner of the entry.
+		 */
+		struct smbXsrv_connection *xconn;
+		/* The reactor does the file I/O of this reply. */
+		struct smbd_smb2_ros_job *job;
+		/* The reactor signs or encrypts this reply. */
+		struct smbd_smb2_ros_reply_seal *seal;
+	} ros;
+
 	TALLOC_CTX *mem_ctx;
 };
 
@@ -662,6 +726,18 @@ struct smbd_smb2_request {
 	/* fake smb1 request. */
 	struct smb_request *smb1req;
 	struct files_struct *compat_chain_fsp;
+
+	/* TrueNAS: the PDU buffer of a truenas_ros reactor. */
+	struct smbd_smb2_ros_buf *ros_buf;
+	/*
+	 * TrueNAS: TN_SMBSRV_* flags of what the reactor did to the
+	 * PDU. ros_crypto_gen is the generation of the keys that it used.
+	 */
+	uint32_t ros_crypto;
+	uint32_t ros_crypto_status;
+	uint64_t ros_crypto_gen;
+	/* TrueNAS: what the reactor signs or encrypts in the reply. */
+	struct smbd_smb2_ros_reply_seal *ros_seal;
 
 	/* Set while smb2_create opens a lookup or query compound's handle */
 	bool compound_lookup;
@@ -833,6 +909,10 @@ struct smbd_server_connection {
 
 	struct notify_mid_map *notify_mid_maps;
 
+	/* TrueNAS: the event queue of the smbros reactors. */
+	struct tn_smbros_ctx *ros_ctx;
+	/* Owns ros_ctx, its fd event and the key copies of the reactors. */
+	struct smbd_smb2_ros_owner *ros_owner;
 	struct pthreadpool_tevent *pool;
 
 	struct smbXsrv_client *client;

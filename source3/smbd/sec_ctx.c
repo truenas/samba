@@ -26,7 +26,7 @@
 #include "smbprofile.h"
 #include "../lib/util/setid.h"
 
-extern struct current_user current_user;
+extern __thread struct current_user current_user;
 
 /****************************************************************************
  Are two UNIX tokens equal ?
@@ -485,6 +485,37 @@ void init_sec_ctx(void)
 	current_user.conn = NULL;
 	current_user.vuid = UID_FIELD_INVALID;
 	current_user.nt_user_token = NULL;
+}
+
+/*
+ * TrueNAS: an ending thread calls this to free the group lists of
+ * its security contexts. It moves their tokens to "tokens" and returns the
+ * count. "tokens" has room for MAX_SEC_CTX_DEPTH + 1. A thread that can
+ * use talloc frees the tokens later.
+ */
+size_t sec_ctx_thread_end(struct security_token **tokens)
+{
+	size_t num = 0;
+	int i;
+
+	for (i = 0; i <= MAX_SEC_CTX_DEPTH; i++) {
+		struct sec_ctx *ctx_p = &sec_ctx_stack[i];
+
+		SAFE_FREE(ctx_p->ut.groups);
+		ctx_p->ut.ngroups = 0;
+		if (ctx_p->token != NULL) {
+			tokens[num] = ctx_p->token;
+			num += 1;
+			ctx_p->token = NULL;
+		}
+	}
+	sec_ctx_stack_ndx = 0;
+
+	current_user.ut.ngroups = 0;
+	current_user.ut.groups = NULL;
+	current_user.nt_user_token = NULL;
+
+	return num;
 }
 
 /*************************************************************

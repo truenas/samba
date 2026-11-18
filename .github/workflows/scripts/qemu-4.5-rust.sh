@@ -36,8 +36,8 @@ cargo clippy --locked --all-targets -- -D warnings
 echo "=========================================="
 echo "truenas_rust: tests"
 echo "=========================================="
-# The test header_is_current compares the C header of the client with the
-# output of cbindgen.
+# The header_is_current tests compare the C headers of smbhad/client,
+# mit/smbros and gpl/smb-server with the output of cbindgen.
 cargo install --locked cbindgen --version 0.29.4
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 # Each HA test starts daemons with io_uring rings, which take locked

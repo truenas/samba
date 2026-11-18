@@ -184,7 +184,7 @@ mod tests {
             unique_id: 7,
         };
         assert_eq!(s.forget_owner(ten, &[]), vec![1]);
-        assert!(s.forget_owner(Owner::DISCONNECTED, &[]).is_empty());
+        assert_eq!(s.forget_owner(Owner::DISCONNECTED, &[]), Vec::<u64>::new());
         assert_eq!(s.len(), 3);
         assert_eq!(s.bytes(), 3 * charge(&record(2, 20, b"x")));
     }

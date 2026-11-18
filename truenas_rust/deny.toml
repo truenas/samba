@@ -1,0 +1,47 @@
+# This file sets the cargo-deny rules for the crates of this workspace.
+# .github/workflows/rust-deps.yml runs cargo-deny in CI. Run it locally
+# with this command.
+#   cargo deny --manifest-path truenas_rust/Cargo.toml check
+
+[graph]
+all-features = true
+
+# The check fails for a crate with a RustSec vulnerability advisory. It
+# also fails for an unsound, unmaintained or yanked crate. Each entry of
+# ignore needs the advisory id and a reason.
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+# The check allows crates only from crates.io and the two TrueNAS git
+# repositories.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    "https://github.com/truenas/truenas_ros",
+    "https://github.com/truenas/truenas_ros_utils",
+]
+
+# The check warns about two versions of one crate. It fails for a
+# dependency without a version. A path dependency between the crates of
+# this workspace needs no version.
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+# A dependency can have only these licenses. The crates of this workspace
+# are not published. cargo-deny does not check their licenses.
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+]
+
+[licenses.private]
+ignore = true

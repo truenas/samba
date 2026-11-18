@@ -1,0 +1,15 @@
+[package]
+name = "truenas_smbros"
+description = "Reactors of truenas_ros as the socket layer of an SMB server, one thread and ring per channel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+publish.workspace = true
+
+[dependencies]
+truenas_ros = { workspace = true, features = ["net-server", "uring-fs"] }
+libc.workspace = true
+
+[lints]
+workspace = true

@@ -703,8 +703,36 @@ static void debug_backends_log(const char *msg, size_t msg_len, int msg_level)
 	state.hs_len = 0;
 }
 
+/*
+ * TrueNAS: the state in this file is not thread safe. A quiet
+ * thread logs nothing. smbd makes its truenas_ros reactor threads quiet.
+ * debuglevel_get_class() reads the per-thread flag only after any thread
+ * became quiet.
+ */
+static bool debug_threads_quiet;
+static __thread bool debug_thread_quiet;
+
+bool debug_thread_set_quiet(bool quiet)
+{
+	bool was = debug_thread_quiet;
+
+	if (quiet &&
+	    !__atomic_load_n(&debug_threads_quiet, __ATOMIC_RELAXED))
+	{
+		__atomic_store_n(&debug_threads_quiet, true, __ATOMIC_RELAXED);
+	}
+	debug_thread_quiet = quiet;
+	return was;
+}
+
 int debuglevel_get_class(size_t idx)
 {
+	if (unlikely(__atomic_load_n(&debug_threads_quiet,
+				     __ATOMIC_RELAXED)) &&
+	    debug_thread_quiet)
+	{
+		return -1;
+	}
 	return dbgc_config[idx].loglevel;
 }
 

@@ -8,7 +8,9 @@ name: Nightly tests
 # OpenZFS debs were built against a kernel the linux nightly has moved past).
 # Scheduled workflows only fire from the default branch, so this inherently
 # exercises truenas/v4-24-stable.  The pipeline itself is the reusable
-# qemu-build-test.yml workflow, invoked via workflow_call.
+# qemu-build-test.yml workflow, invoked via workflow_call.  The nightly run
+# also runs rust-deps.yml.  It finds new RustSec advisories for crates that
+# did not change.
 on:
   schedule:
     - cron: '41 5 * * *'  # 05:41 UTC daily, offset off :00 to dodge scheduler backlog
@@ -20,3 +22,6 @@ permissions:
 jobs:
   test:
     uses: ./.github/workflows/qemu-build-test.yml
+
+  rust-deps:
+    uses: ./.github/workflows/rust-deps.yml

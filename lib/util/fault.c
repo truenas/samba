@@ -175,6 +175,12 @@ _PUBLIC_ void smb_panic_log(const char *why)
 	const char *short_title = process_get_short_title();
 	const char *long_title = process_get_long_title();
 
+	/*
+	 * TrueNAS: smbd makes its truenas_ros reactor threads quiet.
+	 * A panic on such a thread logs anyway.
+	 */
+	debug_thread_set_quiet(false);
+
 	DEBUGSEP(0);
 	DEBUG(0,("INTERNAL ERROR: %s in %s (%s) (%s) pid %lld (%s)\n",
 		 why,

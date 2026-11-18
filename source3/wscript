@@ -1894,6 +1894,9 @@ int main(void) {
         conf.fatal('libtruenas_smbhad_client.a not found: '
                    'run truenas_rust/build.sh')
     conf.ADD_EXTRA_INCLUDES('#truenas_rust/smbhad/client/include')
+    # smbros and smb-server are in the same static library.
+    conf.ADD_EXTRA_INCLUDES('#truenas_rust/mit/smbros/include')
+    conf.ADD_EXTRA_INCLUDES('#truenas_rust/gpl/smb-server/include')
     conf.env.STLIBPATH_TRUENAS_SMBHAD_CLIENT = [smbhad_lib]
     conf.env.STLIB_TRUENAS_SMBHAD_CLIENT = ['truenas_smbhad_client']
     conf.env.LIB_TRUENAS_SMBHAD_CLIENT = ['gcc_s', 'util', 'rt', 'pthread',
