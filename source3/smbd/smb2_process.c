@@ -1799,8 +1799,10 @@ static void smbd_tevent_trace_callback(enum tevent_trace_point point,
 
 	switch (point) {
 	case TEVENT_TRACE_BEFORE_WAIT:
+		smbd_smb2_ros_wait_begin(state->sconn);
 		break;
 	case TEVENT_TRACE_AFTER_WAIT:
+		smbd_smb2_ros_wait_end(state->sconn);
 		mdcache_bump_epoch(state->sconn);
 		break;
 	case TEVENT_TRACE_BEFORE_LOOP_ONCE:
@@ -1823,8 +1825,10 @@ static void smbd_tevent_trace_callback_debug(enum tevent_trace_point point,
 	switch (point) {
 	case TEVENT_TRACE_BEFORE_WAIT:
 		smbd_tevent_trace_callback_before_wait(state);
+		smbd_smb2_ros_wait_begin(state->sconn);
 		break;
 	case TEVENT_TRACE_AFTER_WAIT:
+		smbd_smb2_ros_wait_end(state->sconn);
 		smbd_tevent_trace_callback_after_wait(state);
 		mdcache_bump_epoch(state->sconn);
 		break;
@@ -1858,8 +1862,10 @@ static void smbd_tevent_trace_callback_profile(enum tevent_trace_point point,
 			smbprofile_dump_setup(NULL, NULL);
 		}
 		SMBPROFILE_BASIC_ASYNC_START(idle, profile_p, state->profile_idle);
+		smbd_smb2_ros_wait_begin(state->sconn);
 		break;
 	case TEVENT_TRACE_AFTER_WAIT:
+		smbd_smb2_ros_wait_end(state->sconn);
 		smbd_tevent_trace_callback_after_wait(state);
 		mdcache_bump_epoch(state->sconn);
 		SMBPROFILE_BASIC_ASYNC_END(state->profile_idle);

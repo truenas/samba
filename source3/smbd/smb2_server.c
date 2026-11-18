@@ -52,6 +52,7 @@
 #include "lib/crypto/gnutls_helpers.h"
 #include <gnutls/gnutls.h>
 #include <gnutls/crypto.h>
+#include "smbd/smb2_server_ros.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_SMB2
@@ -327,6 +328,18 @@ static NTSTATUS smbd_initialize_smb2(struct smbXsrv_connection *xconn,
 	tevent_fd_set_auto_close(xconn->transport.fde);
 
 	/*
+	 * TrueNAS: a truenas_ros reactor does the socket I/O of the channel.
+	 * It also does the file I/O of READ, WRITE and FLUSH after smbd
+	 * checks the request. This is the default.
+	 * "truenas:ros transport = no" turns the reactors off. Then smbd does
+	 * all of the I/O, as Samba does.
+	 */
+	xconn->smb2.ros.enabled = lp_parm_bool(GLOBAL_SECTION_SNUM,
+					       "truenas",
+					       "ros transport",
+					       true);
+
+	/*
 	 * Ensure child is set to non-blocking mode,
 	 * unless the system supports MSG_DONTWAIT,
 	 * if MSG_DONTWAIT is available we should force
@@ -376,8 +389,23 @@ static bool smb2_setup_nbt_length(struct iovec *vector, int count)
 
 static int smbd_smb2_request_destructor(struct smbd_smb2_request *req)
 {
+	struct smbd_smb2_send_queue *e = &req->queue_entry;
+
 	TALLOC_FREE(req->first_enc_key);
 	TALLOC_FREE(req->last_sign_key);
+
+	if (e->ros.lent) {
+		/*
+		 * TrueNAS: a reactor can still send from this memory.
+		 * Keep it apart from the connection until TN_SMBROS_SENT. Only
+		 * replies are large enough to lend.
+		 */
+		if (e->ros.xconn != NULL) {
+			talloc_steal(NULL, e->mem_ctx);
+			e->ros.xconn = NULL;
+		}
+		return -1;
+	}
 	return 0;
 }
 
@@ -387,7 +415,7 @@ void smb2_request_set_async_internal(struct smbd_smb2_request *req,
 	req->async_internal = async_internal;
 }
 
-static struct smbd_smb2_request *smbd_smb2_request_allocate(struct smbXsrv_connection *xconn)
+struct smbd_smb2_request *smbd_smb2_request_allocate(struct smbXsrv_connection *xconn)
 {
 	TALLOC_CTX *mem_pool;
 	struct smbd_smb2_request *req;
@@ -423,13 +451,13 @@ static struct smbd_smb2_request *smbd_smb2_request_allocate(struct smbXsrv_conne
 	return req;
 }
 
-static NTSTATUS smbd_smb2_inbuf_parse_compound(struct smbXsrv_connection *xconn,
-					       NTTIME now,
-					       uint8_t *buf,
-					       size_t buflen,
-					       struct smbd_smb2_request *req,
-					       struct iovec **piov,
-					       int *pnum_iov)
+NTSTATUS smbd_smb2_inbuf_parse_compound(struct smbXsrv_connection *xconn,
+					NTTIME now,
+					uint8_t *buf,
+					size_t buflen,
+					struct smbd_smb2_request *req,
+					struct iovec **piov,
+					int *pnum_iov)
 {
 	TALLOC_CTX *mem_ctx = req;
 	struct iovec *iov;
@@ -546,8 +574,19 @@ static NTSTATUS smbd_smb2_inbuf_parse_compound(struct smbXsrv_connection *xconn,
 			tf_iov[1].iov_base = (void *)hdr;
 			tf_iov[1].iov_len = enc_len;
 
-			status = smb2_signing_decrypt_pdu(s->global->decryption_key,
-							  tf_iov, 2);
+			if (req->ros_crypto &
+			    (TN_SMBSRV_DECRYPTED | TN_SMBSRV_DECRYPT_FAILED))
+			{
+				/*
+				 * The truenas_ros reactor did the decryption.
+				 * This message is the whole PDU.
+				 */
+				status = smbd_smb2_ros_decrypted(req, s);
+				req->ros_crypto = 0;
+			} else {
+				status = smb2_signing_decrypt_pdu(
+					s->global->decryption_key, tf_iov, 2);
+			}
 			if (!NT_STATUS_IS_OK(status)) {
 				TALLOC_FREE(iov_alloc);
 				return status;
@@ -886,7 +925,7 @@ static bool smb2_validate_message_id(struct smbXsrv_connection *xconn,
 	return true;
 }
 
-static NTSTATUS smbd_smb2_request_validate(struct smbd_smb2_request *req)
+NTSTATUS smbd_smb2_request_validate(struct smbd_smb2_request *req)
 {
 	int count;
 	int idx;
@@ -1107,7 +1146,7 @@ DATA_BLOB smbd_smb2_generate_outbody(struct smbd_smb2_request *req, size_t size)
 	return data_blob_talloc(req, NULL, size);
 }
 
-static NTSTATUS smbd_smb2_request_setup_out(struct smbd_smb2_request *req)
+NTSTATUS smbd_smb2_request_setup_out(struct smbd_smb2_request *req)
 {
 	struct smbXsrv_connection *xconn = req->xconn;
 	TALLOC_CTX *mem_ctx;
@@ -1568,6 +1607,11 @@ void smbXsrv_connection_disconnect_transport(struct smbXsrv_connection *xconn,
 	}
 
 	xconn->transport.status = status;
+	if (xconn->smb2.ros.conn != NULL) {
+		/* This stops the reactor and drops its queued events. */
+		tn_smbros_close(xconn->smb2.ros.conn);
+		xconn->smb2.ros.conn = NULL;
+	}
 	TALLOC_FREE(xconn->transport.fde);
 	if (xconn->transport.sock != -1) {
 		xconn->transport.sock = -1;
@@ -1767,6 +1811,10 @@ void smbd_server_connection_terminate_ex(struct smbXsrv_connection *xconn,
 	struct smbXsrv_client *client = xconn->client;
 	struct tevent_req *subreq = NULL;
 	size_t num_ok = 0;
+
+	if (smbd_smb2_ros_inline_defer_terminate(xconn, reason, location)) {
+		return;
+	}
 
 	state = talloc_zero(xconn, struct smbd_server_connection_terminate_state);
 	if (state == NULL) {
@@ -2000,7 +2048,7 @@ static struct smbd_smb2_request *dup_smb2_req(const struct smbd_smb2_request *re
 	return newreq;
 }
 
-static NTSTATUS smb2_send_async_interim_response(const struct smbd_smb2_request *req)
+static NTSTATUS smb2_send_async_interim_response(struct smbd_smb2_request *req)
 {
 	struct smbXsrv_connection *xconn = req->xconn;
 	int first_idx = 1;
@@ -2048,10 +2096,21 @@ static NTSTATUS smb2_send_async_interim_response(const struct smbd_smb2_request 
 	}
 
 	/*
+	 * TrueNAS: nreq sends the finished replies. So ros_seal
+	 * moves from req to nreq. The message indexes in nreq are the same.
+	 */
+	nreq->ros_seal = talloc_steal(nreq, req->ros_seal);
+	req->ros_seal = NULL;
+
+	/*
 	 * As we have changed the header (SMB2_HDR_NEXT_COMMAND),
 	 * we need to sign/encrypt here with the last/first key we remembered
 	 */
-	if (firsttf->iov_len == SMB2_TF_HDR_SIZE) {
+	if (firsttf->iov_len == SMB2_TF_HDR_SIZE &&
+	    smbd_smb2_ros_reply_encrypted(nreq))
+	{
+		/* TrueNAS: the truenas_ros reactor encrypts it. */
+	} else if (firsttf->iov_len == SMB2_TF_HDR_SIZE) {
 		status = smb2_signing_encrypt_pdu(req->first_enc_key,
 					firsttf,
 					nreq->out.vector_count - first_idx);
@@ -2065,6 +2124,10 @@ static NTSTATUS smb2_send_async_interim_response(const struct smbd_smb2_request 
 		if (!NT_STATUS_IS_OK(status)) {
 			return status;
 		}
+	}
+
+	if (smbd_smb2_ros_reply_sealed(nreq)) {
+		nreq->queue_entry.ros.seal = nreq->ros_seal;
 	}
 
 	nreq->queue_entry.mem_ctx = nreq;
@@ -2111,6 +2174,12 @@ NTSTATUS smbd_smb2_request_pending_queue(struct smbd_smb2_request *req,
 		tevent_req_notify_callback(subreq);
 		return NT_STATUS_OK;
 	}
+
+	/*
+	 * TrueNAS: the reactor gets no job for a request that waits.
+	 * So the reactor can read more PDUs.
+	 */
+	smbd_smb2_ros_release(req);
 
 	req->subreq = subreq;
 	subreq = NULL;
@@ -2233,7 +2302,6 @@ NTSTATUS smbd_smb2_request_pending_queue(struct smbd_smb2_request *req,
 	return NT_STATUS_OK;
 }
 
-static
 struct smb2_signing_key *smbd_smb2_signing_key(struct smbXsrv_session *session,
 					       struct smbXsrv_connection *xconn,
 					       bool *_has_channel)
@@ -2457,6 +2525,14 @@ static void smbd_smb2_request_pending_timer(struct tevent_context *ev,
 	}
 
 	if (req->do_encryption) {
+		/* TrueNAS: the reactor encrypts it if it can. */
+		state->queue_entry.ros.seal = smbd_smb2_ros_seal_encrypt(
+			state,
+			xconn,
+			req->session,
+			SVAL(outhdr, SMB2_HDR_OPCODE));
+	}
+	if (req->do_encryption && state->queue_entry.ros.seal == NULL) {
 		struct smbXsrv_session *x = req->session;
 		struct smb2_signing_key *encryption_key = x->global->encryption_key;
 
@@ -2987,12 +3063,23 @@ static NTSTATUS smbd_smb2_request_dispatch_update_counts(
 	}
 
 	if (flags & SMB2_HDR_FLAG_REPLAY_OPERATION) {
-		if (cmp == 0 && op->pre_request_count == 0) {
+		/*
+		 * TrueNAS: a delegated job is outstanding until the
+		 * reactor ends its file I/O. Its reply decrements the count of
+		 * the open before that. smbd_smb2_ros_file_seq_old() counts
+		 * the job on its file instead.
+		 */
+		bool pre_none = (op->pre_request_count == 0 &&
+				 smbd_smb2_ros_file_seq_old(
+					 req->compat_chain_fsp) == 0);
+
+		if (cmp == 0 && pre_none) {
 			op->request_count += 1;
 			req->request_counters_updated = true;
-		} else if (cmp > 0 && op->pre_request_count == 0) {
+		} else if (cmp > 0 && pre_none) {
 			op->pre_request_count += op->request_count;
 			op->request_count = 1;
+			smbd_smb2_ros_file_seq_bump(req->compat_chain_fsp);
 			op->global->channel_sequence = channel_sequence;
 			op->global->channel_generation += generation_wrap;
 			update_open = true;
@@ -3007,6 +3094,7 @@ static NTSTATUS smbd_smb2_request_dispatch_update_counts(
 		} else if (cmp > 0) {
 			op->pre_request_count += op->request_count;
 			op->request_count = 1;
+			smbd_smb2_ros_file_seq_bump(req->compat_chain_fsp);
 			op->global->channel_sequence = channel_sequence;
 			op->global->channel_generation += generation_wrap;
 			update_open = true;
@@ -3220,9 +3308,15 @@ NTSTATUS smbd_smb2_request_dispatch(struct smbd_smb2_request *req)
 			req->do_signing = true;
 		}
 
-		status = smb2_signing_check_pdu(signing_key,
-						SMBD_SMB2_IN_HDR_IOV(req),
-						SMBD_SMB2_NUM_IOV_PER_REQ - 1);
+		if (smbd_smb2_ros_signed_ok(req, x, signing_key)) {
+			/* The truenas_ros reactor checked the signature. */
+			status = NT_STATUS_OK;
+		} else {
+			status = smb2_signing_check_pdu(
+				signing_key,
+				SMBD_SMB2_IN_HDR_IOV(req),
+				SMBD_SMB2_NUM_IOV_PER_REQ - 1);
+		}
 		if (NT_STATUS_EQUAL(status, NT_STATUS_ACCESS_DENIED) &&
 		    opcode == SMB2_OP_SESSSETUP && !has_channel &&
 		    NT_STATUS_IS_OK(session_status))
@@ -3315,6 +3409,19 @@ NTSTATUS smbd_smb2_request_dispatch(struct smbd_smb2_request *req)
 	}
 
 skipped_signing:
+
+	/*
+	 * TrueNAS: the truenas_ros reactor of the channel gets the
+	 * keys of the session. It decrypts or checks the next PDUs with them.
+	 */
+	if (xconn->smb2.ros.conn != NULL &&
+	    x != NULL &&
+	    opcode != SMB2_OP_SESSSETUP &&
+	    NT_STATUS_IS_OK(session_status) &&
+	    (req->was_encrypted || req->do_signing))
+	{
+		smbd_smb2_ros_keys_sync(xconn, x);
+	}
 
 	if (flags & SMB2_HDR_FLAG_CHAINED) {
 		if (!NT_STATUS_IS_OK(req->compound_create_err)) {
@@ -3444,9 +3551,19 @@ skipped_signing:
 		}
 	}
 
-	status = smbd_smb2_request_dispatch_update_counts(req, call->modify);
-	if (!NT_STATUS_IS_OK(status)) {
-		return smbd_smb2_request_error(req, status);
+	/*
+	 * MS-SMB2 3.3.5.2.10 applies only to a request with a FileId. For a
+	 * related request without one, compat_chain_fsp is the open of the
+	 * request before it. A CREATE replaces that with its new open.
+	 * Without this check, the CREATE reply decrements a count that the
+	 * new open never had.
+	 */
+	if (call->fileid_ofs != 0) {
+		status = smbd_smb2_request_dispatch_update_counts(req,
+								  call->modify);
+		if (!NT_STATUS_IS_OK(status)) {
+			return smbd_smb2_request_error(req, status);
+		}
 	}
 
 	if (call->as_root) {
@@ -3693,9 +3810,12 @@ static void smbd_smb2_request_reply_update_counts(struct smbd_smb2_request *req)
 	    (op->global->channel_generation == req->channel_generation)) {
 		SMB_ASSERT(op->request_count > 0);
 		op->request_count -= 1;
+		/* TrueNAS: a job still counts until its I/O ends. */
+		smbd_smb2_ros_job_keeps_count(req, true);
 	} else {
 		SMB_ASSERT(op->pre_request_count > 0);
 		op->pre_request_count -= 1;
+		smbd_smb2_ros_job_keeps_count(req, false);
 	}
 }
 
@@ -3799,6 +3919,9 @@ static NTSTATUS smbd_smb2_request_reply(struct smbd_smb2_request *req)
 
 		firsttf->iov_base = (void *)tf;
 		firsttf->iov_len = SMB2_TF_HDR_SIZE;
+
+		/* TrueNAS: the reactor encrypts it if it can. */
+		smbd_smb2_ros_reply_encrypt(req);
 	}
 
 	if ((req->current_idx > SMBD_SMB2_NUM_IOV_PER_REQ) &&
@@ -3845,7 +3968,15 @@ static NTSTATUS smbd_smb2_request_reply(struct smbd_smb2_request *req)
 			return NT_STATUS_NO_MEMORY;
 		}
 
-		if (req->do_signing && firsttf->iov_len == 0) {
+		if (req->do_signing && firsttf->iov_len == 0 &&
+		    smbd_smb2_ros_reply_sign(
+			    req, req->current_idx - SMBD_SMB2_NUM_IOV_PER_REQ))
+		{
+			/*
+			 * TrueNAS: the truenas_ros reactor signs it
+			 * when the reply is complete.
+			 */
+		} else if (req->do_signing && firsttf->iov_len == 0) {
 			struct smbXsrv_session *x = req->session;
 			struct smb2_signing_key *signing_key =
 				smbd_smb2_signing_key(x, xconn, NULL);
@@ -3869,6 +4000,11 @@ static NTSTATUS smbd_smb2_request_reply(struct smbd_smb2_request *req)
 		 * So we use req->xconn->client->raw_ev_ctx instead
 		 * of req->ev_ctx here.
 		 */
+		if (smbd_smb2_ros_inline_take_next(req)) {
+			/* The reactor that runs the PDU dispatches it next. */
+			TALLOC_FREE(im);
+			return NT_STATUS_OK;
+		}
 		tevent_schedule_immediate(im,
 					req->xconn->client->raw_ev_ctx,
 					smbd_smb2_request_dispatch_immediate,
@@ -3894,13 +4030,28 @@ static NTSTATUS smbd_smb2_request_reply(struct smbd_smb2_request *req)
 	/*
 	 * now check if we need to sign the current response
 	 */
-	if (firsttf->iov_len == SMB2_TF_HDR_SIZE) {
+	if (smbd_smb2_ros_job_seals(req)) {
+		/*
+		 * TrueNAS: the truenas_ros reactor signs or encrypts
+		 * the reply after the file I/O of its job. The transform
+		 * header has the nonce.
+		 */
+	} else if (firsttf->iov_len == SMB2_TF_HDR_SIZE &&
+		   smbd_smb2_ros_reply_encrypted(req))
+	{
+		/* TrueNAS: the reactor encrypts the reply. */
+	} else if (firsttf->iov_len == SMB2_TF_HDR_SIZE) {
 		status = smb2_signing_encrypt_pdu(req->first_enc_key,
 					firsttf,
 					req->out.vector_count - first_idx);
 		if (!NT_STATUS_IS_OK(status)) {
 			return status;
 		}
+	} else if (req->do_signing &&
+		   smbd_smb2_ros_reply_sign(
+			   req, req->current_idx - SMBD_SMB2_NUM_IOV_PER_REQ))
+	{
+		/* TrueNAS: the reactor signs the reply. */
 	} else if (req->do_signing) {
 		struct smbXsrv_session *x = req->session;
 		struct smb2_signing_key *signing_key =
@@ -3914,6 +4065,9 @@ static NTSTATUS smbd_smb2_request_reply(struct smbd_smb2_request *req)
 		}
 	}
 	TALLOC_FREE(req->first_enc_key);
+	if (smbd_smb2_ros_reply_sealed(req)) {
+		req->queue_entry.ros.seal = req->ros_seal;
+	}
 
 	if (req->preauth != NULL) {
 		gnutls_hash_hd_t hash_hnd = NULL;
@@ -3991,8 +4145,6 @@ static NTSTATUS smbd_smb2_request_reply(struct smbd_smb2_request *req)
 
 	return NT_STATUS_OK;
 }
-
-static NTSTATUS smbd_smb2_request_next_incoming(struct smbXsrv_connection *xconn);
 
 void smbd_smb2_request_dispatch_immediate(struct tevent_context *ctx,
 					struct tevent_immediate *im,
@@ -4719,7 +4871,7 @@ static bool is_smb2_recvfile_write(struct smbd_smb2_request_read_state *state)
 	return true;
 }
 
-static NTSTATUS smbd_smb2_request_next_incoming(struct smbXsrv_connection *xconn)
+NTSTATUS smbd_smb2_request_next_incoming(struct smbXsrv_connection *xconn)
 {
 	struct smbd_smb2_request_read_state *state = &xconn->smb2.request_read_state;
 	struct smbd_smb2_request *req = NULL;
@@ -4739,6 +4891,30 @@ static NTSTATUS smbd_smb2_request_next_incoming(struct smbXsrv_connection *xconn
 		 * pending, we are done.
 		 */
 		return NT_STATUS_OK;
+	}
+
+	if (xconn->smb2.ros.conn != NULL) {
+		/* The reactor reads the socket. */
+		return NT_STATUS_OK;
+	}
+
+	/*
+	 * The reactor adopts the socket only between PDUs, when the send
+	 * queue is empty. It does not adopt it while a multichannel negprot
+	 * can pass the socket to another process.
+	 */
+	if (smbd_smb2_ros_wanted(xconn) &&
+	    !xconn->smb2.negprot_mc_pending &&
+	    xconn->smb2.send_queue == NULL)
+	{
+		NTSTATUS status = smbd_smb2_ros_adopt(xconn);
+		if (NT_STATUS_IS_OK(status)) {
+			return NT_STATUS_OK;
+		}
+		DBG_WARNING("conn[%s] keeps its own socket I/O: %s\n",
+			    smbXsrv_connection_dbg(xconn),
+			    nt_errstr(status));
+		xconn->smb2.ros.enabled = false;
 	}
 
 	max_send_queue_len = MAX(1, xconn->smb2.credits.max/16);
@@ -5063,9 +5239,69 @@ static NTSTATUS smbd_smb2_flush_with_sendmsg(struct smbXsrv_connection *xconn)
 	return NT_STATUS_MORE_PROCESSING_REQUIRED;
 }
 
+static NTSTATUS smbd_smb2_flush_with_ros(struct smbXsrv_connection *xconn)
+{
+	struct smbd_smb2_send_queue *e = NULL;
+	struct smbd_smb2_send_queue *next = NULL;
+
+	for (e = xconn->smb2.send_queue; e != NULL; e = next) {
+		ssize_t n;
+		bool lent = false;
+		int ret;
+		NTSTATUS status;
+
+		next = e->next;
+
+		if (e->ros.lent) {
+			/* The reactor sends from e until TN_SMBROS_SENT. */
+			continue;
+		}
+
+		SMB_ASSERT(e->sendfile_header == NULL);
+
+		n = iov_buflen(e->vector, e->count);
+		if (n < 0) {
+			return NT_STATUS_INTERNAL_ERROR;
+		}
+
+		ret = smbd_smb2_ros_send(xconn, e, &lent);
+		if (ret != 0) {
+			status = map_nt_error_from_unix_common(ret);
+			smbXsrv_connection_disconnect_transport(xconn, status);
+			return status;
+		}
+
+		if (lent) {
+			xconn->ack.unacked_bytes += n;
+			e->ros.lent = true;
+			e->ros.xconn = xconn;
+			e->ros.acked_bytes = xconn->ack.unacked_bytes;
+			continue;
+		}
+
+		status = smbd_smb2_advance_send_queue(xconn, &e, n);
+		if (!NT_STATUS_IS_OK(status)) {
+			smbXsrv_connection_disconnect_transport(xconn, status);
+			return status;
+		}
+	}
+
+	return NT_STATUS_OK;
+}
+
 static NTSTATUS smbd_smb2_flush_send_queue(struct smbXsrv_connection *xconn)
 {
 	NTSTATUS status;
+
+	/*
+	 * The reactor sends while the transport works. For a failed
+	 * transport, smbd_smb2_flush_with_sendmsg() drops the queue.
+	 */
+	if (xconn->smb2.ros.conn != NULL &&
+	    NT_STATUS_IS_OK(xconn->transport.status))
+	{
+		return smbd_smb2_flush_with_ros(xconn);
+	}
 
 	status = smbd_smb2_flush_with_sendmsg(xconn);
 	if (!NT_STATUS_EQUAL(status, NT_STATUS_MORE_PROCESSING_REQUIRED)) {

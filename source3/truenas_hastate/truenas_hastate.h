@@ -17,6 +17,7 @@ NTSTATUS truenas_hastate_open(struct files_struct *fsp,
 			      bool reconnect);
 void truenas_hastate_disconnect(struct files_struct *fsp);
 void truenas_hastate_close(struct files_struct *fsp);
+bool truenas_hastate_enabled(void);
 NTSTATUS truenas_hastate_dirty(struct files_struct *fsp);
 void truenas_hastate_flushed(struct files_struct *fsp);
 void truenas_hastate_update(struct files_struct *fsp);

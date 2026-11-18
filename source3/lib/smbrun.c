@@ -21,7 +21,7 @@
 #include "system/filesys.h"
 
 /* need to move this from here!! need some sleep ... */
-struct current_user current_user;
+__thread struct current_user current_user;
 
 /****************************************************************************
 This is a utility function of smbrun().

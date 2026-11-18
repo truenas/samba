@@ -26,6 +26,9 @@
 #   * ACL<->Security-Descriptor mapping via ixnas on an NFSv4-ACL dataset
 #   * the smbd metadata cache filling, idling out and refilling
 #     (truenas.mdcache)
+#   * the MS-FSA tests ported from the Microsoft File Server suite
+#     (truenas.msfsa), signed and encrypted, on a share with the
+#     settings that middleware writes for the default purpose
 #   * a curated set of upstream smb2.* protocol regression suites against a
 #     case-sensitive vanilla share
 #   * the vfs_io_uring read/write path, which is linked against the pinned
@@ -155,6 +158,10 @@ for ds in audit auditref; do
   chmod 0777 "/tank/$ds"
 done
 mkdir -m 0777 /tank/audit/ignored /tank/audit/watched /tank/audit/syslog
+# Create the dataset of truenas.msfsa as TrueNAS creates one for SMB.
+zfs create -o acltype=nfsv4 -o aclmode=passthrough -o aclinherit=passthrough \
+           -o casesensitivity=insensitive -o atime=off tank/msfsa
+chmod 0777 /tank/msfsa
 echo "Dataset:"; zfs get casesensitivity tank/share
 
 echo "=========================================="
@@ -347,6 +354,18 @@ cat > /etc/smb4.conf <<CONF
     nfs4:mode = simple
     nfs4:acedup = merge
 
+[zmsfsa]
+    # The MS-FSA tests of the Microsoft File Server suite (truenas.msfsa)
+    # use the settings that middleware writes for the default purpose.
+    path = /tank/msfsa
+    read only = no
+    vfs objects = truenas_streams_xattr shadow_copy_zfs ixnas zfs_core io_uring
+    smbd max xattr size = 2097152
+    ea support = no
+    posix locking = no
+    smb3 unix extensions = no
+    nfs4:mode = simple
+    nfs4:acedup = merge
 [zfruit]
     # Stream-backed metadata and resource forks, in middleware's object
     # order, for truenas.fruit.
@@ -862,6 +881,19 @@ if tn_torture //127.0.0.1/zworm -U 'smbtest%testpass123' \
 else
   echo "ERROR: truenas.worm suite FAILED"; tail -80 /var/log/samba4/smbd.log; exit 1
 fi
+
+echo "=========================================="
+echo "MS-FSA tests of the Microsoft File Server suite (truenas.msfsa)"
+echo "=========================================="
+# Run the suite signed, then encrypted.
+for opt in clientsigning=required clientsmbencrypt=required; do
+  if tn_torture //127.0.0.1/zmsfsa -U 'smbtest%testpass123' \
+       --option="$opt" truenas.msfsa; then
+    echo "truenas.msfsa suite PASSED ($opt)"
+  else
+    echo "ERROR: truenas.msfsa suite FAILED ($opt)"; tail -80 /var/log/samba4/smbd.log; exit 1
+  fi
+done
 
 echo "=========================================="
 echo "Per-user dataset auto-creation + ACL inheritance (fruit + ixnas stack)"

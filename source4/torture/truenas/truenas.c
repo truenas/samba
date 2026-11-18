@@ -3177,6 +3177,8 @@ NTSTATUS torture_truenas_init(TALLOC_CTX *ctx)
 
 	/* Kerberos session subtests (truenas_session.c) */
 	torture_truenas_session_suite(suite);
+	/* MS-FSA tests of the Microsoft File Server suite (truenas_msfsa.c) */
+	torture_truenas_msfsa_suite(suite);
 
 	suite->description = talloc_strdup(suite,
 		"TrueNAS VFS stack tests (zfs_core, truenas_streams_xattr, "
