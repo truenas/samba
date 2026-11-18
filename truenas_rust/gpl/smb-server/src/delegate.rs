@@ -12,11 +12,14 @@ use std::sync::Arc;
 
 use truenas_ros::net::server::{BodyRecycler, Deferred};
 use truenas_ros::uring_fs::{File, FsConn, Personality, RwFlags};
-use truenas_smbros::{Buf, Conn, Job, PLACE_MIN, errno_of, iov_gather, iov_of};
+use truenas_smbros::{
+    Buf, Conn, ConnState, Job, PLACE_MIN, errno_of, iov_gather, iov_of,
+};
 
 use crate::ConnExt;
 use crate::crypto::{CryptoOps, Keys, Seal, TN_SMBSRV_DECRYPTED};
 use crate::file::Hold;
+use crate::pending::Watch;
 use crate::wire::{
     NT_STATUS_DISK_FULL, NT_STATUS_END_OF_FILE, NT_STATUS_FILE_CLOSED,
     NT_STATUS_UNSUCCESSFUL, SMB2_HDR_MAGIC, SMB2_HDR_NEXT_COMMAND,
@@ -120,13 +123,19 @@ struct Ending {
     seal: Seal,
     crypto: Option<CryptoOps>,
     errmap: Arc<[u32]>,
+    /// The interim response of the job, if it can get one.
+    watch: Option<Watch>,
 }
 
 impl Ending {
     /// Sign or encrypt the reply in `buf` as smbd asked. Then send the
-    /// reply. If the signing or encryption fails, close the connection like
-    /// smbd does.
-    fn send(&self, deferred: Deferred, mut buf: Vec<u8>, pooled: bool) {
+    /// reply. After an interim response, the reply is the final response.
+    /// If the signing or encryption fails, close the connection like smbd
+    /// does.
+    fn send(self, deferred: Deferred, mut buf: Vec<u8>, pooled: bool) {
+        if let Some(w) = self.watch {
+            w.finish(&mut buf, self.seal.hdr());
+        }
         if !self.seal.apply(self.crypto.as_ref(), &mut buf) {
             deferred.close();
         } else if pooled {
@@ -183,6 +192,8 @@ struct Delegated {
     work: Work,
     head: Vec<u8>,
     end: Ending,
+    /// The nonce of an encrypted interim response.
+    nonce: [u8; 16],
 }
 
 // A READ, WRITE or FLUSH job queues its reply before it drops its hold. So
@@ -304,6 +315,7 @@ impl Flush {
 impl Job for Delegated {
     fn run(
         self: Box<Self>,
+        conn: &ConnState,
         fs: &mut FsConn<'_>,
         deferred: Deferred,
         recycler: Option<BodyRecycler>,
@@ -311,8 +323,16 @@ impl Job for Delegated {
         let Delegated {
             work,
             mut head,
-            end,
+            mut end,
+            nonce,
         } = *self;
+        // The wait for an interim response starts before the file I/O. An
+        // error reply goes out at once.
+        if !matches!(work, Work::Fail(_))
+            && let Some(ext) = conn.ext::<ConnExt>()
+        {
+            end.watch = Some(ext.interims.watch(fs, &head, &end.seal, &nonce));
+        }
         match work {
             Work::Read(w) => w.run(fs, deferred, recycler, &head, end),
             Work::Write(w) => w.run(fs, deferred, recycler, head, end),
@@ -343,6 +363,10 @@ pub struct Io {
     minimum: u32,
     /// The offset of the WRITE data in the `data` of the PDU event.
     data_ofs: usize,
+    /// The nonce of an interim response with `TN_SMBSRV_SEAL_ENCRYPT`. It
+    /// goes into the transform header as smbd puts its nonces there.
+    pending_nonce_low: u64,
+    pending_nonce_high: u64,
 }
 
 /// Give the file I/O of the SMB2 READ, WRITE or FLUSH in the PDU of `buf`
@@ -358,6 +382,11 @@ pub struct Io {
 /// header with its nonce after the NBT header. The reactor then encrypts
 /// the reply with the encryption key of `keys`. The reactor closes the
 /// connection if it cannot sign or encrypt the reply.
+///
+/// If the I/O runs longer than 500 microseconds, the reactor sends an
+/// interim response as smbd does. That response has the credits of the
+/// reply and is not signed. It is encrypted with the nonce of `io` like the
+/// reply. The reply then has the async flag and grants no credits.
 ///
 /// In all cases, this function takes ownership of `hold` and `keys`. For a
 /// WRITE, it can move the bytes of the PDU out of `buf`. So the caller must
@@ -452,8 +481,18 @@ pub unsafe extern "C" fn tn_smbsrv_delegate(
         seal,
         crypto: ext.crypto,
         errmap: Arc::clone(&ext.errmap),
+        watch: None,
     };
-    conn.delegate(buf, Box::new(Delegated { work, head, end }))
+    let mut nonce = [0u8; 16];
+    nonce[..8].copy_from_slice(&io.pending_nonce_low.to_le_bytes());
+    nonce[8..].copy_from_slice(&io.pending_nonce_high.to_le_bytes());
+    let job = Delegated {
+        work,
+        head,
+        end,
+        nonce,
+    };
+    conn.delegate(buf, Box::new(job))
 }
 
 #[cfg(test)]

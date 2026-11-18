@@ -7,11 +7,19 @@ use truenas_smbros::NBT_HDR_SIZE;
 
 pub(crate) const SMB2_HDR_MAGIC: [u8; 4] = [0xfe, b'S', b'M', b'B'];
 pub(crate) const SMB2_HDR_SIZE: usize = 64;
+pub(crate) const SMB2_HDR_LENGTH: usize = 4;
 pub(crate) const SMB2_HDR_STATUS: usize = 8;
 pub(crate) const SMB2_HDR_OPCODE: usize = 12;
+pub(crate) const SMB2_HDR_CREDIT: usize = 14;
 pub(crate) const SMB2_HDR_FLAGS: usize = 16;
 pub(crate) const SMB2_HDR_NEXT_COMMAND: usize = 20;
+pub(crate) const SMB2_HDR_MESSAGE_ID: usize = 24;
+/// The `AsyncId` of an async header. It takes the place of the process and
+/// tree IDs.
+pub(crate) const SMB2_HDR_ASYNC_ID: usize = 32;
 pub(crate) const SMB2_HDR_SESSION_ID: usize = 40;
+pub(crate) const SMB2_HDR_SIGNATURE: usize = 48;
+pub(crate) const SMB2_HDR_FLAG_ASYNC: u32 = 0x02;
 pub(crate) const SMB2_HDR_FLAG_CHAINED: u32 = 0x04;
 pub(crate) const SMB2_HDR_FLAG_SIGNED: u32 = 0x08;
 pub(crate) const SMB2_OP_NEGPROT: u16 = 0x00;
@@ -27,9 +35,11 @@ pub(crate) const SMB2_RW_COUNT: usize = SMB2_HDR_SIZE + 4;
 /// The SMB2 TRANSFORM header before an encrypted message.
 pub(crate) const SMB2_TF_MAGIC: [u8; 4] = [0xfd, b'S', b'M', b'B'];
 pub(crate) const SMB2_TF_SIZE: usize = 52;
+pub(crate) const SMB2_TF_NONCE: usize = 20;
 pub(crate) const SMB2_TF_MSG_SIZE: usize = 36;
 pub(crate) const SMB2_TF_SESSION_ID: usize = 44;
 
+pub(crate) const NT_STATUS_PENDING: u32 = 0x0000_0103;
 pub(crate) const NT_STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 pub(crate) const NT_STATUS_END_OF_FILE: u32 = 0xC000_0011;
 pub(crate) const NT_STATUS_DISK_FULL: u32 = 0xC000_007F;
