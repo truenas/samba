@@ -27,9 +27,14 @@ use crate::upper::Verdict;
 
 /// The NBT header has a type byte and a 24-bit big-endian length.
 pub const NBT_HDR_SIZE: usize = 4;
-/// The ring reads a body of this size or more into storage from its pool.
-/// Return only such storage to the pool.
+/// Return only body storage of this size or more to the ring's pool. The
+/// ring places a body of `PLACE_MIN - NBT_HDR_SIZE + 1` bytes or more,
+/// because its PDU does not fit a pooled receive buffer.
 pub const PLACE_MIN: usize = 64 * 1024;
+/// `truenas_ros` adds 4 KiB (`RECV_CHUNK`) to each pooled receive buffer, so
+/// the buffers hold 64 KiB. A larger PDU is read into a buffer of its own,
+/// which `Body::take()` moves instead of copying.
+const RECV_BUFFER: usize = PLACE_MIN - 4 * 1024;
 
 pub(crate) type Ready = Result<(PushHandle, ShutdownHandle), c_int>;
 
@@ -145,14 +150,32 @@ fn run_job(
         return Response::Close;
     };
     let (deferred, permit) = responder.defer();
-    job.run(&mut fs, deferred, recycler);
+    job.run(state, &mut fs, deferred, recycler);
     Response::Defer(permit)
+}
+
+/// The classes of file I/O that carry `IOSQE_ASYNC` for the floors of reads
+/// and writes (`usize::MAX`: none), and the floor for `truenas_ros`. It has
+/// one floor for both classes, so the smaller one applies to both.
+pub(crate) fn force_async(
+    read_min: usize,
+    write_min: usize,
+) -> (ForceAsync, usize) {
+    let mut classes = ForceAsync::empty();
+    if read_min != usize::MAX {
+        classes |= ForceAsync::READ;
+    }
+    if write_min != usize::MAX {
+        classes |= ForceAsync::WRITE;
+    }
+    (classes, read_min.min(write_min))
 }
 
 fn server_config(
     max_in_flight: usize,
     delegate: bool,
-    delegate_async: bool,
+    force: (ForceAsync, usize),
+    layer_ops: u32,
 ) -> ServerConfig {
     let max_in_flight = max_in_flight.max(1);
     ServerConfig {
@@ -161,18 +184,21 @@ fn server_config(
         max_in_flight_requests: max_in_flight,
         // The owner bounds its replies itself.
         max_send_backlog: 1 << 30,
-        body_placement_threshold: Some(PLACE_MIN),
-        // Each job is a request in flight. This allows one file op per job.
+        recv_buffer_bytes: RECV_BUFFER,
+        // truenas_ros requires this to be at most recv_buffer_bytes. It does
+        // not place a body the receive buffer holds, so the buffer decides.
+        body_placement_threshold: Some(RECV_BUFFER),
+        // Each job is a request in flight with one file op. The upper layer
+        // keeps `layer_ops` more.
         fs_ops: if delegate {
-            u32::try_from(max_in_flight).unwrap_or(u32::MAX)
+            u32::try_from(max_in_flight)
+                .unwrap_or(u32::MAX)
+                .saturating_add(layer_ops)
         } else {
             0
         },
-        force_async: if delegate_async {
-            ForceAsync::READ | ForceAsync::WRITE
-        } else {
-            ForceAsync::empty()
-        },
+        force_async: force.0,
+        force_async_min_bytes: force.1,
         ..ServerConfig::default()
     }
 }
@@ -185,16 +211,12 @@ pub(crate) fn reactor(
     state: &Arc<ConnState>,
     sock: OwnedFd,
     max_in_flight: usize,
-    delegate_async: bool,
+    force: (ForceAsync, usize),
     back_rx: mpsc::Receiver<Vec<u8>>,
     ready: &mpsc::SyncSender<Ready>,
 ) {
-    // This runs before tn_smbros_adopt() returns. So the state of the upper
-    // layer is set when the owner gets the connection.
     let upper = shared.upper.get().cloned();
-    if let Some(ext) = upper.as_ref().and_then(|u| u.start(state)) {
-        let _ = state.ext.set(ext);
-    }
+    let layer_ops = upper.as_ref().map_or(0, |u| u.fs_ops());
     // Only this thread can use the recycler. The owner sends used bodies to
     // this thread. The handler of the next PDU returns them to the pool.
     let recycler: Rc<RefCell<Option<BodyRecycler>>> =
@@ -239,7 +261,7 @@ pub(crate) fn reactor(
         header: nbt_header,
         body,
     };
-    let cfg = server_config(max_in_flight, state.delegate, delegate_async);
+    let cfg = server_config(max_in_flight, state.delegate, force, layer_ops);
     let mut server =
         match Server::with_config(Vec::<ServerAddr>::new(), cfg, proto) {
             Ok(s) => s,
@@ -284,6 +306,12 @@ pub(crate) fn reactor(
             return;
         }
     };
+    // This runs before tn_smbros_adopt() returns and before the first PDU.
+    // So the state of the upper layer is set when the owner gets the
+    // connection.
+    if let Some(ext) = shared.upper.get().and_then(|u| u.start(state, &push)) {
+        let _ = state.ext.set(ext);
+    }
     let _ = ready.send(Ok((push, stop)));
     let _ = server.serve_forever();
     // Every file op completed before serve_forever() returned. Drop the
@@ -319,6 +347,102 @@ mod tests {
         libc::SIGSEGV,
         libc::SIGBUS,
     ];
+
+    /// Send PDUs with these body sizes to a server with the reactor config.
+    /// For each, return whether the body arrived in a buffer of its own.
+    fn placed(sizes: &[usize]) -> Vec<bool> {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client =
+            std::net::TcpStream::connect(listener.local_addr().unwrap())
+                .unwrap();
+        let (sock, _) = listener.accept().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::channel();
+        let server = {
+            let seen = Arc::clone(&seen);
+            std::thread::spawn(move || {
+                let body = move |req: Request<'_, ()>| {
+                    let Request { mut body, .. } = req;
+                    lock(&seen).push(body.take_owned().is_some());
+                    Response::Reply(Vec::new())
+                };
+                let proto = Protocol {
+                    accept: |_: Incoming<'_>| Some(()),
+                    header: nbt_header,
+                    body,
+                };
+                let cfg = server_config(
+                    16,
+                    false,
+                    force_async(usize::MAX, usize::MAX),
+                    0,
+                );
+                let mut server =
+                    Server::with_config(Vec::<ServerAddr>::new(), cfg, proto)
+                        .unwrap();
+                server.adopt(OwnedFd::from(sock), ()).unwrap();
+                tx.send(server.shutdown_handle()).unwrap();
+                let _ = server.serve_forever();
+            })
+        };
+        let stop = rx.recv().unwrap();
+        for &len in sizes {
+            let mut pdu = vec![0u8; NBT_HDR_SIZE + len];
+            pdu[1..NBT_HDR_SIZE].copy_from_slice(
+                &u32::try_from(len).unwrap().to_be_bytes()[1..],
+            );
+            client.write_all(&pdu).unwrap();
+        }
+        // Bounded, so a body that never arrives fails the test.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while lock(&seen).len() < sizes.len()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        stop.shutdown();
+        server.join().unwrap();
+        let seen = lock(&seen).clone();
+        assert_eq!(seen.len(), sizes.len(), "bodies delivered");
+        seen
+    }
+
+    #[test]
+    fn a_body_of_64_kib_or_more_is_placed() {
+        // A 64 KiB WRITE has 112 bytes of SMB2 header before its data.
+        let sizes = [100, 60 * 1024, 64 * 1024, 64 * 1024 + 112, 1 << 20];
+        assert_eq!(placed(&sizes), [false, false, true, true, true]);
+    }
+
+    #[test]
+    fn a_body_is_placed_once_its_pdu_outgrows_the_receive_buffer() {
+        let whole = PLACE_MIN - NBT_HDR_SIZE;
+        assert_eq!(placed(&[whole, whole + 1]), [false, true]);
+    }
+
+    #[test]
+    fn a_zero_length_body_is_delivered() {
+        assert_eq!(placed(&[0, 1]), [false, false]);
+    }
+
+    #[test]
+    fn each_class_with_a_floor_is_forced_async_from_the_smaller_floor() {
+        let none = usize::MAX;
+        let cfg = server_config(16, true, force_async(128 * 1024, none), 0);
+        assert_eq!(cfg.force_async, ForceAsync::READ);
+        assert_eq!(cfg.force_async_min_bytes, 128 * 1024);
+        let cfg = server_config(16, true, force_async(none, 4096), 0);
+        assert_eq!(cfg.force_async, ForceAsync::WRITE);
+        assert_eq!(cfg.force_async_min_bytes, 4096);
+        let cfg = server_config(16, true, force_async(1, 65536), 0);
+        assert_eq!(cfg.force_async, ForceAsync::READ | ForceAsync::WRITE);
+        assert_eq!(cfg.force_async_min_bytes, 1);
+        let cfg = server_config(16, true, force_async(none, none), 0);
+        assert_eq!(cfg.force_async, ForceAsync::empty());
+    }
 
     #[test]
     fn a_reactor_blocks_all_signals_but_faults() {

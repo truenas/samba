@@ -18,7 +18,9 @@ use truenas_ros::uring_fs::SelfRegistrar;
 
 use crate::ctx::{Ctx, Poster, Reactor, Shared};
 use crate::lock;
-use crate::reactor::{errno_of, reactor, reactor_signals, restore_signals};
+use crate::reactor::{
+    errno_of, force_async, reactor, reactor_signals, restore_signals,
+};
 use crate::upper::Job;
 
 /// Jobs from the owner that the reactor has not started.
@@ -99,22 +101,30 @@ impl Conn {
 /// `max_in_flight` bounds the PDUs in the queue, the PDUs that can still
 /// get a job and the jobs that run. With `delegate`, the caller can give
 /// the reactor a job for a PDU. The layer above the shim has the function
-/// for that. With `delegate_async`, the kernel runs the file reads and
-/// writes of the jobs on io-wq workers, not on the reactor thread. NULL on
-/// failure, with the errno in `*err` if `err` is not NULL.
+/// for that. A file read of a job of `async_read_min` bytes or more carries
+/// `IOSQE_ASYNC`. A hot read on ZFS does not sleep, so without the flag one
+/// io-wq worker runs all such reads of the ring. `async_write_min` does the
+/// same for writes. A flagged write skips the kernel's queue for its file,
+/// so the writes of one file can run at the same time. `usize::MAX` flags
+/// none. `truenas_ros` has one floor, so the smaller one applies to both.
+/// The reactor thread is named `smbros-<n>`, numbered from 0 in each
+/// process.
+/// NULL on failure, with the errno in `*err` if `err` is not NULL.
 ///
 /// # Safety
 ///
 /// `ctx` is a live context from `tn_smbros_ctx_new()`. `sock` is an open
 /// descriptor. `err` is NULL or writable.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn tn_smbros_adopt(
     ctx: *mut Ctx,
     sock: c_int,
     cookie: u64,
     max_in_flight: u32,
     delegate: bool,
-    delegate_async: bool,
+    async_read_min: usize,
+    async_write_min: usize,
     err: *mut c_int,
 ) -> *mut Conn {
     let fail = |e: c_int| {
@@ -152,21 +162,15 @@ pub unsafe extern "C" fn tn_smbros_adopt(
     let st = Arc::clone(&state);
     let conn_shared = Arc::clone(&shared);
     let max_in_flight = usize::try_from(max_in_flight).unwrap_or(usize::MAX);
+    let force = force_async(async_read_min, async_write_min);
+    let name =
+        format!("smbros-{}", ctx.adopted.fetch_add(1, Ordering::Relaxed));
     // The reactor gets its signal mask when it starts. So no signal goes to
     // it before it can block the signal.
     let old_mask = reactor_signals();
-    let spawned =
-        thread::Builder::new().name("smbros".into()).spawn(move || {
-            reactor(
-                &shared,
-                &st,
-                sock,
-                max_in_flight,
-                delegate_async,
-                back_rx,
-                &tx,
-            );
-        });
+    let spawned = thread::Builder::new().name(name).spawn(move || {
+        reactor(&shared, &st, sock, max_in_flight, force, back_rx, &tx);
+    });
     restore_signals(&old_mask);
     let Ok(thread) = spawned else {
         return fail(libc::EAGAIN);

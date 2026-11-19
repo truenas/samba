@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::ffi::{c_int, c_void};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
@@ -134,6 +134,8 @@ pub struct Ctx {
     /// The ID of the process that made the context. A forked child does not
     /// have the reactor threads of that process.
     pid: u32,
+    /// Connections adopted so far, for the reactor thread names.
+    pub(crate) adopted: AtomicUsize,
 }
 
 impl Ctx {
@@ -243,6 +245,7 @@ pub extern "C" fn tn_smbros_ctx_new() -> *mut Ctx {
         }),
         reactors: Mutex::new(Vec::new()),
         pid: std::process::id(),
+        adopted: AtomicUsize::new(0),
     }))
 }
 
