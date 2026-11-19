@@ -50,6 +50,21 @@
 /* A reactor reads at most this many PDUs ahead of smbd. */
 #define SMBD_SMB2_ROS_MAX_IN_FLIGHT 16
 
+/*
+ * The default of "truenas:ros async read size" flags every READ. Without
+ * the flag, one io-wq worker ran the hot reads that ZFS decompresses.
+ * Forced reads then gained 27% to 56% on one channel at 1 to 8 MiB.
+ */
+#define SMBD_SMB2_ROS_ASYNC_READ_SIZE 1
+
+/*
+ * The default of "truenas:ros async write size" flags no WRITE. Forced
+ * writes to one file on one channel gained 26% to 35% on an SSD pool when
+ * the bench rewrote the same 2 GiB, and 4% to 6% on a RAM pool. On four
+ * channels under sustained load on the RAM pool, they lost 6%.
+ */
+#define SMBD_SMB2_ROS_ASYNC_WRITE_SIZE 0
+
 struct smbd_smb2_ros_buf {
 	void *buf;
 	/* The PDU after the NBT header. It points into buf. */
@@ -1061,6 +1076,7 @@ NTSTATUS smbd_smb2_ros_delegate(struct smbd_smb2_request *req,
 		.count = count,
 		.minimum = minimum,
 	};
+	NTSTATUS status;
 	int fd;
 
 	fd = fsp_get_io_fd(fsp);
@@ -1096,6 +1112,16 @@ NTSTATUS smbd_smb2_ros_delegate(struct smbd_smb2_request *req,
 	if (io.seal != TN_SMBSRV_SEAL_NONE) {
 		keys = smbd_smb2_ros_keys_pin(req->xconn, x, io.seal);
 		if (keys == NULL) {
+			return NT_STATUS_RETRY;
+		}
+	}
+	if (io.seal == TN_SMBSRV_SEAL_ENCRYPT) {
+		/* The interim response needs a nonce of its own. */
+		status = smb2_get_new_nonce(x,
+					    &io.pending_nonce_high,
+					    &io.pending_nonce_low);
+		if (!NT_STATUS_IS_OK(status)) {
+			tn_smbsrv_keys_unpin(keys);
 			return NT_STATUS_RETRY;
 		}
 	}
@@ -1229,6 +1255,8 @@ static void smbd_smb2_ros_grow_fd_table(int fd)
 NTSTATUS smbd_smb2_ros_adopt(struct smbXsrv_connection *xconn)
 {
 	struct smbd_server_connection *sconn = xconn->client->sconn;
+	size_t async_read;
+	size_t async_write;
 	int err = 0;
 
 	if (sconn->ros_ctx == NULL) {
@@ -1281,6 +1309,31 @@ NTSTATUS smbd_smb2_ros_adopt(struct smbXsrv_connection *xconn)
 	smbd_smb2_ros_trash_empty();
 
 	/*
+	 * The reactor flags a delegated READ of this size or more with
+	 * IOSQE_ASYNC. A hot read on ZFS does not sleep, so without the flag
+	 * one io-wq worker runs all reads of the ring. 0 flags no READ.
+	 */
+	async_read = lp_parm_ulong(GLOBAL_SECTION_SNUM,
+				   "truenas",
+				   "ros async read size",
+				   SMBD_SMB2_ROS_ASYNC_READ_SIZE);
+	if (async_read == 0) {
+		async_read = SIZE_MAX;
+	}
+
+	/*
+	 * The same for WRITE. A flagged write skips the kernel's queue for
+	 * its file, so the writes of one file can run at the same time.
+	 */
+	async_write = lp_parm_ulong(GLOBAL_SECTION_SNUM,
+				    "truenas",
+				    "ros async write size",
+				    SMBD_SMB2_ROS_ASYNC_WRITE_SIZE);
+	if (async_write == 0) {
+		async_write = SIZE_MAX;
+	}
+
+	/*
 	 * The reactor thread starts with the credentials of this thread.
 	 * It must start as root, not as the last user.
 	 */
@@ -1290,7 +1343,8 @@ NTSTATUS smbd_smb2_ros_adopt(struct smbXsrv_connection *xconn)
 					       (uint64_t)(uintptr_t)xconn,
 					       SMBD_SMB2_ROS_MAX_IN_FLIGHT,
 					       true,	/* delegate */
-					       false,	/* delegate_async */
+					       async_read,
+					       async_write,
 					       &err);
 	unbecome_root();
 	if (xconn->smb2.ros.conn == NULL) {

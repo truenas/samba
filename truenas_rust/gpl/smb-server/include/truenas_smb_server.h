@@ -167,6 +167,12 @@ struct tn_smbsrv_io {
          * The offset of the WRITE data in the `data` of the PDU event.
          */
         size_t data_ofs;
+        /**
+         * The nonce of an interim response with `TN_SMBSRV_SEAL_ENCRYPT`. It
+         * goes into the transform header as smbd puts its nonces there.
+         */
+        uint64_t pending_nonce_low;
+        uint64_t pending_nonce_high;
 };
 
 /**
@@ -255,6 +261,9 @@ void tn_smbsrv_keys_unpin(struct tn_smbsrv_keys *pin);
  * `nsign` messages in `sign`. The reactor closes the connection if it
  * cannot sign or encrypt the reply.
  *
+ * Encryption is done in place, so it overwrites the lent vectors, as
+ * smbd's own encryption of a reply does.
+ *
  * In all cases, this function takes ownership of `encrypt` and of the keys
  * in `sign`. Returns 0 or an errno. ENOKEY if a part has no signing key or
  * the reactors have no crypto functions.
@@ -289,6 +298,11 @@ int tn_smbsrv_send_sealed(struct tn_smbros_conn *conn,
  * header with its nonce after the NBT header. The reactor then encrypts
  * the reply with the encryption key of `keys`. The reactor closes the
  * connection if it cannot sign or encrypt the reply.
+ *
+ * If the I/O runs longer than 500 microseconds, the reactor sends an
+ * interim response as smbd does. That response has the credits of the
+ * reply and is not signed. It is encrypted with the nonce of `io` like the
+ * reply. The reply then has the async flag and grants no credits.
  *
  * In all cases, this function takes ownership of `hold` and `keys`. For a
  * WRITE, it can move the bytes of the PDU out of `buf`. So the caller must

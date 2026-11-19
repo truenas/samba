@@ -37,6 +37,10 @@
 #include "lib/events/events.h"
 #include "system/threads.h"
 
+#ifdef HAVE_SYS_PRCTL_H
+#include <sys/prctl.h>
+#endif
+
 #define FNAME "test_create.dat"
 #define DNAME "smb2_open"
 
@@ -994,6 +998,7 @@ struct test_smb2_bench_thread {
 	struct tevent_context *ev;
 	struct tevent_timer *tick;
 	pthread_t id;
+	char name[16];
 	bool *stop;
 	void **loops;
 	size_t num_loops;
@@ -1064,6 +1069,10 @@ static void *test_smb2_bench_thread_main(void *private_data)
 	sigfillset(&set);
 	pthread_sigmask(SIG_BLOCK, &set, NULL);
 
+#if defined(HAVE_PRCTL) && defined(PR_SET_NAME)
+	prctl(PR_SET_NAME, (unsigned long)t->name, 0, 0, 0);
+#endif
+
 	test_smb2_bench_thread_tick(t->ev, NULL, timeval_zero(), t);
 
 	for (i = 0; i < t->num_loops; i++) {
@@ -1086,6 +1095,8 @@ static void *test_smb2_bench_thread_main(void *private_data)
 
 static struct test_smb2_bench_thread *test_smb2_bench_thread_create(
 	TALLOC_CTX *mem_ctx,
+	size_t conn,
+	size_t channel,
 	bool *stop,
 	size_t max_loops,
 	void (*loop_start)(void *loop),
@@ -1097,6 +1108,7 @@ static struct test_smb2_bench_thread *test_smb2_bench_thread_create(
 	if (t == NULL) {
 		return NULL;
 	}
+	snprintf(t->name, sizeof(t->name), "bench-%zu-ch%zu", conn, channel);
 	t->ev = tevent_context_init(t);
 	if (t->ev == NULL) {
 		TALLOC_FREE(t);
@@ -1766,6 +1778,8 @@ static bool test_smb2_bench_read_threads(
 			}
 			t = test_smb2_bench_thread_create(
 				threads,
+				i,
+				c,
 				&state->thread_stop,
 				state->num_loops,
 				test_smb2_bench_read_tloop_start,
@@ -2441,6 +2455,8 @@ static bool test_smb2_bench_write_threads(
 			}
 			t = test_smb2_bench_thread_create(
 				threads,
+				i,
+				c,
 				&state->thread_stop,
 				state->num_loops,
 				test_smb2_bench_write_tloop_start,

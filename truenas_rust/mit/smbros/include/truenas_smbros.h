@@ -155,9 +155,15 @@ void tn_smbros_buf_release(void *buf);
  * `max_in_flight` bounds the PDUs in the queue, the PDUs that can still
  * get a job and the jobs that run. With `delegate`, the caller can give
  * the reactor a job for a PDU. The layer above the shim has the function
- * for that. With `delegate_async`, the kernel runs the file reads and
- * writes of the jobs on io-wq workers, not on the reactor thread. NULL on
- * failure, with the errno in `*err` if `err` is not NULL.
+ * for that. A file read of a job of `async_read_min` bytes or more carries
+ * `IOSQE_ASYNC`. A hot read on ZFS does not sleep, so without the flag one
+ * io-wq worker runs all such reads of the ring. `async_write_min` does the
+ * same for writes. A flagged write skips the kernel's queue for its file,
+ * so the writes of one file can run at the same time. `usize::MAX` flags
+ * none. `truenas_ros` has one floor, so the smaller one applies to both.
+ * The reactor thread is named `smbros-<n>`, numbered from 0 in each
+ * process.
+ * NULL on failure, with the errno in `*err` if `err` is not NULL.
  *
  * # Safety
  *
@@ -169,7 +175,8 @@ struct tn_smbros_conn *tn_smbros_adopt(struct tn_smbros_ctx *ctx,
                                        uint64_t cookie,
                                        uint32_t max_in_flight,
                                        bool delegate,
-                                       bool delegate_async,
+                                       size_t async_read_min,
+                                       size_t async_write_min,
                                        int *err);
 
 /**
