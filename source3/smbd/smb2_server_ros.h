@@ -92,6 +92,9 @@ struct smb2_signing_key *smbd_smb2_signing_key(
 	struct smbXsrv_connection *xconn,
 	bool *_has_channel);
 NTSTATUS smbd_smb2_request_next_incoming(struct smbXsrv_connection *xconn);
+NTSTATUS smb2_get_new_nonce(struct smbXsrv_session *session,
+			    uint64_t *new_nonce_high,
+			    uint64_t *new_nonce_low);
 
 /* The following definitions come from smbd/smb2_server_ros.c  */
 

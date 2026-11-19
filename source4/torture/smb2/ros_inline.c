@@ -46,7 +46,7 @@
 #define RI_BREAK_TIMEOUT 35
 
 /* Run the event loop for secs seconds. */
-static void ri_sleep(struct torture_context *tctx, double secs)
+void torture_ros_sleep(struct torture_context *tctx, double secs)
 {
 	struct timeval start = timeval_current();
 
@@ -59,10 +59,10 @@ static void ri_sleep(struct torture_context *tctx, double secs)
  * Wait until req has its final reply. Return the seconds from start to
  * that reply, or -1 after limit seconds.
  */
-static double ri_wait_done(struct torture_context *tctx,
-			   struct smb2_request *req,
-			   struct timeval start,
-			   double limit)
+double torture_ros_wait_done(struct torture_context *tctx,
+			     struct smb2_request *req,
+			     struct timeval start,
+			     double limit)
 {
 	while (req->state <= SMB2_REQUEST_RECV) {
 		if (timeval_elapsed(&start) > limit) {
@@ -77,10 +77,10 @@ static double ri_wait_done(struct torture_context *tctx,
  * Wait until req has an interim response or its final reply. Return the
  * seconds from start to that point, or -1 after limit seconds.
  */
-static double ri_wait_pending(struct torture_context *tctx,
-			      struct smb2_request *req,
-			      struct timeval start,
-			      double limit)
+double torture_ros_wait_pending(struct torture_context *tctx,
+				struct smb2_request *req,
+				struct timeval start,
+				double limit)
 {
 	while (!req->cancel.can_cancel && req->state <= SMB2_REQUEST_RECV) {
 		if (timeval_elapsed(&start) > limit) {
@@ -526,14 +526,14 @@ static bool test_ri_lease_timeout(struct torture_context *tctx,
 	req = smb2_create_send(tree, &io2);
 	torture_assert_goto(tctx, req != NULL, ret, done, "create 2 send");
 
-	t_pending = ri_wait_pending(tctx, req, start, 10);
+	t_pending = torture_ros_wait_pending(tctx, req, start, 10);
 	torture_comment(tctx, "interim response after %.3f s\n", t_pending);
 	torture_assert_goto(tctx, t_pending >= 0 && t_pending < 3,
 			    ret, done, "no interim response in time");
 	torture_assert_goto(tctx, req->cancel.can_cancel, ret, done,
 			    "the CREATE did not go async");
 
-	t_done = ri_wait_done(tctx, req, start, RI_BREAK_TIMEOUT * 3);
+	t_done = torture_ros_wait_done(tctx, req, start, RI_BREAK_TIMEOUT * 3);
 	torture_comment(tctx, "CREATE done after %.3f s\n", t_done);
 	torture_assert_goto(tctx,
 			    t_done >= RI_BREAK_TIMEOUT - 2 &&
@@ -630,11 +630,11 @@ static bool ri_lock_wakeup(struct torture_context *tctx,
 	start = timeval_current();
 	req = smb2_lock_send(t2, &lck);
 	torture_assert_goto(tctx, req != NULL, ret, done, "lock 2 send");
-	t = ri_wait_pending(tctx, req, start, 5);
+	t = torture_ros_wait_pending(tctx, req, start, 5);
 	torture_assert_goto(tctx, t >= 0 && req->cancel.can_cancel,
 			    ret, done, "lock 2 did not wait");
 
-	ri_sleep(tctx, 1.0);
+	torture_ros_sleep(tctx, 1.0);
 	torture_assert_goto(tctx, req->state <= SMB2_REQUEST_RECV,
 			    ret, done, "lock 2 ended while lock 1 held");
 
@@ -642,7 +642,7 @@ static bool ri_lock_wakeup(struct torture_context *tctx,
 	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "unlock 1");
 	unlock = timeval_current();
 
-	t = ri_wait_done(tctx, req, unlock, 10);
+	t = torture_ros_wait_done(tctx, req, unlock, 10);
 	torture_comment(tctx, "lock 2 granted %.3f s after the unlock\n", t);
 	torture_assert_goto(tctx, t >= 0 && t < 1.0, ret, done,
 			    "lock 2 not granted at once");
@@ -728,13 +728,13 @@ static bool test_ri_cancel_lock(struct torture_context *tctx,
 	start = timeval_current();
 	req = smb2_lock_send(tree, &lck);
 	torture_assert_goto(tctx, req != NULL, ret, done, "lock 2 send");
-	t = ri_wait_pending(tctx, req, start, 5);
+	t = torture_ros_wait_pending(tctx, req, start, 5);
 	torture_assert_goto(tctx, t >= 0 && req->cancel.can_cancel,
 			    ret, done, "lock 2 did not wait");
 
 	start = timeval_current();
 	smb2_cancel(req);
-	t = ri_wait_done(tctx, req, start, 10);
+	t = torture_ros_wait_done(tctx, req, start, 10);
 	torture_comment(tctx, "cancelled after %.3f s\n", t);
 	torture_assert_goto(tctx, t >= 0 && t < 1.0, ret, done,
 			    "cancel not at once");
@@ -793,7 +793,7 @@ static bool test_ri_notify_create(struct torture_context *tctx,
 	start = timeval_current();
 	req = smb2_notify_send(tree, &n);
 	torture_assert_goto(tctx, req != NULL, ret, done, "notify send");
-	t = ri_wait_pending(tctx, req, start, 5);
+	t = torture_ros_wait_pending(tctx, req, start, 5);
 	torture_assert_goto(tctx, t >= 0 && req->cancel.can_cancel,
 			    ret, done, "notify did not wait");
 
@@ -803,7 +803,7 @@ static bool test_ri_notify_create(struct torture_context *tctx,
 	smb2_util_close(tree, h);
 	ZERO_STRUCT(h);
 
-	t = ri_wait_done(tctx, req, start, 10);
+	t = torture_ros_wait_done(tctx, req, start, 10);
 	torture_comment(tctx, "notify done %.3f s after the CREATE\n", t);
 	torture_assert_goto(tctx, t >= 0 && t < 1.0, ret, done,
 			    "notify not at once");
@@ -1256,7 +1256,7 @@ static bool test_ri_user_share(struct torture_context *tctx,
 		NTSTATUS status;
 
 		/* A reactor runs the tree connect only when smbd is idle. */
-		ri_sleep(tctx, 0.05);
+		torture_ros_sleep(tctx, 0.05);
 		torture_assert(tctx,
 			       ri_tree_connect(tctx, tree->session, share, &t),
 			       "tree connect");
@@ -1448,7 +1448,7 @@ static bool test_ri_ack_notify(struct torture_context *tctx,
 		torture_assert_goto(tctx, seen.count == 1, ret, done,
 				    "no break");
 		/* Let smbd wait for the acknowledgement with its timer set. */
-		ri_sleep(tctx, 0.1);
+		torture_ros_sleep(tctx, 0.1);
 
 		br = (struct smb2_break) {
 			.in.file.handle = seen.h,
@@ -1470,7 +1470,7 @@ static bool test_ri_ack_notify(struct torture_context *tctx,
 		breq = NULL;
 		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
 						"break acknowledgement");
-		t = ri_wait_pending(tctx, nreq, start, 20);
+		t = torture_ros_wait_pending(tctx, nreq, start, 20);
 		torture_comment(tctx,
 				"round %u: interim response after %.3f s\n",
 				round, t);

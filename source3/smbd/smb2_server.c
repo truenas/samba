@@ -2329,9 +2329,10 @@ struct smb2_signing_key *smbd_smb2_signing_key(struct smbXsrv_session *session,
 	return key;
 }
 
-static NTSTATUS smb2_get_new_nonce(struct smbXsrv_session *session,
-				   uint64_t *new_nonce_high,
-				   uint64_t *new_nonce_low)
+/* TrueNAS: the reactors also send interim responses. */
+NTSTATUS smb2_get_new_nonce(struct smbXsrv_session *session,
+			    uint64_t *new_nonce_high,
+			    uint64_t *new_nonce_low)
 {
 	uint64_t nonce_high;
 	uint64_t nonce_low;

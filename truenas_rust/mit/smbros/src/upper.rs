@@ -8,7 +8,7 @@ use std::any::Any;
 use std::ffi::{c_int, c_void};
 use std::fmt::Debug;
 
-use truenas_ros::net::server::{BodyRecycler, Deferred};
+use truenas_ros::net::server::{BodyRecycler, Deferred, PushHandle};
 use truenas_ros::uring_fs::FsConn;
 
 use crate::conn::ConnState;
@@ -29,21 +29,33 @@ pub struct Verdict {
 /// thread.
 pub trait Upper: Debug + Send + Sync {
     /// Runs on the thread of a new connection before `tn_smbros_adopt()`
-    /// returns. `ConnState::ext()` returns the result.
-    fn start(&self, conn: &ConnState) -> Option<Box<dyn Any + Send + Sync>>;
+    /// returns. `push` sends PDUs on the connection, in order with the
+    /// replies of jobs. `ConnState::ext()` returns the result.
+    fn start(
+        &self,
+        conn: &ConnState,
+        push: &PushHandle,
+    ) -> Option<Box<dyn Any + Send + Sync>>;
 
     /// Runs for each new PDU before the owner gets it. The layer can change
     /// the PDU in place.
     fn incoming(&self, conn: &ConnState, pdu: &mut [u8]) -> Verdict;
+
+    /// The file ops that the layer keeps on the ring of a connection with
+    /// `delegate`, besides the one of each job.
+    fn fs_ops(&self) -> u32 {
+        0
+    }
 }
 
 /// Work for a PDU. The owner gives it to the reactor with
 /// `Conn::delegate()`.
 pub trait Job: Debug + Send {
-    /// Runs on the reactor thread. `fs` does file I/O on the ring of the
-    /// reactor. The job answers `reply`.
+    /// Runs on the reactor thread of `conn`. `fs` does file I/O on the ring
+    /// of the reactor. The job answers `reply`.
     fn run(
         self: Box<Self>,
+        conn: &ConnState,
         fs: &mut FsConn<'_>,
         reply: Deferred,
         recycler: Option<BodyRecycler>,

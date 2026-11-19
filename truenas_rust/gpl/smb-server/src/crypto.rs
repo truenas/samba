@@ -149,6 +149,25 @@ fn split_iov(buf: &mut [u8], at: usize) -> [libc::iovec; 2] {
     ]
 }
 
+/// Like `host_crypto()`, on any number of vectors.
+///
+/// # Safety
+///
+/// The vectors must be readable and writable, and unused elsewhere during
+/// the call.
+unsafe fn host_crypto_iov(
+    f: Option<CryptoFn>,
+    key: Option<&HostKey>,
+    iov: &mut [libc::iovec],
+) -> u32 {
+    let (Some(f), Some(key), Ok(count)) = (f, key, c_int::try_from(iov.len()))
+    else {
+        return NT_STATUS_UNSUCCESSFUL;
+    };
+    // SAFETY: `f` and `key` are from smbd, and `f` does not keep the vectors.
+    unsafe { f(key.key, iov.as_mut_ptr(), count) }
+}
+
 /// Run smbd's `f` with `key` on `buf`, split at `at`. Returns the NTSTATUS
 /// of `f`. `NT_STATUS_UNSUCCESSFUL` if `f` or `key` is missing.
 fn host_crypto(
@@ -157,13 +176,73 @@ fn host_crypto(
     buf: &mut [u8],
     at: usize,
 ) -> u32 {
-    let (Some(f), Some(key)) = (f, key) else {
-        return NT_STATUS_UNSUCCESSFUL;
-    };
     let mut iov = split_iov(buf, at);
-    // SAFETY: `f` and `key` are from smbd. The two vectors point into
-    // `buf`. `f` does not keep them.
-    unsafe { f(key.key, iov.as_mut_ptr(), 2) }
+    // SAFETY: the two vectors point into `buf`, which this call borrows.
+    unsafe { host_crypto_iov(f, key, &mut iov) }
+}
+
+/// The vectors covering `range` of the PDU made of `segs` (pointer, length)
+/// in order. None if the PDU is shorter than `range`.
+fn slice_iov(
+    segs: &[(*mut u8, usize)],
+    range: &Range<usize>,
+) -> Option<Vec<libc::iovec>> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for &(ptr, len) in segs {
+        let end = at.checked_add(len)?;
+        let lo = range.start.max(at);
+        let hi = range.end.min(end);
+        if lo < hi {
+            out.push(libc::iovec {
+                iov_base: ptr.wrapping_add(lo - at).cast(),
+                iov_len: hi - lo,
+            });
+        }
+        at = end;
+    }
+    (range.end <= at).then_some(out)
+}
+
+/// `smb2_signing_sign_pdu()` asserts on more vectors per message.
+const SIGN_MAX_IOV: usize = 4;
+
+/// For each message, the SMB2 header vector, then the rest of the message.
+/// None if a header spans segments or a message needs too many vectors.
+fn sign_vectors(
+    segs: &[(*mut u8, usize)],
+    msgs: &[Range<usize>],
+) -> Option<Vec<Vec<libc::iovec>>> {
+    msgs.iter()
+        .map(|at| {
+            let hdr = at.start..at.start.checked_add(SMB2_HDR_SIZE)?;
+            // libcli asserts on a message of a header alone.
+            if hdr.end >= at.end {
+                return None;
+            }
+            let mut iov = slice_iov(segs, &hdr)?;
+            if iov.len() != 1 {
+                return None;
+            }
+            iov.extend(slice_iov(segs, &(hdr.end..at.end))?);
+            (iov.len() <= SIGN_MAX_IOV).then_some(iov)
+        })
+        .collect()
+}
+
+/// The transform header vector, then the rest of the `total` byte PDU.
+/// None if the transform header spans segments.
+fn encrypt_vectors(
+    segs: &[(*mut u8, usize)],
+    total: usize,
+) -> Option<Vec<libc::iovec>> {
+    let tf = NBT_HDR_SIZE..NBT_HDR_SIZE + SMB2_TF_SIZE;
+    let mut iov = slice_iov(segs, &tf)?;
+    if iov.len() != 1 {
+        return None;
+    }
+    iov.extend(slice_iov(segs, &(tf.end..total))?);
+    Some(iov)
 }
 
 /// Sign the SMB2 message in `msg`. False on failure.
@@ -220,6 +299,15 @@ impl Seal {
         match self {
             Seal::Encrypt(_) => NBT_HDR_SIZE + SMB2_TF_SIZE,
             _ => NBT_HDR_SIZE,
+        }
+    }
+
+    /// The `Seal` of the interim response for this reply. smbd encrypts an
+    /// interim response like the reply but does not sign it.
+    pub(crate) fn interim(&self) -> Seal {
+        match self {
+            Seal::Encrypt(keys) => Seal::Encrypt(Arc::clone(keys)),
+            _ => Seal::None,
         }
     }
 
@@ -378,6 +466,91 @@ impl ReplySeal {
             }),
         }
     }
+
+    /// Sign or encrypt the PDU in place in `segs`. Some(false) on failure.
+    /// None, with nothing changed, if libcli cannot take this layout.
+    ///
+    /// # Safety
+    ///
+    /// As for `host_crypto_iov()`, for every segment.
+    unsafe fn apply_in_place(
+        &self,
+        ops: &CryptoOps,
+        segs: &[(*mut u8, usize)],
+    ) -> Option<bool> {
+        let total: usize = segs.iter().map(|&(_, len)| len).sum();
+        match self {
+            ReplySeal::Encrypt(keys) => {
+                if total <= NBT_HDR_SIZE + SMB2_TF_SIZE {
+                    return Some(false);
+                }
+                let mut iov = encrypt_vectors(segs, total)?;
+                // SAFETY: the caller's guarantee covers these vectors.
+                let status = unsafe {
+                    host_crypto_iov(
+                        ops.encrypt,
+                        keys.encrypt.as_ref(),
+                        &mut iov,
+                    )
+                };
+                Some(status == 0)
+            }
+            ReplySeal::Sign(msgs) => {
+                if msgs.iter().any(|(_, at)| at.len() <= SMB2_HDR_SIZE) {
+                    return Some(false);
+                }
+                let ranges: Vec<Range<usize>> =
+                    msgs.iter().map(|(_, at)| at.clone()).collect();
+                let mut iovs = sign_vectors(segs, &ranges)?;
+                Some(msgs.iter().zip(iovs.iter_mut()).all(
+                    |((keys, _), iov)| {
+                        // SAFETY: the caller's guarantee covers these vectors.
+                        let status = unsafe {
+                            host_crypto_iov(ops.sign, keys.sign.as_ref(), iov)
+                        };
+                        status == 0
+                    },
+                ))
+            }
+        }
+    }
+}
+
+/// smbd's pointers for the vectors that `Conn::parts()` lends, in order.
+#[derive(Debug)]
+struct LentVecs(Vec<(*mut u8, usize)>);
+
+// SAFETY: only the connection's reactor uses the pointers, before the send.
+// smbd keeps the memory valid until TN_SMBROS_SENT.
+unsafe impl Send for LentVecs {}
+
+impl LentVecs {
+    /// The PDU in `parts` as segments: each owned part's buffer and smbd's
+    /// pointer for each lent part. None on a mismatch, so the caller seals
+    /// a copy instead of writing to memory that is not the part's.
+    fn segments(
+        &self,
+        parts: &mut [PushPart],
+    ) -> Option<Vec<(*mut u8, usize)>> {
+        let mut lent = self.0.iter();
+        let mut segs = Vec::with_capacity(parts.len());
+        for p in parts.iter_mut() {
+            match p {
+                PushPart::Owned(v) => segs.push((v.as_mut_ptr(), v.len())),
+                PushPart::Lent(l) => {
+                    let &(ptr, len) = lent.next()?;
+                    let bytes = l.as_slice();
+                    if !std::ptr::eq(ptr.cast_const(), bytes.as_ptr())
+                        || len != bytes.len()
+                    {
+                        return None;
+                    }
+                    segs.push((ptr, len));
+                }
+            }
+        }
+        lent.next().is_none().then_some(segs)
+    }
 }
 
 /// The `HostKey` of `key`. None for NULL.
@@ -498,6 +671,9 @@ pub unsafe extern "C" fn tn_smbsrv_keys_unpin(pin: *mut Keys) {
 /// `nsign` messages in `sign`. The reactor closes the connection if it
 /// cannot sign or encrypt the reply.
 ///
+/// Encryption is done in place, so it overwrites the lent vectors, as
+/// smbd's own encryption of a reply does.
+///
 /// In all cases, this function takes ownership of `encrypt` and of the keys
 /// in `sign`. Returns 0 or an errno. ENOKEY if a part has no signing key or
 /// the reactors have no crypto functions.
@@ -561,16 +737,30 @@ pub unsafe extern "C" fn tn_smbsrv_send_sealed(
         (None, false) => ReplySeal::Sign(msgs),
         _ => return libc::EINVAL,
     };
+    // Encryption writes to the lent vectors, so keep smbd's pointers.
+    let lent_vecs = LentVecs(
+        iov.iter()
+            .filter(|v| v.iov_len > 0 && v.iov_len >= lend_min)
+            .map(|v| (v.iov_base.cast::<u8>(), v.iov_len))
+            .collect(),
+    );
     // SAFETY: the caller keeps the lent vectors valid until TN_SMBROS_SENT.
     let (parts, any_lent) = unsafe { conn.parts(iov, lend_min, sent_cookie) };
     // SAFETY: the caller passes room for a bool.
     unsafe { lent.write(any_lent) };
-    // The reactor runs the closure on its thread before it queues the reply
-    // for sending. The closure replaces the parts with a signed or
-    // encrypted copy. This drops the lent parts.
+    // The reactor runs the closure before it queues the reply. It seals the
+    // parts in place, or seals a copy if libcli cannot take the layout.
     conn.send_finished(
         parts,
         Box::new(move |parts: &mut Vec<PushPart>| {
+            if let Some(segs) = lent_vecs.segments(parts) {
+                // SAFETY: the segments are owned parts and smbd's lent
+                // memory, valid until TN_SMBROS_SENT. The ring reads them
+                // only after this closure.
+                if let Some(ok) = unsafe { seal.apply_in_place(&ops, &segs) } {
+                    return ok;
+                }
+            }
             let size = parts.iter().map(|p| p.as_slice().len()).sum();
             let mut buf = Vec::with_capacity(size);
             for p in parts.iter() {
@@ -588,7 +778,170 @@ pub unsafe extern "C" fn tn_smbsrv_send_sealed(
 
 #[cfg(test)]
 mod tests {
-    use super::{Seal, TN_SMBSRV_SEAL_NONE};
+    use super::{
+        LentVecs, SMB2_HDR_SIZE, SMB2_TF_SIZE, Seal, TN_SMBSRV_SEAL_NONE,
+        encrypt_vectors, sign_vectors, slice_iov,
+    };
+    use truenas_ros::net::server::{Lent, PushPart};
+
+    fn segs(bufs: &mut [Vec<u8>]) -> Vec<(*mut u8, usize)> {
+        bufs.iter_mut().map(|b| (b.as_mut_ptr(), b.len())).collect()
+    }
+
+    fn lens(iov: &[libc::iovec]) -> Vec<usize> {
+        iov.iter().map(|v| v.iov_len).collect()
+    }
+
+    /// The bytes of `iov`, in order.
+    fn gathered(iov: &[libc::iovec]) -> Vec<u8> {
+        iov.iter()
+            .flat_map(|v| {
+                // SAFETY: the vectors point into the test's own buffers.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        v.iov_base.cast::<u8>(),
+                        v.iov_len,
+                    )
+                }
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Buffers of `lens` bytes with no byte equal to its neighbours, and
+    /// the same bytes in one buffer, as the copying path gathers them.
+    fn layout(lens: &[usize]) -> (Vec<Vec<u8>>, Vec<u8>) {
+        let flat: Vec<u8> = (0..lens.iter().sum::<usize>())
+            .map(|k| u8::try_from(k % 251).unwrap())
+            .collect();
+        let mut rest = flat.as_slice();
+        let bufs = lens
+            .iter()
+            .map(|&n| {
+                let (buf, tail) = rest.split_at(n);
+                rest = tail;
+                buf.to_vec()
+            })
+            .collect();
+        (bufs, flat)
+    }
+
+    #[test]
+    fn in_place_vectors_hold_the_bytes_of_the_copy() {
+        let data = 1 << 16;
+        let one = 4 + 64 + 16;
+        let single = |at: std::ops::Range<usize>| vec![at];
+        for (lens, msgs) in [
+            (vec![one], single(4..one)),
+            (vec![one, data, 8], single(4..one + data + 8)),
+            (vec![one + 100, data], vec![4..104, 104..one + 100 + data]),
+        ] {
+            let (mut bufs, flat) = layout(&lens);
+            let s = segs(&mut bufs);
+            let iovs = sign_vectors(&s, &msgs).unwrap();
+            for (iov, at) in iovs.iter().zip(&msgs) {
+                assert_eq!(iov[0].iov_len, SMB2_HDR_SIZE, "{lens:?}");
+                assert!(gathered(iov) == flat[at.clone()], "{lens:?}");
+            }
+        }
+        let lens = [4 + 52 + 64 + 16, data, 8];
+        let (mut bufs, flat) = layout(&lens);
+        let s = segs(&mut bufs);
+        let iov = encrypt_vectors(&s, flat.len()).unwrap();
+        assert_eq!(iov[0].iov_len, SMB2_TF_SIZE);
+        assert!(gathered(&iov) == flat[4..]);
+    }
+
+    #[test]
+    fn a_header_alone_is_not_signed_in_place() {
+        let mut bufs = vec![vec![0u8; 4 + 64]];
+        let s = segs(&mut bufs);
+        assert!(sign_vectors(&s, std::slice::from_ref(&(4..68))).is_none());
+    }
+
+    #[test]
+    fn a_lent_part_pairs_only_with_its_own_pointer() {
+        let mine = vec![7u8; 32];
+        let other = vec![9u8; 32];
+        // SAFETY: the buffers outlive the parts, and nothing writes them.
+        let lent = unsafe { Lent::new(mine.as_ptr(), mine.len(), || {}) };
+        let mut parts =
+            vec![PushPart::Owned(vec![1u8; 4]), PushPart::Lent(lent)];
+        let at = |b: &Vec<u8>| vec![(b.as_ptr().cast_mut(), b.len())];
+        let s = LentVecs(at(&mine)).segments(&mut parts).unwrap();
+        assert_eq!(s[1], (mine.as_ptr().cast_mut(), mine.len()));
+        assert!(LentVecs(at(&other)).segments(&mut parts).is_none());
+        assert!(LentVecs(Vec::new()).segments(&mut parts).is_none());
+    }
+
+    #[test]
+    fn a_slice_points_into_the_segments() {
+        let mut bufs = vec![vec![0u8; 10], vec![1u8; 20], vec![2u8; 5]];
+        let s = segs(&mut bufs);
+        assert_eq!(lens(&slice_iov(&s, &(2..8)).unwrap()), [6]);
+        assert_eq!(lens(&slice_iov(&s, &(8..33)).unwrap()), [2, 20, 3]);
+        assert_eq!(lens(&slice_iov(&s, &(0..35)).unwrap()), [10, 20, 5]);
+        assert!(slice_iov(&s, &(30..36)).is_none());
+        let v = slice_iov(&s, &(12..13)).unwrap();
+        assert_eq!(v[0].iov_base.cast::<u8>(), s[1].0.wrapping_add(2));
+    }
+
+    #[test]
+    fn a_read_reply_is_signed_where_it_lies() {
+        // Owned header and body, lent data, owned padding.
+        let mut bufs =
+            vec![vec![0u8; 4 + 64 + 16], vec![0u8; 1 << 16], vec![0u8; 8]];
+        let s = segs(&mut bufs);
+        let iovs = sign_vectors(
+            &s,
+            std::slice::from_ref(&(4..4 + 80 + (1 << 16) + 8)),
+        )
+        .unwrap();
+        assert_eq!(lens(&iovs[0]), [64, 16, 1 << 16, 8]);
+        assert_eq!(iovs[0][2].iov_base.cast::<u8>(), s[1].0);
+    }
+
+    #[test]
+    fn a_compound_reply_is_signed_per_message() {
+        // Two messages: an owned one, and one with lent data.
+        let mut bufs = vec![vec![0u8; 4 + 100 + 80], vec![0u8; 1 << 16]];
+        let s = segs(&mut bufs);
+        let iovs =
+            sign_vectors(&s, &[4..104, 104..104 + 80 + (1 << 16)]).unwrap();
+        assert_eq!(lens(&iovs[0]), [64, 36]);
+        assert_eq!(lens(&iovs[1]), [64, 16, 1 << 16]);
+    }
+
+    #[test]
+    fn a_layout_that_libcli_cannot_take_is_copied() {
+        // More vectors than smb2_signing_sign_pdu() takes.
+        let mut bufs = vec![
+            vec![0u8; 4 + 80],
+            vec![0u8; 100],
+            vec![0u8; 100],
+            vec![0u8; 100],
+        ];
+        let s = segs(&mut bufs);
+        assert!(sign_vectors(&s, std::slice::from_ref(&(4..384))).is_none());
+        // An SMB2 header in two segments.
+        let mut bufs = vec![vec![0u8; 4 + 32], vec![0u8; 132]];
+        let s = segs(&mut bufs);
+        assert!(sign_vectors(&s, std::slice::from_ref(&(4..168))).is_none());
+        // A transform header in two segments.
+        let mut bufs = vec![vec![0u8; 4 + 20], vec![0u8; 132]];
+        let s = segs(&mut bufs);
+        assert!(encrypt_vectors(&s, 156).is_none());
+    }
+
+    #[test]
+    fn an_encrypted_reply_uses_the_lent_memory() {
+        let mut bufs = vec![vec![0u8; 4 + 52 + 64 + 16], vec![7u8; 1 << 16]];
+        let s = segs(&mut bufs);
+        let iov = encrypt_vectors(&s, 4 + 52 + 80 + (1 << 16)).unwrap();
+        assert_eq!(lens(&iov), [52, 80, 1 << 16]);
+        assert_eq!(iov[0].iov_base.cast::<u8>(), s[0].0.wrapping_add(4));
+        assert_eq!(iov[2].iov_base.cast::<u8>(), s[1].0);
+    }
 
     #[test]
     fn seal_none_needs_no_keys() {

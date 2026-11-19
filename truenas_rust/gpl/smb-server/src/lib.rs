@@ -11,6 +11,7 @@
 mod crypto;
 mod delegate;
 mod file;
+mod pending;
 mod wire;
 
 use std::any::Any;
@@ -18,6 +19,7 @@ use std::collections::HashMap;
 use std::ffi::c_int;
 use std::sync::{Arc, Mutex};
 
+use truenas_ros::net::server::PushHandle;
 use truenas_smbros::{ConnState, Ctx, TN_SMBROS_UPPER, Upper, Verdict, lock};
 
 use crypto::{CryptoOps, Keys};
@@ -51,6 +53,8 @@ pub(crate) struct ConnExt {
     pub(crate) errmap: Arc<[u32]>,
     /// The keys of the sessions on the connection, by session id.
     pub(crate) keys: Mutex<HashMap<u64, Arc<Keys>>>,
+    /// The interim responses of the jobs on the connection.
+    pub(crate) interims: Arc<pending::Interims>,
 }
 
 impl ConnExt {
@@ -60,7 +64,11 @@ impl ConnExt {
 }
 
 impl Upper for Layer {
-    fn start(&self, _conn: &ConnState) -> Option<Box<dyn Any + Send + Sync>> {
+    fn start(
+        &self,
+        _conn: &ConnState,
+        push: &PushHandle,
+    ) -> Option<Box<dyn Any + Send + Sync>> {
         // start() runs on the reactor thread of the new connection.
         if let Some(init) = self.crypto.and_then(|ops| ops.thread_init) {
             // SAFETY: tn_smbsrv_attach() requires functions that any
@@ -71,7 +79,16 @@ impl Upper for Layer {
             crypto: self.crypto,
             errmap: Arc::clone(&self.errmap),
             keys: Mutex::new(HashMap::new()),
+            interims: Arc::new(pending::Interims::new(
+                self.crypto,
+                push.clone(),
+            )),
         }))
+    }
+
+    /// The timer of the interim responses, see pending.rs.
+    fn fs_ops(&self) -> u32 {
+        1
     }
 
     fn incoming(&self, conn: &ConnState, pdu: &mut [u8]) -> Verdict {
