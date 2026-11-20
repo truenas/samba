@@ -15,6 +15,11 @@ name: Build & Test
 #   * the prebuilt OpenZFS kmod only loads under the matching running kernel,
 #     so the VM has to boot the TrueNAS kernel, and
 #   * smbd/the VFS modules need real root + a real ZFS pool to exercise.
+#
+# The build job builds the debs once and runs the truenas_rust tests. Then
+# the test jobs run in parallel. Each starts a VM of its own and installs
+# the debs of the build job (.github/actions/samba-vm). The job "Debian
+# Trixie" passes when all the other jobs pass.
 
 on:
   pull_request:
@@ -54,9 +59,14 @@ env:
   IMAGE_VERSION: v2
 
 jobs:
-  build-test:
-    name: Debian Trixie
+  build:
+    name: Build
     runs-on: ubuntu-24.04
+    outputs:
+      train: ${{ steps.train.outputs.train }}
+      # Set once the debs are uploaded. The test jobs then run even if the
+      # truenas_rust tests fail.
+      debs: ${{ steps.debs.outputs.artifact-id }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -94,9 +104,10 @@ jobs:
         key: debian-trixie-cloudimage-${{ env.IMAGE_VERSION }}
 
     # ccache speeds up the (full, per-PR) Samba rebuild. Rolling key: restore
-    # the most recent cache, save an updated one keyed on this commit.
-    - name: Cache ccache (Samba build)
-      uses: actions/cache@v4
+    # the most recent cache, save an updated one keyed on this commit once
+    # the build succeeds.
+    - name: Restore ccache (Samba build)
+      uses: actions/cache/restore@v4
       with:
         path: /tmp/ccache
         key: ccache-samba-debian-trixie-${{ env.IMAGE_VERSION }}-${{ github.sha }}
@@ -115,9 +126,48 @@ jobs:
         TRAIN: ${{ steps.train.outputs.train }}
       run: bash .github/workflows/scripts/qemu-3-build.sh
 
+    - name: Save ccache (Samba build)
+      uses: actions/cache/save@v4
+      with:
+        path: /tmp/ccache
+        key: ccache-samba-debian-trixie-${{ env.IMAGE_VERSION }}-${{ github.sha }}
+
+    # The kernel, OpenZFS and truenas-samba debs for the test jobs
+    - name: Upload the debs
+      id: debs
+      uses: actions/upload-artifact@v4
+      with:
+        name: debs
+        path: /tmp/ci-debs
+        retention-days: 3
+        # The debs are compressed.
+        compression-level: 0
+        if-no-files-found: error
+        overwrite: true
+
     - name: Restart VM into the TrueNAS kernel
       timeout-minutes: 10
       run: bash .github/workflows/scripts/qemu-3.5-restart.sh
+
+    - name: truenas_rust tests
+      timeout-minutes: 30
+      run: bash .github/workflows/scripts/qemu-4.5-rust.sh
+
+  smoke:
+    name: Smoke test
+    needs: build
+    if: ${{ !cancelled() && needs.build.outputs.debs != '' }}
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    - name: Start a VM with the debs of the build job
+      timeout-minutes: 30
+      uses: ./.github/actions/samba-vm
+      with:
+        image-version: ${{ env.IMAGE_VERSION }}
 
     - name: Smoke-test the TrueNAS VFS stack on ZFS
       # Bumped from 25: now also runs the truenas streams/shadow_copy/acl torture
@@ -125,33 +175,6 @@ jobs:
       # from 45 for the SMB auditing tests.
       timeout-minutes: 60
       run: bash .github/workflows/scripts/qemu-4-test.sh
-
-    - name: truenas_rust tests
-      timeout-minutes: 30
-      run: bash .github/workflows/scripts/qemu-4.5-rust.sh
-
-    - name: Spotlight truesearch backend against a mock truesearchd
-      timeout-minutes: 15
-      env:
-        TRAIN: ${{ steps.train.outputs.train }}
-      run: bash .github/workflows/scripts/qemu-4.7-spotlight.sh
-
-    - name: Kerberos session revalidation against a Samba AD DC
-      timeout-minutes: 20
-      run: bash .github/workflows/scripts/qemu-4.8-kerberos.sh
-
-    - name: fstests through the kernel SMB client
-      timeout-minutes: 45
-      run: bash .github/workflows/scripts/qemu-4.9-fstests.sh
-
-    - name: Interim responses of READ, WRITE and FLUSH on slow storage
-      timeout-minutes: 20
-      run: bash .github/workflows/scripts/qemu-4.10-ros.sh
-
-    # Runs last against the VM: it ends with a crash of the VM through sysrq.
-    - name: Durable handles across failovers, smbd restarts and a VM crash
-      timeout-minutes: 60
-      run: bash .github/workflows/scripts/qemu-4.6-durable.sh
 
     - name: Collect logs
       if: always()
@@ -161,10 +184,151 @@ jobs:
     - uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: samba-build-test-logs-debian-trixie
+        name: samba-build-test-logs-smoke
         path: /tmp/qemu-logs.tar.gz
         if-no-files-found: ignore
 
     - name: Test Summary
       if: always()
       run: bash .github/workflows/scripts/qemu-6-summary.sh
+
+  durable-cases:
+    name: "Durable handles: failures and a VM crash"
+    needs: build
+    if: ${{ !cancelled() && needs.build.outputs.debs != '' }}
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    - name: Start a VM with the debs of the build job
+      timeout-minutes: 30
+      uses: ./.github/actions/samba-vm
+      with:
+        image-version: ${{ env.IMAGE_VERSION }}
+        base: "true"
+
+    # Ends with a crash of the VM through sysrq.
+    - name: Durable handles across failovers, smbd restarts and a VM crash
+      timeout-minutes: 40
+      run: bash .github/workflows/scripts/qemu-4.6-durable.sh cases
+
+    - name: Collect logs
+      if: always()
+      timeout-minutes: 5
+      run: bash .github/workflows/scripts/qemu-5-collect-logs.sh
+
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: samba-build-test-logs-durable-cases
+        path: /tmp/qemu-logs.tar.gz
+        if-no-files-found: ignore
+
+  durable-suites:
+    name: "Durable handles: upstream suites ${{ matrix.part }}/2"
+    needs: build
+    if: ${{ !cancelled() && needs.build.outputs.debs != '' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each job runs every second suite of durable-vm.sh.
+        part: [1, 2]
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    - name: Start a VM with the debs of the build job
+      timeout-minutes: 30
+      uses: ./.github/actions/samba-vm
+      with:
+        image-version: ${{ env.IMAGE_VERSION }}
+        base: "true"
+
+    - name: Upstream suites with stateful failover off and on
+      timeout-minutes: 45
+      run: bash .github/workflows/scripts/qemu-4.6-durable.sh regress ${{ matrix.part }}/2
+
+    - name: Collect logs
+      if: always()
+      timeout-minutes: 5
+      run: bash .github/workflows/scripts/qemu-5-collect-logs.sh
+
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: samba-build-test-logs-durable-suites-${{ matrix.part }}
+        path: /tmp/qemu-logs.tar.gz
+        if-no-files-found: ignore
+
+  services:
+    name: Spotlight, Kerberos, fstests and slow storage
+    needs: build
+    if: ${{ !cancelled() && needs.build.outputs.debs != '' }}
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+    - name: Start a VM with the debs of the build job
+      id: vm
+      timeout-minutes: 30
+      uses: ./.github/actions/samba-vm
+      with:
+        image-version: ${{ env.IMAGE_VERSION }}
+        base: "true"
+
+    # Each step runs after a failure of an earlier one.
+    - name: Spotlight truesearch backend against a mock truesearchd
+      if: ${{ !cancelled() && steps.vm.outcome == 'success' }}
+      timeout-minutes: 15
+      env:
+        TRAIN: ${{ needs.build.outputs.train }}
+      run: bash .github/workflows/scripts/qemu-4.7-spotlight.sh
+
+    - name: Kerberos session revalidation against a Samba AD DC
+      if: ${{ !cancelled() && steps.vm.outcome == 'success' }}
+      timeout-minutes: 20
+      run: bash .github/workflows/scripts/qemu-4.8-kerberos.sh
+
+    - name: fstests through the kernel SMB client
+      if: ${{ !cancelled() && steps.vm.outcome == 'success' }}
+      timeout-minutes: 45
+      run: bash .github/workflows/scripts/qemu-4.9-fstests.sh
+
+    - name: Interim responses of READ, WRITE and FLUSH on slow storage
+      if: ${{ !cancelled() && steps.vm.outcome == 'success' }}
+      timeout-minutes: 20
+      run: bash .github/workflows/scripts/qemu-4.10-ros.sh
+
+    - name: Collect logs
+      if: always()
+      timeout-minutes: 5
+      run: bash .github/workflows/scripts/qemu-5-collect-logs.sh
+
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: samba-build-test-logs-services
+        path: /tmp/qemu-logs.tar.gz
+        if-no-files-found: ignore
+
+  # The check of the single job that this workflow had before.
+  result:
+    name: Debian Trixie
+    needs: [build, smoke, durable-cases, durable-suites, services]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Check that all jobs passed
+      env:
+        RESULTS: ${{ join(needs.*.result, ' ') }}
+      run: |
+        echo "Results: $RESULTS"
+        for r in $RESULTS; do
+          [ "$r" = success ] || exit 1
+        done

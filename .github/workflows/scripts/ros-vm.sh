@@ -8,8 +8,10 @@
 # microseconds with an interim response ([MS-SMB2] 3.3.4.2). A Windows
 # client then waits 4 times longer before it drops the connection. The
 # truenas_ros reactors must do the same for the file I/O that smbd gives
-# them. The share is an ext4 file system on a dm-delay device. The device
-# delays each read, write and flush by DELAY_MS.
+# them. The share is a ZFS pool on a file. zinject delays each I/O of the
+# pool by DELAY_MS, because the TrueNAS kernel has no device mapper. The
+# pool caches no file data, so a READ goes to the file. pending/sync is a
+# dataset that writes synchronously.
 #
 # The checks:
 #   P1 smb2.ros-pending read, write, flush and cancel pass with the
@@ -27,21 +29,29 @@
 #      These shares are on ZFS. With the reactors on, the profile counts of
 #      the I/O of vfs_io_uring do not grow. With the reactors off, they
 #      grow.
+#   P5 A logoff and a tree disconnect end a CHANGE_NOTIFY that waits, with
+#      the reactors on and off, plain, signed and encrypted. smbd waits
+#      until it frees the request.
+#   P6 An encrypted session re-authenticates, with the reactors on and
+#      off, also with wrong credentials and a bad NTLMSSP message. Until it
+#      is done, smbd finds the session of a PDU in the global record. With
+#      the reactors on, smbd must accept the decryption of the reactor,
+#      which used the keys of the session of the connection.
 #
-# To run outside the VM, set ROS_DEV empty (no device, no dropped caches
-# and no stop of other daemons) and ROS_DIR to a directory on slow
-# storage. Set ROS_TN_DIR to a directory on ZFS with NFSv4 ACLs. ROS_TN_VFS
-# can leave out the modules that need libzfs. ROS_WORK, ROS_USER,
+# To run outside the VM, set ROS_POOL empty (no pool and no stop of other
+# daemons) and ROS_DIR to a directory on slow storage. Set ROS_TN_DIR to
+# a directory on ZFS with NFSv4 ACLs. ROS_TN_VFS can leave out the
+# modules that need libzfs. ROS_WORK, ROS_USER,
 # ROS_DELAY_MS (0: any delay), ROS_IO_SIZE, SMBD, SMBPASSWD, SMBSTATUS and
 # SMBTORTURE can also change.
 ######################################################################
 
 set -eu
 
-DEV="${ROS_DEV-rosslow}"
+POOL="${ROS_POOL-rosslow}"
 DIR="${ROS_DIR:-/mnt/rosslow}"
 WORK="${ROS_WORK:-/var/tmp/ros}"
-DELAY_MS="${ROS_DELAY_MS:-1000}"
+DELAY_MS="${ROS_DELAY_MS:-100}"
 IO_SIZE="${ROS_IO_SIZE:-1048576}"
 USER_NAME="${ROS_USER:-rosuser}"
 USER_PASS='Passw0rd.3'
@@ -74,7 +84,6 @@ MEM_FLOOR_KB=1
 [ "$DELAY_MS" -eq 0 ] || MEM_FLOOR_KB=$((8 * DEEP_SIZE / 1024))
 PASS=0
 FAILED=0
-LOOP=""
 
 ok() { PASS=$((PASS + 1)); echo "PASS  $1: $2"; }
 bad() { FAILED=$((FAILED + 1)); echo "FAIL  $1: $2"; }
@@ -98,10 +107,9 @@ stop_smbd() {
 
 stop() {
 	stop_smbd
-	[ -n "$DEV" ] || return 0
-	umount "$DIR" 2> /dev/null || true
-	dmsetup remove "$DEV" 2> /dev/null || true
-	[ -z "$LOOP" ] || losetup -d "$LOOP" 2> /dev/null || true
+	[ -n "$POOL" ] || return 0
+	zinject -c all > /dev/null 2>&1 || true
+	zpool destroy "$POOL" 2> /dev/null || true
 	rm -f "$WORK/slow.img"
 	zpool destroy rosz 2> /dev/null || true
 	rm -f "$WORK/rosz.img"
@@ -123,20 +131,25 @@ start_smbd() { # $1: on or off
 	return 1
 }
 
-# The files of a run: read.dat is not in the page cache, and the kernel
-# writes the files in sync synchronously.
+# The files of a run: read.dat is not in memory, and the kernel writes the
+# files in sync synchronously. sync can be the mountpoint of a dataset, so
+# this empties the directories and does not remove them.
 prepare() {
 	local f
-	rm -rf "$DIR/pending"
 	mkdir -p "$DIR/pending/sync"
+	find "$DIR/pending" -mindepth 1 -maxdepth 1 ! -name sync -exec rm -rf {} +
+	find "$DIR/pending/sync" -mindepth 1 -delete
 	head -c "$IO_SIZE" /dev/urandom > "$DIR/pending/read.dat"
 	for f in write $(seq -f 'deep%g' 0 $((FILES - 1))); do
 		touch "$DIR/pending/sync/$f.dat"
-		[ -z "$DEV" ] || chattr +S "$DIR/pending/sync/$f.dat"
 	done
 	chown -R "$USER_NAME" "$DIR/pending"
+	# The tests open these files with all rights. Without an inherited ACL,
+	# smbd gives an owner full control only for rwx.
+	chmod -R u+rwx "$DIR/pending"
 	sync -f "$DIR/pending/read.dat"
-	[ -z "$DEV" ] || echo 3 > /proc/sys/vm/drop_caches
+	# The pool frees the dirty data of read.dat only when its txg syncs.
+	[ -z "$POOL" ] || zpool sync "$POOL"
 }
 
 # smbtorture as the test user, on the share SHARE (default slow). A skipped
@@ -210,7 +223,7 @@ done
 id "$USER_NAME" > /dev/null 2>&1 || useradd -M "$USER_NAME"
 
 trap stop EXIT
-if [ -n "$DEV" ]; then
+if [ -n "$POOL" ]; then
 	# Stop the smbd of the earlier steps and its RPC daemons
 	systemctl stop smbd nmbd winbind 2> /dev/null || true
 	DAEMONS='smbd|nmbd|winbindd|samba-dcerpcd|rpcd_[a-z_]+'
@@ -221,20 +234,23 @@ if [ -n "$DEV" ]; then
 	done
 	pkill -KILL -x "$DAEMONS" 2> /dev/null || true
 
-	step "a file system on a device with a delay of $DELAY_MS ms"
-	command -v dmsetup > /dev/null ||
-		DEBIAN_FRONTEND=noninteractive apt-get install -y dmsetup
-	modprobe dm_delay
-	truncate -s 1G "$WORK/slow.img"
-	LOOP=$(losetup -f --show "$WORK/slow.img")
-	mkfs.ext4 -q -F "$LOOP"
-	SECTORS=$(blockdev --getsz "$LOOP")
-	dmsetup create "$DEV" --table "0 $SECTORS delay $LOOP 0 $DELAY_MS \
-$LOOP 0 $DELAY_MS $LOOP 0 $DELAY_MS"
-	mount "/dev/mapper/$DEV" "$DIR"
+	# zinject delays each I/O of the file of the pool. ZFS runs at most 10
+	# writes of a kind on a vdev at once, so the delay also limits the rate.
+	# 1 MiB records keep the 512 MiB that P2 writes within the 60 s request
+	# timeout of smbtorture. P2 runs three times, and ZFS frees space only
+	# some transactions later, so the pool holds more than one run.
+	step "a ZFS pool whose I/O takes $DELAY_MS ms"
+	modprobe zfs
+	zinject -c all > /dev/null 2>&1 || true
+	zpool destroy "$POOL" 2> /dev/null || true
+	truncate -s 4G "$WORK/slow.img"
+	zpool create -f -m "$DIR" -O primarycache=metadata -O compression=off \
+		"$POOL" "$WORK/slow.img"
+	zfs create -o sync=always -o recordsize=1M \
+		-o mountpoint="$DIR/pending/sync" "$POOL/sync"
+	zinject -d "$WORK/slow.img" -D "$DELAY_MS:256" "$POOL"
 
 	step "a ZFS dataset for the shares of P4"
-	modprobe zfs
 	zpool destroy rosz 2> /dev/null || true
 	truncate -s 1G "$WORK/rosz.img"
 	zpool create -f -m /rosz rosz "$WORK/rosz.img"
@@ -244,6 +260,8 @@ $LOOP 0 $DELAY_MS $LOOP 0 $DELAY_MS"
 	TN_DIR=/rosz/share
 fi
 mkdir -p "$TN_DIR"
+# P5 and P6 create files at the root of [tn].
+chown "$USER_NAME" "$TN_DIR"
 
 cat > "$CONF" <<CONF
 [global]
@@ -410,6 +428,28 @@ for transport in on off; do
 				bad P4b "$name: vfs_io_uring did not count the I/O"
 		fi
 	done
+
+	for seal in plain signed encrypted; do
+		name="reactors $transport, $seal"
+		step "P5: $name, a logoff and a tree disconnect"
+		case "$seal" in
+		signed) set -- --option=clientsigning=required ;;
+		encrypted) set -- --option=clientsmbencrypt=required ;;
+		*) set -- ;;
+		esac
+		SHARE=tn torture "p5-$transport-$seal" "$@" smb2.notify.logoff \
+			smb2.notify.tdis &&
+			ok P5 "$name: the waiting requests ended" ||
+			bad P5 "$name: a logoff or a tree disconnect failed"
+	done
+
+	name="reactors $transport, encrypted"
+	step "P6: $name, a re-authentication"
+	SHARE=tn torture "p6-$transport" --option=clientsmbencrypt=required \
+		smb2.session.reauth1 smb2.session.reauth6 \
+		smb2.session.bind_invalid_auth smb2.session.ntlmssp_bug14932 &&
+		ok P6 "$name: smbd answered each re-authentication" ||
+		bad P6 "$name: a re-authentication failed"
 done
 stop_smbd
 

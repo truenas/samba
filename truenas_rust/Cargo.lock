@@ -360,7 +360,7 @@ dependencies = [
 [[package]]
 name = "truenas_ros"
 version = "0.1.0"
-source = "git+https://github.com/truenas/truenas_ros?rev=4db7228cbc6d0b3e25f26153ad11987d7e36718b#4db7228cbc6d0b3e25f26153ad11987d7e36718b"
+source = "git+https://github.com/truenas/truenas_ros?rev=9c51fc40889c99775dd80c99c35ba7456cbaea93#9c51fc40889c99775dd80c99c35ba7456cbaea93"
 dependencies = [
  "bitflags",
  "libc",

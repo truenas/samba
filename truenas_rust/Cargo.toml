@@ -32,7 +32,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [workspace.dependencies]
-truenas_ros = { git = "https://github.com/truenas/truenas_ros", rev = "4db7228cbc6d0b3e25f26153ad11987d7e36718b", default-features = false }
+truenas_ros = { git = "https://github.com/truenas/truenas_ros", rev = "9c51fc40889c99775dd80c99c35ba7456cbaea93", default-features = false }
 truenas_xdr = { git = "https://github.com/truenas/truenas_ros_utils", rev = "0c3bf46bb3e4bdac62d1688ae87815e9b6b4bea8" }
 truenas_smbhad_proto = { path = "smbhad/proto" }
 truenas_smbhad_client = { path = "smbhad/client" }

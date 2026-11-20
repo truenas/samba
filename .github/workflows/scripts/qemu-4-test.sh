@@ -1305,7 +1305,7 @@ echo "=========================================="
 # nodes rather than one, so that there is a node that is not the leader, the
 # leader can change, and a recovery has somewhere to copy records to;
 # PYCTDB_TEST_NODES=1 runs the tests that can do without. The tests are not
-# installed, so they come from the source tree that qemu-3-build.sh copied in.
+# installed, so they come from the source tree that qemu-3-install.sh copied in.
 PYCTDB_TESTS=/home/debian/samba/ctdb/pyclient/tests
 PYCTDB_TEST_DIR=/var/tmp/pyctdb-test
 test -f "$PYCTDB_TESTS/test_pyctdb.py" \
