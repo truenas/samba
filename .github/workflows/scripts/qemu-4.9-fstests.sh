@@ -17,7 +17,7 @@ $VMSSH "sudo apt-get update -q > /dev/null"
 $VMSSH "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
   acl attr automake bc cifs-utils dbench dump e2fsprogs fio gawk gcc git \
   indent libacl1-dev libaio-dev libcap-dev libgdbm-compat-dev libgdbm-dev \
-  libtool libtool-bin libuuid1 make psmisc python3 quota sed sqlite3 \
+  libtool libtool-bin libuuid1 make pkgconf psmisc python3 quota sed sqlite3 \
   uuid-dev uuid-runtime xfsprogs xfslibs-dev > /dev/null"
 # qemu-3-install.sh copied the source tree into the VM.
 $VMSSH "sudo bash /home/debian/samba/.github/workflows/scripts/fstests-vm.sh"

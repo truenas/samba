@@ -66,11 +66,10 @@
 #define SMBD_SMB2_ROS_ASYNC_WRITE_SIZE 0
 
 /*
- * The default of "truenas:ros zero copy size" sends every reply with a
- * copy. Over loopback the kernel copies a zero-copy send anyway, so no
- * test on one host shows the gain.
+ * The default of "truenas:ros zero copy size" is the default floor of
+ * truenas_ros. 0 copies every reply.
  */
-#define SMBD_SMB2_ROS_ZERO_COPY_SIZE 0
+#define SMBD_SMB2_ROS_ZERO_COPY_SIZE (64 * 1024)
 
 struct smbd_smb2_ros_buf {
 	void *buf;

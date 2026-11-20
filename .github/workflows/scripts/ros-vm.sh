@@ -144,6 +144,9 @@ prepare() {
 		touch "$DIR/pending/sync/$f.dat"
 	done
 	chown -R "$USER_NAME" "$DIR/pending"
+	# The tests open these files with all rights. Without an inherited ACL,
+	# smbd gives an owner full control only for rwx.
+	chmod -R u+rwx "$DIR/pending"
 	sync -f "$DIR/pending/read.dat"
 	# The pool frees the dirty data of read.dat only when its txg syncs.
 	[ -z "$POOL" ] || zpool sync "$POOL"
@@ -254,6 +257,8 @@ if [ -n "$POOL" ]; then
 	TN_DIR=/rosz/share
 fi
 mkdir -p "$TN_DIR"
+# P5 and P6 create files at the root of [tn].
+chown "$USER_NAME" "$TN_DIR"
 
 cat > "$CONF" <<CONF
 [global]
