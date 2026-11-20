@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 
 ######################################################################
-# Run fstests through the kernel SMB client (cifs.ko) in the VM of the
-# smoke test. fstests-vm.sh runs in the VM as root, with its own datasets
-# and smbd. This step must run before the durable handle tests because
-# they crash the VM. The step installs the packages that fstests needs.
+# Run fstests through the kernel SMB client (cifs.ko) in the VM of a test
+# job (qemu-3.6-base.sh). fstests-vm.sh runs in the VM as root, with its
+# own datasets and smbd. The step installs the packages that fstests needs.
 # It does not install Debian's liburing-dev. fstests works without it.
 # The Samba build links only the vendored liburing of debian/build-liburing.sh.
 ######################################################################
@@ -20,7 +19,7 @@ $VMSSH "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
   indent libacl1-dev libaio-dev libcap-dev libgdbm-compat-dev libgdbm-dev \
   libtool libtool-bin libuuid1 make psmisc python3 quota sed sqlite3 \
   uuid-dev uuid-runtime xfsprogs xfslibs-dev > /dev/null"
-# qemu-3-build.sh copied the source tree into the VM.
+# qemu-3-install.sh copied the source tree into the VM.
 $VMSSH "sudo bash /home/debian/samba/.github/workflows/scripts/fstests-vm.sh"
 
 echo "fstests through cifs.ko PASSED"

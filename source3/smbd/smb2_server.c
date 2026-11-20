@@ -503,6 +503,7 @@ NTSTATUS smbd_smb2_inbuf_parse_compound(struct smbXsrv_connection *xconn,
 		}
 		if (IVAL(hdr, 0) == SMB2_TF_MAGIC) {
 			struct smbXsrv_session *s = NULL;
+			struct smbXsrv_session *conn_s = NULL;
 			uint64_t uid;
 			struct iovec tf_iov[2];
 			NTSTATUS status;
@@ -557,6 +558,13 @@ NTSTATUS smbd_smb2_inbuf_parse_compound(struct smbXsrv_connection *xconn,
 
 			status = smb2srv_session_lookup_conn(xconn, uid, now,
 							     &s);
+			/*
+			 * TrueNAS: the reactor decrypts with the keys of the
+			 * session of xconn. This lookup returns that session
+			 * with an error while it re-authenticates. The global
+			 * lookup then makes a session with new key objects.
+			 */
+			conn_s = s;
 			if (!NT_STATUS_IS_OK(status)) {
 				status = smb2srv_session_lookup_global(xconn->client,
 								       uid, req, &s);
@@ -581,7 +589,7 @@ NTSTATUS smbd_smb2_inbuf_parse_compound(struct smbXsrv_connection *xconn,
 				 * The truenas_ros reactor did the decryption.
 				 * This message is the whole PDU.
 				 */
-				status = smbd_smb2_ros_decrypted(req, s);
+				status = smbd_smb2_ros_decrypted(req, conn_s);
 				req->ros_crypto = 0;
 			} else {
 				status = smb2_signing_decrypt_pdu(

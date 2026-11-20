@@ -45,8 +45,8 @@ ssh debian@$VM_IP "sudo sh -c 'cd /var/tmp && tar czf - --exclude=slow.img --exc
 # of fstests (qemu-4.9-fstests.sh).
 ssh debian@$VM_IP "sudo sh -c 'cd /var/tmp && tar czf - fstests'" \
   > "$LOG_DIR/fstests.tar.gz" 2>/dev/null || true
-# Listing of the built debs (handy when a build/packaging step failed).
-ssh debian@$VM_IP "ls -l ~/*.deb /tmp/*.deb 2>/dev/null" > "$LOG_DIR/built-debs.txt" 2>/dev/null || true
+# Listing of the installed debs (handy when a build/packaging step failed).
+ssh debian@$VM_IP "ls -lR /tmp/ci-debs 2>/dev/null" > "$LOG_DIR/built-debs.txt" 2>/dev/null || true
 
 cd /tmp
 tar czf qemu-logs.tar.gz test-logs/
