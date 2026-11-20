@@ -15,8 +15,8 @@ use std::sync::{Arc, mpsc};
 
 use truenas_ros::net::server::{
     BodyRecycler, CloseReason, ForceAsync, Framing, Incoming, Protocol,
-    PushHandle, Request, Response, Server, ServerAddr, ServerConfig,
-    ShutdownHandle,
+    PushHandle, Request, Response, SendZeroCopy, Server, ServerAddr,
+    ServerConfig, ShutdownHandle,
 };
 
 use crate::buf::Buf;
@@ -30,9 +30,9 @@ pub const NBT_HDR_SIZE: usize = 4;
 /// Return only body storage of this size or more to the ring's pool. The
 /// ring places a body of `PLACE_MIN - NBT_HDR_SIZE + 1` bytes or more,
 /// because its PDU does not fit a pooled receive buffer.
-pub const PLACE_MIN: usize = 64 * 1024;
+pub const PLACE_MIN: usize = 16 * 1024;
 /// `truenas_ros` adds 4 KiB (`RECV_CHUNK`) to each pooled receive buffer, so
-/// the buffers hold 64 KiB. A larger PDU is read into a buffer of its own,
+/// the buffers hold 16 KiB. A larger PDU is read into a buffer of its own,
 /// which `Body::take()` moves instead of copying.
 const RECV_BUFFER: usize = PLACE_MIN - 4 * 1024;
 
@@ -154,27 +154,51 @@ fn run_job(
     Response::Defer(permit)
 }
 
-/// The classes of file I/O that carry `IOSQE_ASYNC` for the floors of reads
-/// and writes (`usize::MAX`: none), and the floor for `truenas_ros`. It has
-/// one floor for both classes, so the smaller one applies to both.
-pub(crate) fn force_async(
-    read_min: usize,
-    write_min: usize,
-) -> (ForceAsync, usize) {
-    let mut classes = ForceAsync::empty();
-    if read_min != usize::MAX {
-        classes |= ForceAsync::READ;
+/// What the owner sets for each connection: the file I/O that carries
+/// `IOSQE_ASYNC` and the replies that go out without the kernel's copy.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Tuning {
+    force_async: ForceAsync,
+    force_async_min_bytes: usize,
+    send_zero_copy: Option<SendZeroCopy>,
+}
+
+impl Tuning {
+    /// The floors of forced reads, forced writes and zero-copy replies,
+    /// `usize::MAX` for none. `truenas_ros` has one floor for forced file
+    /// I/O, so the smaller one applies to reads and writes.
+    pub(crate) fn new(
+        read_min: usize,
+        write_min: usize,
+        zero_copy_min: usize,
+    ) -> Tuning {
+        let mut force_async = ForceAsync::empty();
+        if read_min != usize::MAX {
+            force_async |= ForceAsync::READ;
+        }
+        if write_min != usize::MAX {
+            force_async |= ForceAsync::WRITE;
+        }
+        let send_zero_copy = (zero_copy_min != usize::MAX).then(|| {
+            let default = SendZeroCopy::default();
+            SendZeroCopy {
+                threshold: zero_copy_min,
+                max_pinned: default.max_pinned.max(zero_copy_min),
+                ..default
+            }
+        });
+        Tuning {
+            force_async,
+            force_async_min_bytes: read_min.min(write_min),
+            send_zero_copy,
+        }
     }
-    if write_min != usize::MAX {
-        classes |= ForceAsync::WRITE;
-    }
-    (classes, read_min.min(write_min))
 }
 
 fn server_config(
     max_in_flight: usize,
     delegate: bool,
-    force: (ForceAsync, usize),
+    tuning: Tuning,
     layer_ops: u32,
 ) -> ServerConfig {
     let max_in_flight = max_in_flight.max(1);
@@ -197,8 +221,9 @@ fn server_config(
         } else {
             0
         },
-        force_async: force.0,
-        force_async_min_bytes: force.1,
+        force_async: tuning.force_async,
+        force_async_min_bytes: tuning.force_async_min_bytes,
+        send_zero_copy: tuning.send_zero_copy,
         ..ServerConfig::default()
     }
 }
@@ -211,7 +236,7 @@ pub(crate) fn reactor(
     state: &Arc<ConnState>,
     sock: OwnedFd,
     max_in_flight: usize,
-    force: (ForceAsync, usize),
+    tuning: Tuning,
     back_rx: mpsc::Receiver<Vec<u8>>,
     ready: &mpsc::SyncSender<Ready>,
 ) {
@@ -261,7 +286,7 @@ pub(crate) fn reactor(
         header: nbt_header,
         body,
     };
-    let cfg = server_config(max_in_flight, state.delegate, force, layer_ops);
+    let cfg = server_config(max_in_flight, state.delegate, tuning, layer_ops);
     let mut server =
         match Server::with_config(Vec::<ServerAddr>::new(), cfg, proto) {
             Ok(s) => s,
@@ -373,12 +398,9 @@ mod tests {
                     header: nbt_header,
                     body,
                 };
-                let cfg = server_config(
-                    16,
-                    false,
-                    force_async(usize::MAX, usize::MAX),
-                    0,
-                );
+                let none = usize::MAX;
+                let cfg =
+                    server_config(16, false, Tuning::new(none, none, none), 0);
                 let mut server =
                     Server::with_config(Vec::<ServerAddr>::new(), cfg, proto)
                         .unwrap();
@@ -411,10 +433,18 @@ mod tests {
     }
 
     #[test]
-    fn a_body_of_64_kib_or_more_is_placed() {
-        // A 64 KiB WRITE has 112 bytes of SMB2 header before its data.
-        let sizes = [100, 60 * 1024, 64 * 1024, 64 * 1024 + 112, 1 << 20];
-        assert_eq!(placed(&sizes), [false, false, true, true, true]);
+    fn a_body_of_16_kib_or_more_is_placed() {
+        // A WRITE has 112 bytes of SMB2 header before its data. The reactor
+        // moves the data of 16 KiB and 60 KiB WRITEs instead of copying it.
+        let sizes = [
+            100,
+            12 * 1024,
+            16 * 1024,
+            16 * 1024 + 112,
+            60 * 1024 + 112,
+            1 << 20,
+        ];
+        assert_eq!(placed(&sizes), [false, false, true, true, true, true]);
     }
 
     #[test]
@@ -431,17 +461,33 @@ mod tests {
     #[test]
     fn each_class_with_a_floor_is_forced_async_from_the_smaller_floor() {
         let none = usize::MAX;
-        let cfg = server_config(16, true, force_async(128 * 1024, none), 0);
+        let cfg =
+            server_config(16, true, Tuning::new(128 * 1024, none, none), 0);
         assert_eq!(cfg.force_async, ForceAsync::READ);
         assert_eq!(cfg.force_async_min_bytes, 128 * 1024);
-        let cfg = server_config(16, true, force_async(none, 4096), 0);
+        let cfg = server_config(16, true, Tuning::new(none, 4096, none), 0);
         assert_eq!(cfg.force_async, ForceAsync::WRITE);
         assert_eq!(cfg.force_async_min_bytes, 4096);
-        let cfg = server_config(16, true, force_async(1, 65536), 0);
+        let cfg = server_config(16, true, Tuning::new(1, 65536, none), 0);
         assert_eq!(cfg.force_async, ForceAsync::READ | ForceAsync::WRITE);
         assert_eq!(cfg.force_async_min_bytes, 1);
-        let cfg = server_config(16, true, force_async(none, none), 0);
+        let cfg = server_config(16, true, Tuning::new(none, none, none), 0);
         assert_eq!(cfg.force_async, ForceAsync::empty());
+    }
+
+    #[test]
+    fn replies_go_out_zero_copy_from_their_floor() {
+        let none = usize::MAX;
+        let cfg = server_config(16, true, Tuning::new(none, none, none), 0);
+        assert!(cfg.send_zero_copy.is_none());
+        let cfg = server_config(16, true, Tuning::new(none, none, 65536), 0);
+        let zc = cfg.send_zero_copy.expect("zero-copy replies");
+        assert_eq!(zc.threshold, 65536);
+        assert!(zc.max_pinned >= zc.threshold);
+        // A floor above the default cap raises the cap, which must hold one.
+        let big = 128 << 20;
+        let cfg = server_config(16, true, Tuning::new(none, none, big), 0);
+        assert_eq!(cfg.send_zero_copy.expect("on").max_pinned, big);
     }
 
     #[test]

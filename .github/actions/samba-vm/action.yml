@@ -1,0 +1,50 @@
+name: Samba test VM
+description: >
+  Start a Debian Trixie VM, install the debs of the build job (the TrueNAS
+  kernel, OpenZFS and truenas-samba) and boot it on the TrueNAS kernel.
+inputs:
+  image-version:
+    description: The IMAGE_VERSION of the cloud image cache
+    required: true
+  base:
+    description: >
+      "true": also create what the tests take from the smoke test
+      (qemu-3.6-base.sh)
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+  - name: Setup QEMU
+    shell: bash
+    run: bash .github/workflows/scripts/qemu-1-setup.sh
+
+  # The build job saves the image.
+  - name: Restore the Debian Trixie cloud image
+    uses: actions/cache/restore@v4
+    with:
+      path: /tmp/qemu-work/debian-trixie.qcow2
+      key: debian-trixie-cloudimage-${{ inputs.image-version }}
+
+  - name: Start Debian Trixie VM
+    shell: bash
+    run: bash .github/workflows/scripts/qemu-2-start.sh
+
+  - name: Download the debs of the build job
+    uses: actions/download-artifact@v4
+    with:
+      name: debs
+      path: /tmp/ci-debs
+
+  - name: Install the debs in the VM
+    shell: bash
+    run: bash .github/workflows/scripts/qemu-3-install.sh
+
+  - name: Restart VM into the TrueNAS kernel
+    shell: bash
+    run: bash .github/workflows/scripts/qemu-3.5-restart.sh
+
+  - name: Create the state of the smoke test
+    if: inputs.base == 'true'
+    shell: bash
+    run: bash .github/workflows/scripts/qemu-3.6-base.sh

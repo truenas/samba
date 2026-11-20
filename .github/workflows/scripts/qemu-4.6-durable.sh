@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 
 ######################################################################
-# Durable handles across HA failovers ("truenas stateful failover"), on
-# the VM that the smoke test left behind. A restart of smbd restores
+# Durable handles across HA failovers ("truenas stateful failover"), in
+# the VM of a test job (qemu-3.6-base.sh). A restart of smbd restores
 # nothing.
+#
+#   qemu-4.6-durable.sh cases
+#   qemu-4.6-durable.sh regress [N/M]
+#
 # durable-vm.sh does the steps in the VM, as root:
-#   * the packaged truenas-smbhad.service on a system that is not HA
-#   * the failure cases, each with one truenas.durable.restore run
-#   * upstream smb2 suites with the option off and on: the same failures
-#   * a crash of the VM through sysrq. Both daemons lose their copy. smbd
-#     starts and restores nothing.
-# Runs last against the VM: it ends with the crash of the VM.
+#   * cases: the packaged truenas-smbhad.service on a system that is not
+#     HA, the failure cases, each with one truenas.durable.restore run,
+#     then a crash of the VM through sysrq. Both daemons lose their copy.
+#     smbd starts and restores nothing. The crash ends the use of the VM.
+#   * regress: upstream smb2 suites with the option off and on: the same
+#     failures. N/M selects the suites N, N + M, N + 2M... of the list in
+#     durable-vm.sh (default: all).
 ######################################################################
 
 set -eu
@@ -18,10 +23,12 @@ set -eu
 source /tmp/vm-info.sh
 VMSSH="ssh -o ConnectTimeout=5 -o ServerAliveInterval=5"
 VMSSH="$VMSSH -o ServerAliveCountMax=3 debian@$VM_IP"
-# qemu-3-build.sh copied the source tree into the VM.
+# qemu-3-install.sh copied the source tree into the VM.
 DVM="sudo bash /home/debian/samba/.github/workflows/scripts/durable-vm.sh"
 CASES="restart crash failover tamper tamper2 devmove lockfail restartfail
 	blipfail smbdfirst daemonrestart"
+MODE="${1:-}"
+[ $# -gt 0 ] && shift
 
 step() {
 	echo "=========================================="
@@ -29,8 +36,22 @@ step() {
 	echo "=========================================="
 }
 
+case $MODE in
+cases|regress) ;;
+*)
+	echo "usage: qemu-4.6-durable.sh cases | regress [N/M]"
+	exit 2;;
+esac
+
 step setup
 $VMSSH "$DVM setup"
+
+if [ "$MODE" = regress ]; then
+	step "upstream suites with the option off and on: ${1:-all}"
+	$VMSSH "$DVM regress ${1:-}"
+	echo "Durable handle tests PASSED"
+	exit 0
+fi
 
 step "the packaged unit, not HA"
 $VMSSH "$DVM unit"
@@ -39,9 +60,6 @@ for c in $CASES; do
 	step "$c"
 	$VMSSH "$DVM case $c"
 done
-
-step "upstream suites with the option off and on"
-$VMSSH "$DVM regress"
 
 step "crash of the VM (sysrq)"
 $VMSSH "$DVM crash-prepare"

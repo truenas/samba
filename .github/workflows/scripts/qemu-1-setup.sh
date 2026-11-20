@@ -11,14 +11,22 @@ echo "Setting up QEMU environment..."
 
 export DEBIAN_FRONTEND="noninteractive"
 sudo apt-get -y update
-sudo apt-get install -y \
-  cloud-image-utils \
-  guestfs-tools \
-  virt-manager \
+# Only what the scripts use. The recommended packages of these bring the
+# desktop and libguestfs stacks, about 100 MB that made this step time out
+# on slow mirrors. qemu-utils has qemu-img, libvirt-clients has virsh and
+# virtinst has virt-install. virt-install boots the VM with the UEFI
+# firmware of ovmf and needs the OS names of osinfo-db. The default
+# network of libvirt gives the VM its address with dnsmasq-base.
+sudo apt-get install -y --no-install-recommends \
   qemu-system-x86 \
   qemu-utils \
+  ovmf \
+  ipxe-qemu-256k-compat-efi-roms \
   libvirt-daemon-system \
   libvirt-clients \
+  dnsmasq-base \
+  virtinst \
+  osinfo-db \
   rsync \
   wget
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 
 ######################################################################
-# Test the truesearch Spotlight backend in the VM of the smoke test.
-# truesearchd is closed source. truesearch-mock.py replaces it.
-# spotlight-vm.sh runs in the VM as root, with its own dataset and smbd.
-# Run this step before the durable handle tests, which crash the VM.
+# Test the truesearch Spotlight backend in the VM of a test job
+# (qemu-3.6-base.sh). truesearchd is closed source. truesearch-mock.py
+# replaces it. spotlight-vm.sh runs in the VM as root, with its own
+# dataset and smbd.
 #
 # Invoked with the TrueNAS train in the TRAIN environment variable. The
 # mock needs truenas_os. The step installs it from the python3-truenas-pyos
@@ -18,7 +18,7 @@ TRAIN="${TRAIN:?TRAIN must be set}"
 source /tmp/vm-info.sh
 VMSSH="ssh -o ConnectTimeout=5 -o ServerAliveInterval=5"
 VMSSH="$VMSSH -o ServerAliveCountMax=3 debian@$VM_IP"
-# qemu-3-build.sh copied the source tree into the VM.
+# qemu-3-install.sh copied the source tree into the VM.
 $VMSSH bash -s "$TRAIN" <<'REMOTE_SCRIPT'
 set -eu
 cd ~/samba
