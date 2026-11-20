@@ -234,17 +234,20 @@ if [ -n "$POOL" ]; then
 	done
 	pkill -KILL -x "$DAEMONS" 2> /dev/null || true
 
-	# zinject delays each I/O of the file of the pool. With a lane for each
-	# I/O in flight, the delay adds latency and does not limit the rate.
+	# zinject delays each I/O of the file of the pool. ZFS runs at most 10
+	# writes of a kind on a vdev at once, so the delay also limits the rate.
+	# 1 MiB records keep the 512 MiB that P2 writes within the 60 s request
+	# timeout of smbtorture. P2 runs three times, and ZFS frees space only
+	# some transactions later, so the pool holds more than one run.
 	step "a ZFS pool whose I/O takes $DELAY_MS ms"
 	modprobe zfs
 	zinject -c all > /dev/null 2>&1 || true
 	zpool destroy "$POOL" 2> /dev/null || true
-	truncate -s 1G "$WORK/slow.img"
+	truncate -s 4G "$WORK/slow.img"
 	zpool create -f -m "$DIR" -O primarycache=metadata -O compression=off \
 		"$POOL" "$WORK/slow.img"
-	zfs create -o sync=always -o mountpoint="$DIR/pending/sync" \
-		"$POOL/sync"
+	zfs create -o sync=always -o recordsize=1M \
+		-o mountpoint="$DIR/pending/sync" "$POOL/sync"
 	zinject -d "$WORK/slow.img" -D "$DELAY_MS:256" "$POOL"
 
 	step "a ZFS dataset for the shares of P4"
