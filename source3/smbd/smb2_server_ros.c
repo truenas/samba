@@ -65,6 +65,12 @@
  */
 #define SMBD_SMB2_ROS_ASYNC_WRITE_SIZE 0
 
+/*
+ * The default of "truenas:ros zero copy size" is the default floor of
+ * truenas_ros. 0 copies every reply.
+ */
+#define SMBD_SMB2_ROS_ZERO_COPY_SIZE (64 * 1024)
+
 struct smbd_smb2_ros_buf {
 	void *buf;
 	/* The PDU after the NBT header. It points into buf. */
@@ -695,16 +701,19 @@ void smbd_smb2_ros_keys_drop(struct smbXsrv_client *client,
 
 /*
  * Return the status of the decryption that the reactor did for the PDU of
- * req. Return NT_STATUS_ACCESS_DENIED if smbd no longer uses the keys of
- * the reactor for session s.
+ * req. s is the session of the PDU on req->xconn, or NULL. Return
+ * NT_STATUS_ACCESS_DENIED if smbd no longer uses the keys of the reactor
+ * for s.
  */
 NTSTATUS smbd_smb2_ros_decrypted(struct smbd_smb2_request *req,
 				 struct smbXsrv_session *s)
 {
-	struct smbd_smb2_ros_keys *k =
-		smbd_smb2_ros_keys_find(req->xconn,
-					s->global->session_wire_id);
+	struct smbd_smb2_ros_keys *k = NULL;
 
+	if (s != NULL) {
+		k = smbd_smb2_ros_keys_find(req->xconn,
+					    s->global->session_wire_id);
+	}
 	if (k == NULL ||
 	    k->generation != req->ros_crypto_gen ||
 	    k->decrypt == NULL ||
@@ -1257,6 +1266,7 @@ NTSTATUS smbd_smb2_ros_adopt(struct smbXsrv_connection *xconn)
 	struct smbd_server_connection *sconn = xconn->client->sconn;
 	size_t async_read;
 	size_t async_write;
+	size_t zero_copy;
 	int err = 0;
 
 	if (sconn->ros_ctx == NULL) {
@@ -1334,6 +1344,19 @@ NTSTATUS smbd_smb2_ros_adopt(struct smbXsrv_connection *xconn)
 	}
 
 	/*
+	 * A reply of this size or more goes out without the kernel's copy.
+	 * The reactor then keeps lent reply memory until the client
+	 * acknowledges it. 0 copies every reply.
+	 */
+	zero_copy = lp_parm_ulong(GLOBAL_SECTION_SNUM,
+				  "truenas",
+				  "ros zero copy size",
+				  SMBD_SMB2_ROS_ZERO_COPY_SIZE);
+	if (zero_copy == 0) {
+		zero_copy = SIZE_MAX;
+	}
+
+	/*
 	 * The reactor thread starts with the credentials of this thread.
 	 * It must start as root, not as the last user.
 	 */
@@ -1345,6 +1368,7 @@ NTSTATUS smbd_smb2_ros_adopt(struct smbXsrv_connection *xconn)
 					       true,	/* delegate */
 					       async_read,
 					       async_write,
+					       zero_copy,
 					       &err);
 	unbecome_root();
 	if (xconn->smb2.ros.conn == NULL) {

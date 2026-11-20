@@ -161,8 +161,11 @@ void tn_smbros_buf_release(void *buf);
  * same for writes. A flagged write skips the kernel's queue for its file,
  * so the writes of one file can run at the same time. `usize::MAX` flags
  * none. `truenas_ros` has one floor, so the smaller one applies to both.
- * The reactor thread is named `smbros-<n>`, numbered from 0 in each
- * process.
+ * A reply of `zero_copy_min` bytes or more goes out without the kernel's
+ * copy. The kernel then reads it until the peer acknowledges it, so
+ * `TN_SMBROS_SENT` for its lent vectors comes only then. `usize::MAX`
+ * copies every reply. The reactor thread is named `smbros-<n>`, numbered
+ * from 0 in each process.
  * NULL on failure, with the errno in `*err` if `err` is not NULL.
  *
  * # Safety
@@ -177,6 +180,7 @@ struct tn_smbros_conn *tn_smbros_adopt(struct tn_smbros_ctx *ctx,
                                        bool delegate,
                                        size_t async_read_min,
                                        size_t async_write_min,
+                                       size_t zero_copy_min,
                                        int *err);
 
 /**

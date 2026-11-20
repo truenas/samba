@@ -19,7 +19,7 @@ use truenas_ros::uring_fs::SelfRegistrar;
 use crate::ctx::{Ctx, Poster, Reactor, Shared};
 use crate::lock;
 use crate::reactor::{
-    errno_of, force_async, reactor, reactor_signals, restore_signals,
+    Tuning, errno_of, reactor, reactor_signals, restore_signals,
 };
 use crate::upper::Job;
 
@@ -107,8 +107,11 @@ impl Conn {
 /// same for writes. A flagged write skips the kernel's queue for its file,
 /// so the writes of one file can run at the same time. `usize::MAX` flags
 /// none. `truenas_ros` has one floor, so the smaller one applies to both.
-/// The reactor thread is named `smbros-<n>`, numbered from 0 in each
-/// process.
+/// A reply of `zero_copy_min` bytes or more goes out without the kernel's
+/// copy. The kernel then reads it until the peer acknowledges it, so
+/// `TN_SMBROS_SENT` for its lent vectors comes only then. `usize::MAX`
+/// copies every reply. The reactor thread is named `smbros-<n>`, numbered
+/// from 0 in each process.
 /// NULL on failure, with the errno in `*err` if `err` is not NULL.
 ///
 /// # Safety
@@ -125,6 +128,7 @@ pub unsafe extern "C" fn tn_smbros_adopt(
     delegate: bool,
     async_read_min: usize,
     async_write_min: usize,
+    zero_copy_min: usize,
     err: *mut c_int,
 ) -> *mut Conn {
     let fail = |e: c_int| {
@@ -162,14 +166,14 @@ pub unsafe extern "C" fn tn_smbros_adopt(
     let st = Arc::clone(&state);
     let conn_shared = Arc::clone(&shared);
     let max_in_flight = usize::try_from(max_in_flight).unwrap_or(usize::MAX);
-    let force = force_async(async_read_min, async_write_min);
+    let tuning = Tuning::new(async_read_min, async_write_min, zero_copy_min);
     let name =
         format!("smbros-{}", ctx.adopted.fetch_add(1, Ordering::Relaxed));
     // The reactor gets its signal mask when it starts. So no signal goes to
     // it before it can block the signal.
     let old_mask = reactor_signals();
     let spawned = thread::Builder::new().name(name).spawn(move || {
-        reactor(&shared, &st, sock, max_in_flight, force, back_rx, &tx);
+        reactor(&shared, &st, sock, max_in_flight, tuning, back_rx, &tx);
     });
     restore_signals(&old_mask);
     let Ok(thread) = spawned else {

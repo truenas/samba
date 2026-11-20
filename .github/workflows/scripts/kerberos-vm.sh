@@ -35,6 +35,11 @@
 #      group that can use the share GROUP_SHARE. After the end of the
 #      ticket, smbd replaced the token, and the session can connect to
 #      that share (truenas.session.groups).
+#   K9 The parameter is off. An encrypted session expires, with the
+#      truenas_ros reactors on and off (truenas.session.expire). After the
+#      end of the ticket, smbd finds the session of a PDU in the global
+#      record. With the reactors on, smbd must accept the decryption of
+#      the reactor and answer NETWORK_SESSION_EXPIRED.
 #
 # "kerberos-vm.sh bootstrap" only installs the DC into the chroot. This
 # is the only part that needs the network. "kerberos-vm.sh hang N" stops
@@ -226,13 +231,14 @@ stop() {
 }
 
 # (Re)start smbd with the parameter on or off. "off" sets nothing: the
-# default.
-nas_start() { # $1: on or off
+# default. With $2 off, smbd runs without the truenas_ros reactors.
+nas_start() { # $1: on or off, $2: reactors on (default) or off
 	stop_pid "$NAS/run/smbd.pid"
 	case "$1" in
 	on) echo "truenas:keep kerberos sessions = yes" > "$SWITCH" ;;
 	*) : > "$SWITCH" ;;
 	esac
+	[ "${2:-on}" = on ] || echo "truenas:ros transport = no" >> "$SWITCH"
 	"$SMBD" -D -s "$CONF" -l "$LOGDIR"
 	retry 50 0.2 listens "$NAS_IP" 445 && return 0
 	echo "ERROR: smbd does not listen"
@@ -511,6 +517,15 @@ logged "for $USER_NAME@$REALM is different from the token" &&
 	ok K8b "smbd replaced the token" ||
 	bad K8b "no new token in the smbd log"
 dc samba-tool group removemembers "$GROUP" "$USER_NAME" > /dev/null
+
+step "K9: an encrypted session expires"
+for ros in on off; do
+	nas_start off "$ros"
+	torture "k9-$ros" "$LIFETIME" --use-kerberos=required \
+		--option=clientsmbencrypt=required truenas.session.expire &&
+		ok K9 "reactors $ros: the encrypted session expired" ||
+		bad K9 "reactors $ros: truenas.session.expire failed"
+done
 
 step "$PASS passed, $FAILED failed"
 if [ "$FAILED" -ne 0 ]; then

@@ -6,7 +6,8 @@
 #   setup          the dataset, the configurations, the link secret
 #   unit           the packaged unit on a system that is not HA
 #   case NAME      one failure case, see run_case()
-#   regress        upstream suites with the option off and on
+#   regress [N/M]  upstream suites with the option off and on: the
+#                  suites N, N + M, N + 2M... (default: all)
 #   crash-prepare  durable handles open before the crash of the VM
 #   crash-verify   after the crash: smbd starts, nothing is restored
 # Two truenas_smbhad from the package stand in for the controllers. A is
@@ -376,7 +377,7 @@ check_panic() {
 }
 
 setup() {
-	# The smoke test left smbd and maybe winbindd running.
+	# An earlier test can leave smbd and winbindd running.
 	smbd_down TERM
 	pkill -TERM -x winbindd 2> /dev/null || true
 	hd_stop
@@ -564,15 +565,29 @@ same() { # $1, $2: modes, $3: suite
 
 # The upstream suites must have the same failures with the option off and
 # on. A suite with other failures runs again once, to rule out flaky
-# tests.
+# tests. $1: N/M, the suites N, N + M, N + 2M... of $SUITES (default 1/1).
 regress() {
-	local s again="" bad=0
+	local s t again="" bad=0 suites="" noha="" n=1 m=1 i=0
+	if [ -n "${1:-}" ]; then
+		n=${1%/*}
+		m=${1#*/}
+	fi
 	CASE=regress
-	smbd_mode off
-	for s in $SUITES; do suite off "$s"; done
-	smbd_mode on
-	for s in $SUITES; do suite on "$s"; done
 	for s in $SUITES; do
+		if [ $((i % m + 1)) -eq "$n" ]; then suites="$suites $s"; fi
+		i=$((i + 1))
+	done
+	[ -n "$suites" ] || fail "no suites in shard ${1:-}"
+	for s in $suites; do
+		for t in $NOHA_SUITES; do
+			if [ "$s" = "$t" ]; then noha="$noha $s"; fi
+		done
+	done
+	smbd_mode off
+	for s in $suites; do suite off "$s"; done
+	smbd_mode on
+	for s in $suites; do suite on "$s"; done
+	for s in $suites; do
 		same off on "$s" || again="$again $s"
 	done
 	if [ -n "$again" ]; then
@@ -582,11 +597,13 @@ regress() {
 		smbd_mode on
 		for s in $again; do suite on "$s"; done
 	fi
-	smbd_mode noha
-	for s in $NOHA_SUITES; do suite noha "$s"; done
+	if [ -n "$noha" ]; then
+		smbd_mode noha
+		for s in $noha; do suite noha "$s"; done
+	fi
 	smbd_down TERM
 	hd_stop
-	for s in $SUITES; do
+	for s in $suites; do
 		if same off on "$s"; then
 			echo "  same $s: $(grep -c '^success: ' \
 				"$OUT/regress-on-$s.txt") passed, $(wc -l < \
@@ -599,7 +616,7 @@ regress() {
 			bad=1
 		fi
 	done
-	for s in $NOHA_SUITES; do
+	for s in $noha; do
 		if same off noha "$s"; then
 			echo "  same $s, not HA"
 		else
@@ -660,11 +677,11 @@ case ${1:-} in
 setup) setup;;
 unit) unit;;
 case) run_case "${2:?case name}";;
-regress) regress;;
+regress) regress "${2:-}";;
 crash-prepare) crash_prepare;;
 crash-verify) crash_verify;;
 *)
-	echo "usage: durable-vm.sh setup | unit | case NAME | regress |"
+	echo "usage: durable-vm.sh setup | unit | case NAME | regress [N/M] |"
 	echo "       crash-prepare | crash-verify"
 	exit 2;;
 esac
