@@ -1,27 +1,27 @@
 // Copyright (C) iXsystems, Inc. 2026
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Signing and encryption with smbd's functions and the keys of the
-//! sessions. A reactor decrypts a request or checks its signatures before
-//! smbd gets it. A reactor also signs or encrypts a reply before it sends
-//! the reply.
+//! Signing and encryption on the reactors with smbd's functions and keys.
 
 use std::ffi::{c_int, c_void};
-use std::ops::Range;
 use std::ptr;
 use std::sync::Arc;
 
-use truenas_ros::net::server::PushPart;
-use truenas_smbros::{Conn, NBT_HDR_SIZE, Note, Poster, iov_of, lock};
-
-use crate::wire::{
-    NT_STATUS_UNSUCCESSFUL, SMB2_HDR_FLAG_CHAINED, SMB2_HDR_FLAG_SIGNED,
-    SMB2_HDR_FLAGS, SMB2_HDR_MAGIC, SMB2_HDR_NEXT_COMMAND, SMB2_HDR_OPCODE,
-    SMB2_HDR_SESSION_ID, SMB2_HDR_SIZE, SMB2_OP_CANCEL, SMB2_OP_NEGPROT,
-    SMB2_OP_SESSSETUP, SMB2_TF_MAGIC, SMB2_TF_MSG_SIZE, SMB2_TF_SESSION_ID,
-    SMB2_TF_SIZE, le16, le32, le64,
+use truenas_smbros::{
+    Conn, Shim, ShimReactor, iov_of, make_out, release_out, send_out,
 };
-use crate::{ConnExt, TN_SMBSRV_KEY_FREE};
+
+use crate::keys::{KeyCache, KeyTable, Keys, pin, unpin};
+use crate::plan::Plan;
+use crate::upper::{Layer, local_parts};
+use crate::wire::{
+    NBT_HDR_SIZE, NT_STATUS_UNSUCCESSFUL, SMB2_HDR_FLAG_CHAINED,
+    SMB2_HDR_FLAG_SIGNED, SMB2_HDR_FLAGS, SMB2_HDR_MAGIC,
+    SMB2_HDR_NEXT_COMMAND, SMB2_HDR_OPCODE, SMB2_HDR_SESSION_ID, SMB2_HDR_SIZE,
+    SMB2_OP_CANCEL, SMB2_OP_NEGPROT, SMB2_OP_SESSSETUP, SMB2_TF_MAGIC,
+    SMB2_TF_MSG_SIZE, SMB2_TF_SESSION_ID, SMB2_TF_SIZE, is_magic, le16, le32,
+    le64,
+};
 
 /// A flag of a PDU event. The reactor decrypted the request. `data` has the
 /// transform header and the decrypted message. `tag` has the generation of
@@ -42,9 +42,8 @@ pub const TN_SMBSRV_SEAL_SIGN: c_int = 1;
 /// The reactor encrypts the reply of a job.
 pub const TN_SMBSRV_SEAL_ENCRYPT: c_int = 2;
 
-/// A crypto function of smbd. It works in place on the vectors of one PDU
-/// with a key. It returns an NTSTATUS.
-type CryptoFn =
+/// A crypto function of smbd. It works in place and returns an NTSTATUS.
+pub(crate) type CryptoFn =
     unsafe extern "C" fn(*mut c_void, *mut libc::iovec, c_int) -> u32;
 
 /// The SMB2 signing and encryption functions of the caller. The reactors
@@ -56,88 +55,49 @@ type CryptoFn =
 #[derive(Debug, Clone, Copy)]
 pub struct CryptoOps {
     /// Each reactor thread calls this first. NULL is allowed.
-    pub(crate) thread_init: Option<unsafe extern "C" fn()>,
-    // These fields do not use `CryptoFn`. With the written-out types,
-    // cbindgen makes nullable C pointers.
-    sign: Option<
+    pub thread_init: Option<unsafe extern "C" fn()>,
+    // Not `CryptoFn`: cbindgen makes nullable C pointers of these types.
+    pub sign: Option<
         unsafe extern "C" fn(*mut c_void, *mut libc::iovec, c_int) -> u32,
     >,
-    check: Option<
+    pub check: Option<
         unsafe extern "C" fn(*mut c_void, *mut libc::iovec, c_int) -> u32,
     >,
-    encrypt: Option<
+    pub encrypt: Option<
         unsafe extern "C" fn(*mut c_void, *mut libc::iovec, c_int) -> u32,
     >,
-    decrypt: Option<
+    pub decrypt: Option<
         unsafe extern "C" fn(*mut c_void, *mut libc::iovec, c_int) -> u32,
     >,
 }
 
-/// A key that smbd gave to one connection. Only the reactor of the
-/// connection uses it. smbd frees it on its main thread after
-/// `TN_SMBSRV_KEY_FREE`.
-#[derive(Debug)]
-struct HostKey {
+/// Run smbd's `f` with `key` on `iov`. `NT_STATUS_UNSUCCESSFUL` if `f` or
+/// `key` is missing.
+pub(crate) fn host_crypto(
+    f: Option<CryptoFn>,
     key: *mut c_void,
-    poster: Poster,
-}
-
-// SAFETY: only the reactor of the connection passes the key to smbd's
-// functions. smbd frees the key on its main thread.
-unsafe impl Send for HostKey {}
-// SAFETY: the reason for Send applies here too.
-unsafe impl Sync for HostKey {}
-
-impl Drop for HostKey {
-    fn drop(&mut self) {
-        self.poster.post(Box::new(KeyFree(self.key)));
+    iov: &mut [libc::iovec],
+) -> u32 {
+    let Some(f) = f else {
+        return NT_STATUS_UNSUCCESSFUL;
+    };
+    if key.is_null() {
+        return NT_STATUS_UNSUCCESSFUL;
     }
+    let n = c_int::try_from(iov.len()).unwrap_or(0);
+    // SAFETY: smbd's function gets a key of smbd and the caller's vectors.
+    unsafe { f(key, iov.as_mut_ptr(), n) }
 }
 
-/// A key for smbd to free.
-#[derive(Debug)]
-struct KeyFree(*mut c_void);
-
-// SAFETY: only smbd's main thread uses the pointer of the event. That
-// thread frees the key.
-unsafe impl Send for KeyFree {}
-
-impl Note for KeyFree {
-    fn take(self: Box<Self>) -> Option<(c_int, u64, *mut c_void)> {
-        Some((TN_SMBSRV_KEY_FREE, 0, self.0))
-    }
-}
-
-/// The keys of one session on one connection, from
-/// `tn_smbsrv_session_keys()`. A `struct tn_smbsrv_keys` pointer is one
-/// reference to them.
-#[derive(Debug)]
-pub struct Keys {
-    /// The number that smbd gave these keys.
-    generation: u64,
-    /// The signing key of the channel.
-    sign: Option<HostKey>,
-    /// The key that encrypts replies.
-    encrypt: Option<HostKey>,
-    /// The key that decrypts requests.
-    decrypt: Option<HostKey>,
-}
-
-/// Take ownership of the reference `pin` from smbd. None for NULL.
-///
-/// # Safety
-///
-/// `pin` is NULL or is from `tn_smbsrv_keys_pin()`. The caller does not use
-/// it again.
-unsafe fn unpin(pin: *mut Keys) -> Option<Arc<Keys>> {
-    // SAFETY: the caller transfers a reference from Arc::into_raw().
-    (!pin.is_null()).then(|| unsafe { Arc::from_raw(pin.cast_const()) })
-}
-
-/// Split `buf` at `at` into two vectors for smbd's functions.
-fn split_iov(buf: &mut [u8], at: usize) -> [libc::iovec; 2] {
+/// Run `f` on `buf`, split at `at`.
+fn host_crypto_split(
+    f: Option<CryptoFn>,
+    key: *mut c_void,
+    buf: &mut [u8],
+    at: usize,
+) -> u32 {
     let (head, rest) = buf.split_at_mut(at);
-    [
+    let mut iov = [
         libc::iovec {
             iov_base: head.as_mut_ptr().cast(),
             iov_len: head.len(),
@@ -146,168 +106,183 @@ fn split_iov(buf: &mut [u8], at: usize) -> [libc::iovec; 2] {
             iov_base: rest.as_mut_ptr().cast(),
             iov_len: rest.len(),
         },
-    ]
+    ];
+    host_crypto(f, key, &mut iov)
 }
 
-/// Like `host_crypto()`, on any number of vectors.
-///
-/// # Safety
-///
-/// The vectors must be readable and writable, and unused elsewhere during
-/// the call.
-unsafe fn host_crypto_iov(
-    f: Option<CryptoFn>,
-    key: Option<&HostKey>,
-    iov: &mut [libc::iovec],
-) -> u32 {
-    let (Some(f), Some(key), Ok(count)) = (f, key, c_int::try_from(iov.len()))
-    else {
-        return NT_STATUS_UNSUCCESSFUL;
-    };
-    // SAFETY: `f` and `key` are from smbd, and `f` does not keep the vectors.
-    unsafe { f(key.key, iov.as_mut_ptr(), count) }
+/// What `open_pdu()` found.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Opened {
+    pub(crate) flags: u32,
+    pub(crate) status: u32,
+    pub(crate) tag: u64,
 }
 
-/// Run smbd's `f` with `key` on `buf`, split at `at`. Returns the NTSTATUS
-/// of `f`. `NT_STATUS_UNSUCCESSFUL` if `f` or `key` is missing.
-fn host_crypto(
-    f: Option<CryptoFn>,
-    key: Option<&HostKey>,
-    buf: &mut [u8],
-    at: usize,
-) -> u32 {
-    let mut iov = split_iov(buf, at);
-    // SAFETY: the two vectors point into `buf`, which this call borrows.
-    unsafe { host_crypto_iov(f, key, &mut iov) }
-}
+/// The most messages that the reactor checks in one PDU.
+const MAXMSG: usize = 64;
 
-/// The vectors covering `range` of the PDU made of `segs` (pointer, length)
-/// in order. None if the PDU is shorter than `range`.
-fn slice_iov(
-    segs: &[(*mut u8, usize)],
-    range: &Range<usize>,
-) -> Option<Vec<libc::iovec>> {
-    let mut out = Vec::new();
-    let mut at = 0usize;
-    for &(ptr, len) in segs {
-        let end = at.checked_add(len)?;
-        let lo = range.start.max(at);
-        let hi = range.end.min(end);
-        if lo < hi {
-            out.push(libc::iovec {
-                iov_base: ptr.wrapping_add(lo - at).cast(),
-                iov_len: hi - lo,
-            });
-        }
-        at = end;
-    }
-    (range.end <= at).then_some(out)
-}
-
-/// `smb2_signing_sign_pdu()` asserts on more vectors per message.
-const SIGN_MAX_IOV: usize = 4;
-
-/// For each message, the SMB2 header vector, then the rest of the message.
-/// None if a header spans segments or a message needs too many vectors.
-fn sign_vectors(
-    segs: &[(*mut u8, usize)],
-    msgs: &[Range<usize>],
-) -> Option<Vec<Vec<libc::iovec>>> {
-    msgs.iter()
-        .map(|at| {
-            let hdr = at.start..at.start.checked_add(SMB2_HDR_SIZE)?;
-            // libcli asserts on a message of a header alone.
-            if hdr.end >= at.end {
-                return None;
-            }
-            let mut iov = slice_iov(segs, &hdr)?;
-            if iov.len() != 1 {
-                return None;
-            }
-            iov.extend(slice_iov(segs, &(hdr.end..at.end))?);
-            (iov.len() <= SIGN_MAX_IOV).then_some(iov)
-        })
-        .collect()
-}
-
-/// The transform header vector, then the rest of the `total` byte PDU.
-/// None if the transform header spans segments.
-fn encrypt_vectors(
-    segs: &[(*mut u8, usize)],
-    total: usize,
-) -> Option<Vec<libc::iovec>> {
-    let tf = NBT_HDR_SIZE..NBT_HDR_SIZE + SMB2_TF_SIZE;
-    let mut iov = slice_iov(segs, &tf)?;
-    if iov.len() != 1 {
+/// The length, flags, opcode and session of the SMB2 message at `at`.
+fn message(pdu: &[u8], at: usize) -> Option<(usize, u32, u16, u64)> {
+    let rest = &pdu[at..];
+    if rest.len() < SMB2_HDR_SIZE + 2
+        || !is_magic(rest, SMB2_HDR_MAGIC)
+        || le16(rest, 4) != 64
+    {
         return None;
     }
-    iov.extend(slice_iov(segs, &(tf.end..total))?);
-    Some(iov)
+    let next = le32(rest, SMB2_HDR_NEXT_COMMAND) as usize;
+    let len = match next {
+        0 => rest.len(),
+        n if n < SMB2_HDR_SIZE + 2 || n > rest.len() => return None,
+        n => n,
+    };
+    Some((
+        len,
+        le32(rest, SMB2_HDR_FLAGS),
+        le16(rest, SMB2_HDR_OPCODE),
+        le64(rest, SMB2_HDR_SESSION_ID),
+    ))
 }
 
-/// Sign the SMB2 message in `msg`. False on failure.
-fn sign_msg(ops: &CryptoOps, keys: &Keys, msg: &mut [u8]) -> bool {
-    msg.len() > SMB2_HDR_SIZE
-        && host_crypto(ops.sign, keys.sign.as_ref(), msg, SMB2_HDR_SIZE) == 0
+/// The number of messages of `pdu` and their one session, if all are signed
+/// and none is a NEGOTIATE, `SESSION_SETUP` or CANCEL.
+fn signed_messages(pdu: &[u8]) -> Option<(usize, u64)> {
+    let mut n = 0;
+    let mut session: Option<u64> = None;
+    let mut at = 0;
+    while at < pdu.len() {
+        if n == MAXMSG {
+            return None;
+        }
+        let (len, flags, op, field) = message(pdu, at)?;
+        if flags & SMB2_HDR_FLAG_SIGNED == 0
+            || op == SMB2_OP_NEGPROT
+            || op == SMB2_OP_SESSSETUP
+            || op == SMB2_OP_CANCEL
+        {
+            return None;
+        }
+        let id = if flags & SMB2_HDR_FLAG_CHAINED != 0 {
+            // A related first message has no session in smbd.
+            session?
+        } else {
+            field
+        };
+        if session.is_some_and(|s| s != id) {
+            return None;
+        }
+        session = Some(id);
+        n += 1;
+        at += len;
+    }
+    Some((n, session?))
 }
 
-/// Encrypt the PDU in `buf`. The transform header is after the NBT header.
-/// smbd built that header and set its nonce. False on failure.
-fn encrypt_pdu(ops: &CryptoOps, keys: &Keys, buf: &mut [u8]) -> bool {
-    buf.len() > NBT_HDR_SIZE + SMB2_TF_SIZE
-        && host_crypto(
-            ops.encrypt,
-            keys.encrypt.as_ref(),
-            &mut buf[NBT_HDR_SIZE..],
-            SMB2_TF_SIZE,
-        ) == 0
+/// Decrypt `pdu` in place or check its signatures. None, with the PDU
+/// unchanged, if smbd must do it.
+pub(crate) fn open_pdu(
+    ops: &CryptoOps,
+    kc: &mut KeyCache,
+    t: &KeyTable,
+    pdu: &mut [u8],
+) -> Option<Opened> {
+    if pdu.len() >= SMB2_TF_SIZE && is_magic(pdu, SMB2_TF_MAGIC) {
+        // Clients send one encrypted message per PDU. smbd decrypts others.
+        if SMB2_TF_SIZE + le32(pdu, SMB2_TF_MSG_SIZE) as usize != pdu.len() {
+            return None;
+        }
+        let k = kc.find(t, le64(pdu, SMB2_TF_SESSION_ID))?;
+        if ops.decrypt.is_none() || k.decrypt.is_null() {
+            return None;
+        }
+        // A failed decryption changes the PDU, so smbd uses this status.
+        let status =
+            host_crypto_split(ops.decrypt, k.decrypt, pdu, SMB2_TF_SIZE);
+        let flags = if status == 0 {
+            TN_SMBSRV_DECRYPTED
+        } else {
+            TN_SMBSRV_DECRYPT_FAILED
+        };
+        return Some(Opened {
+            flags,
+            status,
+            tag: k.generation,
+        });
+    }
+    let (n, session) = signed_messages(pdu)?;
+    let k = kc.find(t, session)?;
+    let mut at = 0;
+    for _ in 0..n {
+        let (len, ..) = message(pdu, at)?;
+        let msg = &mut pdu[at..at + len];
+        if host_crypto_split(ops.check, k.sign, msg, SMB2_HDR_SIZE) != 0 {
+            return None;
+        }
+        at += len;
+    }
+    Some(Opened {
+        flags: TN_SMBSRV_SIGNED_OK,
+        status: 0,
+        tag: k.generation,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SealKind {
+    #[default]
+    None,
+    Sign,
+    Encrypt,
 }
 
 /// The protection of the reply of a job.
-#[derive(Debug)]
-pub(crate) enum Seal {
-    None,
-    Sign(Arc<Keys>),
-    Encrypt(Arc<Keys>),
+#[derive(Debug, Default)]
+pub(crate) struct Seal {
+    pub(crate) kind: SealKind,
+    pub(crate) keys: Option<Arc<Keys>>,
 }
 
 impl Seal {
-    /// The `Seal` for the `TN_SMBSRV_SEAL_*` value `seal`. This function
-    /// takes ownership of the reference `pin`. None if the key for `seal`
-    /// is missing. None if `seal` is not a `TN_SMBSRV_SEAL_*` value.
-    ///
-    /// # Safety
-    ///
-    /// `pin` is NULL or is from `tn_smbsrv_keys_pin()`. The caller does not
-    /// use it again.
-    pub(crate) unsafe fn of(seal: c_int, pin: *mut Keys) -> Option<Seal> {
-        // SAFETY: the caller transfers ownership of `pin`.
-        match (seal, unsafe { unpin(pin) }) {
-            (TN_SMBSRV_SEAL_SIGN, Some(k)) if k.sign.is_some() => {
-                Some(Seal::Sign(k))
-            }
-            (TN_SMBSRV_SEAL_ENCRYPT, Some(k)) if k.encrypt.is_some() => {
-                Some(Seal::Encrypt(k))
-            }
-            (TN_SMBSRV_SEAL_NONE, _) => Some(Seal::None),
-            _ => None,
-        }
+    /// The seal of a `TN_SMBSRV_SEAL_*` value with the keys of `pin`. None
+    /// for a bad value or a missing key.
+    pub(crate) fn of(seal: c_int, pin: Option<Arc<Keys>>) -> Option<Seal> {
+        let kind = match seal {
+            TN_SMBSRV_SEAL_NONE => return Some(Seal::default()),
+            TN_SMBSRV_SEAL_SIGN => SealKind::Sign,
+            TN_SMBSRV_SEAL_ENCRYPT => SealKind::Encrypt,
+            _ => return None,
+        };
+        let k = pin?;
+        let key = if kind == SealKind::Sign {
+            k.sign
+        } else {
+            k.encrypt
+        };
+        (!key.is_null()).then_some(Seal {
+            kind,
+            keys: Some(k),
+        })
     }
 
     /// The offset of the SMB2 header in the reply.
+    #[inline]
     pub(crate) fn hdr(&self) -> usize {
-        match self {
-            Seal::Encrypt(_) => NBT_HDR_SIZE + SMB2_TF_SIZE,
-            _ => NBT_HDR_SIZE,
+        if self.kind == SealKind::Encrypt {
+            NBT_HDR_SIZE + SMB2_TF_SIZE
+        } else {
+            NBT_HDR_SIZE
         }
     }
 
-    /// The `Seal` of the interim response for this reply. smbd encrypts an
-    /// interim response like the reply but does not sign it.
+    /// smbd encrypts an interim response like the reply but does not sign
+    /// it.
     pub(crate) fn interim(&self) -> Seal {
-        match self {
-            Seal::Encrypt(keys) => Seal::Encrypt(Arc::clone(keys)),
-            _ => Seal::None,
+        if self.kind != SealKind::Encrypt {
+            return Seal::default();
+        }
+        Seal {
+            kind: SealKind::Encrypt,
+            keys: self.keys.clone(),
         }
     }
 
@@ -318,107 +293,34 @@ impl Seal {
         buf: &mut [u8],
     ) -> bool {
         let Some(ops) = ops else {
-            return matches!(self, Seal::None);
+            return self.kind == SealKind::None;
         };
-        match self {
-            Seal::None => true,
-            Seal::Sign(keys) => sign_msg(ops, keys, &mut buf[NBT_HDR_SIZE..]),
-            Seal::Encrypt(keys) => encrypt_pdu(ops, keys, buf),
+        match (self.kind, &self.keys) {
+            (SealKind::None, _) => true,
+            (SealKind::Sign, Some(k)) => {
+                sign_msg(ops, k, &mut buf[NBT_HDR_SIZE..])
+            }
+            (SealKind::Encrypt, Some(k)) => encrypt_pdu(ops, k, buf),
+            _ => false,
         }
     }
 }
 
-/// Decrypt the request in `pdu` in place, or check its signatures. Returns
-/// the `TN_SMBSRV_*` flags, the NTSTATUS of a failed decryption and the
-/// generation of the keys. Returns None for a PDU that smbd must handle
-/// itself, for example after a wrong signature. Such a PDU is unchanged.
-pub(crate) fn open_pdu(
-    ext: &ConnExt,
-    pdu: &mut [u8],
-) -> Option<(u32, u32, u64)> {
-    let ops = ext.crypto.as_ref()?;
-    if pdu.len() >= SMB2_TF_SIZE && pdu[..4] == SMB2_TF_MAGIC {
-        // Clients send one encrypted message per PDU. smbd decrypts any
-        // other PDU itself.
-        let size = usize::try_from(le32(pdu, SMB2_TF_MSG_SIZE)).ok()?;
-        if SMB2_TF_SIZE.checked_add(size) != Some(pdu.len()) {
-            return None;
-        }
-        let keys = ext.keys_of(le64(pdu, SMB2_TF_SESSION_ID))?;
-        if ops.decrypt.is_none() || keys.decrypt.is_none() {
-            return None;
-        }
-        // A failed decryption changes the PDU. So smbd uses this status. It
-        // does not decrypt the PDU again.
-        let status =
-            host_crypto(ops.decrypt, keys.decrypt.as_ref(), pdu, SMB2_TF_SIZE);
-        return Some(match status {
-            0 => (TN_SMBSRV_DECRYPTED, 0, keys.generation),
-            status => (TN_SMBSRV_DECRYPT_FAILED, status, keys.generation),
-        });
-    }
-    let (session_id, msgs) = signed_messages(pdu)?;
-    let keys = ext.keys_of(session_id)?;
-    for at in msgs {
-        let status = host_crypto(
-            ops.check,
-            keys.sign.as_ref(),
-            &mut pdu[at],
-            SMB2_HDR_SIZE,
-        );
-        if status != 0 {
-            return None;
-        }
-    }
-    Some((TN_SMBSRV_SIGNED_OK, 0, keys.generation))
+pub(crate) fn sign_msg(ops: &CryptoOps, k: &Keys, msg: &mut [u8]) -> bool {
+    msg.len() > SMB2_HDR_SIZE
+        && host_crypto_split(ops.sign, k.sign, msg, SMB2_HDR_SIZE) == 0
 }
 
-/// The session and the byte range of each message of `pdu`. None unless
-/// every message is signed and all have one session. None if a message is
-/// a NEGOTIATE, `SESSION_SETUP` or CANCEL. smbd selects the keys for those.
-/// The ranges match `smbd_smb2_inbuf_parse_compound()`.
-fn signed_messages(pdu: &[u8]) -> Option<(u64, Vec<Range<usize>>)> {
-    let mut msgs = Vec::new();
-    let mut session: Option<u64> = None;
-    let mut at = 0;
-    while at < pdu.len() {
-        let rest = &pdu[at..];
-        if rest.len() < SMB2_HDR_SIZE + 2
-            || rest[..4] != SMB2_HDR_MAGIC
-            || le16(rest, 4) != 64
-        {
-            return None;
-        }
-        let flags = le32(rest, SMB2_HDR_FLAGS);
-        if flags & SMB2_HDR_FLAG_SIGNED == 0
-            || matches!(
-                le16(rest, SMB2_HDR_OPCODE),
-                SMB2_OP_NEGPROT | SMB2_OP_SESSSETUP | SMB2_OP_CANCEL
-            )
-        {
-            return None;
-        }
-        let id = match (flags & SMB2_HDR_FLAG_CHAINED != 0, session) {
-            (true, Some(prev)) => prev,
-            // smbd has no session for a related first message. See
-            // smbd_smb2_request_check_session().
-            (true, None) => return None,
-            (false, _) => le64(rest, SMB2_HDR_SESSION_ID),
-        };
-        if session.is_some_and(|s| s != id) {
-            return None;
-        }
-        session = Some(id);
-        let next = usize::try_from(le32(rest, SMB2_HDR_NEXT_COMMAND)).ok()?;
-        let len = match next {
-            0 => rest.len(),
-            n if n < SMB2_HDR_SIZE + 2 || n > rest.len() => return None,
-            n => n,
-        };
-        msgs.push(at..at + len);
-        at += len;
-    }
-    Some((session?, msgs))
+/// Encrypt `buf`. smbd put the transform header with its nonce after the
+/// NBT header.
+pub(crate) fn encrypt_pdu(ops: &CryptoOps, k: &Keys, buf: &mut [u8]) -> bool {
+    buf.len() > NBT_HDR_SIZE + SMB2_TF_SIZE
+        && host_crypto_split(
+            ops.encrypt,
+            k.encrypt,
+            &mut buf[NBT_HDR_SIZE..],
+            SMB2_TF_SIZE,
+        ) == 0
 }
 
 /// One SMB2 message of a reply that `tn_smbsrv_send_sealed()` signs.
@@ -427,138 +329,38 @@ fn signed_messages(pdu: &[u8]) -> Option<(u64, Vec<Range<usize>>)> {
 pub struct SignPart {
     /// Keys from `tn_smbsrv_keys_pin()`. The reactor signs the message with
     /// their signing key.
-    keys: *mut Keys,
+    pub keys: *mut Keys,
     /// The message is the `iovcnt` vectors of the reply that start at index
     /// `iov`.
-    iov: c_int,
-    iovcnt: c_int,
+    pub iov: c_int,
+    pub iovcnt: c_int,
 }
 
 impl SignPart {
-    /// The byte range of the message in the PDU of `iov`. The PDU starts
-    /// with the NBT header. None if `iov` lacks the vectors.
-    fn range(&self, iov: &[libc::iovec]) -> Option<Range<usize>> {
+    /// The byte range of the message in the PDU of `iov`.
+    fn range(&self, iov: &[libc::iovec]) -> Option<(usize, usize)> {
         let first = usize::try_from(self.iov).ok()?;
         let count = usize::try_from(self.iovcnt).ok()?;
         let msg = iov.get(first..first.checked_add(count)?)?;
         let start: usize = iov[..first].iter().map(|v| v.iov_len).sum();
         let len: usize = msg.iter().map(|v| v.iov_len).sum();
-        Some(start..start + len)
+        Some((start, start + len))
     }
 }
 
-/// The protection of a reply from `tn_smbsrv_send_sealed()`.
-#[derive(Debug)]
-enum ReplySeal {
-    Encrypt(Arc<Keys>),
-    /// The keys and the byte range of each SMB2 message to sign.
-    Sign(Vec<(Arc<Keys>, Range<usize>)>),
-}
-
-impl ReplySeal {
-    /// Sign or encrypt the PDU in `buf`. False on failure.
-    fn apply(&self, ops: &CryptoOps, buf: &mut [u8]) -> bool {
-        match self {
-            ReplySeal::Encrypt(keys) => encrypt_pdu(ops, keys, buf),
-            ReplySeal::Sign(msgs) => msgs.iter().all(|(keys, at)| {
-                buf.get_mut(at.clone())
-                    .is_some_and(|msg| sign_msg(ops, keys, msg))
-            }),
+/// Make the reactor drop its cached keys, so smbd gets old keys back soon.
+fn keys_changed(conn: &Conn) {
+    // SAFETY: a C function holds no borrow of the reactor at its start.
+    if let Some(mut r) = unsafe { conn.local() } {
+        // SAFETY: as above.
+        if let Some((_, l)) = unsafe { local_parts(&mut r) } {
+            l.keys.clear();
         }
+        return;
     }
-
-    /// Sign or encrypt the PDU in place in `segs`. Some(false) on failure.
-    /// None, with nothing changed, if libcli cannot take this layout.
-    ///
-    /// # Safety
-    ///
-    /// As for `host_crypto_iov()`, for every segment.
-    unsafe fn apply_in_place(
-        &self,
-        ops: &CryptoOps,
-        segs: &[(*mut u8, usize)],
-    ) -> Option<bool> {
-        let total: usize = segs.iter().map(|&(_, len)| len).sum();
-        match self {
-            ReplySeal::Encrypt(keys) => {
-                if total <= NBT_HDR_SIZE + SMB2_TF_SIZE {
-                    return Some(false);
-                }
-                let mut iov = encrypt_vectors(segs, total)?;
-                // SAFETY: the caller's guarantee covers these vectors.
-                let status = unsafe {
-                    host_crypto_iov(
-                        ops.encrypt,
-                        keys.encrypt.as_ref(),
-                        &mut iov,
-                    )
-                };
-                Some(status == 0)
-            }
-            ReplySeal::Sign(msgs) => {
-                if msgs.iter().any(|(_, at)| at.len() <= SMB2_HDR_SIZE) {
-                    return Some(false);
-                }
-                let ranges: Vec<Range<usize>> =
-                    msgs.iter().map(|(_, at)| at.clone()).collect();
-                let mut iovs = sign_vectors(segs, &ranges)?;
-                Some(msgs.iter().zip(iovs.iter_mut()).all(
-                    |((keys, _), iov)| {
-                        // SAFETY: the caller's guarantee covers these vectors.
-                        let status = unsafe {
-                            host_crypto_iov(ops.sign, keys.sign.as_ref(), iov)
-                        };
-                        status == 0
-                    },
-                ))
-            }
-        }
+    if let Some(ext) = conn.ext::<Layer>() {
+        ext.post_keys_msg(conn);
     }
-}
-
-/// smbd's pointers for the vectors that `Conn::parts()` lends, in order.
-#[derive(Debug)]
-struct LentVecs(Vec<(*mut u8, usize)>);
-
-// SAFETY: only the connection's reactor uses the pointers, before the send.
-// smbd keeps the memory valid until TN_SMBROS_SENT.
-unsafe impl Send for LentVecs {}
-
-impl LentVecs {
-    /// The PDU in `parts` as segments: each owned part's buffer and smbd's
-    /// pointer for each lent part. None on a mismatch, so the caller seals
-    /// a copy instead of writing to memory that is not the part's.
-    fn segments(
-        &self,
-        parts: &mut [PushPart],
-    ) -> Option<Vec<(*mut u8, usize)>> {
-        let mut lent = self.0.iter();
-        let mut segs = Vec::with_capacity(parts.len());
-        for p in parts.iter_mut() {
-            match p {
-                PushPart::Owned(v) => segs.push((v.as_mut_ptr(), v.len())),
-                PushPart::Lent(l) => {
-                    let &(ptr, len) = lent.next()?;
-                    let bytes = l.as_slice();
-                    if !std::ptr::eq(ptr.cast_const(), bytes.as_ptr())
-                        || len != bytes.len()
-                    {
-                        return None;
-                    }
-                    segs.push((ptr, len));
-                }
-            }
-        }
-        lent.next().is_none().then_some(segs)
-    }
-}
-
-/// The `HostKey` of `key`. None for NULL.
-fn host_key(poster: &Poster, key: *mut c_void) -> Option<HostKey> {
-    (!key.is_null()).then(|| HostKey {
-        key,
-        poster: poster.clone(),
-    })
 }
 
 /// Give the reactor of `conn` the keys of `session_id`. `sign` is the
@@ -586,20 +388,20 @@ pub unsafe extern "C" fn tn_smbsrv_session_keys(
 ) -> c_int {
     // SAFETY: the caller passes a live connection.
     let conn = unsafe { &*conn };
-    let poster = conn.poster();
-    let keys = Keys {
-        generation,
-        sign: host_key(&poster, sign),
-        encrypt: host_key(&poster, encrypt),
-        decrypt: host_key(&poster, decrypt),
-    };
-    // On ENOTSUP, the drop of `keys` posts a KEY_FREE event for each key.
-    let Some(ext) =
-        conn.state().ext::<ConnExt>().filter(|e| e.crypto.is_some())
-    else {
+    let hub = conn.hub_ref();
+    // On an error, the drop of the keys gives each key back.
+    let keys = Arc::new(Keys::new(hub, generation, sign, encrypt, decrypt));
+    let Some(ext) = conn.ext::<Layer>().filter(|e| e.ops.is_some()) else {
         return libc::ENOTSUP;
     };
-    lock(&ext.keys).insert(session_id, Arc::new(keys));
+    match ext.keys.insert(session_id, keys) {
+        Ok(old) => drop(old),
+        Err(keys) => {
+            drop(keys);
+            return libc::ENOMEM;
+        }
+    }
+    keys_changed(conn);
     0
 }
 
@@ -616,11 +418,13 @@ pub unsafe extern "C" fn tn_smbsrv_session_drop(
 ) {
     // SAFETY: the caller passes a live connection.
     let conn = unsafe { &*conn };
-    let Some(ext) = conn.state().ext::<ConnExt>() else {
+    let Some(ext) = conn.ext::<Layer>() else {
         return;
     };
-    let keys = lock(&ext.keys).remove(&session_id);
-    drop(keys);
+    if let Some(k) = ext.keys.remove(session_id) {
+        drop(k);
+        keys_changed(conn);
+    }
 }
 
 /// A reference to the keys of `session_id` on `conn`. NULL if `conn` has no
@@ -639,14 +443,21 @@ pub unsafe extern "C" fn tn_smbsrv_keys_pin(
 ) -> *mut Keys {
     // SAFETY: the caller passes a live connection.
     let conn = unsafe { &*conn };
-    let keys = conn
-        .state()
-        .ext::<ConnExt>()
-        .and_then(|ext| ext.keys_of(session_id));
-    match keys {
-        Some(keys) if keys.generation == generation => {
-            Arc::into_raw(keys).cast_mut()
+    let Some(ext) = conn.ext::<Layer>() else {
+        return ptr::null_mut();
+    };
+    // SAFETY: a C function holds no borrow of the reactor at its start.
+    if let Some(mut r) = unsafe { conn.local() } {
+        // SAFETY: as above.
+        if let Some((_, l)) = unsafe { local_parts(&mut r) } {
+            return match l.keys.find(&ext.keys, session_id) {
+                Some(k) if k.generation == generation => pin(Arc::clone(k)),
+                _ => ptr::null_mut(),
+            };
         }
+    }
+    match ext.keys.find(session_id) {
+        Some(k) if k.generation == generation => pin(k),
         _ => ptr::null_mut(),
     }
 }
@@ -659,7 +470,7 @@ pub unsafe extern "C" fn tn_smbsrv_keys_pin(
 /// it again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tn_smbsrv_keys_unpin(pin: *mut Keys) {
-    // SAFETY: the caller transfers ownership of `pin`.
+    // SAFETY: the caller gives up its reference.
     drop(unsafe { unpin(pin) });
 }
 
@@ -697,25 +508,35 @@ pub unsafe extern "C" fn tn_smbsrv_send_sealed(
 ) -> c_int {
     // SAFETY: the caller passes `iovcnt` vectors.
     let iov = unsafe { iov_of(iov, iovcnt) };
-    // SAFETY: the caller transfers ownership of `encrypt`.
+    // Each key goes into the plan or is dropped before an error return.
+    // SAFETY: the caller gives up its reference.
     let encrypt = unsafe { unpin(encrypt) };
-    let sign = if sign.is_null() {
+    let parts = if sign.is_null() {
         &[]
     } else {
         // SAFETY: the caller passes `nsign` parts.
         unsafe { std::slice::from_raw_parts(sign, nsign) }
     };
-    // This function owns the keys of every part. So the loop calls unpin()
-    // for each part before this function can return an error.
-    let mut msgs = Vec::with_capacity(sign.len());
+    let Some(mut plan) = Plan::get(encrypt) else {
+        for part in parts {
+            // SAFETY: the caller gives up the reference of each part.
+            drop(unsafe { unpin(part.keys) });
+        }
+        return libc::ENOMEM;
+    };
     let mut err = 0;
-    for part in sign {
-        // SAFETY: the caller transfers ownership of the keys of the part.
-        let keys = unsafe { unpin(part.keys) }.filter(|k| k.sign.is_some());
-        match (keys, iov.and_then(|iov| part.range(iov))) {
-            (Some(keys), Some(at)) => msgs.push((keys, at)),
+    for part in parts {
+        // SAFETY: the caller gives up the reference of each part.
+        let k = unsafe { unpin(part.keys) };
+        match (k, iov.and_then(|v| part.range(v))) {
+            (Some(k), Some(rg)) if !k.sign.is_null() => {
+                if !plan.sign(k, rg) {
+                    err = libc::ENOMEM;
+                }
+            }
+            (Some(k), _) if k.sign.is_null() => err = libc::ENOKEY,
             (None, _) => err = libc::ENOKEY,
-            (Some(_), None) => err = libc::EINVAL,
+            _ => err = libc::EINVAL,
         }
     }
     let Some(iov) = iov else {
@@ -723,240 +544,41 @@ pub unsafe extern "C" fn tn_smbsrv_send_sealed(
     };
     // SAFETY: the caller passes a live connection.
     let conn = unsafe { &*conn };
-    let ops = conn.state().ext::<ConnExt>().and_then(|ext| ext.crypto);
-    let Some(ops) = ops else {
+    if conn.ext::<Layer>().is_none_or(|e| e.ops.is_none()) {
         return libc::ENOKEY;
-    };
+    }
     if err != 0 {
         return err;
     }
-    let seal = match (encrypt, sign.is_empty()) {
-        (Some(keys), true) if keys.encrypt.is_some() => {
-            ReplySeal::Encrypt(keys)
-        }
-        (None, false) => ReplySeal::Sign(msgs),
-        _ => return libc::EINVAL,
+    if !plan.valid(parts.len()) {
+        return libc::EINVAL;
+    }
+    // SAFETY: a C function holds no borrow of the reactor at its start.
+    let mut local = unsafe { conn.local() };
+    // SAFETY: the caller keeps the vectors readable until TN_SMBROS_SENT.
+    let Some(mut o) =
+        (unsafe { make_out(local.as_deref_mut(), iov, lend_min) })
+    else {
+        return libc::ENOMEM;
     };
-    // Encryption writes to the lent vectors, so keep smbd's pointers.
-    let lent_vecs = LentVecs(
-        iov.iter()
-            .filter(|v| v.iov_len > 0 && v.iov_len >= lend_min)
-            .map(|v| (v.iov_base.cast::<u8>(), v.iov_len))
-            .collect(),
-    );
-    // SAFETY: the caller keeps the lent vectors valid until TN_SMBROS_SENT.
-    let (parts, any_lent) = unsafe { conn.parts(iov, lend_min, sent_cookie) };
+    o.cookie = sent_cookie;
     // SAFETY: the caller passes room for a bool.
-    unsafe { lent.write(any_lent) };
-    // The reactor runs the closure before it queues the reply. It seals the
-    // parts in place, or seals a copy if libcli cannot take the layout.
-    conn.send_finished(
-        parts,
-        Box::new(move |parts: &mut Vec<PushPart>| {
-            if let Some(segs) = lent_vecs.segments(parts) {
-                // SAFETY: the segments are owned parts and smbd's lent
-                // memory, valid until TN_SMBROS_SENT. The ring reads them
-                // only after this closure.
-                if let Some(ok) = unsafe { seal.apply_in_place(&ops, &segs) } {
-                    return ok;
-                }
-            }
-            let size = parts.iter().map(|p| p.as_slice().len()).sum();
-            let mut buf = Vec::with_capacity(size);
-            for p in parts.iter() {
-                buf.extend_from_slice(p.as_slice());
-            }
-            if !seal.apply(&ops, &mut buf) {
-                return false;
-            }
-            *parts = vec![PushPart::Owned(buf)];
-            true
-        }),
-    );
+    unsafe { lent.write(o.lent) };
+    o.plan = plan.into_raw();
+    o.finish = true;
+    match local.as_deref_mut() {
+        Some(r) => send_finished(r, o),
+        None => send_out(conn, None, o),
+    }
     0
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        LentVecs, SMB2_HDR_SIZE, SMB2_TF_SIZE, Seal, TN_SMBSRV_SEAL_NONE,
-        encrypt_vectors, sign_vectors, slice_iov,
-    };
-    use truenas_ros::net::server::{Lent, PushPart};
-
-    fn segs(bufs: &mut [Vec<u8>]) -> Vec<(*mut u8, usize)> {
-        bufs.iter_mut().map(|b| (b.as_mut_ptr(), b.len())).collect()
+/// Sign or encrypt `o` on its reactor `r`, then queue it.
+fn send_finished(r: &mut ShimReactor, mut o: Box<truenas_smbros::Out>) {
+    if !<Layer as truenas_smbros::Upper>::finish_out(r, &mut o) {
+        release_out(r, o);
+        r.end::<Shim<Layer>>(libc::ECONNABORTED);
+        return;
     }
-
-    fn lens(iov: &[libc::iovec]) -> Vec<usize> {
-        iov.iter().map(|v| v.iov_len).collect()
-    }
-
-    /// The bytes of `iov`, in order.
-    fn gathered(iov: &[libc::iovec]) -> Vec<u8> {
-        iov.iter()
-            .flat_map(|v| {
-                // SAFETY: the vectors point into the test's own buffers.
-                unsafe {
-                    std::slice::from_raw_parts(
-                        v.iov_base.cast::<u8>(),
-                        v.iov_len,
-                    )
-                }
-            })
-            .copied()
-            .collect()
-    }
-
-    /// Buffers of `lens` bytes with no byte equal to its neighbours, and
-    /// the same bytes in one buffer, as the copying path gathers them.
-    fn layout(lens: &[usize]) -> (Vec<Vec<u8>>, Vec<u8>) {
-        let flat: Vec<u8> = (0..lens.iter().sum::<usize>())
-            .map(|k| u8::try_from(k % 251).unwrap())
-            .collect();
-        let mut rest = flat.as_slice();
-        let bufs = lens
-            .iter()
-            .map(|&n| {
-                let (buf, tail) = rest.split_at(n);
-                rest = tail;
-                buf.to_vec()
-            })
-            .collect();
-        (bufs, flat)
-    }
-
-    #[test]
-    fn in_place_vectors_hold_the_bytes_of_the_copy() {
-        let data = 1 << 16;
-        let one = 4 + 64 + 16;
-        let single = |at: std::ops::Range<usize>| vec![at];
-        for (lens, msgs) in [
-            (vec![one], single(4..one)),
-            (vec![one, data, 8], single(4..one + data + 8)),
-            (vec![one + 100, data], vec![4..104, 104..one + 100 + data]),
-        ] {
-            let (mut bufs, flat) = layout(&lens);
-            let s = segs(&mut bufs);
-            let iovs = sign_vectors(&s, &msgs).unwrap();
-            for (iov, at) in iovs.iter().zip(&msgs) {
-                assert_eq!(iov[0].iov_len, SMB2_HDR_SIZE, "{lens:?}");
-                assert!(gathered(iov) == flat[at.clone()], "{lens:?}");
-            }
-        }
-        let lens = [4 + 52 + 64 + 16, data, 8];
-        let (mut bufs, flat) = layout(&lens);
-        let s = segs(&mut bufs);
-        let iov = encrypt_vectors(&s, flat.len()).unwrap();
-        assert_eq!(iov[0].iov_len, SMB2_TF_SIZE);
-        assert!(gathered(&iov) == flat[4..]);
-    }
-
-    #[test]
-    fn a_header_alone_is_not_signed_in_place() {
-        let mut bufs = vec![vec![0u8; 4 + 64]];
-        let s = segs(&mut bufs);
-        assert!(sign_vectors(&s, std::slice::from_ref(&(4..68))).is_none());
-    }
-
-    #[test]
-    fn a_lent_part_pairs_only_with_its_own_pointer() {
-        let mine = vec![7u8; 32];
-        let other = vec![9u8; 32];
-        // SAFETY: the buffers outlive the parts, and nothing writes them.
-        let lent = unsafe { Lent::new(mine.as_ptr(), mine.len(), || {}) };
-        let mut parts =
-            vec![PushPart::Owned(vec![1u8; 4]), PushPart::Lent(lent)];
-        let at = |b: &Vec<u8>| vec![(b.as_ptr().cast_mut(), b.len())];
-        let s = LentVecs(at(&mine)).segments(&mut parts).unwrap();
-        assert_eq!(s[1], (mine.as_ptr().cast_mut(), mine.len()));
-        assert!(LentVecs(at(&other)).segments(&mut parts).is_none());
-        assert!(LentVecs(Vec::new()).segments(&mut parts).is_none());
-    }
-
-    #[test]
-    fn a_slice_points_into_the_segments() {
-        let mut bufs = vec![vec![0u8; 10], vec![1u8; 20], vec![2u8; 5]];
-        let s = segs(&mut bufs);
-        assert_eq!(lens(&slice_iov(&s, &(2..8)).unwrap()), [6]);
-        assert_eq!(lens(&slice_iov(&s, &(8..33)).unwrap()), [2, 20, 3]);
-        assert_eq!(lens(&slice_iov(&s, &(0..35)).unwrap()), [10, 20, 5]);
-        assert!(slice_iov(&s, &(30..36)).is_none());
-        let v = slice_iov(&s, &(12..13)).unwrap();
-        assert_eq!(v[0].iov_base.cast::<u8>(), s[1].0.wrapping_add(2));
-    }
-
-    #[test]
-    fn a_read_reply_is_signed_where_it_lies() {
-        // Owned header and body, lent data, owned padding.
-        let mut bufs =
-            vec![vec![0u8; 4 + 64 + 16], vec![0u8; 1 << 16], vec![0u8; 8]];
-        let s = segs(&mut bufs);
-        let iovs = sign_vectors(
-            &s,
-            std::slice::from_ref(&(4..4 + 80 + (1 << 16) + 8)),
-        )
-        .unwrap();
-        assert_eq!(lens(&iovs[0]), [64, 16, 1 << 16, 8]);
-        assert_eq!(iovs[0][2].iov_base.cast::<u8>(), s[1].0);
-    }
-
-    #[test]
-    fn a_compound_reply_is_signed_per_message() {
-        // Two messages: an owned one, and one with lent data.
-        let mut bufs = vec![vec![0u8; 4 + 100 + 80], vec![0u8; 1 << 16]];
-        let s = segs(&mut bufs);
-        let iovs =
-            sign_vectors(&s, &[4..104, 104..104 + 80 + (1 << 16)]).unwrap();
-        assert_eq!(lens(&iovs[0]), [64, 36]);
-        assert_eq!(lens(&iovs[1]), [64, 16, 1 << 16]);
-    }
-
-    #[test]
-    fn a_layout_that_libcli_cannot_take_is_copied() {
-        // More vectors than smb2_signing_sign_pdu() takes.
-        let mut bufs = vec![
-            vec![0u8; 4 + 80],
-            vec![0u8; 100],
-            vec![0u8; 100],
-            vec![0u8; 100],
-        ];
-        let s = segs(&mut bufs);
-        assert!(sign_vectors(&s, std::slice::from_ref(&(4..384))).is_none());
-        // An SMB2 header in two segments.
-        let mut bufs = vec![vec![0u8; 4 + 32], vec![0u8; 132]];
-        let s = segs(&mut bufs);
-        assert!(sign_vectors(&s, std::slice::from_ref(&(4..168))).is_none());
-        // A transform header in two segments.
-        let mut bufs = vec![vec![0u8; 4 + 20], vec![0u8; 132]];
-        let s = segs(&mut bufs);
-        assert!(encrypt_vectors(&s, 156).is_none());
-    }
-
-    #[test]
-    fn an_encrypted_reply_uses_the_lent_memory() {
-        let mut bufs = vec![vec![0u8; 4 + 52 + 64 + 16], vec![7u8; 1 << 16]];
-        let s = segs(&mut bufs);
-        let iov = encrypt_vectors(&s, 4 + 52 + 80 + (1 << 16)).unwrap();
-        assert_eq!(lens(&iov), [52, 80, 1 << 16]);
-        assert_eq!(iov[0].iov_base.cast::<u8>(), s[0].0.wrapping_add(4));
-        assert_eq!(iov[2].iov_base.cast::<u8>(), s[1].0);
-    }
-
-    #[test]
-    fn seal_none_needs_no_keys() {
-        // SAFETY: a NULL pin is allowed.
-        let seal =
-            unsafe { Seal::of(TN_SMBSRV_SEAL_NONE, std::ptr::null_mut()) };
-        assert!(matches!(seal, Some(Seal::None)));
-    }
-
-    #[test]
-    fn an_unknown_seal_is_refused() {
-        for value in [3, -1] {
-            // SAFETY: a NULL pin is allowed.
-            let seal = unsafe { Seal::of(value, std::ptr::null_mut()) };
-            assert!(seal.is_none());
-        }
-    }
+    r.queue_api(o);
 }

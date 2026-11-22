@@ -7,8 +7,9 @@
 # - smbhad/client: the client in smbd, with the record of a durable handle and
 #   the durable cookie of vfs_zfs_core. A static library with a C header that
 #   smbd links.
-# The workspace also has the truenas_ros reactors of smbd. See README.md.
-# - mit/smbros: a shim between an SMB server and truenas_ros
+# The workspace also has the reactors of smbd on io_uring. See README.md.
+# - mit/smbros: the socket layer of an SMB server, one reactor thread and
+#   ring per connection
 # - gpl/smb-server, gpl/smb-vfs: the layer of smbd above the shim
 # build.sh builds the workspace before waf builds Samba. Cargo.lock is in
 # git. `rev` pins each git dependency to a commit. A package build is

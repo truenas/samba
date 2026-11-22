@@ -2024,6 +2024,111 @@ NTSTATUS parent_pathref(TALLOC_CTX *mem_ctx,
 	return NT_STATUS_OK;
 }
 
+static int unlink_dirfsp_destructor(struct files_struct *keep)
+{
+	size_t refcount = fh_get_refcount(keep->fh);
+
+	if (refcount > 1) {
+		fh_set_refcount(keep->fh, refcount - 1);
+		return 0;
+	}
+	fd_close(keep);
+	TALLOC_FREE(keep->fh);
+	return 0;
+}
+
+/*
+ * TrueNAS: keep a pathref of dirfsp, the directory that fsp was opened in,
+ * until fsp is freed. It shares the descriptor of dirfsp, so the unlink of a
+ * delete on close needs no new lookup of the directory.
+ */
+void fsp_keep_unlink_dirfsp(struct files_struct *fsp,
+			    struct files_struct *dirfsp)
+{
+	struct files_struct *keep = NULL;
+
+	if ((fsp->unlink_dirfsp != NULL) || (dirfsp == NULL) ||
+	    (dirfsp == dirfsp->conn->cwd_fsp) ||
+	    (fsp_get_pathref_fd(dirfsp) == -1))
+	{
+		return;
+	}
+
+	keep = talloc_zero(fsp, struct files_struct);
+	if (keep == NULL) {
+		return;
+	}
+	keep->fsp_name = cp_smb_filename(keep, dirfsp->fsp_name);
+	if (keep->fsp_name == NULL) {
+		TALLOC_FREE(keep);
+		return;
+	}
+	keep->fnum = FNUM_FIELD_INVALID;
+	keep->conn = dirfsp->conn;
+	keep->file_id = dirfsp->file_id;
+	keep->fsp_flags.is_pathref = true;
+	keep->fsp_flags.is_directory = true;
+	keep->fsp_flags.have_proc_fds = dirfsp->fsp_flags.have_proc_fds;
+	/* keep makes the last close(2), see fd_close_posix() */
+	keep->fsp_flags.use_ofd_locks = dirfsp->fsp_flags.use_ofd_locks;
+	keep->fh = dirfsp->fh;
+	fh_set_refcount(keep->fh, fh_get_refcount(keep->fh) + 1);
+	talloc_set_destructor(keep, unlink_dirfsp_destructor);
+
+	fsp->unlink_dirfsp = keep;
+}
+
+/*
+ * parent_pathref() for the unlink of fsp at close. While fsp is still in
+ * the directory that it was opened in, the parent is the pathref that
+ * fsp_keep_unlink_dirfsp() kept.
+ */
+NTSTATUS close_parent_pathref(TALLOC_CTX *mem_ctx,
+			      struct files_struct *fsp,
+			      struct smb_filename **_parent,
+			      struct smb_filename **_atname)
+{
+	struct files_struct *keep = fsp->unlink_dirfsp;
+	struct smb_filename *parent = NULL;
+	struct smb_filename *atname = NULL;
+	NTSTATUS status;
+
+	if (keep == NULL) {
+		goto lookup;
+	}
+
+	status = SMB_VFS_PARENT_PATHNAME(fsp->conn,
+					 mem_ctx,
+					 fsp->fsp_name,
+					 &parent,
+					 &atname);
+	if (!NT_STATUS_IS_OK(status)) {
+		return status;
+	}
+	if (strcmp(parent->base_name, keep->fsp_name->base_name) != 0) {
+		/* A rename moved fsp to another directory */
+		TALLOC_FREE(parent);
+		goto lookup;
+	}
+	status = reference_smb_fname_fsp_link(atname, fsp->fsp_name);
+	if (!NT_STATUS_IS_OK(status)) {
+		TALLOC_FREE(parent);
+		return status;
+	}
+	parent->fsp = keep;
+
+	*_parent = parent;
+	*_atname = atname;
+	return NT_STATUS_OK;
+
+lookup:
+	return parent_pathref(mem_ctx,
+			      fsp->conn->cwd_fsp,
+			      fsp->fsp_name,
+			      _parent,
+			      _atname);
+}
+
 static bool close_file_in_loop(struct files_struct *fsp,
 			       enum file_close_type close_type)
 {

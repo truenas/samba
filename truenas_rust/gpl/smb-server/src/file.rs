@@ -1,22 +1,21 @@
 // Copyright (C) iXsystems, Inc. 2026
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The open files of smbd. The reactors do file I/O with smbd's descriptor
-//! of each file. smbd closes the descriptor only when no job uses it.
+//! The open files of smbd that jobs use, and the holds of the jobs.
 
-use std::ffi::{c_int, c_void};
+use std::cell::RefCell;
+use std::ffi::c_int;
 use std::mem::ManuallyDrop;
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
-use truenas_ros::uring_fs::File;
-use truenas_smbros::{Ctx, Note, Poster, lock};
+use truenas_smbros::{Ctx, HubRef, Node, TnSmbrosEvent, lock, try_box};
 
 use crate::TN_SMBSRV_IDLE;
+use crate::upper::EV_IDLE;
 
-/// One job in `OpenFile::state` that smbd gave to a reactor.
+/// One job in the state of a file that smbd gave to a reactor.
 const RUNNING: u64 = 1;
 const RUNNING_MASK: u64 = (1 << 30) - 1;
 /// One job that smbd did not give to a reactor yet.
@@ -28,27 +27,24 @@ const WAIT_EVENT: u64 = 1 << 62;
 /// A thread of smbd blocks until the last running job ends.
 const WAIT_BLOCK: u64 = 1 << 63;
 
-/// `OpenFile::seq` counts the jobs that are outstanding requests of the
-/// open. smbd uses the counts for the channel sequence checks of
-/// [MS-SMB2] 3.3.5.2.10. This is one job of the current channel sequence.
+/// One outstanding request of the current channel sequence, for the checks
+/// of [MS-SMB2] 3.3.5.2.10.
 const SEQ_CUR: u64 = 1;
 const SEQ_CUR_MASK: u64 = 0xff_ffff;
 /// One job of an older channel sequence.
 const SEQ_OLD: u64 = 1 << 24;
 const SEQ_OLD_MASK: u64 = SEQ_CUR_MASK << 24;
-/// The epoch counts the changes of the channel sequence. A job counts as
-/// current until the epoch changes.
+/// The epoch counts the changes of the channel sequence.
 const SEQ_EPOCH_SHIFT: u32 = 48;
 
 fn seq_epoch(v: u64) -> u16 {
-    // The shift leaves 16 bits.
-    #[allow(clippy::cast_possible_truncation)]
-    let e = (v >> SEQ_EPOCH_SHIFT) as u16;
-    e
+    (v >> SEQ_EPOCH_SHIFT) as u16
 }
 
 /// No position from a read.
 const NO_POS: u64 = u64::MAX;
+/// The holds that one thread keeps for reuse.
+const CACHE_MAX: usize = 64;
 
 /// An open file of the caller, from `tn_smbsrv_file_new()`. The reactors
 /// do file I/O with the descriptor of the caller. The file counts each job
@@ -60,73 +56,71 @@ const NO_POS: u64 = u64::MAX;
 #[derive(Debug)]
 pub struct OpenFile {
     /// smbd's descriptor. Only smbd closes it.
-    fd: ManuallyDrop<Arc<OwnedFd>>,
+    fd: c_int,
     /// The counts of running and pending jobs, and the wait flags.
     state: AtomicU64,
-    /// The channel sequence counts. See `SEQ_CUR`.
     seq: AtomicU64,
     /// The end of the last read that returned data, or `NO_POS`.
     pos: AtomicU64,
-    /// True if smbd closed the file. Only the thread that runs smbd uses
-    /// this flag.
+    /// True if smbd closed the file.
     closed: AtomicBool,
     cookie: u64,
-    poster: Poster,
+    hub: HubRef,
     /// `tn_smbsrv_file_close()` waits on `idle` for the running jobs.
     lock: Mutex<()>,
     idle: Condvar,
 }
 
 impl OpenFile {
+    pub(crate) fn fd(&self) -> c_int {
+        self.fd
+    }
+
     pub(crate) fn set_pos(&self, pos: u64) {
         self.pos.store(pos, Ordering::Release);
     }
 
-    /// Move the position of the last read to `*pos`. False if there is none
-    /// or `pos` is NULL.
-    ///
-    /// # Safety
-    ///
-    /// `pos` is NULL or writable.
-    unsafe fn take_pos(&self, pos: *mut u64) -> bool {
+    fn take_pos(&self) -> Option<u64> {
         let p = self.pos.swap(NO_POS, Ordering::AcqRel);
-        if p == NO_POS || pos.is_null() {
-            return false;
-        }
-        // SAFETY: the caller passes room for a position.
-        unsafe { pos.write(p) };
-        true
-    }
-}
-
-impl Drop for OpenFile {
-    fn drop(&mut self) {
-        // SAFETY: nothing uses `self.fd` after this drop.
-        let fd = unsafe { ManuallyDrop::take(&mut self.fd) };
-        // Only smbd closes the descriptor. After that, the number can refer
-        // to another file. If a job that ended still has a clone, this code
-        // leaks the reference. Then no drop closes the descriptor.
-        match Arc::try_unwrap(fd) {
-            Ok(fd) => {
-                let _ = fd.into_raw_fd();
-            }
-            Err(fd) => std::mem::forget(fd),
-        }
+        (p != NO_POS).then_some(p)
     }
 }
 
 /// The event for `TN_SMBSRV_IDLE`. The last job of a file ended.
+#[repr(C)]
 #[derive(Debug)]
-struct Idle(Arc<OpenFile>);
+struct IdleNote {
+    node: Node,
+    file: Arc<OpenFile>,
+}
 
-impl Note for Idle {
-    fn take(self: Box<Self>) -> Option<(c_int, u64, *mut c_void)> {
-        // smbd frees the cookie when it closes the file.
-        if self.0.closed.load(Ordering::Relaxed) {
-            return None;
-        }
-        Some((TN_SMBSRV_IDLE, self.0.cookie, ptr::null_mut()))
+/// Fill `ev` from an IDLE node. False if smbd closed the file.
+///
+/// # Safety
+///
+/// `n` is the node of a leaked `IdleNote`.
+pub(crate) unsafe fn take_idle(
+    n: NonNull<Node>,
+    ev: &mut TnSmbrosEvent,
+) -> bool {
+    // SAFETY: as the caller says.
+    let i = unsafe { Box::from_raw(n.cast::<IdleNote>().as_ptr()) };
+    // smbd frees the cookie when it closes the file.
+    if i.file.closed.load(Ordering::Relaxed) {
+        return false;
     }
+    *ev = TnSmbrosEvent::bare(i.file.cookie, TN_SMBSRV_IDLE);
+    true
+}
+
+/// Free an IDLE node that smbd does not get.
+///
+/// # Safety
+///
+/// As for `take_idle()`.
+pub(crate) unsafe fn drop_idle(n: NonNull<Node>) {
+    // SAFETY: as the caller says.
+    drop(unsafe { Box::from_raw(n.cast::<IdleNote>().as_ptr()) });
 }
 
 /// One job of a file, from `tn_smbsrv_file_hold()`. The file counts the job
@@ -134,92 +128,117 @@ impl Note for Idle {
 /// hold to `tn_smbsrv_delegate()`. Then the job is running.
 #[derive(Debug)]
 pub struct Hold {
-    file: Arc<OpenFile>,
+    file: Option<Arc<OpenFile>>,
     running: bool,
-    /// The epoch in which the job counts as current. An old job has an
-    /// earlier epoch. None if the job does not count.
-    seq: Option<u16>,
+    /// True if the job counts as an outstanding request of the open.
+    counted: bool,
+    /// The epoch in which the job counts as current.
+    epoch: u16,
+}
+
+// smbd holds a hold as a pointer to its box, so the cache keeps boxes.
+thread_local! {
+    #[allow(clippy::vec_box)]
+    static HOLDS: RefCell<Vec<Box<Hold>>> = const { RefCell::new(Vec::new()) };
 }
 
 impl Hold {
-    fn new(file: &Arc<OpenFile>) -> Hold {
+    /// A new pending job of `file`. None without memory.
+    fn new(file: &Arc<OpenFile>) -> Option<Box<Hold>> {
+        let cached = HOLDS.try_with(|c| c.borrow_mut().pop()).ok().flatten();
+        let mut h = match cached {
+            Some(h) => h,
+            None => try_box(|| Hold {
+                file: None,
+                running: false,
+                counted: false,
+                epoch: 0,
+            })?,
+        };
         file.state.fetch_add(PENDING, Ordering::AcqRel);
-        Hold {
-            file: Arc::clone(file),
-            running: false,
-            seq: None,
-        }
+        h.file = Some(Arc::clone(file));
+        h.running = false;
+        h.counted = false;
+        h.epoch = 0;
+        Some(h)
     }
 
-    pub(crate) fn file(&self) -> &OpenFile {
-        &self.file
+    pub(crate) fn file(&self) -> Option<&OpenFile> {
+        self.file.as_deref()
     }
 
-    /// Count the job as an outstanding request of the open until the hold
-    /// drops. `current` is true for the current channel sequence.
     fn count_seq(&mut self, current: bool) {
-        if self.seq.is_some() {
+        let Some(f) = &self.file else {
+            return;
+        };
+        if self.counted {
             return;
         }
         let one = if current { SEQ_CUR } else { SEQ_OLD };
-        let old = self.file.seq.fetch_add(one, Ordering::AcqRel);
-        let epoch = seq_epoch(old);
-        self.seq = Some(if current {
-            epoch
-        } else {
-            epoch.wrapping_sub(1)
-        });
+        let e = seq_epoch(f.seq.fetch_add(one, Ordering::AcqRel));
+        self.epoch = if current { e } else { e.wrapping_sub(1) };
+        self.counted = true;
     }
 
-    /// Mark the job as running. Returns the descriptor for the I/O and the
-    /// hold. None if smbd closed the file.
-    pub(crate) fn start(mut self) -> Option<(File, Hold)> {
-        if self.file.closed.load(Ordering::Relaxed) {
-            return None;
+    /// Mark the job as running. False if smbd closed the file.
+    pub(crate) fn start(&mut self) -> bool {
+        let Some(f) = &self.file else {
+            return false;
+        };
+        if f.closed.load(Ordering::Relaxed) {
+            return false;
         }
-        // One atomic step moves the job from pending to running. So the
-        // count of jobs is never zero in between.
-        self.file
-            .state
+        // One step, so the count of jobs is never zero in between.
+        f.state
             .fetch_add(RUNNING.wrapping_sub(PENDING), Ordering::AcqRel);
         self.running = true;
-        let fd = File::from_shared(Arc::clone(&*self.file.fd));
-        Some((fd, self))
+        true
     }
 }
 
-impl Drop for Hold {
-    fn drop(&mut self) {
-        let file = &self.file;
-        if let Some(epoch) = self.seq {
-            // tn_smbsrv_file_seq_bump() moves the current jobs to the old
-            // count. The epoch shows which count has this job.
-            let _ =
-                file.seq
-                    .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                        let one = if seq_epoch(v) == epoch {
-                            SEQ_CUR
-                        } else {
-                            SEQ_OLD
-                        };
-                        Some(v - one)
-                    });
-        }
-        let one = if self.running { RUNNING } else { PENDING };
-        let old = file.state.fetch_sub(one, Ordering::AcqRel);
-        if old & JOBS == one && old & WAIT_EVENT != 0 {
-            file.poster.post(Box::new(Idle(Arc::clone(file))));
-        }
-        if self.running
-            && old & RUNNING_MASK == RUNNING
-            && old & WAIT_BLOCK != 0
-        {
-            // The waiter has `lock` locked from its check of the count until
-            // its wait. So this notification cannot occur between the two.
-            let _guard = lock(&file.lock);
-            file.idle.notify_all();
-        }
+/// Free the hold `h`. The last job of its file posts the IDLE event or
+/// wakes `tn_smbsrv_file_close()`.
+pub(crate) fn hold_free(mut h: Box<Hold>) {
+    let Some(f) = h.file.take() else {
+        return;
+    };
+    if h.counted {
+        // The epoch tells if tn_smbsrv_file_seq_bump() made the job old.
+        let _ = f.seq.try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+            let one = if seq_epoch(v) == h.epoch {
+                SEQ_CUR
+            } else {
+                SEQ_OLD
+            };
+            Some(v - one)
+        });
     }
+    let one = if h.running { RUNNING } else { PENDING };
+    let old = f.state.fetch_sub(one, Ordering::AcqRel);
+    if old & JOBS == one
+        && old & WAIT_EVENT != 0
+        && let Some(n) = try_box(|| IdleNote {
+            node: Node::new(EV_IDLE),
+            file: Arc::clone(&f),
+        })
+    {
+        let n = Box::leak(n);
+        // SAFETY: the node starts a leaked IdleNote, as its kind tells.
+        unsafe { f.hub.hub().post(NonNull::from(&mut n.node)) };
+    }
+    if h.running && old & RUNNING_MASK == RUNNING && old & WAIT_BLOCK != 0 {
+        // The waiter holds the lock from its check to its wait.
+        let _guard = lock(&f.lock);
+        f.idle.notify_all();
+    }
+    drop(f);
+    // An ending thread has no cache. Then the hold is freed.
+    let _ = HOLDS.try_with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() < CACHE_MAX {
+            c.push(h);
+        }
+    });
 }
 
 /// Make the open file of `fd`. The IDLE events of the file have `cookie`.
@@ -239,22 +258,29 @@ pub unsafe extern "C" fn tn_smbsrv_file_new(
         return ptr::null_mut();
     }
     // SAFETY: the caller passes a live context.
-    let poster = unsafe { (*ctx).poster() };
-    // SAFETY: the caller keeps `fd` open. The drop of `OpenFile` does not
-    // close it.
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let hub = unsafe { &*ctx }.hub_ref();
     Arc::into_raw(Arc::new(OpenFile {
-        fd: ManuallyDrop::new(Arc::new(fd)),
+        fd,
         state: AtomicU64::new(0),
         seq: AtomicU64::new(0),
         pos: AtomicU64::new(NO_POS),
         closed: AtomicBool::new(false),
         cookie,
-        poster,
+        hub,
         lock: Mutex::new(()),
         idle: Condvar::new(),
     }))
     .cast_mut()
+}
+
+/// The file of smbd's reference, without taking the reference.
+///
+/// # Safety
+///
+/// `file` is from `tn_smbsrv_file_new()` and smbd did not close it.
+unsafe fn file_ref(file: *const OpenFile) -> ManuallyDrop<Arc<OpenFile>> {
+    // SAFETY: as the caller says. ManuallyDrop keeps smbd's reference.
+    ManuallyDrop::new(unsafe { Arc::from_raw(file) })
 }
 
 /// Count a new pending job of `file`. Returns the hold of the job. Give the
@@ -269,10 +295,9 @@ pub unsafe extern "C" fn tn_smbsrv_file_new(
 pub unsafe extern "C" fn tn_smbsrv_file_hold(
     file: *const OpenFile,
 ) -> *mut Hold {
-    // SAFETY: the reference of the caller keeps the file live. This code
-    // borrows that reference and does not drop it.
-    let file = ManuallyDrop::new(unsafe { Arc::from_raw(file) });
-    Box::into_raw(Box::new(Hold::new(&file)))
+    // SAFETY: as the caller says.
+    let f = unsafe { file_ref(file) };
+    Hold::new(&f).map_or(ptr::null_mut(), Box::into_raw)
 }
 
 /// Free a hold that the caller did not delegate. NULL is allowed.
@@ -284,8 +309,8 @@ pub unsafe extern "C" fn tn_smbsrv_file_hold(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tn_smbsrv_hold_free(hold: *mut Hold) {
     if !hold.is_null() {
-        // SAFETY: the caller transfers ownership of the hold.
-        drop(unsafe { Box::from_raw(hold) });
+        // SAFETY: the caller gives up its hold, a leaked box.
+        hold_free(unsafe { Box::from_raw(hold) });
     }
 }
 
@@ -300,9 +325,9 @@ pub unsafe extern "C" fn tn_smbsrv_hold_free(hold: *mut Hold) {
 /// `hold` is from `tn_smbsrv_file_hold()`. The caller still owns it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tn_smbsrv_hold_seq(hold: *mut Hold, current: bool) {
-    // SAFETY: the caller passes a live hold.
-    if let Some(hold) = unsafe { hold.as_mut() } {
-        hold.count_seq(current);
+    // SAFETY: the caller passes NULL or its hold.
+    if let Some(h) = unsafe { hold.as_mut() } {
+        h.count_seq(current);
     }
 }
 
@@ -315,12 +340,9 @@ pub unsafe extern "C" fn tn_smbsrv_hold_seq(hold: *mut Hold, current: bool) {
 /// `tn_smbsrv_file_close()` on it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tn_smbsrv_file_seq_old(file: *const OpenFile) -> u32 {
-    // SAFETY: the reference of the caller keeps the file live.
+    // SAFETY: the caller passes a live file.
     let v = unsafe { &*file }.seq.load(Ordering::Acquire);
-    // The count has 24 bits.
-    #[allow(clippy::cast_possible_truncation)]
-    let old = ((v & SEQ_OLD_MASK) >> 24) as u32;
-    old
+    u32::try_from((v & SEQ_OLD_MASK) >> 24).unwrap_or(u32::MAX)
 }
 
 /// Call this when the channel sequence of the open changes. The jobs that
@@ -332,7 +354,7 @@ pub unsafe extern "C" fn tn_smbsrv_file_seq_old(file: *const OpenFile) -> u32 {
 /// `tn_smbsrv_file_close()` on it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tn_smbsrv_file_seq_bump(file: *const OpenFile) {
-    // SAFETY: the reference of the caller keeps the file live.
+    // SAFETY: the caller passes a live file.
     let file = unsafe { &*file };
     let _ = file
         .seq
@@ -357,9 +379,16 @@ pub unsafe extern "C" fn tn_smbsrv_file_take_pos(
     file: *const OpenFile,
     pos: *mut u64,
 ) -> bool {
-    // SAFETY: the reference of the caller keeps the file live. The caller
-    // passes room for a position.
-    unsafe { (*file).take_pos(pos) }
+    // SAFETY: the caller passes a live file.
+    let Some(p) = unsafe { &*file }.take_pos() else {
+        return false;
+    };
+    if pos.is_null() {
+        return false;
+    }
+    // SAFETY: the caller passes room for the position.
+    unsafe { pos.write(p) };
+    true
 }
 
 /// True if `file` has pending or running jobs. After this call,
@@ -374,7 +403,7 @@ pub unsafe extern "C" fn tn_smbsrv_file_take_pos(
 /// `tn_smbsrv_file_close()` on it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tn_smbsrv_file_busy(file: *const OpenFile) -> bool {
-    // SAFETY: the reference of the caller keeps the file live.
+    // SAFETY: the caller passes a live file.
     let file = unsafe { &*file };
     file.state.fetch_or(WAIT_EVENT, Ordering::AcqRel) & JOBS != 0
 }
@@ -397,10 +426,9 @@ pub unsafe extern "C" fn tn_smbsrv_file_close(
     if file.is_null() {
         return false;
     }
-    // SAFETY: the caller transfers its reference from tn_smbsrv_file_new().
+    // SAFETY: the caller gives up its reference.
     let file = unsafe { Arc::from_raw(file) };
-    // No pending job starts after this. Only the running jobs can still
-    // use the descriptor.
+    // No pending job starts after this.
     file.closed.store(true, Ordering::Relaxed);
     let old = file.state.fetch_or(WAIT_BLOCK, Ordering::AcqRel);
     if old & RUNNING_MASK != 0 {
@@ -412,7 +440,14 @@ pub unsafe extern "C" fn tn_smbsrv_file_close(
                 .unwrap_or_else(PoisonError::into_inner);
         }
     }
-    // No read runs now. So the position is final.
-    // SAFETY: the caller passes NULL or room for a position.
-    unsafe { file.take_pos(pos) }
+    // No read runs now, so the position is final.
+    let Some(p) = file.take_pos() else {
+        return false;
+    };
+    if pos.is_null() {
+        return false;
+    }
+    // SAFETY: the caller passes room for the position.
+    unsafe { pos.write(p) };
+    true
 }
