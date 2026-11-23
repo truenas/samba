@@ -1,23 +1,26 @@
 // Copyright (C) iXsystems, Inc. 2026
 // SPDX-License-Identifier: MIT
 
-//! The context of a process. It has the event queue of the owner thread,
-//! its eventfd and the reactor threads.
+//! The context of a process: the event queue of the owner thread and the
+//! reactor threads.
 
-use std::collections::VecDeque;
+use std::any::Any;
 use std::ffi::{c_int, c_void};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
+use std::os::unix::thread::JoinHandleExt;
+use std::ptr::{self, NonNull};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread::JoinHandle;
 
-use truenas_ros::net::server::{Deferred, ShutdownHandle};
-
-use crate::buf::Buf;
-use crate::conn::ConnState;
+use crate::conn::{Conn, conn_unref};
+use crate::hub::{
+    Attached, EV_CLOSED, EV_PDU, EV_SENT, Hub, HubRef, InlineHook, hub_unref,
+};
 use crate::lock;
-use crate::upper::{Note, Upper, Verdict};
+use crate::out::Out;
+use crate::pdu::{Pdu, pdu_free};
+use crate::sys;
+use crate::upper::{Upper, UpperVt};
 
 /// The event kind for a new PDU of a connection.
 pub const TN_SMBROS_PDU: c_int = 1;
@@ -29,28 +32,6 @@ pub const TN_SMBROS_SENT: c_int = 3;
 /// The layer above the shim uses the event kinds from this value up.
 pub const TN_SMBROS_UPPER: c_int = 16;
 
-/// An event in the queue for the owner thread.
-#[derive(Debug)]
-pub(crate) enum Event {
-    /// A new PDU. `buf` has its deferred reply.
-    Pdu {
-        buf: Box<Buf>,
-        nbt_type: u8,
-        verdict: Verdict,
-    },
-    Closed {
-        conn: Arc<ConnState>,
-        error: c_int,
-    },
-    /// The reactor no longer uses the memory that a send lent it. The owner
-    /// can free the memory then. So the owner gets this event for a closed
-    /// connection too.
-    Sent {
-        cookie: u64,
-    },
-    Note(Box<dyn Note>),
-}
-
 /// A function that runs a new PDU on the reactor thread that calls it. It
 /// returns true if it ran the PDU. Then it owns `ev->buf`, as with an event
 /// from `tn_smbros_next()`. If it returns false, it does not keep or free
@@ -59,128 +40,37 @@ pub(crate) enum Event {
 pub type InlineFn =
     unsafe extern "C" fn(*mut c_void, *mut TnSmbrosEvent) -> bool;
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct InlineHook {
-    pub(crate) func: InlineFn,
-    pub(crate) private: *mut c_void,
-}
-
-// SAFETY: tn_smbros_ctx_inline() requires a function that every reactor
-// thread can call. Only that function uses `private`.
-unsafe impl Send for InlineHook {}
-// SAFETY: as for Send.
-unsafe impl Sync for InlineHook {}
-
-/// The event queue of a process, its eventfd and the hooks of its reactors.
-#[derive(Debug)]
-pub(crate) struct Shared {
-    queue: Mutex<VecDeque<Event>>,
-    efd: OwnedFd,
-    pub(crate) upper: OnceLock<Arc<dyn Upper>>,
-    pub(crate) inline: OnceLock<InlineHook>,
-}
-
-impl Shared {
-    pub(crate) fn post(&self, ev: Event) {
-        let was_empty = {
-            let mut q = lock(&self.queue);
-            let was_empty = q.is_empty();
-            q.push_back(ev);
-            was_empty
-        };
-        // The owner empties the queue after each wake. So only a post to an
-        // empty queue needs a wake.
-        if was_empty {
-            self.wake();
-        }
-    }
-
-    fn wake(&self) {
-        let one: u64 = 1;
-        // SAFETY: `one` has the 8 bytes that the write reads.
-        unsafe {
-            libc::write(
-                self.efd.as_raw_fd(),
-                (&raw const one).cast::<c_void>(),
-                8,
-            );
-        }
-    }
-}
-
-/// Queues the events of the upper layer for the owner thread.
-#[derive(Debug, Clone)]
-pub struct Poster(pub(crate) Arc<Shared>);
-
-impl Poster {
-    pub fn post(&self, note: Box<dyn Note>) {
-        self.0.post(Event::Note(note));
-    }
-}
-
-/// The handles that stop and join one reactor thread.
-#[derive(Debug)]
-pub(crate) struct Reactor {
-    pub(crate) stop: ShutdownHandle,
-    pub(crate) thread: thread::JoinHandle<()>,
-}
-
-/// The context of a process, from `tn_smbros_ctx_new()`.
-#[derive(Debug)]
-pub struct Ctx {
-    pub(crate) shared: Arc<Shared>,
-    /// The reactor threads that `tn_smbros_ctx_free()` stops and joins.
-    pub(crate) reactors: Mutex<Vec<Reactor>>,
-    /// The ID of the process that made the context. A forked child does not
-    /// have the reactor threads of that process.
-    pid: u32,
-    /// Connections adopted so far, for the reactor thread names.
-    pub(crate) adopted: AtomicUsize,
-}
-
-impl Ctx {
-    /// Set the upper layer of the reactors. Call this before the first
-    /// `tn_smbros_adopt()`. False if an upper layer is set already.
-    pub fn set_upper(&self, upper: Arc<dyn Upper>) -> bool {
-        self.shared.upper.set(upper).is_ok()
-    }
-
-    pub fn poster(&self) -> Poster {
-        Poster(Arc::clone(&self.shared))
-    }
-}
-
 /// An event for the caller, from `tn_smbros_next()`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct TnSmbrosEvent {
     /// The `cookie` of `tn_smbros_adopt()` in a PDU or CLOSED event. The
     /// `sent_cookie` of `tn_smbros_send()` in a SENT event.
-    pub(crate) cookie: u64,
+    pub cookie: u64,
     /// `TN_SMBROS_PDU`, `TN_SMBROS_CLOSED`, `TN_SMBROS_SENT` or a kind of
     /// the layer above the shim.
-    pub(crate) kind: c_int,
+    pub kind: c_int,
     /// The first byte of the NBT header in a PDU event.
-    pub(crate) nbt_type: u8,
+    pub nbt_type: u8,
     /// The message of a PDU event, without the 4-byte NBT header.
-    pub(crate) data: *mut u8,
-    pub(crate) len: usize,
+    pub data: *mut u8,
+    pub len: usize,
     /// The buffer of a PDU event. It owns `data`. Free it with
     /// `tn_smbros_buf_free()`.
-    pub(crate) buf: *mut c_void,
+    pub buf: *mut c_void,
     /// The errno of a CLOSED event. 0 means that the peer closed the
     /// connection.
-    pub(crate) error: c_int,
+    pub error: c_int,
     /// In a PDU event, `flags`, `status` and `tag` are values of the layer
     /// above the shim. The header of that layer describes them.
-    pub(crate) flags: u32,
-    pub(crate) status: u32,
-    pub(crate) tag: u64,
+    pub flags: u32,
+    pub status: u32,
+    pub tag: u64,
 }
 
 impl TnSmbrosEvent {
     /// An event of `kind` without a PDU.
-    pub(crate) fn bare(cookie: u64, kind: c_int) -> Self {
+    pub fn bare(cookie: u64, kind: c_int) -> Self {
         Self {
             cookie,
             kind,
@@ -194,58 +84,104 @@ impl TnSmbrosEvent {
             tag: 0,
         }
     }
+}
 
-    /// Make the event of a new PDU. The event owns `buf`. `buf` still has
-    /// the deferred reply of a PDU that can get a job. This returns the
-    /// reply of any other PDU.
-    pub(crate) fn pdu(
-        mut buf: Box<Buf>,
-        nbt_type: u8,
-        verdict: &Verdict,
-    ) -> (Self, Option<Deferred>) {
-        let keep = if buf.conn.delegate && verdict.job {
-            None
-        } else {
-            buf.deferred.take()
-        };
-        let cookie = buf.conn.cookie;
-        let ev = Self {
-            nbt_type,
-            // The storage of the body does not move while the box exists.
-            data: buf.body.as_mut_ptr(),
-            len: buf.body.len(),
-            buf: Box::into_raw(buf).cast::<c_void>(),
-            flags: verdict.flags,
-            status: verdict.status,
-            tag: verdict.tag,
-            ..Self::bare(cookie, TN_SMBROS_PDU)
-        };
-        (ev, keep)
+/// A reactor thread and a reference to its connection.
+#[derive(Debug)]
+pub(crate) struct Thr {
+    pub(crate) handle: JoinHandle<()>,
+    pub(crate) conn: NonNull<Conn>,
+}
+
+// SAFETY: the connection is Sync, and the record has its own reference.
+unsafe impl Send for Thr {}
+
+/// The context of a process, from `tn_smbros_ctx_new()`.
+#[derive(Debug)]
+pub struct Ctx {
+    hub: NonNull<Hub>,
+    /// The process that made the context. A forked child has no reactors.
+    pid: u32,
+    /// For the reactor thread names.
+    adopted: AtomicU32,
+    thrs: Mutex<Vec<Thr>>,
+}
+
+impl Ctx {
+    pub fn hub(&self) -> &Hub {
+        // SAFETY: the context keeps a reference to its hub.
+        unsafe { self.hub.as_ref() }
     }
+
+    pub(crate) fn hub_ptr(&self) -> NonNull<Hub> {
+        self.hub
+    }
+
+    pub fn hub_ref(&self) -> HubRef {
+        HubRef::new(self.hub)
+    }
+
+    pub(crate) fn next_index(&self) -> u32 {
+        self.adopted.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn push_thr(&self, t: Thr) {
+        lock(&self.thrs).push(t);
+    }
+
+    /// Join the reactor threads that ended.
+    pub(crate) fn reap_done(&self) {
+        let done: Vec<Thr> = {
+            let mut thrs = lock(&self.thrs);
+            if !thrs.iter().any(|t| t.handle.is_finished()) {
+                return;
+            }
+            let (done, keep) = std::mem::take(&mut *thrs)
+                .into_iter()
+                .partition(|t| t.handle.is_finished());
+            *thrs = keep;
+            done
+        };
+        for t in done {
+            reap_thr(t);
+        }
+    }
+
+    /// Attach the layer `U` before the first `tn_smbros_adopt()`. False if
+    /// `ctx` has a layer or `vt` is not the table of `U`.
+    pub fn attach<U: Upper>(&self, vt: &'static UpperVt, g: U::Global) -> bool {
+        if (vt.id)() != std::any::TypeId::of::<U>() {
+            return false;
+        }
+        let global: Box<dyn Any + Send + Sync> = Box::new(g);
+        self.hub().attached.set(Attached { vt, global }).is_ok()
+    }
+}
+
+/// Join the thread of `t`, or detach it if it is the calling thread.
+fn reap_thr(t: Thr) {
+    let id = usize::try_from(t.handle.as_pthread_t()).unwrap_or(0);
+    if id == sys::thread_self() {
+        drop(t.handle);
+    } else {
+        let _ = t.handle.join();
+    }
+    // SAFETY: this is the reference of the record.
+    unsafe { conn_unref(t.conn) };
 }
 
 /// Make the context of the process. Use one per process. NULL on failure,
 /// with errno set.
 #[unsafe(no_mangle)]
 pub extern "C" fn tn_smbros_ctx_new() -> *mut Ctx {
-    // SAFETY: eventfd has no pointer arguments.
-    let fd =
-        unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-    if fd < 0 {
+    let Ok(hub) = Hub::new() else {
         return ptr::null_mut();
-    }
-    // SAFETY: `fd` is a new descriptor that nothing else owns.
-    let efd = unsafe { OwnedFd::from_raw_fd(fd) };
+    };
     Box::into_raw(Box::new(Ctx {
-        shared: Arc::new(Shared {
-            queue: Mutex::new(VecDeque::new()),
-            efd,
-            upper: OnceLock::new(),
-            inline: OnceLock::new(),
-        }),
-        reactors: Mutex::new(Vec::new()),
+        hub,
         pid: std::process::id(),
-        adopted: AtomicUsize::new(0),
+        adopted: AtomicU32::new(0),
+        thrs: Mutex::new(Vec::new()),
     }))
 }
 
@@ -264,39 +200,26 @@ pub unsafe extern "C" fn tn_smbros_ctx_free(ctx: *mut Ctx) {
     if ctx.is_null() {
         return;
     }
-    // SAFETY: the caller passes a context from tn_smbros_ctx_new(). A
-    // reactor can use it until the joins below.
-    let c = unsafe { &*ctx };
-    if std::process::id() != c.pid {
-        // A forked child has none of these threads. It cannot join them.
-        // The context and its events belong to the parent.
+    // SAFETY: the caller passes a context from tn_smbros_ctx_new().
+    let x = unsafe { &*ctx };
+    if std::process::id() != x.pid {
+        // The context and its threads belong to the parent.
         return;
     }
-    let reactors = std::mem::take(&mut *lock(&c.reactors));
-    for r in &reactors {
-        r.stop.shutdown();
+    let thrs = std::mem::take(&mut *lock(&x.thrs));
+    for t in &thrs {
+        // SAFETY: the record keeps the connection live.
+        unsafe { t.conn.as_ref() }.sh.request_stop();
     }
-    let me = thread::current().id();
-    for r in reactors {
-        if r.thread.thread().id() == me {
-            // The owner can exit on a reactor thread. A thread cannot join
-            // itself.
-            std::mem::forget(r);
-            continue;
-        }
-        let _ = r.thread.join();
+    for t in thrs {
+        reap_thr(t);
     }
-    // SAFETY: no reactor uses the context now. The caller does not use it
-    // after this call.
-    let Ctx { shared, .. } = *unsafe { Box::from_raw(ctx) };
-    // The drop of an event can post another event. So drop the events
-    // outside the lock.
-    loop {
-        let events = std::mem::take(&mut *lock(&shared.queue));
-        if events.is_empty() {
-            break;
-        }
-        drop(events);
+    // SAFETY: no reactor is left, and the caller gives up the context.
+    let x = unsafe { Box::from_raw(ctx) };
+    // SAFETY: as above.
+    unsafe {
+        x.hub().drop_events();
+        hub_unref(x.hub);
     }
 }
 
@@ -308,8 +231,7 @@ pub unsafe extern "C" fn tn_smbros_ctx_free(ctx: *mut Ctx) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tn_smbros_ctx_fd(ctx: *const Ctx) -> c_int {
     // SAFETY: the caller passes a live context.
-    let ctx = unsafe { &*ctx };
-    ctx.shared.efd.as_raw_fd()
+    unsafe { &*ctx }.hub().efd()
 }
 
 /// Clear the eventfd. Call this before the calls to `tn_smbros_next()` that
@@ -320,18 +242,8 @@ pub unsafe extern "C" fn tn_smbros_ctx_fd(ctx: *const Ctx) -> c_int {
 /// `ctx` is a live context from `tn_smbros_ctx_new()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tn_smbros_ctx_ack(ctx: *mut Ctx) {
-    let mut count: u64 = 0;
     // SAFETY: the caller passes a live context.
-    let ctx = unsafe { &*ctx };
-    // SAFETY: the read writes at most 8 bytes into `count`. It fails with
-    // EAGAIN if the eventfd is clear.
-    unsafe {
-        libc::read(
-            ctx.shared.efd.as_raw_fd(),
-            (&raw mut count).cast::<c_void>(),
-            8,
-        );
-    }
+    sys::drain_eventfd(unsafe { &*ctx }.hub().efd());
 }
 
 /// Make the eventfd readable, even if the queue is empty. This wakes the
@@ -343,8 +255,7 @@ pub unsafe extern "C" fn tn_smbros_ctx_ack(ctx: *mut Ctx) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tn_smbros_ctx_wake(ctx: *const Ctx) {
     // SAFETY: the caller passes a live context.
-    let ctx = unsafe { &*ctx };
-    ctx.shared.wake();
+    sys::poke(unsafe { &*ctx }.hub().efd());
 }
 
 /// Set the inline function of the reactors to `func`. Call this before the
@@ -360,8 +271,7 @@ pub unsafe extern "C" fn tn_smbros_ctx_wake(ctx: *const Ctx) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tn_smbros_ctx_inline(
     ctx: *mut Ctx,
-    // This is `InlineFn` written out. cbindgen does not make a nullable C
-    // pointer of `Option<InlineFn>`.
+    // `InlineFn` written out, so cbindgen makes a nullable C pointer.
     func: Option<unsafe extern "C" fn(*mut c_void, *mut TnSmbrosEvent) -> bool>,
     private: *mut c_void,
 ) -> bool {
@@ -370,7 +280,7 @@ pub unsafe extern "C" fn tn_smbros_ctx_inline(
     let Some(func) = func else {
         return false;
     };
-    ctx.shared.inline.set(InlineHook { func, private }).is_ok()
+    ctx.hub().inline.set(InlineHook { func, private }).is_ok()
 }
 
 /// Move the next event of the queue to `*ev`. False if the queue is empty.
@@ -386,54 +296,62 @@ pub unsafe extern "C" fn tn_smbros_next(
     ctx: *mut Ctx,
     ev: *mut TnSmbrosEvent,
 ) -> bool {
-    // SAFETY: the caller passes a live context.
-    let shared = unsafe { &(*ctx).shared };
+    // SAFETY: the caller passes a live context and room for one event.
+    let (hub, ev) = unsafe { ((*ctx).hub(), &mut *ev) };
     loop {
-        let next = lock(&shared.queue).pop_front();
-        let Some(next) = next else {
+        // SAFETY: only the owner thread calls tn_smbros_next().
+        let Some(n) = (unsafe { hub.next_node() }) else {
             return false;
         };
-        let out = match next {
-            Event::Pdu {
-                buf,
-                nbt_type,
-                verdict,
-            } => {
-                buf.conn.queued.fetch_sub(1, Ordering::AcqRel);
-                if buf.conn.closed.load(Ordering::Relaxed) {
+        // SAFETY: the queue gave up the node, and its kind names its owner.
+        match unsafe { n.as_ref().kind } {
+            EV_PDU => {
+                // SAFETY: as above.
+                let mut p = unsafe { Pdu::from_ev(n) };
+                let c = p.conn();
+                c.queued.fetch_sub(1, Ordering::AcqRel);
+                if c.closed.load(Ordering::Relaxed) {
+                    pdu_free(p);
                     continue;
                 }
-                // The owner has the PDU. The reactor can read the next one.
-                let (ev, keep) = TnSmbrosEvent::pdu(buf, nbt_type, &verdict);
-                if let Some(d) = keep {
-                    d.reply(Vec::new());
+                // Free the slot now unless the PDU can still get a job.
+                if !p.delegable && p.deferred {
+                    p.deferred = false;
+                    p.conn().release_slot();
                 }
-                ev
+                *ev = p.event();
+                Box::leak(p);
+                return true;
             }
-            Event::Closed { conn, error } => {
-                if conn.closed.load(Ordering::Relaxed) {
-                    continue;
-                }
-                TnSmbrosEvent {
-                    error,
+            EV_CLOSED => {
+                // SAFETY: as above.
+                let c = unsafe { Conn::from_closed_ev(n) };
+                // SAFETY: the event has a reference to the connection.
+                let conn = unsafe { c.as_ref() };
+                let skip = conn.closed.load(Ordering::Relaxed);
+                *ev = TnSmbrosEvent {
+                    error: conn.closed_err.load(Ordering::Relaxed),
                     ..TnSmbrosEvent::bare(conn.cookie, TN_SMBROS_CLOSED)
-                }
-            }
-            Event::Sent { cookie } => {
-                TnSmbrosEvent::bare(cookie, TN_SMBROS_SENT)
-            }
-            Event::Note(note) => {
-                let Some((kind, cookie, buf)) = note.take() else {
-                    continue;
                 };
-                TnSmbrosEvent {
-                    buf,
-                    ..TnSmbrosEvent::bare(cookie, kind)
+                // SAFETY: this is the reference of the event.
+                unsafe { conn_unref(c) };
+                if skip {
+                    continue;
+                }
+                return true;
+            }
+            EV_SENT => {
+                // SAFETY: as above.
+                let o = unsafe { Out::from_ev(n) };
+                *ev = TnSmbrosEvent::bare(o.cookie, TN_SMBROS_SENT);
+                return true;
+            }
+            _ => {
+                // SAFETY: as above. The layer above posted the node.
+                if unsafe { (hub.vt().take_note)(n, ev) } {
+                    return true;
                 }
             }
-        };
-        // SAFETY: the caller passes room for one event.
-        unsafe { ev.write(out) };
-        return true;
+        }
     }
 }

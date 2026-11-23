@@ -27,6 +27,7 @@
 #include "lib/util/tevent_unix.h"
 #include "librpc/gen_ndr/ioctl.h"
 #include "hash_inode.h"
+#include "smbd/truenas_mdcache.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_VFS
@@ -44,6 +45,9 @@ struct stream_io {
 	void *fsp_name_ptr;
 	files_struct *fsp;
 	vfs_handle_struct *handle;
+	/* The xattr length that the open read, in mdcache_epoch() len_epoch */
+	ssize_t len;
+	uint64_t len_epoch;
 };
 
 static bool can_write_ea(files_struct *fsp)
@@ -89,15 +93,22 @@ static ssize_t get_xattr_len_fsp(struct files_struct *fsp,
  */
 static ssize_t get_stream_size_fsp(vfs_handle_struct *handle,
 				   struct files_struct *fsp,
-				   const char *xattr_name)
+				   const char *xattr_name,
+				   const struct stream_io *io)
 {
 	ssize_t len;
 	struct streams_xattr_config *config = NULL;
+	uint64_t epoch = mdcache_epoch(handle->conn);
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config, struct streams_xattr_config,
 				return -1);
 
-	len = get_xattr_len_fsp(fsp, xattr_name);
+	if ((io != NULL) && (epoch != 0) && (io->len_epoch == epoch)) {
+		/* The open read it in this epoch */
+		len = io->len;
+	} else {
+		len = get_xattr_len_fsp(fsp, xattr_name);
+	}
 	if (len == -1) {
 		return -1;
 	}
@@ -327,14 +338,27 @@ static int streams_xattr_fstat(vfs_handle_struct *handle, files_struct *fsp,
 		return -1;
 	}
 
-	ret = SMB_VFS_NEXT_FSTAT(handle, fsp->base_fsp, sbuf);
-	if (ret == -1) {
-		return -1;
+	if (vfs_stat_fsp_current(fsp->base_fsp)) {
+		/*
+		 * The DOS attribute cache is not a stat result. The one of
+		 * the base can have FILE_ATTRIBUTE_DIRECTORY, so keep ours,
+		 * as SMB_VFS_NEXT_FSTAT() below does.
+		 */
+		uint32_t dosattrs = sbuf->cached_dos_attributes;
+
+		*sbuf = fsp->base_fsp->fsp_name->st;
+		sbuf->cached_dos_attributes = dosattrs;
+	} else {
+		ret = SMB_VFS_NEXT_FSTAT(handle, fsp->base_fsp, sbuf);
+		if (ret == -1) {
+			return -1;
+		}
 	}
 
 	sbuf->st_ex_size = get_stream_size_fsp(handle,
 					       fsp->base_fsp,
-					       io->xattr_name);
+					       io->xattr_name,
+					       io);
 	if (sbuf->st_ex_size == -1) {
 		SET_STAT_INVALID(*sbuf);
 		return -1;
@@ -413,7 +437,7 @@ static int streams_xattr_stat(vfs_handle_struct *handle,
 	}
 
 	smb_fname->st.st_ex_size = get_stream_size_fsp(handle, fsp,
-							xattr_name);
+							xattr_name, NULL);
 	if (smb_fname->st.st_ex_size == -1) {
 		TALLOC_FREE(xattr_name);
 		TALLOC_FREE(pathref);
@@ -507,7 +531,7 @@ static int streams_xattr_fstatat(struct vfs_handle_struct *handle,
 
 	*sbuf = fsp->fsp_name->st;
 
-	size = get_stream_size_fsp(handle, fsp, xattr_name);
+	size = get_stream_size_fsp(handle, fsp, xattr_name, NULL);
 	if (size == -1) {
 		errno = ENOENT;
 		ret = -1;
@@ -540,6 +564,7 @@ static int streams_xattr_openat(struct vfs_handle_struct *handle,
 	char *xattr_name = NULL;
 	int fakefd = -1;
 	bool set_empty_xattr = false;
+	ssize_t len;
 	int ret;
 
 	SMB_VFS_HANDLE_GET_DATA(handle, config, struct streams_xattr_config,
@@ -575,7 +600,8 @@ static int streams_xattr_openat(struct vfs_handle_struct *handle,
 	}
 
 	/* Only whether the stream exists matters here, not its value */
-	if (get_xattr_len_fsp(fsp->base_fsp, xattr_name) == -1) {
+	len = get_xattr_len_fsp(fsp->base_fsp, xattr_name);
+	if (len == -1) {
 		ret = errno;
 		DBG_DEBUG("get_xattr_len_fsp returned %s\n", strerror(ret));
 
@@ -667,6 +693,9 @@ static int streams_xattr_openat(struct vfs_handle_struct *handle,
 	sio->fsp_name_ptr = fsp->fsp_name;
 	sio->handle = handle;
 	sio->fsp = fsp;
+	/* The write above moved the epoch, so this is the one after it */
+	sio->len = set_empty_xattr ? config->xattr_compat_bytes : len;
+	sio->len_epoch = mdcache_epoch(handle->conn);
 
 	return fakefd;
 
@@ -1006,7 +1035,7 @@ static NTSTATUS add_xattr_streams(vfs_handle_struct *handle,
 			continue;
 		}
 
-		size = get_stream_size_fsp(handle, fsp, name);
+		size = get_stream_size_fsp(handle, fsp, name, NULL);
 		if (size == -1) {
 			/* Removed since the listxattr, or unreadable */
 			DBG_DEBUG("Skipping %s on %s: %s\n",

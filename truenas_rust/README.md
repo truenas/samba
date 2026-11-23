@@ -9,11 +9,13 @@ This Cargo workspace has the TrueNAS Rust code in the Samba tree.
 - `mit/`: crates with the MIT license. A crate here does not link Samba
   code, copy Samba code or use a crate from `gpl/`. Because of this, a
   server other than Samba can use it.
-  - `mit/smbros`: a shim between an SMB server and truenas_ros. Each
+  - `mit/smbros`: the socket layer of an SMB server on io_uring. Each
     connection has a reactor thread with its own ring. The
     reactor reads and sends the PDUs of the connection. The shim parses
     the framing of a PDU, but not its content. A layer above the shim
     receives each PDU first. That layer submits jobs to the reactors.
+    The binary `lbench` is a server of the rosbench protocol on the same
+    reactors.
 - `gpl/`: crates with the GPL-3.0-or-later license. They are for code that
   links Samba code or copies Samba logic. A crate here can use the crates
   in `mit/`.

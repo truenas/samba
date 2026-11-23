@@ -1,6 +1,6 @@
 [package]
 name = "truenas_smbros"
-description = "Reactors of truenas_ros as the socket layer of an SMB server, one thread and ring per channel"
+description = "The socket layer of an SMB server on io_uring, one thread and ring per connection"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +8,12 @@ license = "MIT"
 publish.workspace = true
 
 [dependencies]
-truenas_ros = { workspace = true, features = ["net-server", "uring-fs"] }
 libc.workspace = true
+
+# A server of the rosbench protocol on the same reactors.
+[[bin]]
+name = "lbench"
+path = "src/bin/lbench.rs"
 
 [lints]
 workspace = true

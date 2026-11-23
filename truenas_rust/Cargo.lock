@@ -372,7 +372,6 @@ name = "truenas_smb_server"
 version = "0.1.0"
 dependencies = [
  "libc",
- "truenas_ros",
  "truenas_smbros",
 ]
 
@@ -421,7 +420,6 @@ name = "truenas_smbros"
 version = "0.1.0"
 dependencies = [
  "libc",
- "truenas_ros",
 ]
 
 [[package]]

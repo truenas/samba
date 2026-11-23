@@ -9,7 +9,6 @@ publish.workspace = true
 
 [dependencies]
 truenas_smbros.workspace = true
-truenas_ros = { workspace = true, features = ["net-server", "uring-fs"] }
 libc.workspace = true
 
 [lints]
