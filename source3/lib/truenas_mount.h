@@ -105,6 +105,18 @@ int tn_mount_entry_get_path(TALLOC_CTX *mem_ctx,
 int tn_mount_path_get_mnt_id(const char *path, uint64_t *mnt_id_out);
 
 /**
+ * @brief Whether a path is the root of a mount.
+ *
+ * Symlinks in the path are followed.
+ *
+ * @param[in]	path		path to look up
+ * @param[out]	is_root_out	true if the path is the root of a mount
+ *
+ * @return	0 on success, -1 on failure with errno set
+ */
+int tn_mount_path_is_root(const char *path, bool *is_root_out);
+
+/**
  * @brief Duplicate a mount entry under a new talloc memory context.
  *
  * @param[in]	mem_ctx		talloc memory context for the copy
