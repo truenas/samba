@@ -188,9 +188,18 @@ uint64_t smb_zfs_disk_free(uint64_t mnt_id,
  * it too -- and without `create_ancestors` that is refused rather than
  * done silently.
  *
+ * The dataset the path already lies in is found from the nearest ancestor
+ * of the path that exists. If `root_dataset` is not mounted, that ancestor
+ * is in another dataset: the one mounted above it, or one in the pool of
+ * the root file system if the whole pool is not mounted. No dataset is
+ * created there: the call fails with errno EXDEV unless the ancestor is in
+ * `root_dataset` or in a dataset below it.
+ *
  * @param[in]	mem_ctx			memory context for the returned
  *					array itself
  * @para[in]	path			path to be created.
+ * @para[in]	root_dataset		name of the dataset the new datasets
+ *					have to be below. Required.
  * @para[in]	quota			quota to set on final dataset.
  * @para[out]	_array_out		array of the datasets created,
  *					deepest first, followed by the
@@ -205,10 +214,18 @@ uint64_t smb_zfs_disk_free(uint64_t mnt_id,
  * @return	0 on success -1 on failure.
  */
 int smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
-			   const char *path, const char *quota,
+			   const char *path,
+			   const char *root_dataset,
+			   const char *quota,
 			   const struct zfs_dataset ***_array_out,
 			   size_t *_nentries,
 			   bool create_ancestors);
+
+/*
+ * Whether the dataset `name` is the dataset `parent` or is below it. Only
+ * the names are compared: neither dataset has to exist.
+ */
+bool smb_zfs_dataset_within(const char *name, const char *parent);
 
 /*
  * List the snapshots of a dataset, newest first, from a read of the
