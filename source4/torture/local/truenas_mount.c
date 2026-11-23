@@ -216,6 +216,45 @@ static bool test_stale_mnt_id(struct torture_context *tctx)
 	return true;
 }
 
+/*
+ * tn_mount_path_is_root() tells the root of a mount from a directory. A
+ * dataset that is not mounted leaves a directory behind where it was
+ * mounted, in the dataset above it.
+ */
+static bool test_path_is_root(struct torture_context *tctx)
+{
+	char tmpl[] = "/tmp/tn_mount_root_XXXXXX";
+	char *dir = NULL;
+	char *missing = NULL;
+	bool is_root = false;
+	int ret;
+	int saved_errno;
+
+	ret = tn_mount_path_is_root("/", &is_root);
+	torture_assert_int_equal(tctx, ret, 0, "root of the namespace");
+	torture_assert(tctx, is_root, "/ is the root of a mount");
+
+	dir = mkdtemp(tmpl);
+	torture_assert(tctx, dir != NULL, "mkdtemp");
+
+	is_root = true;
+	ret = tn_mount_path_is_root(dir, &is_root);
+	missing = talloc_asprintf(tctx, "%s/missing", dir);
+	rmdir(dir);
+	torture_assert_int_equal(tctx, ret, 0, "directory");
+	torture_assert(tctx, !is_root,
+		       "a directory is not the root of a mount");
+
+	torture_assert(tctx, missing != NULL, "talloc");
+	ret = tn_mount_path_is_root(missing, &is_root);
+	saved_errno = errno;
+	torture_assert_int_equal(tctx, ret, -1, "missing path fails");
+	torture_assert_int_equal(tctx, saved_errno, ENOENT,
+				 "missing path fails ENOENT");
+
+	return true;
+}
+
 struct traverse_state {
 	size_t count;
 	size_t limit;		/* stop after this many, 0 = no limit */
@@ -622,6 +661,8 @@ struct torture_suite *torture_local_truenas_mount(TALLOC_CTX *mem_ctx)
 				      test_lookup_equivalence);
 	torture_suite_add_simple_test(suite, "stale_mnt_id",
 				      test_stale_mnt_id);
+	torture_suite_add_simple_test(suite, "path_is_root",
+				      test_path_is_root);
 	torture_suite_add_simple_test(suite, "traverse", test_traverse);
 	torture_suite_add_simple_test(suite, "zfs_dataset",
 				      test_zfs_dataset);
@@ -1005,7 +1046,7 @@ static bool test_libzfs_create_dataset(struct torture_context *tctx)
 	/* the share root is the dataset mountpoint */
 	snprintf(path, sizeof(path), "%s/tn_ac_user", mp);
 	snprintf(name, sizeof(name), "%s/tn_ac_user", ds);
-	ret = smb_zfs_create_dataset(tctx, path, NULL, &created, &nentries,
+	ret = smb_zfs_create_dataset(tctx, path, ds, NULL, &created, &nentries,
 				     false);
 	torture_assert_int_equal(tctx, ret, 0, "create below dataset root");
 	torture_assert_int_equal(tctx, nentries, 2, "created plus anchor");
@@ -1035,12 +1076,12 @@ static bool test_libzfs_create_dataset(struct torture_context *tctx)
 	snprintf(path, sizeof(path), "%s/tn_ac_user", subdir);
 
 	/* the intermediate dataset is not created behind the caller's back */
-	ret = smb_zfs_create_dataset(tctx, path, NULL, &created, &nentries,
+	ret = smb_zfs_create_dataset(tctx, path, ds, NULL, &created, &nentries,
 				     false);
 	torture_assert_int_equal(tctx, ret, -1,
 				 "refuses the missing dataset level");
 
-	ret = smb_zfs_create_dataset(tctx, path, NULL, &created, &nentries,
+	ret = smb_zfs_create_dataset(tctx, path, ds, NULL, &created, &nentries,
 				     true);
 	torture_assert_int_equal(tctx, ret, 0, "create below a directory");
 	torture_assert_int_equal(tctx, nentries, 3, "two created plus anchor");
@@ -1074,7 +1115,7 @@ static bool test_libzfs_create_dataset(struct torture_context *tctx)
 
 	/* intermediate datasets, deepest first */
 	snprintf(path, sizeof(path), "%s/tn_ac_deep/a/b", mp);
-	ret = smb_zfs_create_dataset(tctx, path, NULL, &created, &nentries,
+	ret = smb_zfs_create_dataset(tctx, path, ds, NULL, &created, &nentries,
 				     true);
 	torture_assert_int_equal(tctx, ret, 0, "create with ancestors");
 	torture_assert_int_equal(tctx, nentries, 4,
@@ -1093,7 +1134,7 @@ static bool test_libzfs_create_dataset(struct torture_context *tctx)
 
 	/* missing ancestors are refused unless asked for */
 	snprintf(path, sizeof(path), "%s/tn_ac_deep/a/b/c/d", mp);
-	ret = smb_zfs_create_dataset(tctx, path, NULL, &created, &nentries,
+	ret = smb_zfs_create_dataset(tctx, path, ds, NULL, &created, &nentries,
 				     false);
 	torture_assert_int_equal(tctx, ret, -1, "refuses missing ancestors");
 
@@ -1101,10 +1142,120 @@ static bool test_libzfs_create_dataset(struct torture_context *tctx)
 	tn_zfs_destroy(name);
 
 	/* an existing path is refused */
-	ret = smb_zfs_create_dataset(tctx, mp, NULL, &created, &nentries,
+	ret = smb_zfs_create_dataset(tctx, mp, ds, NULL, &created, &nentries,
 				     false);
 	torture_assert_int_equal(tctx, ret, -1, "refuses existing path");
 	torture_assert_int_equal(tctx, errno, EEXIST, "EEXIST");
+
+	return true;
+}
+
+/* smb_zfs_dataset_within() compares names: it needs no ZFS */
+static bool test_libzfs_dataset_within(struct torture_context *tctx)
+{
+	bool ok;
+
+	ok = smb_zfs_dataset_within("tank/share", "tank/share");
+	torture_assert(tctx, ok, "the dataset itself");
+	ok = smb_zfs_dataset_within("tank/share/user", "tank/share");
+	torture_assert(tctx, ok, "a child");
+	ok = smb_zfs_dataset_within("tank/share/DOM/user", "tank/share");
+	torture_assert(tctx, ok, "a grandchild");
+	ok = smb_zfs_dataset_within("tank/share", "tank");
+	torture_assert(tctx, ok, "below the pool");
+	ok = smb_zfs_dataset_within("tank", "tank");
+	torture_assert(tctx, ok, "the pool itself");
+
+	ok = smb_zfs_dataset_within("tank", "tank/share");
+	torture_assert(tctx, !ok, "the parent");
+	ok = smb_zfs_dataset_within("tank/share2", "tank/share");
+	torture_assert(tctx, !ok, "a name that only starts the same");
+	ok = smb_zfs_dataset_within("tank/other/share", "tank/share");
+	torture_assert(tctx, !ok, "a sibling");
+	ok = smb_zfs_dataset_within("tank2/share", "tank");
+	torture_assert(tctx, !ok, "another pool");
+	ok = smb_zfs_dataset_within("boot-pool/ROOT/27.0.0/mnt",
+				    "offsite/timemachine");
+	torture_assert(tctx, !ok, "the boot pool");
+	ok = smb_zfs_dataset_within("tank/share@snap", "tank/share");
+	torture_assert(tctx, !ok, "a snapshot");
+
+	ok = smb_zfs_dataset_within("tank/share", "");
+	torture_assert(tctx, !ok, "empty parent");
+	ok = smb_zfs_dataset_within(NULL, "tank");
+	torture_assert(tctx, !ok, "no name");
+	ok = smb_zfs_dataset_within("tank", NULL);
+	torture_assert(tctx, !ok, "no parent");
+
+	return true;
+}
+
+/*
+ * A share whose dataset is not mounted: the nearest existing ancestor of
+ * its connectpath is a directory of another dataset -- the one mounted
+ * above it, or /mnt of the boot pool if the whole pool is not mounted --
+ * and auto-creation created the datasets of the path there. The caller now
+ * names the dataset the new ones have to be below. The refusal is decided
+ * from the mount table before libzfs is used.
+ */
+static bool test_libzfs_create_refused(struct torture_context *tctx)
+{
+	const char *ds = tn_mount_setting(tctx, "tn_mount_ds");
+	const char *mp = tn_mount_setting(tctx, "tn_mount_mp");
+	const struct zfs_dataset **created = NULL;
+	char dir[PATH_MAX];
+	char path[PATH_MAX];
+	char name[ZFSDS_NAMELEN];
+	size_t nentries = 0;
+	int ret;
+	int err;
+
+	if ((ds == NULL) || (mp == NULL)) {
+		return tn_skip_or_fail(tctx,
+			"no tn_mount_ds/tn_mount_mp configured");
+	}
+
+	snprintf(dir, sizeof(dir), "%s/tn_ac_refused", mp);
+	snprintf(path, sizeof(path), "%s/user", dir);
+
+	/* the dataset to create below has to be named */
+	ret = smb_zfs_create_dataset(tctx, path, NULL, NULL, &created,
+				     &nentries, true);
+	err = errno;
+	torture_assert_int_equal(tctx, ret, -1, "refuses without a dataset");
+	torture_assert_int_equal(tctx, err, EINVAL, "EINVAL");
+
+	/*
+	 * The nearest existing ancestor is the mountpoint of ds. For a
+	 * share of ds/tn_ac_refused that is the state of its dataset not
+	 * being mounted.
+	 */
+	snprintf(name, sizeof(name), "%s/tn_ac_refused", ds);
+	ret = smb_zfs_create_dataset(tctx, path, name, NULL, &created,
+				     &nentries, true);
+	err = errno;
+	torture_assert_int_equal(tctx, ret, -1,
+				 "refuses the dataset above the share");
+	torture_assert_int_equal(tctx, err, EXDEV, "EXDEV");
+
+	/* the share is in a pool that is not mounted at all */
+	ret = smb_zfs_create_dataset(tctx, path, "tn-torture-absent/share",
+				     NULL, &created, &nentries, true);
+	err = errno;
+	torture_assert_int_equal(tctx, ret, -1, "refuses another pool");
+	torture_assert_int_equal(tctx, err, EXDEV, "EXDEV");
+
+	/* a name that only starts like the dataset */
+	snprintf(name, sizeof(name), "%s2", ds);
+	ret = smb_zfs_create_dataset(tctx, path, name, NULL, &created,
+				     &nentries, true);
+	err = errno;
+	torture_assert_int_equal(tctx, ret, -1, "refuses a longer name");
+	torture_assert_int_equal(tctx, err, EXDEV, "EXDEV");
+
+	/* nothing was created or mounted for any of them */
+	ret = access(dir, F_OK);
+	torture_assert_int_equal(tctx, ret, -1, "nothing was created");
 
 	return true;
 }
@@ -1151,8 +1302,8 @@ static bool test_libzfs_space_in_name(struct torture_context *tctx)
 	tn_zfs_destroy(name);
 
 	snprintf(path, sizeof(path), "%s/tn_ac_space", space_mp);
-	ret = smb_zfs_create_dataset(tctx, path, NULL, &created, &nentries,
-				     false);
+	ret = smb_zfs_create_dataset(tctx, path, space_ds, NULL, &created,
+				     &nentries, false);
 	torture_assert_int_equal(tctx, ret, 0, "create below a spaced name");
 	torture_assert_int_equal(tctx, nentries, 2, "created plus anchor");
 	torture_assert_str_equal(tctx, created[0]->dataset_name, name,
@@ -1631,6 +1782,10 @@ struct torture_suite *torture_local_smb_libzfs(TALLOC_CTX *mem_ctx)
 				      test_libzfs_ds_cache);
 	torture_suite_add_simple_test(suite, "create_dataset",
 				      test_libzfs_create_dataset);
+	torture_suite_add_simple_test(suite, "dataset_within",
+				      test_libzfs_dataset_within);
+	torture_suite_add_simple_test(suite, "create_refused",
+				      test_libzfs_create_refused);
 	torture_suite_add_simple_test(suite, "space_in_name",
 				      test_libzfs_space_in_name);
 	torture_suite_add_simple_test(suite, "lookup_stability",

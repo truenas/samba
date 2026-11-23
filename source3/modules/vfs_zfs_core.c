@@ -23,6 +23,7 @@
 
 #include "lib/util/tevent_ntstatus.h"
 #include "source3/lib/substitute.h"
+#include "source3/lib/truenas_mount.h"
 #include "vfs_zfs_core.h"
 #include "zfs_core_file_id.h"
 
@@ -393,9 +394,25 @@ static int create_zfs_connectpath(vfs_handle_struct *handle,
 		return 0;
 	}
 
+	/*
+	 * A missing connectpath means a user without a dataset only if the
+	 * dataset of the share is mounted. Without its name that cannot be
+	 * told from a share whose dataset is not mounted, where a dataset
+	 * would be created in whatever is mounted above the path.
+	 */
+	if (config->share_dataset == NULL) {
+		DBG_ERR("%s: zfs_core:share_dataset is not set, so the "
+			"dataset of the share is not known. Not creating a "
+			"dataset.\n",
+			handle->conn->connectpath);
+		errno = ENOENT;
+		return -1;
+	}
+
 	DBG_ERR("preparing to create: %s\n", handle->conn->connectpath);
 	rv = smb_zfs_create_dataset(handle->conn,
 				    handle->conn->connectpath,
+				    config->share_dataset,
 				    config->dataset_auto_quota,
 				    &config->created,
 				    &config->ncreated, true);
@@ -722,11 +739,97 @@ static bool zfs_fix_connectpath_for_upn(vfs_handle_struct *handle)
 	return true;
 }
 
+/*
+ * zfs_core:share_dataset is the name of the dataset the path of the share
+ * is in. The connectpath has to be in that dataset or in one below it. If
+ * it is in another one, the dataset of the share is not mounted: the path
+ * leads to a directory of the dataset mounted above it, or of the pool of
+ * the root file system if the whole pool is not mounted. Files written
+ * there are not in the share, and are covered once the dataset is mounted.
+ *
+ * Returns false with errno set if the connection has to be refused.
+ */
+static bool zfs_core_ds_in_share(vfs_handle_struct *handle,
+				 const struct zfs_core_config_data *config)
+{
+	const char *connectpath = handle->conn->connectpath;
+	const char *dsname = "not ZFS";
+
+	if (config->share_dataset == NULL) {
+		return true;
+	}
+
+	if (config->ds != NULL) {
+		dsname = config->ds->dataset_name;
+		if (smb_zfs_dataset_within(dsname, config->share_dataset)) {
+			return true;
+		}
+	}
+
+	/*
+	 * conn_zfs_init() gives the dataset of the nearest existing ancestor
+	 * for a connectpath that does not exist. smbd refuses the missing
+	 * path itself, with NT_STATUS_BAD_NETWORK_NAME.
+	 */
+	if (access(connectpath, F_OK) != 0) {
+		return true;
+	}
+
+	DBG_ERR("%s: the path is in the dataset [%s], not in the dataset of "
+		"the share [%s] or below it. Is [%s] mounted? Refusing the "
+		"connection.\n",
+		connectpath, dsname,
+		config->share_dataset, config->share_dataset);
+	errno = EXDEV;
+	return false;
+}
+
+/*
+ * The connectpath of a share with zfs_auto_create is the mountpoint of the
+ * dataset of the user. If that dataset is not mounted, the connectpath is
+ * the empty directory it is mounted on, in the dataset above. It passes
+ * zfs_core_ds_in_share(), and the client would see an empty share.
+ *
+ * The mount table does not tell that directory from one that never had a
+ * dataset, so a connectpath that is not the root of a mount is refused.
+ *
+ * Returns false with errno set if the connection has to be refused.
+ */
+static bool zfs_core_user_ds_mounted(vfs_handle_struct *handle,
+				     const struct zfs_core_config_data *config)
+{
+	const char *connectpath = handle->conn->connectpath;
+	bool is_root = false;
+	int ret;
+
+	if (!config->zfs_auto_create) {
+		return true;
+	}
+
+	ret = tn_mount_path_is_root(connectpath, &is_root);
+	if (ret != 0) {
+		DBG_ERR("%s: failed to look up the path: %s\n",
+			connectpath, strerror(errno));
+		return false;
+	}
+	if (!is_root) {
+		DBG_ERR("%s: the path is not the mountpoint of a dataset: "
+			"its dataset is not mounted, or it is a directory "
+			"without a dataset. Refusing the connection.\n",
+			connectpath);
+		errno = ENODEV;
+		return false;
+	}
+
+	return true;
+}
+
 static int zfs_core_connect(struct vfs_handle_struct *handle,
 			    const char *service, const char *user)
 {
 	struct zfs_core_config_data *config = NULL;
 	int ret;
+	int saved_errno;
 	const char *base_quota_str = NULL;
 
 	ret = SMB_VFS_NEXT_CONNECT(handle, service, user);
@@ -751,6 +854,13 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 	config->dataset_auto_quota = lp_parm_const_string(SNUM(handle->conn),
 			"zfs_core", "dataset_auto_quota", NULL);
 
+	config->share_dataset = lp_parm_const_string(SNUM(handle->conn),
+			"zfs_core", "share_dataset", NULL);
+	if ((config->share_dataset != NULL) &&
+	    (config->share_dataset[0] == '\0')) {
+		config->share_dataset = NULL;
+	}
+
 	if (config->zfs_auto_create) {
 		if (!zfs_fix_connectpath_for_upn(handle)) {
 			goto disconnect_out;
@@ -765,6 +875,11 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 	if (ret != 0) {
 		DBG_ERR("Failed to initialize ZFS data: %s\n",
 			strerror(errno));
+		goto disconnect_out;
+	}
+
+	if (!zfs_core_ds_in_share(handle, config) ||
+	    !zfs_core_user_ds_mounted(handle, config)) {
 		goto disconnect_out;
 	}
 
@@ -806,8 +921,11 @@ static int zfs_core_connect(struct vfs_handle_struct *handle,
 	return 0;
 
 disconnect_out:
+	/* smbd logs the reason of a failed connect from errno */
+	saved_errno = errno;
 	TALLOC_FREE(config);
 	SMB_VFS_NEXT_DISCONNECT(handle);
+	errno = saved_errno;
 	return -1;
 }
 
