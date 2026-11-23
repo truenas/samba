@@ -823,9 +823,28 @@ static const struct zfs_dataset *name_get_dataset(uint64_t parent_mnt_id,
 	return out;
 }
 
+bool smb_zfs_dataset_within(const char *name, const char *parent)
+{
+	size_t len;
+
+	if ((name == NULL) || (parent == NULL)) {
+		return false;
+	}
+
+	len = strlen(parent);
+	if ((len == 0) || (strncmp(name, parent, len) != 0)) {
+		return false;
+	}
+
+	/* tank/share2 is not below tank/share */
+	return (name[len] == '\0') || (name[len] == '/');
+}
+
 int
 smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
-		       const char *path, const char *quota,
+		       const char *path,
+		       const char *root_dataset,
+		       const char *quota,
 		       const struct zfs_dataset ***_array_out,
 		       size_t *_nentries,
 		       bool create_ancestors)
@@ -845,15 +864,16 @@ smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 	TALLOC_CTX *tmp_ctx = NULL;
 	libzfs_handle_t *lz = NULL;
 
-	lz = get_global_smblibzfs_handle();
-	if (lz == NULL) {
+	if ((root_dataset == NULL) || (*root_dataset == '\0')) {
+		DBG_ERR("%s: no dataset to create below was given\n", path);
+		errno = EINVAL;
 		return -1;
 	}
 
 	tmp_ctx = talloc_new(mem_ctx);
 	if (tmp_ctx == NULL) {
 		errno = ENOMEM;
-		goto fail;
+		return -1;
 	}
 
 	if (access(path, F_OK) == 0) {
@@ -889,6 +909,25 @@ smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 		goto fail;
 	}
 
+	/*
+	 * The nearest existing ancestor is in root_dataset only if
+	 * root_dataset is mounted. If it is not, the ancestor is a directory
+	 * of whatever is mounted above it, and a dataset created from here
+	 * would be created and mounted there. The name of the new dataset
+	 * is built from this mount entry and the dataset is created by
+	 * name, so nothing that is mounted or unmounted after this check
+	 * changes where it goes.
+	 */
+	if (!smb_zfs_dataset_within(parent_entry->sb_source, root_dataset)) {
+		DBG_ERR("%s: the nearest existing directory [%s] is in the "
+			"dataset [%s], which is not [%s] or below it. "
+			"Is [%s] mounted? Not creating a dataset.\n",
+			path, parent, parent_entry->sb_source,
+			root_dataset, root_dataset);
+		errno = EXDEV;
+		goto fail;
+	}
+
 	mp_len = strlen(parent_entry->mnt_point);
 	if (strncmp(path, parent_entry->mnt_point, mp_len) != 0) {
 		DBG_ERR("%s: path does not lie below mountpoint [%s]\n",
@@ -920,6 +959,12 @@ smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 		if (*p == '/') {
 			to_create++;
 		}
+	}
+
+	/* everything above needs the mount table only */
+	lz = get_global_smblibzfs_handle();
+	if (lz == NULL) {
+		goto fail;
 	}
 
 	if (create_ancestors) {
@@ -1003,12 +1048,17 @@ smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 	*_nentries = (size_t)to_create + 1;
 	rv = 0;
 fail:
+	/* the caller gets the errno of the failure */
+	error = errno;
 	TALLOC_FREE(tmp_ctx);
 	/*
 	 * The datasets we resolved above hold their own references; this
 	 * one was only needed for the creation itself.
 	 */
-	global_handle_decref();
+	if (lz != NULL) {
+		global_handle_decref();
+	}
+	errno = error;
 	return rv;
 }
 
