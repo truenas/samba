@@ -1,507 +1,695 @@
 // Copyright (C) iXsystems, Inc. 2026
 // SPDX-License-Identifier: MIT
 
-//! The thread of one connection. It runs a `truenas_ros` server that has
-//! no listeners and adopts the socket. The server stops when the
-//! connection closes or when the owner stops it.
+//! The reactor of one connection: a thread with its own ring that reads
+//! whole PDUs for a handler and sends what it queues.
 
-use std::cell::RefCell;
+use std::cell::UnsafeCell;
 use std::ffi::c_int;
-use std::os::fd::OwnedFd;
-use std::ptr;
-use std::rc::Rc;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, mpsc};
+use std::ops::{Deref, DerefMut};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::ptr::NonNull;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use truenas_ros::net::server::{
-    BodyRecycler, CloseReason, ForceAsync, Framing, Incoming, Protocol,
-    PushHandle, Request, Response, SendZeroCopy, Server, ServerAddr,
-    ServerConfig, ShutdownHandle,
-};
+use crate::block::{Block, FreeList, Pool};
+use crate::list::{BoxList, Msg, MsgKind, Push, Stack};
+use crate::out::Out;
+use crate::ring::{ASYNC_CANCEL_ANY, Cqe, OP_ASYNC_CANCEL, Ring, Sqe};
+use crate::sys;
+use crate::transmit::Gather;
 
-use crate::buf::Buf;
-use crate::conn::ConnState;
-use crate::ctx::{Event, Shared, TnSmbrosEvent};
-use crate::lock;
-use crate::upper::Verdict;
-
-/// The NBT header has a type byte and a 24-bit big-endian length.
-pub const NBT_HDR_SIZE: usize = 4;
-/// Return only body storage of this size or more to the ring's pool. The
-/// ring places a body of `PLACE_MIN - NBT_HDR_SIZE + 1` bytes or more,
-/// because its PDU does not fit a pooled receive buffer.
-pub const PLACE_MIN: usize = 16 * 1024;
-/// `truenas_ros` adds 4 KiB (`RECV_CHUNK`) to each pooled receive buffer, so
-/// the buffers hold 16 KiB. A larger PDU is read into a buffer of its own,
-/// which `Body::take()` moves instead of copying.
-const RECV_BUFFER: usize = PLACE_MIN - 4 * 1024;
-
-pub(crate) type Ready = Result<(PushHandle, ShutdownHandle), c_int>;
-
-pub fn errno_of(e: &truenas_ros::Error) -> c_int {
-    match e {
-        truenas_ros::Error::Errno(e) => *e as c_int,
-        _ => libc::EINVAL,
-    }
+/// The settings of a reactor.
+#[derive(Debug, Clone, Copy)]
+pub struct Config {
+    /// The most PDUs that the handler can have at once.
+    pub max_inflight: u32,
+    /// A gather of this many bytes or more goes out without the kernel's
+    /// copy. `usize::MAX` copies every send.
+    pub zc_min: usize,
+    /// Zero-copy bytes that can wait for the peer's acknowledgement.
+    pub zc_max_pinned: usize,
+    /// A read for the next PDU reads up to this many bytes.
+    pub readahead: u32,
+    /// Bytes of blocks that the pool keeps for reuse.
+    pub budget: usize,
 }
 
-fn nbt_header(buf: &[u8], _state: &mut ()) -> Framing {
-    if buf.len() < NBT_HDR_SIZE {
-        return Framing::Need(NBT_HDR_SIZE - buf.len());
-    }
-    let len = (usize::from(buf[1]) << 16)
-        | (usize::from(buf[2]) << 8)
-        | usize::from(buf[3]);
-    Framing::Complete {
-        header_len: NBT_HDR_SIZE,
-        body_len: len,
-    }
-}
-
-/// Give this thread the signal mask of a reactor and return the old mask.
-/// A thread that this thread starts gets the same mask. A reactor blocks
-/// all signals, so the owner handles them on its own thread. The exceptions
-/// are SIGSEGV and SIGBUS. If a fault signal is blocked, Linux kills the
-/// process without the fault handler of the owner.
-pub(crate) fn reactor_signals() -> libc::sigset_t {
-    // SAFETY: the calls fill local sets. pthread_sigmask changes the mask
-    // of this thread only.
-    unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        let mut old: libc::sigset_t = std::mem::zeroed();
-        libc::sigfillset(&raw mut set);
-        libc::sigdelset(&raw mut set, libc::SIGSEGV);
-        libc::sigdelset(&raw mut set, libc::SIGBUS);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &raw const set, &raw mut old);
-        old
-    }
-}
-
-/// Give this thread the mask `old` from `reactor_signals()` again.
-pub(crate) fn restore_signals(old: &libc::sigset_t) {
-    // SAFETY: `old` is a mask from pthread_sigmask(). The call changes the
-    // mask of this thread only.
-    unsafe {
-        libc::pthread_sigmask(libc::SIG_SETMASK, old, ptr::null_mut());
-    }
-}
-
-/// Give a new PDU to the owner, inline or through the queue.
-fn deliver(shared: &Shared, buf: Box<Buf>, nbt_type: u8, verdict: Verdict) {
-    let Some(buf) = try_inline(shared, buf, nbt_type, &verdict) else {
-        return;
-    };
-    buf.conn.queued.fetch_add(1, Ordering::AcqRel);
-    shared.post(Event::Pdu {
-        buf,
-        nbt_type,
-        verdict,
-    });
-}
-
-/// Offer a new PDU to the inline function of the owner. Returns the PDU if
-/// the function did not run it. A PDU does not run before the queued PDUs
-/// of its connection.
-fn try_inline(
-    shared: &Shared,
-    buf: Box<Buf>,
-    nbt_type: u8,
-    verdict: &Verdict,
-) -> Option<Box<Buf>> {
-    let Some(hook) = shared.inline.get() else {
-        return Some(buf);
-    };
-    if buf.conn.queued.load(Ordering::Acquire) != 0
-        || buf.conn.closed.load(Ordering::Relaxed)
-    {
-        return Some(buf);
-    }
-    let (mut ev, keep) = TnSmbrosEvent::pdu(buf, nbt_type, verdict);
-    let buf = ev.buf.cast::<Buf>();
-    // SAFETY: tn_smbros_ctx_inline() requires a function that any reactor
-    // thread can call. The function keeps the buffer only if it returns
-    // true.
-    if unsafe { (hook.func)(hook.private, &raw mut ev) } {
-        // The owner has the PDU, as in tn_smbros_next().
-        if let Some(d) = keep {
-            d.reply(Vec::new());
-        }
-        return None;
-    }
-    // SAFETY: the function returned false. So it did not keep the buffer.
-    let mut buf = unsafe { Box::from_raw(buf) };
-    if keep.is_some() {
-        buf.deferred = keep;
-    }
-    Some(buf)
-}
-
-/// Handle the redelivery of a PDU that got a job. Run the next job on this
-/// ring.
-fn run_job(
-    req: Request<'_, ()>,
-    state: &ConnState,
-    recycler: Option<BodyRecycler>,
-) -> Response {
-    let Request { fs, responder, .. } = req;
-    let job = lock(&state.jobs).queue.pop_front();
-    let (Some(job), Some(mut fs)) = (job, fs) else {
-        // Without a job or `fs`, nothing answers the reply.
-        return Response::Close;
-    };
-    let (deferred, permit) = responder.defer();
-    job.run(state, &mut fs, deferred, recycler);
-    Response::Defer(permit)
-}
-
-/// What the owner sets for each connection: the file I/O that carries
-/// `IOSQE_ASYNC` and the replies that go out without the kernel's copy.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Tuning {
-    force_async: ForceAsync,
-    force_async_min_bytes: usize,
-    send_zero_copy: Option<SendZeroCopy>,
-}
-
-impl Tuning {
-    /// The floors of forced reads, forced writes and zero-copy replies,
-    /// `usize::MAX` for none. `truenas_ros` has one floor for forced file
-    /// I/O, so the smaller one applies to reads and writes.
-    pub(crate) fn new(
-        read_min: usize,
-        write_min: usize,
-        zero_copy_min: usize,
-    ) -> Tuning {
-        let mut force_async = ForceAsync::empty();
-        if read_min != usize::MAX {
-            force_async |= ForceAsync::READ;
-        }
-        if write_min != usize::MAX {
-            force_async |= ForceAsync::WRITE;
-        }
-        let send_zero_copy = (zero_copy_min != usize::MAX).then(|| {
-            let default = SendZeroCopy::default();
-            SendZeroCopy {
-                threshold: zero_copy_min,
-                max_pinned: default.max_pinned.max(zero_copy_min),
-                ..default
-            }
-        });
-        Tuning {
-            force_async,
-            force_async_min_bytes: read_min.min(write_min),
-            send_zero_copy,
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            max_inflight: 16,
+            zc_min: usize::MAX,
+            zc_max_pinned: 64 << 20,
+            readahead: 1024,
+            budget: 64 << 20,
         }
     }
 }
 
-fn server_config(
-    max_in_flight: usize,
-    delegate: bool,
-    tuning: Tuning,
-    layer_ops: u32,
-) -> ServerConfig {
-    let max_in_flight = max_in_flight.max(1);
-    ServerConfig {
-        pool_size: 1,
-        max_request_bytes: NBT_HDR_SIZE + 0x00ff_ffff,
-        max_in_flight_requests: max_in_flight,
-        // The owner bounds its replies itself.
-        max_send_backlog: 1 << 30,
-        recv_buffer_bytes: RECV_BUFFER,
-        // truenas_ros requires this to be at most recv_buffer_bytes. It does
-        // not place a body the receive buffer holds, so the buffer decides.
-        body_placement_threshold: Some(RECV_BUFFER),
-        // Each job is a request in flight with one file op. The upper layer
-        // keeps `layer_ops` more.
-        fs_ops: if delegate {
-            u32::try_from(max_in_flight)
-                .unwrap_or(u32::MAX)
-                .saturating_add(layer_ops)
-        } else {
-            0
-        },
-        force_async: tuning.force_async,
-        force_async_min_bytes: tuning.force_async_min_bytes,
-        send_zero_copy: tuning.send_zero_copy,
-        ..ServerConfig::default()
-    }
+/// The tag of a `user_data` that points to an operation of the handler.
+pub const TAG_OP: u64 = 0;
+pub(crate) const TAG_CORE: u64 = 1;
+pub(crate) const TAG_ZC: u64 = 2;
+/// The tag of the handler's other completions, with its id above bit 3.
+pub const TAG_UPPER: u64 = 3;
+
+pub(crate) const UD_RECV: u64 = (1 << 3) | TAG_CORE;
+pub(crate) const UD_SEND: u64 = (2 << 3) | TAG_CORE;
+const UD_WAKE: u64 = (3 << 3) | TAG_CORE;
+const UD_CANCEL: u64 = (4 << 3) | TAG_CORE;
+/// An uncounted completion, such as the failure of a skip-success SQE.
+pub(crate) const UD_IGNORE: u64 = (5 << 3) | TAG_CORE;
+
+const ACTIVE: u32 = 0;
+const PARKED: u32 = 1;
+const NOTIFIED: u32 = 2;
+const DEAD: u32 = 3;
+
+/// What other threads share with a reactor.
+#[derive(Debug)]
+pub struct Shared {
+    /// Messages from other threads, such as sends and jobs.
+    pub inbox: Stack,
+    /// In-flight slots that other threads released.
+    pub(crate) released: AtomicU32,
+    /// True while the reactor waits for released slots.
+    pub(crate) cap_wait: AtomicBool,
+    /// ACTIVE, PARKED, NOTIFIED or DEAD. Only a parked reactor gets an
+    /// eventfd write.
+    wstate: AtomicU32,
+    stop: AtomicBool,
+    efd: OwnedFd,
+    /// The `pthread_t` of the reactor while it runs, else 0.
+    thread: AtomicUsize,
+    /// The ring descriptor or -1. The lock orders registers and the close.
+    gate: Mutex<c_int>,
 }
 
-/// Serve `sock` until it closes or the owner stops the reactor. `back_rx`
-/// receives the used bodies of the connection. The reactor sends the
-/// handles of the connection to `ready`, or the errno of a failed start.
-pub(crate) fn reactor(
-    shared: &Arc<Shared>,
-    state: &Arc<ConnState>,
-    sock: OwnedFd,
-    max_in_flight: usize,
-    tuning: Tuning,
-    back_rx: mpsc::Receiver<Vec<u8>>,
-    ready: &mpsc::SyncSender<Ready>,
-) {
-    let upper = shared.upper.get().cloned();
-    let layer_ops = upper.as_ref().map_or(0, |u| u.fs_ops());
-    // Only this thread can use the recycler. The owner sends used bodies to
-    // this thread. The handler of the next PDU returns them to the pool.
-    let recycler: Rc<RefCell<Option<BodyRecycler>>> =
-        Rc::new(RefCell::new(None));
-    let body = {
-        let shared = Arc::clone(shared);
-        let state = Arc::clone(state);
-        let recycler = Rc::clone(&recycler);
-        move |req: Request<'_, ()>| {
-            // A redelivery has an empty frame.
-            if req.header.is_empty() {
-                let r = recycler.borrow().clone();
-                return run_job(req, &state, r);
-            }
-            let Request {
-                header,
-                mut body,
-                responder,
-                ..
-            } = req;
-            if let Some(r) = recycler.borrow().as_ref() {
-                while let Ok(v) = back_rx.try_recv() {
-                    r.recycle(v);
-                }
-            }
-            let (deferred, permit) = responder.defer();
-            let mut pdu = body.take();
-            let verdict = upper.as_ref().map_or_else(Verdict::default, |u| {
-                u.incoming(&state, &mut pdu)
-            });
-            let buf = Box::new(Buf {
-                conn: Arc::clone(&state),
-                body: pdu,
-                deferred: Some(deferred),
-            });
-            deliver(&shared, buf, header[0], verdict);
-            Response::Defer(permit)
-        }
-    };
-    let proto = Protocol {
-        accept: |_: Incoming<'_>| Some(()),
-        header: nbt_header,
-        body,
-    };
-    let cfg = server_config(max_in_flight, state.delegate, tuning, layer_ops);
-    let mut server =
-        match Server::with_config(Vec::<ServerAddr>::new(), cfg, proto) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = ready.send(Err(errno_of(&e)));
+impl Shared {
+    /// # Errors
+    ///
+    /// The errno if the eventfd cannot be made.
+    pub fn new() -> Result<Shared, c_int> {
+        let fd = sys::eventfd(libc::EFD_NONBLOCK)?;
+        Ok(Shared {
+            inbox: Stack::new(),
+            released: AtomicU32::new(0),
+            cap_wait: AtomicBool::new(false),
+            wstate: AtomicU32::new(ACTIVE),
+            stop: AtomicBool::new(false),
+            // SAFETY: the eventfd is new and nothing else owns it.
+            efd: unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) },
+            thread: AtomicUsize::new(0),
+            gate: Mutex::new(-1),
+        })
+    }
+
+    /// True if the caller runs on the reactor thread.
+    #[inline]
+    pub fn on_thread(&self) -> bool {
+        self.thread.load(Ordering::Relaxed) == sys::thread_self()
+    }
+
+    pub fn poke(&self) {
+        let mut cur = self.wstate.load(Ordering::Acquire);
+        loop {
+            if cur == NOTIFIED || cur == DEAD {
                 return;
             }
-        };
-    *recycler.borrow_mut() = server.body_recycler();
-    // The owner calls tn_smbros_adopt() as root. So this registers the
-    // identity of root.
-    match server.register_self() {
-        Ok(p) => state.root.store(p.id(), Ordering::Release),
-        Err(e) => {
-            let _ = ready.send(Err(errno_of(&e)));
-            return;
+            match self.wstate.compare_exchange_weak(
+                cur,
+                NOTIFIED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if cur == PARKED {
+                        sys::poke(self.efd.as_raw_fd());
+                    }
+                    return;
+                }
+                Err(seen) => cur = seen,
+            }
         }
     }
-    let _ = state.creds.set(server.self_registrar());
-    let stop = server.shutdown_handle();
-    {
-        let shared = Arc::clone(shared);
-        let state = Arc::clone(state);
-        let stop = stop.clone();
-        server.set_close_hook(move |_peer, reason, _state| {
-            let error = match reason {
-                CloseReason::PeerClosed => 0,
-                CloseReason::RecvError(e) => e as c_int,
-                _ => libc::ECONNABORTED,
-            };
-            shared.post(Event::Closed {
-                conn: Arc::clone(&state),
-                error,
-            });
-            stop.shutdown();
-        });
-    }
-    let push = match server.adopt(sock, ()) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = ready.send(Err(errno_of(&e)));
-            return;
+
+    /// Give the reactor a message. False if it stopped. Then the caller
+    /// keeps `m`.
+    ///
+    /// # Safety
+    ///
+    /// `m` is valid and in no list. The reactor owns it after a true return.
+    pub unsafe fn post(&self, m: NonNull<Msg>) -> bool {
+        // SAFETY: as the caller says.
+        match unsafe { self.inbox.push(m.cast()) } {
+            Push::First => {
+                self.poke();
+                true
+            }
+            Push::More => true,
+            Push::Dead => false,
         }
-    };
-    // This runs before tn_smbros_adopt() returns and before the first PDU.
-    // So the state of the upper layer is set when the owner gets the
-    // connection.
-    if let Some(ext) = shared.upper.get().and_then(|u| u.start(state, &push)) {
-        let _ = state.ext.set(ext);
     }
-    let _ = ready.send(Ok((push, stop)));
-    let _ = server.serve_forever();
-    // Every file op completed before serve_forever() returned. Drop the
-    // jobs that did not start. With `stopped` set, the owner cannot add
-    // more.
-    let unstarted = {
-        let mut jobs = lock(&state.jobs);
-        jobs.stopped = true;
-        std::mem::take(&mut jobs.queue)
-    };
-    drop(unstarted);
+
+    /// Release an in-flight slot from another thread.
+    pub fn release(&self) {
+        self.released.fetch_add(1, Ordering::SeqCst);
+        if self.cap_wait.load(Ordering::SeqCst) {
+            self.poke();
+        }
+    }
+
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.poke();
+    }
+
+    /// Register the caller's credentials on the ring. The id or -errno.
+    pub fn register_self(&self) -> c_int {
+        let fd = crate::lock(&self.gate);
+        if *fd < 0 {
+            return -libc::ENOTCONN;
+        }
+        sys::register_personality(*fd)
+    }
+
+    /// Refuse register calls before the ring closes.
+    pub(crate) fn clear_ring(&self) {
+        *crate::lock(&self.gate) = -1;
+    }
+
+    pub(crate) fn clear_thread(&self) {
+        self.thread.store(0, Ordering::Relaxed);
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// The handler of the PDUs of a reactor, on the reactor thread.
+pub trait Handler: Sized {
+    type State;
+    /// True for a 4-byte NBT header, false for a big-endian 32-bit length.
+    const NBT: bool;
 
-    /// True if `sig` is blocked on this thread.
-    fn blocked(sig: c_int) -> bool {
-        // SAFETY: the calls read the mask of this thread into a local set.
-        unsafe {
-            let mut set: libc::sigset_t = std::mem::zeroed();
-            libc::pthread_sigmask(libc::SIG_BLOCK, ptr::null(), &raw mut set);
-            libc::sigismember(&raw const set, sig) == 1
-        }
-    }
+    /// A PDU in `b`, `len` bytes after the header, with one in-flight slot.
+    /// It gets the cell, as its code can enter the reactor again.
+    fn on_pdu(cell: &ReactorCell<Self::State>, b: Block, len: u32);
+    /// An inbox message that is not a send.
+    fn on_msg(r: &mut Reactor<Self::State>, m: NonNull<Msg>);
+    /// The same, after the reactor stopped.
+    fn drop_msg(r: &mut Reactor<Self::State>, m: NonNull<Msg>);
+    /// The step of an out with `finish` set. False closes the connection.
+    fn finish_out(r: &mut Reactor<Self::State>, o: &mut Out) -> bool;
+    /// The reactor is done with `o`.
+    fn release_out(r: &mut Reactor<Self::State>, o: Box<Out>);
+    /// The connection ended. Called one time.
+    fn on_closed(r: &mut Reactor<Self::State>, err: c_int);
+    fn on_batch(r: &mut Reactor<Self::State>);
+    /// True if the handler has local work.
+    fn pending(r: &Reactor<Self::State>) -> bool;
+    /// A completion with `TAG_OP` or `TAG_UPPER`.
+    fn on_cqe(r: &mut Reactor<Self::State>, ud: u64, res: i32);
+    /// The reactor stops, before it waits for its operations.
+    fn on_stop(r: &mut Reactor<Self::State>);
+    /// All operations are done.
+    fn on_end(r: &mut Reactor<Self::State>);
+}
 
-    const SIGNALS: [c_int; 6] = [
-        libc::SIGTERM,
-        libc::SIGHUP,
-        libc::SIGCHLD,
-        libc::SIGALRM,
-        libc::SIGSEGV,
-        libc::SIGBUS,
-    ];
+/// The reactor of one connection. Only its own thread uses it.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug)]
+pub struct Reactor<S> {
+    pub ring: Ring,
+    sh: NonNull<Shared>,
+    pub h: S,
+    pub cfg: Config,
+    /// Fixed file 0 of the ring.
+    pub(crate) sock: OwnedFd,
+    pub blocks: Pool,
+    pub(crate) outs: FreeList<Out>,
+    pub(crate) zcs: FreeList<Gather>,
 
-    /// Send PDUs with these body sizes to a server with the reactor config.
-    /// For each, return whether the body arrived in a buffer of its own.
-    fn placed(sizes: &[usize]) -> Vec<bool> {
-        use std::io::Write;
+    // Receive
+    pub(crate) cur: Option<Block>,
+    pub(crate) have: u32,
+    pub(crate) total: u32,
+    pub(crate) recv_armed: bool,
+    pub(crate) inflight: u32,
+    pub(crate) capped: bool,
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut client =
-            std::net::TcpStream::connect(listener.local_addr().unwrap())
-                .unwrap();
-        let (sock, _) = listener.accept().unwrap();
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (tx, rx) = mpsc::channel();
-        let server = {
-            let seen = Arc::clone(&seen);
-            std::thread::spawn(move || {
-                let body = move |req: Request<'_, ()>| {
-                    let Request { mut body, .. } = req;
-                    lock(&seen).push(body.take_owned().is_some());
-                    Response::Reply(Vec::new())
-                };
-                let proto = Protocol {
-                    accept: |_: Incoming<'_>| Some(()),
-                    header: nbt_header,
-                    body,
-                };
-                let none = usize::MAX;
-                let cfg =
-                    server_config(16, false, Tuning::new(none, none, none), 0);
-                let mut server =
-                    Server::with_config(Vec::<ServerAddr>::new(), cfg, proto)
-                        .unwrap();
-                server.adopt(OwnedFd::from(sock), ()).unwrap();
-                tx.send(server.shutdown_handle()).unwrap();
-                let _ = server.serve_forever();
-            })
+    // Send
+    pub(crate) sendq: BoxList<Out>,
+    pub(crate) sending: bool,
+    pub(crate) gather: Gather,
+    pub(crate) zc_on: bool,
+    pub(crate) zc_pinned: usize,
+    pub(crate) zc_notifs: u32,
+
+    wake_buf: u64,
+    /// The CQEs that are still due.
+    pub(crate) ops: u32,
+    pub stopping: bool,
+    ended: bool,
+    pub(crate) in_drain: bool,
+}
+
+impl<S> Reactor<S> {
+    /// # Errors
+    ///
+    /// The errno if the ring cannot be made.
+    ///
+    /// # Safety
+    ///
+    /// `sh` stays valid while the reactor lives on the calling thread.
+    pub unsafe fn new(
+        sh: NonNull<Shared>,
+        cfg: Config,
+        sock: OwnedFd,
+        h: S,
+    ) -> Result<Reactor<S>, c_int> {
+        let ring = Ring::new(256, 512)?;
+        ring.register_files(&[sock.as_raw_fd()])
+            .map_err(|_| libc::EIO)?;
+        let r = Reactor {
+            ring,
+            sh,
+            h,
+            cfg,
+            sock,
+            blocks: Pool::new(cfg.budget),
+            outs: FreeList::new(256),
+            zcs: FreeList::new(16),
+            cur: None,
+            have: 0,
+            total: 0,
+            recv_armed: false,
+            inflight: 0,
+            capped: false,
+            sendq: BoxList::new(),
+            sending: false,
+            gather: Gather::new(),
+            zc_on: cfg.zc_min != usize::MAX,
+            zc_pinned: 0,
+            zc_notifs: 0,
+            wake_buf: 0,
+            ops: 0,
+            stopping: false,
+            ended: false,
+            in_drain: false,
         };
-        let stop = rx.recv().unwrap();
-        for &len in sizes {
-            let mut pdu = vec![0u8; NBT_HDR_SIZE + len];
-            pdu[1..NBT_HDR_SIZE].copy_from_slice(
-                &u32::try_from(len).unwrap().to_be_bytes()[1..],
-            );
-            client.write_all(&pdu).unwrap();
+        *crate::lock(&r.sh().gate) = r.ring.fd();
+        r.sh().thread.store(sys::thread_self(), Ordering::Relaxed);
+        Ok(r)
+    }
+
+    #[inline]
+    pub fn sh(&self) -> &Shared {
+        // SAFETY: the shared state outlives the reactor, see new().
+        unsafe { self.sh.as_ref() }
+    }
+
+    /// Queue a counted operation. False if the ring stays full.
+    ///
+    /// # Safety
+    ///
+    /// The conditions of `Ring::push()` apply.
+    #[inline]
+    pub unsafe fn push_sqe(&mut self, s: Sqe) -> bool {
+        // SAFETY: as the caller says.
+        if unsafe { self.ring.push(s) } {
+            self.ops += 1;
+            return true;
         }
-        // Bounded, so a body that never arrives fails the test.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while lock(&seen).len() < sizes.len()
-            && std::time::Instant::now() < deadline
+        // SAFETY: as the caller says.
+        unsafe { self.push_sqe_slow(s) }
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn push_sqe_slow(&mut self, s: Sqe) -> bool {
+        self.ring.submit();
+        // SAFETY: as in push_sqe().
+        if unsafe { self.ring.push(s) } {
+            self.ops += 1;
+            return true;
+        }
+        false
+    }
+
+    /// As `push_sqe()`, for an SQE whose success posts no completion.
+    ///
+    /// # Safety
+    ///
+    /// The conditions of `Ring::push()` apply.
+    pub unsafe fn push_sqe_uncounted(&mut self, mut s: Sqe) -> bool {
+        s.user_data = UD_IGNORE;
+        s.flags |= crate::ring::IOSQE_CQE_SKIP_SUCCESS;
+        // SAFETY: as the caller says.
+        let ok = unsafe { self.push_sqe(s) };
+        if ok {
+            self.ops -= 1;
+        }
+        ok
+    }
+
+    pub fn end<H: Handler<State = S>>(&mut self, err: c_int) {
+        if !self.ended {
+            self.ended = true;
+            H::on_closed(self, err);
+        }
+        self.stopping = true;
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub fn fail<H: Handler<State = S>>(&mut self, err: c_int) {
+        self.end::<H>(err);
+    }
+
+    fn arm_wake<H: Handler<State = S>>(&mut self) {
+        let s = Sqe {
+            opcode: crate::ring::OP_READ,
+            fd: self.sh().efd.as_raw_fd(),
+            addr: (&raw mut self.wake_buf) as u64,
+            len: 8,
+            off: u64::MAX,
+            user_data: UD_WAKE,
+            ..Sqe::ZERO
+        };
+        // SAFETY: wake_buf is in the reactor, which outlives its operations.
+        if !unsafe { self.push_sqe(s) } {
+            self.fail::<H>(libc::EIO);
+        }
+    }
+
+    fn on_wake<H: Handler<State = S>>(&mut self) {
+        if !self.stopping {
+            self.arm_wake::<H>();
+        }
+    }
+
+    /// Queue `o` on the reactor thread, after the sends that other threads
+    /// posted before it.
+    #[inline]
+    pub fn queue<H: Handler<State = S>>(&mut self, o: Box<Out>) {
+        if let Some(o) = self.queue_with(o, Self::drain_inbox::<H>) {
+            H::release_out(self, o);
+        }
+    }
+
+    /// `queue()` with the inbox drain as a function. Gives back an out
+    /// without segments.
+    #[inline]
+    pub fn queue_with(
+        &mut self,
+        o: Box<Out>,
+        drain: fn(&mut Self),
+    ) -> Option<Box<Out>> {
+        if !self.in_drain && self.sh().inbox.ready() {
+            drain(self);
+        }
+        if o.nseg == 0 {
+            return Some(o);
+        }
+        self.sendq.push(o);
+        None
+    }
+
+    fn accept<H: Handler<State = S>>(&mut self, mut o: Box<Out>) {
+        if o.finish && !H::finish_out(self, &mut o) {
+            H::release_out(self, o);
+            self.end::<H>(libc::ECONNABORTED);
+            return;
+        }
+        self.queue::<H>(o);
+    }
+
+    pub fn drain_inbox<H: Handler<State = S>>(&mut self) {
+        // A send of this batch must not wait behind a newer batch.
+        self.in_drain = true;
+        let mut l = self.sh().inbox.take();
+        while let Some(link) = l.pop() {
+            let m = link.cast::<Msg>();
+            // SAFETY: a Send message starts a leaked Box<Out>.
+            unsafe {
+                if m.as_ref().kind == MsgKind::Send {
+                    self.accept::<H>(Box::from_raw(m.cast::<Out>().as_ptr()));
+                } else {
+                    H::on_msg(self, m);
+                }
+            }
+        }
+        self.in_drain = false;
+    }
+
+    #[inline]
+    fn drain<H: Handler<State = S>>(&mut self) {
+        if self.sh().stop.load(Ordering::Acquire) {
+            self.stopping = true;
+        }
+        if self.sh().inbox.ready() {
+            self.drain_inbox::<H>();
+        }
+    }
+
+    fn park(&mut self) -> bool {
+        let w = &self.sh().wstate;
+        if w.compare_exchange(
+            ACTIVE,
+            PARKED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
         {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            return true;
         }
-        stop.shutdown();
-        server.join().unwrap();
-        let seen = lock(&seen).clone();
-        assert_eq!(seen.len(), sizes.len(), "bodies delivered");
-        seen
+        w.store(ACTIVE, Ordering::Release);
+        false
     }
 
-    #[test]
-    fn a_body_of_16_kib_or_more_is_placed() {
-        // A WRITE has 112 bytes of SMB2 header before its data. The reactor
-        // moves the data of 16 KiB and 60 KiB WRITEs instead of copying it.
-        let sizes = [
-            100,
-            12 * 1024,
-            16 * 1024,
-            16 * 1024 + 112,
-            60 * 1024 + 112,
-            1 << 20,
-        ];
-        assert_eq!(placed(&sizes), [false, false, true, true, true, true]);
+    #[inline]
+    fn dispatch<H: Handler<State = S>>(&mut self, c: Cqe) {
+        let ud = c.user_data;
+        if ud == UD_IGNORE {
+            return;
+        }
+        self.ops -= 1;
+        match ud & 7 {
+            TAG_CORE => match ud {
+                UD_RECV => self.on_recv::<H>(c.res),
+                UD_SEND => self.on_send::<H>(c.res),
+                UD_WAKE => self.on_wake::<H>(),
+                _ => {}
+            },
+            TAG_ZC => self.on_zc::<H>(ud & !7, c.res, c.flags),
+            _ => H::on_cqe(self, ud, c.res),
+        }
     }
 
-    #[test]
-    fn a_body_is_placed_once_its_pdu_outgrows_the_receive_buffer() {
-        let whole = PLACE_MIN - NBT_HDR_SIZE;
-        assert_eq!(placed(&[whole, whole + 1]), [false, true]);
+    /// Run the completions in place, 64 at most per batch.
+    fn reap<H: Handler<State = S>>(&mut self) {
+        loop {
+            let head = self.ring.cq_head();
+            let n = self.ring.cq_tail().wrapping_sub(head).min(64);
+            if n == 0 {
+                return;
+            }
+            for i in 0..n {
+                // SAFETY: the position is before the tail.
+                let c = unsafe { self.ring.cqe(head.wrapping_add(i)) };
+                self.dispatch::<H>(c);
+            }
+            self.ring.cq_set_head(head.wrapping_add(n));
+        }
     }
 
-    #[test]
-    fn a_zero_length_body_is_delivered() {
-        assert_eq!(placed(&[0, 1]), [false, false]);
+    fn teardown<H: Handler<State = S>>(&mut self) {
+        self.stopping = true;
+        let mut left = self.sh().inbox.close();
+        while let Some(link) = left.pop() {
+            let m = link.cast::<Msg>();
+            // SAFETY: as in drain_inbox().
+            unsafe {
+                if m.as_ref().kind == MsgKind::Send {
+                    let o = Box::from_raw(m.cast::<Out>().as_ptr());
+                    H::release_out(self, o);
+                } else {
+                    H::drop_msg(self, m);
+                }
+            }
+        }
+        H::on_stop(self);
+        let cancel = Sqe {
+            opcode: OP_ASYNC_CANCEL,
+            fd: -1,
+            op_flags: ASYNC_CANCEL_ANY,
+            user_data: UD_CANCEL,
+            ..Sqe::ZERO
+        };
+        // Only the cancel ends the read of the eventfd. If the ring refuses
+        // it, try again after a reap.
+        // SAFETY: a cancel names no memory.
+        while self.ops > 0 && !unsafe { self.push_sqe(cancel) } {
+            sys::sleep_ns(sys::NS_PER_MS);
+            self.reap::<H>();
+        }
+        // A notification cannot be cancelled. After one second, a reset of
+        // the connection frees the pages.
+        let deadline = sys::now_ns() + sys::NS_PER_SEC;
+        let mut reset = false;
+        while self.ops > 0 {
+            if !reset && self.ops <= self.zc_notifs {
+                if sys::now_ns() >= deadline {
+                    reset_socket(&self.sock);
+                    reset = true;
+                } else {
+                    self.ring.submit();
+                    sys::sleep_ns(sys::NS_PER_MS);
+                    self.reap::<H>();
+                    continue;
+                }
+            }
+            self.ring.submit_and_wait(1);
+            self.reap::<H>();
+        }
+        let q = std::mem::take(&mut self.sendq);
+        self.release_outs::<H>(q);
+        let g = std::mem::take(&mut self.gather.outs);
+        self.release_outs::<H>(g);
+        if let Some(b) = self.cur.take() {
+            self.blocks.put(b);
+        }
+        H::on_end(self);
+        self.sh().wstate.store(DEAD, Ordering::Release);
+        self.sh().clear_ring();
+    }
+}
+
+/// Reset the connection with a connect to `AF_UNSPEC` (0).
+fn reset_socket(sock: &OwnedFd) {
+    let unspec = libc::sockaddr {
+        sa_family: 0,
+        sa_data: [0; 14],
+    };
+    let len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr>())
+        .unwrap_or(0);
+    // SAFETY: connect reads one sockaddr.
+    unsafe { libc::connect(sock.as_raw_fd(), &raw const unspec, len) };
+}
+
+/// A reactor that inline runs of smbd can enter again. The reactor holds no
+/// borrow of itself while such code runs.
+#[derive(Debug)]
+pub struct ReactorCell<S> {
+    r: UnsafeCell<Reactor<S>>,
+    #[cfg(debug_assertions)]
+    busy: std::cell::Cell<bool>,
+}
+
+/// A borrow of the reactor in a `ReactorCell`.
+#[derive(Debug)]
+pub struct Borrow<'a, S>(&'a ReactorCell<S>);
+
+impl<S> ReactorCell<S> {
+    pub fn new(r: Reactor<S>) -> Self {
+        ReactorCell {
+            r: UnsafeCell::new(r),
+            #[cfg(debug_assertions)]
+            busy: std::cell::Cell::new(false),
+        }
     }
 
-    #[test]
-    fn each_class_with_a_floor_is_forced_async_from_the_smaller_floor() {
-        let none = usize::MAX;
-        let cfg =
-            server_config(16, true, Tuning::new(128 * 1024, none, none), 0);
-        assert_eq!(cfg.force_async, ForceAsync::READ);
-        assert_eq!(cfg.force_async_min_bytes, 128 * 1024);
-        let cfg = server_config(16, true, Tuning::new(none, 4096, none), 0);
-        assert_eq!(cfg.force_async, ForceAsync::WRITE);
-        assert_eq!(cfg.force_async_min_bytes, 4096);
-        let cfg = server_config(16, true, Tuning::new(1, 65536, none), 0);
-        assert_eq!(cfg.force_async, ForceAsync::READ | ForceAsync::WRITE);
-        assert_eq!(cfg.force_async_min_bytes, 1);
-        let cfg = server_config(16, true, Tuning::new(none, none, none), 0);
-        assert_eq!(cfg.force_async, ForceAsync::empty());
+    /// # Panics
+    ///
+    /// In a debug build, if the reactor is borrowed already.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the reactor thread and has no other live borrow. The
+    /// borrow ends before code runs that can borrow the reactor again.
+    #[inline]
+    pub unsafe fn borrow(&self) -> Borrow<'_, S> {
+        #[cfg(debug_assertions)]
+        {
+            assert!(!self.busy.get(), "the reactor is borrowed already");
+            self.busy.set(true);
+        }
+        Borrow(self)
     }
 
-    #[test]
-    fn replies_go_out_zero_copy_from_their_floor() {
-        let none = usize::MAX;
-        let cfg = server_config(16, true, Tuning::new(none, none, none), 0);
-        assert!(cfg.send_zero_copy.is_none());
-        let cfg = server_config(16, true, Tuning::new(none, none, 65536), 0);
-        let zc = cfg.send_zero_copy.expect("zero-copy replies");
-        assert_eq!(zc.threshold, 65536);
-        assert!(zc.max_pinned >= zc.threshold);
-        // A floor above the default cap raises the cap, which must hold one.
-        let big = 128 << 20;
-        let cfg = server_config(16, true, Tuning::new(none, none, big), 0);
-        assert_eq!(cfg.send_zero_copy.expect("on").max_pinned, big);
+    pub fn into_inner(self) -> Reactor<S> {
+        self.r.into_inner()
     }
+}
 
-    #[test]
-    fn a_reactor_blocks_all_signals_but_faults() {
-        std::thread::spawn(|| {
-            let before = SIGNALS.map(blocked);
-            let old = reactor_signals();
-            let started =
-                std::thread::spawn(|| SIGNALS.map(blocked)).join().unwrap();
-            restore_signals(&old);
-            assert_eq!(started, [true, true, true, true, false, false]);
-            assert_eq!(SIGNALS.map(blocked), before);
-        })
-        .join()
-        .unwrap();
+impl<S> Deref for Borrow<'_, S> {
+    type Target = Reactor<S>;
+
+    #[inline]
+    fn deref(&self) -> &Reactor<S> {
+        // SAFETY: the borrow is the only one, see ReactorCell::borrow().
+        unsafe { &*self.0.r.get() }
     }
+}
+
+impl<S> DerefMut for Borrow<'_, S> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Reactor<S> {
+        // SAFETY: as in deref().
+        unsafe { &mut *self.0.r.get() }
+    }
+}
+
+impl<S> Drop for Borrow<'_, S> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        self.0.busy.set(false);
+    }
+}
+
+/// Deliver the PDUs that are buffered and arm a read for more.
+fn deliver<H: Handler>(cell: &ReactorCell<H::State>) {
+    loop {
+        // SAFETY: no borrow is live. The borrow ends with this statement.
+        let next = unsafe { cell.borrow() }.next_pdu::<H>();
+        let Some((b, len)) = next else {
+            return;
+        };
+        H::on_pdu(cell, b, len);
+    }
+}
+
+/// Serve the connection until it ends or another thread stops the reactor.
+pub fn run<H: Handler>(cell: &ReactorCell<H::State>) {
+    // SAFETY: each borrow ends before the next and before deliver() runs.
+    let borrow = || unsafe { cell.borrow() };
+    borrow().arm_wake::<H>();
+    deliver::<H>(cell);
+    loop {
+        borrow().reap::<H>();
+        deliver::<H>(cell);
+        {
+            let mut r = borrow();
+            H::on_batch(&mut r);
+            r.drain::<H>();
+            if r.stopping {
+                break;
+            }
+        }
+        deliver::<H>(cell);
+        let mut r = borrow();
+        r.kick_send::<H>();
+        if r.stopping {
+            break;
+        }
+        if H::pending(&r) || r.ring.cq_ready() {
+            continue;
+        }
+        if !r.park() {
+            continue;
+        }
+        r.ring.submit_and_wait(1);
+        r.sh().wstate.store(ACTIVE, Ordering::Release);
+    }
+    borrow().teardown::<H>();
 }

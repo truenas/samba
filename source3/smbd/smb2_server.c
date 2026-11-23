@@ -4920,9 +4920,9 @@ NTSTATUS smbd_smb2_request_next_incoming(struct smbXsrv_connection *xconn)
 		if (NT_STATUS_IS_OK(status)) {
 			return NT_STATUS_OK;
 		}
-		DBG_WARNING("conn[%s] keeps its own socket I/O: %s\n",
-			    smbXsrv_connection_dbg(xconn),
-			    nt_errstr(status));
+		DBG_ERR("conn[%s] keeps its own socket I/O: %s\n",
+			smbXsrv_connection_dbg(xconn),
+			nt_errstr(status));
 		xconn->smb2.ros.enabled = false;
 	}
 

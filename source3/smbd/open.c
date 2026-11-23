@@ -1172,7 +1172,8 @@ static NTSTATUS reopen_from_fsp_pathref_based(
 	struct smb_filename *smb_fname,
 	struct files_struct *fsp,
 	const struct vfs_open_how *how,
-	bool *p_file_created)
+	bool *p_file_created,
+	bool *p_by_name)
 {
 	NTSTATUS status;
 	struct sys_proc_fd_path_buf buf;
@@ -1240,6 +1241,7 @@ retry:
 			 * This is a not yet triggered indirect automount
 			 * detected by openat(pathref_fd). Retry name-based.
 			 */
+			*p_by_name = true;
 			return reopen_from_fsp_namebased(dirfsp,
 							 smb_fname,
 							 fsp,
@@ -1255,6 +1257,7 @@ retry:
 			 * openat2(pathref_fd, .., RESOLVE_NO_XDEV).
 			 * Retry name-based.
 			 */
+			*p_by_name = true;
 			return reopen_from_fsp_namebased(dirfsp,
 							 smb_fname,
 							 fsp,
@@ -1298,13 +1301,20 @@ retry:
 	return NT_STATUS_OK;
 }
 
-NTSTATUS reopen_from_fsp(struct files_struct *dirfsp,
-			 struct smb_filename *smb_fname,
-			 struct files_struct *fsp,
-			 const struct vfs_open_how *how,
-			 bool *p_file_created)
+/*
+ * *p_by_name tells if the reopen opened the name again. Only then can the
+ * new fd refer to another inode than the old one.
+ */
+static NTSTATUS reopen_from_fsp_ext(struct files_struct *dirfsp,
+				    struct smb_filename *smb_fname,
+				    struct files_struct *fsp,
+				    const struct vfs_open_how *how,
+				    bool *p_file_created,
+				    bool *p_by_name)
 {
 	int old_fd;
+
+	*p_by_name = false;
 
 	if (fsp_is_xattr_stream(fsp) && (fsp_get_pathref_fd(fsp) != -1)) {
 		/*
@@ -1323,14 +1333,28 @@ NTSTATUS reopen_from_fsp(struct files_struct *dirfsp,
 						     smb_fname,
 						     fsp,
 						     how,
-						     p_file_created);
+						     p_file_created,
+						     p_by_name);
 	}
 
+	*p_by_name = true;
 	return reopen_from_fsp_namebased(dirfsp,
 					 smb_fname,
 					 fsp,
 					 how,
 					 p_file_created);
+}
+
+NTSTATUS reopen_from_fsp(struct files_struct *dirfsp,
+			 struct smb_filename *smb_fname,
+			 struct files_struct *fsp,
+			 const struct vfs_open_how *how,
+			 bool *p_file_created)
+{
+	bool by_name;
+
+	return reopen_from_fsp_ext(
+		dirfsp, smb_fname, fsp, how, p_file_created, &by_name);
 }
 
 /****************************************************************************
@@ -2530,6 +2554,7 @@ struct delay_for_oplock_state {
 	bool disallow_write_lease;
 	uint32_t total_lease_types;
 	bool delay;
+	TALLOC_CTX *mem_ctx;
 	struct blocker_debug_state *blocker_debug_state;
 };
 
@@ -2716,7 +2741,22 @@ static bool delay_for_oplock_fn(
 	}
 
 	if (state->blocker_debug_state == NULL) {
-		return false;
+		/* Read the option only when an open must wait */
+		if (!lp_parm_bool(GLOBAL_SECTION_SNUM,
+				  "smbd lease break",
+				  "debug hung procs",
+				  false))
+		{
+			return false;
+		}
+		state->blocker_debug_state = talloc_zero(
+			state->mem_ctx, struct blocker_debug_state);
+		if (state->blocker_debug_state == NULL) {
+			DBG_ERR("talloc_zero failed\n");
+			return false;
+		}
+		talloc_set_destructor(state->blocker_debug_state,
+				      blocker_debug_state_destructor);
 	}
 
 	subreq = server_id_watch_send(state->blocker_debug_state,
@@ -2778,6 +2818,7 @@ static NTSTATUS delay_for_oplock(files_struct *fsp,
 		.lease = lease,
 		.first_open_attempt = first_open_attempt,
 		.info = info,
+		.mem_ctx = talloc_tos(),
 	};
 	uint32_t requested;
 	uint32_t granted;
@@ -2805,22 +2846,6 @@ static NTSTATUS delay_for_oplock(files_struct *fsp,
 
 	if (is_oplock_stat_open(fsp->access_mask)) {
 		goto grant;
-	}
-
-	if (lp_parm_bool(GLOBAL_SECTION_SNUM,
-			 "smbd lease break",
-			 "debug hung procs",
-			 false))
-	{
-		state.blocker_debug_state = talloc_zero(fsp,
-						struct blocker_debug_state);
-		if (state.blocker_debug_state == NULL) {
-			return NT_STATUS_NO_MEMORY;
-		}
-		talloc_steal(talloc_tos(), state.blocker_debug_state);
-
-		talloc_set_destructor(state.blocker_debug_state,
-				      blocker_debug_state_destructor);
 	}
 
 	state.delay_mask = have_sharing_violation ?
@@ -5401,6 +5426,7 @@ static NTSTATUS open_directory(connection_struct *conn,
 	bool deferred = false;
 	struct open_ntcreate_lock_state lck_state = {};
 	bool keep_locked = false;
+	bool by_name = false;
 	NTSTATUS status;
 	int info = 0;
 	uint32_t need_fd_access;
@@ -5633,8 +5659,12 @@ static NTSTATUS open_directory(connection_struct *conn,
 		};
 		bool file_created;
 
-		status = reopen_from_fsp(
-			dirfsp, smb_fname_atname, fsp, &how, &file_created);
+		status = reopen_from_fsp_ext(dirfsp,
+					     smb_fname_atname,
+					     fsp,
+					     &how,
+					     &file_created,
+					     &by_name);
 		if (!NT_STATUS_IS_OK(status)) {
 			DBG_INFO("Could not open fd for [%s]: %s\n",
 				 smb_fname_str_dbg(smb_dname),
@@ -5643,10 +5673,16 @@ static NTSTATUS open_directory(connection_struct *conn,
 		}
 	}
 
-	status = vfs_stat_fsp(fsp);
-	if (!NT_STATUS_IS_OK(status)) {
-		fd_close(fsp);
-		return status;
+	/*
+	 * The lookup stat'ed an existing directory in this request. Only a
+	 * reopen by name can find another directory.
+	 */
+	if (!dir_existed || by_name) {
+		status = vfs_stat_fsp(fsp);
+		if (!NT_STATUS_IS_OK(status)) {
+			fd_close(fsp);
+			return status;
+		}
 	}
 
 	if(!S_ISDIR(fsp->fsp_name->st.st_ex_mode)) {
@@ -7247,6 +7283,13 @@ static NTSTATUS create_file_unixpath(connection_struct *conn,
 	}
 
 	DEBUG(10, ("create_file_unixpath: info=%d\n", info));
+
+	if (((access_mask & DELETE_ACCESS) ||
+	     (create_options & FILE_DELETE_ON_CLOSE)) &&
+	    !fsp_is_alternate_stream(fsp))
+	{
+		fsp_keep_unlink_dirfsp(fsp, dirfsp);
+	}
 
 	*result = fsp;
 	if (pinfo != NULL) {

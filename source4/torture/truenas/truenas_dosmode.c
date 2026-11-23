@@ -448,6 +448,80 @@ done:
 	return ret;
 }
 
+/*
+ * The CREATE reply of a directory gives the attributes and times that a
+ * query right after it gives. smbd sets the ACL and the DOS attributes of
+ * a new directory after its first stat, so the reply needs a later stat.
+ * An existing directory opened for a listing has the stat of its lookup.
+ */
+static bool test_truenas_dosmode_dir_reply(struct torture_context *tctx,
+					   struct smb2_tree *tree)
+{
+	struct smb2_handle h = {{0}};
+	NTSTATUS status;
+	bool ret = true;
+	int i;
+
+	smb2_deltree(tree, DM_DIR);
+	status = torture_smb2_testdir(tree, DM_DIR, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"create directory");
+	smb2_util_close(tree, h);
+	ZERO_STRUCT(h);
+
+	for (i = 0; i < 2; i++) {
+		const char *which = (i == 0) ? "new" : "existing";
+		struct smb2_create c = {
+			.in.desired_access = SEC_RIGHTS_DIR_ALL,
+			.in.file_attributes = FILE_ATTRIBUTE_DIRECTORY,
+			.in.share_access = NTCREATEX_SHARE_ACCESS_MASK,
+			.in.create_disposition = (i == 0) ?
+				NTCREATEX_DISP_CREATE : NTCREATEX_DISP_OPEN,
+			.in.create_options = NTCREATEX_OPTIONS_DIRECTORY,
+			.in.fname = DM_DIR "\\d",
+		};
+		union smb_fileinfo finfo = {
+			.all_info2.level = RAW_FILEINFO_SMB2_ALL_INFORMATION,
+		};
+
+		status = smb2_create(tree, tctx, &c);
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						"create");
+		h = c.out.file.handle;
+		finfo.all_info2.in.file.handle = h;
+		status = smb2_getinfo_file(tree, tctx, &finfo);
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						"getinfo");
+
+		torture_assert_int_equal_goto(
+			tctx, c.out.file_attr, finfo.all_info2.out.attrib,
+			ret, done,
+			talloc_asprintf(tctx, "%s: attributes", which));
+		torture_assert_u64_equal_goto(
+			tctx, c.out.create_time,
+			finfo.all_info2.out.create_time, ret, done,
+			talloc_asprintf(tctx, "%s: create time", which));
+		torture_assert_u64_equal_goto(
+			tctx, c.out.write_time,
+			finfo.all_info2.out.write_time, ret, done,
+			talloc_asprintf(tctx, "%s: write time", which));
+		torture_assert_u64_equal_goto(
+			tctx, c.out.change_time,
+			finfo.all_info2.out.change_time, ret, done,
+			talloc_asprintf(tctx, "%s: change time", which));
+
+		smb2_util_close(tree, h);
+		ZERO_STRUCT(h);
+	}
+
+done:
+	if (!smb2_util_handle_empty(h)) {
+		smb2_util_close(tree, h);
+	}
+	smb2_deltree(tree, DM_DIR);
+	return ret;
+}
+
 void torture_truenas_dosmode_suite(struct torture_suite *suite)
 {
 	struct torture_suite *dosmode = torture_suite_create(suite,
@@ -463,6 +537,8 @@ void torture_truenas_dosmode_suite(struct torture_suite *suite)
 				     test_truenas_dosmode_basic_info);
 	torture_suite_add_1smb2_test(dosmode, "stream",
 				     test_truenas_dosmode_stream);
+	torture_suite_add_1smb2_test(dosmode, "dir_reply",
+				     test_truenas_dosmode_dir_reply);
 
 	torture_suite_add_suite(suite, dosmode);
 }

@@ -1,25 +1,25 @@
 // Copyright (C) iXsystems, Inc. 2026
 // SPDX-License-Identifier: MIT
 
-//! The PDUs that the owner sends. The shim copies small parts. The owner
-//! lends large parts to the reactor.
+//! The PDUs that the owner sends.
 
 use std::ffi::c_int;
-use std::sync::Arc;
+use std::ptr::NonNull;
 
-use truenas_ros::net::server::{Lent, PushFinish, PushPart};
-
+use crate::block::try_box;
 use crate::conn::Conn;
-use crate::ctx::{Event, Shared};
+use crate::hub::Hub;
+use crate::list::Msg;
+use crate::out::Out;
+use crate::shim::post_sent;
+use crate::upper::ShimReactor;
 
-/// The vectors at `iov`. None for a negative count, and for a NULL `iov`
-/// with a count above 0. A count of 0 gives an empty slice, and `iov` can
-/// be NULL then.
+/// The vectors at `iov`. None for a negative count, for NULL with a count
+/// above 0, or for a vector with bytes at NULL.
 ///
 /// # Safety
 ///
-/// If `iov` is not NULL, it points to `iovcnt` vectors. They are valid for
-/// `'a`.
+/// A non-NULL `iov` points to `iovcnt` vectors that are valid for `'a`.
 pub unsafe fn iov_of<'a>(
     iov: *const libc::iovec,
     iovcnt: c_int,
@@ -32,107 +32,56 @@ pub unsafe fn iov_of<'a>(
         return None;
     }
     // SAFETY: the caller passes `count` vectors at `iov`.
-    Some(unsafe { std::slice::from_raw_parts(iov, count) })
+    let v = unsafe { std::slice::from_raw_parts(iov, count) };
+    v.iter()
+        .all(|v| !v.iov_base.is_null() || v.iov_len == 0)
+        .then_some(v)
 }
 
-/// The bytes of each vector of `iov` that is not empty.
-///
-/// # Safety
-///
-/// Each vector points to `iov_len` readable bytes. The bytes are valid for
-/// the lifetime of `iov`.
-unsafe fn iov_bytes(iov: &[libc::iovec]) -> impl Iterator<Item = &[u8]> {
-    iov.iter().filter(|v| v.iov_len > 0).map(|v| {
-        // SAFETY: the caller passes vectors of readable memory.
-        unsafe {
-            std::slice::from_raw_parts(v.iov_base.cast::<u8>(), v.iov_len)
-        }
-    })
-}
-
-/// The bytes of `iov` in one buffer.
+/// An out for `iov`, from the free list of `r` unless the owner frees it.
+/// None without memory.
 ///
 /// # Safety
 ///
 /// Each vector points to `iov_len` readable bytes.
-pub unsafe fn iov_gather(iov: &[libc::iovec]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(iov.iter().map(|v| v.iov_len).sum());
-    // SAFETY: the caller passes vectors of readable memory.
-    for bytes in unsafe { iov_bytes(iov) } {
-        out.extend_from_slice(bytes);
+pub unsafe fn make_out(
+    mut r: Option<&mut ShimReactor>,
+    iov: &[libc::iovec],
+    lend_min: usize,
+) -> Option<Box<Out>> {
+    let lends = iov.iter().any(|v| v.iov_len > 0 && v.iov_len >= lend_min);
+    let mut o = match r.as_deref_mut() {
+        Some(r) if !lends => r.new_out()?,
+        _ => try_box(Out::new)?,
+    };
+    // SAFETY: as the caller says.
+    unsafe { o.fill(iov, lend_min, r.map(|r| &mut r.blocks)) }.then_some(o)
+}
+
+/// Queue `o` on `c`. `r` is the reactor of `c` if the caller runs on it.
+pub fn send_out(c: &Conn, r: Option<&mut ShimReactor>, o: Box<Out>) {
+    if let Some(r) = r {
+        r.queue_api(o);
+        return;
     }
-    out
-}
-
-/// Posts `Event::Sent` when the last lent part of a send is dropped.
-#[derive(Debug)]
-struct SentGuard {
-    shared: Arc<Shared>,
-    cookie: u64,
-}
-
-impl Drop for SentGuard {
-    fn drop(&mut self) {
-        self.shared.post(Event::Sent {
-            cookie: self.cookie,
+    let m = NonNull::from(Box::leak(o)).cast::<Msg>();
+    // SAFETY: the out starts with its Msg. A post gives it to the reactor.
+    if !unsafe { c.post(m) } {
+        // SAFETY: the post failed, so the out is still ours.
+        drop_foreign(c.hub(), unsafe {
+            Box::from_raw(m.cast::<Out>().as_ptr())
         });
     }
 }
 
-impl Conn {
-    /// Make the parts of a PDU from `iov`. Copy the vectors under
-    /// `lend_min` bytes, and lend the others. The owner gets
-    /// `TN_SMBROS_SENT` with `sent_cookie` after the last lent part is
-    /// dropped. The `bool` is true if a part is lent.
-    ///
-    /// # Safety
-    ///
-    /// The vectors of `iov` point to readable memory. The caller keeps the
-    /// vectors of `lend_min` bytes or more valid and unchanged until
-    /// `TN_SMBROS_SENT` with `sent_cookie`.
-    pub unsafe fn parts(
-        &self,
-        iov: &[libc::iovec],
-        lend_min: usize,
-        sent_cookie: u64,
-    ) -> (Vec<PushPart>, bool) {
-        let mut parts = Vec::new();
-        let mut owned = Vec::new();
-        let mut guard: Option<Arc<SentGuard>> = None;
-        // SAFETY: the caller passes vectors of readable memory.
-        for bytes in unsafe { iov_bytes(iov) } {
-            if bytes.len() < lend_min {
-                owned.extend_from_slice(bytes);
-                continue;
-            }
-            if !owned.is_empty() {
-                parts.push(PushPart::Owned(std::mem::take(&mut owned)));
-            }
-            let g = Arc::clone(guard.get_or_insert_with(|| {
-                Arc::new(SentGuard {
-                    shared: Arc::clone(&self.shared),
-                    cookie: sent_cookie,
-                })
-            }));
-            // SAFETY: the caller keeps the vector valid and unchanged until
-            // TN_SMBROS_SENT. The guard posts that event after the last lent
-            // part is dropped.
-            parts.push(PushPart::Lent(unsafe {
-                Lent::new(bytes.as_ptr(), bytes.len(), move || drop(g))
-            }));
-        }
-        if !owned.is_empty() {
-            parts.push(PushPart::Owned(owned));
-        }
-        // After this return, only the lent parts have references to the guard.
-        (parts, guard.is_some())
+/// Free an out off its reactor thread.
+pub fn drop_foreign(hub: &Hub, mut o: Box<Out>) {
+    if !o.plan.is_null() {
+        (hub.vt().drop_plan)(&mut o, None);
     }
-
-    /// Send `parts` after the reactor runs `finish` on them. The reactor
-    /// runs `finish` on its thread, in the send order of the connection.
-    /// `finish` returns false to close the connection.
-    pub fn send_finished(&self, parts: Vec<PushPart>, finish: PushFinish) {
-        self.push.push_parts_finished(parts, finish);
+    o.drop_data(None);
+    if o.lent {
+        post_sent(hub, o);
     }
 }
 
@@ -163,37 +112,17 @@ pub unsafe extern "C" fn tn_smbros_send(
     };
     // SAFETY: the caller passes a live connection.
     let conn = unsafe { &*conn };
-    if iov.iter().all(|v| v.iov_len < lend_min) {
-        // SAFETY: the caller passes room for a bool.
-        unsafe { lent.write(false) };
-        // SAFETY: the caller passes vectors of readable memory.
-        conn.push.push(unsafe { iov_gather(iov) });
-        return 0;
-    }
-    // SAFETY: the caller keeps the lent vectors valid and unchanged until
-    // TN_SMBROS_SENT.
-    let (parts, any_lent) = unsafe { conn.parts(iov, lend_min, sent_cookie) };
+    // SAFETY: a C function holds no borrow at its start.
+    let mut local = unsafe { conn.local() };
+    // SAFETY: the caller passes vectors of readable memory.
+    let Some(mut o) =
+        (unsafe { make_out(local.as_deref_mut(), iov, lend_min) })
+    else {
+        return libc::ENOMEM;
+    };
+    o.cookie = sent_cookie;
     // SAFETY: the caller passes room for a bool.
-    unsafe { lent.write(any_lent) };
-    conn.push.push_parts(parts);
+    unsafe { lent.write(o.lent) };
+    send_out(conn, local.as_deref_mut(), o);
     0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::iov_of;
-
-    #[test]
-    fn a_null_iov_without_vectors_is_empty() {
-        // SAFETY: a count of 0 reads no vectors.
-        let iov = unsafe { iov_of(std::ptr::null(), 0) };
-        assert_eq!(iov.map(<[libc::iovec]>::len), Some(0));
-    }
-
-    #[test]
-    fn a_null_iov_with_vectors_is_refused() {
-        // SAFETY: iov_of checks for NULL before it reads.
-        let iov = unsafe { iov_of(std::ptr::null(), 2) };
-        assert!(iov.is_none());
-    }
 }

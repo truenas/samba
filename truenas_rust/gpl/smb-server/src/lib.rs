@@ -1,33 +1,53 @@
 // Copyright (C) iXsystems, Inc. 2026
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The layer of smbd above the `truenas_smbros` shim. The
-//! reactors sign, check, encrypt and decrypt PDUs with smbd's functions and
-//! keys. They also do the file I/O of the READ, WRITE and FLUSH requests
-//! that smbd gives them.
+//! The layer of smbd above the `truenas_smbros` shim: crypto and file I/O
+//! on the reactors. `include/truenas_smb_server.h` is the C interface.
 
 #![allow(unsafe_code)]
 
+// The modules with C functions come first, in the order of the header.
 mod crypto;
 mod delegate;
 mod file;
+
+mod job;
+mod keys;
 mod pending;
+mod plan;
+mod upper;
 mod wire;
 
-use std::any::Any;
-use std::collections::HashMap;
 use std::ffi::c_int;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use truenas_ros::net::server::PushHandle;
-use truenas_smbros::{ConnState, Ctx, TN_SMBROS_UPPER, Upper, Verdict, lock};
+use truenas_smbros::{Ctx, TN_SMBROS_UPPER};
 
-use crypto::{CryptoOps, Keys};
-// The C interface has these constants.
+// The C interface has these constants and types.
 pub use crypto::{
-    TN_SMBSRV_DECRYPT_FAILED, TN_SMBSRV_DECRYPTED, TN_SMBSRV_SEAL_ENCRYPT,
-    TN_SMBSRV_SEAL_NONE, TN_SMBSRV_SEAL_SIGN, TN_SMBSRV_SIGNED_OK,
+    CryptoOps, SignPart, TN_SMBSRV_DECRYPT_FAILED, TN_SMBSRV_DECRYPTED,
+    TN_SMBSRV_SEAL_ENCRYPT, TN_SMBSRV_SEAL_NONE, TN_SMBSRV_SEAL_SIGN,
+    TN_SMBSRV_SIGNED_OK,
 };
+pub use delegate::Io;
+pub use file::OpenFile;
+pub use keys::{KeyCache, KeyTable, Keys};
+use upper::{Global, LAYER, Layer};
+
+/// The C functions, for Rust callers and tests.
+pub mod ffi {
+    pub use crate::crypto::{
+        tn_smbsrv_keys_pin, tn_smbsrv_keys_unpin, tn_smbsrv_send_sealed,
+        tn_smbsrv_session_drop, tn_smbsrv_session_keys,
+    };
+    pub use crate::delegate::tn_smbsrv_delegate;
+    pub use crate::file::{
+        tn_smbsrv_file_busy, tn_smbsrv_file_close, tn_smbsrv_file_hold,
+        tn_smbsrv_file_new, tn_smbsrv_file_seq_bump, tn_smbsrv_file_seq_old,
+        tn_smbsrv_file_take_pos, tn_smbsrv_hold_free, tn_smbsrv_hold_seq,
+    };
+    pub use crate::tn_smbsrv_attach;
+}
 
 /// An event kind of `tn_smbros_next()`. The last job of a file ended.
 /// `cookie` is the cookie of `tn_smbsrv_file_new()`. See
@@ -37,74 +57,6 @@ pub const TN_SMBSRV_IDLE: c_int = TN_SMBROS_UPPER;
 /// to `tn_smbsrv_session_keys()`. No reactor uses the key now. The caller
 /// frees it.
 pub const TN_SMBSRV_KEY_FREE: c_int = TN_SMBROS_UPPER + 1;
-
-/// The layer of smbd above the reactors. Each process has one.
-#[derive(Debug)]
-struct Layer {
-    crypto: Option<CryptoOps>,
-    /// The NTSTATUS of each errno.
-    errmap: Arc<[u32]>,
-}
-
-/// The state of the layer for one connection.
-#[derive(Debug)]
-pub(crate) struct ConnExt {
-    pub(crate) crypto: Option<CryptoOps>,
-    pub(crate) errmap: Arc<[u32]>,
-    /// The keys of the sessions on the connection, by session id.
-    pub(crate) keys: Mutex<HashMap<u64, Arc<Keys>>>,
-    /// The interim responses of the jobs on the connection.
-    pub(crate) interims: Arc<pending::Interims>,
-}
-
-impl ConnExt {
-    pub(crate) fn keys_of(&self, session_id: u64) -> Option<Arc<Keys>> {
-        lock(&self.keys).get(&session_id).cloned()
-    }
-}
-
-impl Upper for Layer {
-    fn start(
-        &self,
-        _conn: &ConnState,
-        push: &PushHandle,
-    ) -> Option<Box<dyn Any + Send + Sync>> {
-        // start() runs on the reactor thread of the new connection.
-        if let Some(init) = self.crypto.and_then(|ops| ops.thread_init) {
-            // SAFETY: tn_smbsrv_attach() requires functions that any
-            // reactor thread can call.
-            unsafe { init() };
-        }
-        Some(Box::new(ConnExt {
-            crypto: self.crypto,
-            errmap: Arc::clone(&self.errmap),
-            keys: Mutex::new(HashMap::new()),
-            interims: Arc::new(pending::Interims::new(
-                self.crypto,
-                push.clone(),
-            )),
-        }))
-    }
-
-    /// The timer of the interim responses, see pending.rs.
-    fn fs_ops(&self) -> u32 {
-        1
-    }
-
-    fn incoming(&self, conn: &ConnState, pdu: &mut [u8]) -> Verdict {
-        let Some(ext) = conn.ext::<ConnExt>() else {
-            return Verdict::default();
-        };
-        let (flags, status, tag) =
-            crypto::open_pdu(ext, pdu).unwrap_or_default();
-        Verdict {
-            flags,
-            status,
-            tag,
-            job: delegate::delegable(pdu, flags),
-        }
-    }
-}
 
 /// Attach this layer to the reactors of `ctx`. Call this one time, before
 /// the first `tn_smbros_adopt()`. `ops` is the table of crypto functions or
@@ -126,12 +78,12 @@ pub unsafe extern "C" fn tn_smbsrv_attach(
     len: usize,
 ) -> bool {
     // SAFETY: the caller passes a live context and a table or NULL.
-    let (ctx, crypto) = unsafe { (&*ctx, ops.as_ref().copied()) };
+    let (ctx, ops) = unsafe { (&*ctx, ops.as_ref().copied()) };
     let errmap: Arc<[u32]> = if errmap.is_null() {
-        Arc::new([])
+        Arc::from([])
     } else {
         // SAFETY: the caller passes `len` values.
         unsafe { std::slice::from_raw_parts(errmap, len) }.into()
     };
-    ctx.set_upper(Arc::new(Layer { crypto, errmap }))
+    ctx.attach::<Layer>(&LAYER, Global { ops, errmap })
 }
