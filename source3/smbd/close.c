@@ -594,11 +594,10 @@ static NTSTATUS close_remove_share_mode(files_struct *fsp,
 	}
 
 	if (!fsp_is_xattr_stream(fsp)) {
-		status = parent_pathref(talloc_tos(),
-					conn->cwd_fsp,
-					fsp->fsp_name,
-					&parent_fname,
-					&base_fname);
+		status = close_parent_pathref(talloc_tos(),
+					      fsp,
+					      &parent_fname,
+					      &base_fname);
 		if (!NT_STATUS_IS_OK(status)) {
 			goto done;
 		}
@@ -1294,11 +1293,10 @@ static NTSTATUS close_directory(struct smb_request *req, files_struct *fsp,
 		changed_user = true;
 	}
 
-	status = parent_pathref(talloc_tos(),
-				conn->cwd_fsp,
-				fsp->fsp_name,
-				&parent_fname,
-				&base_fname);
+	status = close_parent_pathref(talloc_tos(),
+				      fsp,
+				      &parent_fname,
+				      &base_fname);
 	if (!NT_STATUS_IS_OK(status)) {
 		DBG_DEBUG("parent_pathref(%s) failed: %s\n",
 			  fsp_str_dbg(fsp), nt_errstr(status));

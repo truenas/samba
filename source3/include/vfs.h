@@ -525,6 +525,8 @@ typedef struct files_struct {
 	struct files_struct *stream_fsp; /* backlink from base_fsp */
 	/* TrueNAS: the directory an fsp_new_fdless() entry was listed from */
 	struct files_struct *dirfsp;
+	/* TrueNAS: the directory of an open for delete, see close_parent_pathref() */
+	struct files_struct *unlink_dirfsp;
 	/* TrueNAS: TRUENAS_FSP_* */
 	uint64_t truenas_fsp_flags;
 	/* TrueNAS: change cookie of the file as the client knows it */

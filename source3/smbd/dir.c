@@ -95,6 +95,7 @@ struct dptr_struct {
 	uint32_t attr;
 	bool has_wild; /* Set to true if the wcard entry has MS wildcard characters in it. */
 	bool did_stat; /* Optimisation for non-wcard searches. */
+	SMB_STRUCT_STAT wcard_st; /* lstat of a non-wcard search */
 	bool priv;     /* Directory handle opened with privilege. */
 
 	char *last_name_sent;	/* for name-based trans2 resume */
@@ -453,7 +454,6 @@ char *dptr_ReadDirName(TALLOC_CTX *ctx, struct dptr_struct *dptr)
 	struct smb_filename smb_fname_base;
 	bool retry_scanning = false;
 	int ret;
-	int flags = 0;
 
 	if (dptr->has_wild) {
 		const char *name_temp = NULL;
@@ -467,6 +467,9 @@ char *dptr_ReadDirName(TALLOC_CTX *ctx, struct dptr_struct *dptr)
 		}
 		return talloc_strdup(ctx, name_temp);
 	}
+
+	dir_hnd->prefetch.cur_st = NULL;
+	dir_hnd->prefetch.cur_id = NULL;
 
 	if (dptr->did_stat) {
 		/*
@@ -485,13 +488,28 @@ char *dptr_ReadDirName(TALLOC_CTX *ctx, struct dptr_struct *dptr)
 		.twrp = dir_name->twrp,
 	};
 
-	if (dir_name->flags & SMB_FILENAME_POSIX_PATH) {
-		flags |= AT_SYMLINK_NOFOLLOW;
-	}
+	/*
+	 * The lstat goes to smbd_dirptr_get_entry() with the name. A
+	 * symlink exists only if its target exists, except for POSIX.
+	 */
+	ret = SMB_VFS_FSTATAT(dir_hnd->conn,
+			      dir_fsp,
+			      &smb_fname_base,
+			      &st,
+			      AT_SYMLINK_NOFOLLOW);
+	if ((ret == 0) && S_ISLNK(st.st_ex_mode) &&
+	    !(dir_name->flags & SMB_FILENAME_POSIX_PATH))
+	{
+		struct stat_ex target = {
+			.st_ex_nlink = 0,
+		};
 
-	ret = SMB_VFS_FSTATAT(
-		dir_hnd->conn, dir_fsp, &smb_fname_base, &st, flags);
+		ret = SMB_VFS_FSTATAT(
+			dir_hnd->conn, dir_fsp, &smb_fname_base, &target, 0);
+	}
 	if (ret == 0) {
+		dptr->wcard_st = st;
+		dir_hnd->prefetch.cur_st = &dptr->wcard_st;
 		return talloc_strdup(ctx, dptr->wcard);
 	}
 

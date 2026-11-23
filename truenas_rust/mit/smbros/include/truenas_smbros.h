@@ -2,8 +2,8 @@
  * Copyright (C) iXsystems, Inc. 2026
  * SPDX-License-Identifier: MIT
  *
- * truenas_smbros is a shim between an SMB server and truenas_ros. Each
- * adopted connection gets a reactor. A reactor is a
+ * truenas_smbros is the socket layer of an SMB server. Each adopted
+ * connection gets a reactor. A reactor is a
  * thread with its own io_uring ring. The reactor reads whole PDUs and
  * queues them for the thread of the caller. It sends the PDUs that the
  * caller gives it. The caller polls one eventfd per process for the queue.
@@ -160,7 +160,7 @@ void tn_smbros_buf_release(void *buf);
  * io-wq worker runs all such reads of the ring. `async_write_min` does the
  * same for writes. A flagged write skips the kernel's queue for its file,
  * so the writes of one file can run at the same time. `usize::MAX` flags
- * none. `truenas_ros` has one floor, so the smaller one applies to both.
+ * none. One floor, the smaller one, applies to both.
  * A reply of `zero_copy_min` bytes or more goes out without the kernel's
  * copy. The kernel then reads it until the peer acknowledges it, so
  * `TN_SMBROS_SENT` for its lent vectors comes only then. `usize::MAX`

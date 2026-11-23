@@ -3586,9 +3586,11 @@ static NTSTATUS vfswrap_fstreaminfo(vfs_handle_struct *handle,
 		 */
 		goto done;
 	}
-	status = vfs_stat_fsp(fsp);
-	if (!NT_STATUS_IS_OK(status)) {
-		return status;
+	if (!vfs_stat_fsp_current(fsp)) {
+		status = vfs_stat_fsp(fsp);
+		if (!NT_STATUS_IS_OK(status)) {
+			return status;
+		}
 	}
 
 	if (num_streams + 1 < 1) {

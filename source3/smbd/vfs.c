@@ -1381,10 +1381,22 @@ NTSTATUS vfs_stat_fsp(files_struct *fsp)
 
 	/* TrueNAS: a stream's DOS attributes are in its base file's stat */
 	if (fsp_is_alternate_stream(fsp) &&
-	    lp_kernel_dosmodes(SNUM(fsp->conn))) {
+	    lp_kernel_dosmodes(SNUM(fsp->conn)) &&
+	    !vfs_stat_fsp_current(fsp->base_fsp)) {
 		return vfs_stat_fsp(fsp->base_fsp);
 	}
 	return NT_STATUS_OK;
+}
+
+/*
+ * TrueNAS: true if the stat of fsp came from its fd in the current
+ * mdcache_epoch(). A new fstat cannot see a change that it does not see.
+ */
+bool vfs_stat_fsp_current(const struct files_struct *fsp)
+{
+	uint64_t epoch = mdcache_epoch(fsp->conn);
+
+	return (epoch != 0) && (fsp->fsp_name->st.st_ex_epoch == epoch);
 }
 
 void init_smb_file_time(struct smb_file_time *ft)
@@ -1433,10 +1445,21 @@ NTSTATUS vfs_fstreaminfo(struct files_struct *fsp,
 			streams);
 }
 
+/*
+ * TrueNAS: fake fds that vfs_fake_fd_close() gave back, for reuse. All
+ * callers run smbd request code, which holds the process lock.
+ */
+static int fake_fd_pool[64];
+static size_t fake_fd_pooled;
+
 int vfs_fake_fd(void)
 {
 	int pipe_fds[2];
 	int ret;
+
+	if (fake_fd_pooled > 0) {
+		return fake_fd_pool[--fake_fd_pooled];
+	}
 
 	/*
 	 * Return a valid fd, but ensure any attempt to use
@@ -1457,6 +1480,10 @@ int vfs_fake_fd(void)
  */
 int vfs_fake_fd_close(int fd)
 {
+	if ((fd >= 0) && (fake_fd_pooled < ARRAY_SIZE(fake_fd_pool))) {
+		fake_fd_pool[fake_fd_pooled++] = fd;
+		return 0;
+	}
 	return close(fd);
 }
 

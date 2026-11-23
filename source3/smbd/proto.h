@@ -443,6 +443,12 @@ NTSTATUS parent_pathref(TALLOC_CTX *mem_ctx,
 			const struct smb_filename *smb_fname,
 			struct smb_filename **_parent,
 			struct smb_filename **_atname);
+void fsp_keep_unlink_dirfsp(struct files_struct *fsp,
+			    struct files_struct *dirfsp);
+NTSTATUS close_parent_pathref(TALLOC_CTX *mem_ctx,
+			      struct files_struct *fsp,
+			      struct smb_filename **_parent,
+			      struct smb_filename **_atname);
 
 void fsp_apply_private_ntcreatex_flags(struct files_struct *fsp,
 				       uint32_t flags);
@@ -1219,6 +1225,7 @@ int vfs_stat_smb_basename(struct connection_struct *conn,
 			const struct smb_filename *smb_fname_in,
 			SMB_STRUCT_STAT *psbuf);
 NTSTATUS vfs_stat_fsp(files_struct *fsp);
+bool vfs_stat_fsp_current(const struct files_struct *fsp);
 NTSTATUS vfs_fstreaminfo(struct files_struct *fsp,
 			TALLOC_CTX *mem_ctx,
 			unsigned int *num_streams,

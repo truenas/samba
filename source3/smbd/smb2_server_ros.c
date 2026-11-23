@@ -1088,6 +1088,15 @@ NTSTATUS smbd_smb2_ros_delegate(struct smbd_smb2_request *req,
 	NTSTATUS status;
 	int fd;
 
+	/*
+	 * The descriptor of a stream is a fake one, a pipe. The callers
+	 * check this before their own work. This check is for a caller
+	 * that does not.
+	 */
+	if (fsp_is_alternate_stream(fsp)) {
+		return NT_STATUS_RETRY;
+	}
+
 	fd = fsp_get_io_fd(fsp);
 	if (fd == -1) {
 		return NT_STATUS_RETRY;

@@ -40,6 +40,7 @@
 #define MDC_FILES	50
 #define MDC_IDLE	2	/* seconds */
 #define ABE_DIR		"truenas_mdcache_abe"
+#define ONE_DIR		"truenas_mdcache_one"
 
 /* Set the idle timeout unless it is 0, and get the table size and entries */
 static NTSTATUS mdc_fsctl(struct torture_context *tctx,
@@ -496,6 +497,146 @@ done:
 	return ret;
 }
 
+/* The one entry that a search for name gives on h, from its start */
+static bool one_find(struct torture_context *tctx,
+		     struct smb2_tree *tree,
+		     struct smb2_handle h,
+		     const char *name,
+		     union smb_search_data *_e)
+{
+	union smb_search_data *d = NULL;
+	unsigned int n = 0;
+
+	torture_assert(tctx, mdc_find_all(tctx, tree, h, name, &d, &n),
+		       "search");
+	torture_assert_int_equal(tctx, n, 1,
+				 talloc_asprintf(tctx, "entries for %s", name));
+	*_e = d[0];
+	return true;
+}
+
+static bool one_equal(struct torture_context *tctx,
+		      const union smb_search_data *a,
+		      const union smb_search_data *b,
+		      const char *name)
+{
+	const char *what = talloc_asprintf(tctx, "%s: search for the name "
+					   "against the full listing", name);
+
+	torture_assert_int_equal(tctx, a->both_directory_info.attrib,
+				 b->both_directory_info.attrib, what);
+	torture_assert_u64_equal(tctx, a->both_directory_info.size,
+				 b->both_directory_info.size, what);
+	torture_assert_u64_equal(tctx, a->both_directory_info.alloc_size,
+				 b->both_directory_info.alloc_size, what);
+	torture_assert_u64_equal(tctx, a->both_directory_info.create_time,
+				 b->both_directory_info.create_time, what);
+	torture_assert_u64_equal(tctx, a->both_directory_info.write_time,
+				 b->both_directory_info.write_time, what);
+	torture_assert_u64_equal(tctx, a->both_directory_info.change_time,
+				 b->both_directory_info.change_time, what);
+	return true;
+}
+
+/*
+ * A search for one name (no wildcard) stats the name, and smbd lists the
+ * entry from that stat. The entry must be the one of a full listing, and
+ * a search from the start on the same handle must see a change.
+ */
+static bool test_truenas_mdcache_one_name(struct torture_context *tctx,
+					  struct smb2_tree *tree)
+{
+	const char *names[] = { "file", "dir" };
+	struct smb2_handle h = {{0}};
+	struct smb2_handle sh = {{0}};
+	struct smb2_handle fh = {{0}};
+	union smb_search_data *all = NULL;
+	union smb_search_data one;
+	uint8_t buf[4096] = {0};
+	unsigned int nall = 0;
+	uint32_t slots = 0, count = 0;
+	size_t i;
+	NTSTATUS status;
+	bool ret = true;
+
+	smb2_deltree(tree, ONE_DIR);
+	status = torture_smb2_testdir(tree, ONE_DIR, &h);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"create directory");
+	status = torture_smb2_testfile(tree, ONE_DIR "\\file", &fh);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"create file");
+	status = smb2_util_write(tree, fh, buf, 0, 1);
+	smb2_util_close(tree, fh);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "write");
+	status = torture_smb2_testdir(tree, ONE_DIR "\\dir", &fh);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"create subdirectory");
+	smb2_util_close(tree, fh);
+
+	torture_assert_goto(tctx, mdc_find_all(tctx, tree, h, "*", &all, &nall),
+			    ret, done, "list");
+
+	status = mdc_fsctl(tctx, tree, h, 0, &slots, &count);
+	if (mdc_no_fsctl(status)) {
+		torture_skip_goto(tctx, done,
+				  "smbd:FSCTL_SMBTORTURE is not enabled\n");
+	}
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"FSCTL_SMBTORTURE_MDCACHE");
+	if (count == 0) {
+		/* Only a listing from the cache uses the stat of the search */
+		torture_skip_goto(tctx, done, "nothing fills the metadata "
+				  "cache on this share\n");
+	}
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		const union smb_search_data *e = mdc_entry(all, nall, names[i]);
+
+		torture_assert_goto(tctx, e != NULL, ret, done,
+				    talloc_asprintf(tctx, "%s listed",
+						    names[i]));
+		status = torture_smb2_testdir(tree, ONE_DIR, &sh);
+		torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+						"open directory");
+		torture_assert_goto(tctx,
+				    one_find(tctx, tree, sh, names[i], &one),
+				    ret, done, "search for one name");
+		torture_assert_goto(tctx, one_equal(tctx, e, &one, names[i]),
+				    ret, done, "entry");
+		smb2_util_close(tree, sh);
+		ZERO_STRUCT(sh);
+	}
+
+	status = torture_smb2_testdir(tree, ONE_DIR, &sh);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done,
+					"open directory");
+	torture_assert_goto(tctx, one_find(tctx, tree, sh, "file", &one),
+			    ret, done, "search for one name");
+	torture_assert_u64_equal_goto(tctx, one.both_directory_info.size, 1,
+				      ret, done, "size before the write");
+
+	status = torture_smb2_testfile(tree, ONE_DIR "\\file", &fh);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "open file");
+	status = smb2_util_write(tree, fh, buf, 1, sizeof(buf));
+	smb2_util_close(tree, fh);
+	torture_assert_ntstatus_ok_goto(tctx, status, ret, done, "write");
+
+	torture_assert_goto(tctx, one_find(tctx, tree, sh, "file", &one),
+			    ret, done, "search for one name again");
+	torture_assert_u64_equal_goto(tctx, one.both_directory_info.size,
+				      1 + sizeof(buf), ret, done,
+				      "size after the write");
+
+done:
+	if (!smb2_util_handle_empty(sh)) {
+		smb2_util_close(tree, sh);
+	}
+	smb2_util_close(tree, h);
+	smb2_deltree(tree, ONE_DIR);
+	return ret;
+}
+
 void torture_truenas_mdcache_suite(struct torture_suite *suite)
 {
 	struct torture_suite *mdcache = torture_suite_create(suite, "mdcache");
@@ -508,6 +649,8 @@ void torture_truenas_mdcache_suite(struct torture_suite *suite)
 				     test_truenas_mdcache_relist);
 	torture_suite_add_1smb2_test(mdcache, "abe",
 				     test_truenas_mdcache_abe);
+	torture_suite_add_1smb2_test(mdcache, "one_name",
+				     test_truenas_mdcache_one_name);
 
 	torture_suite_add_suite(suite, mdcache);
 }
