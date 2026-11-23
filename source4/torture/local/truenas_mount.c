@@ -46,7 +46,6 @@
 
 #include "includes.h"
 #include "system/filesys.h"
-#include "system/wait.h"
 #include "torture/torture.h"
 #include "torture/local/proto.h"
 
@@ -213,6 +212,45 @@ static bool test_stale_mnt_id(struct torture_context *tctx)
 	torture_assert_int_equal(tctx, ret, -1, "bogus id fails");
 	torture_assert_int_equal(tctx, saved_errno, ENOENT,
 				 "bogus id fails ENOENT");
+
+	return true;
+}
+
+/*
+ * tn_mount_path_is_root() tells the root of a mount from a directory. A
+ * dataset that is not mounted leaves a directory behind where it was
+ * mounted, in the dataset above it.
+ */
+static bool test_path_is_root(struct torture_context *tctx)
+{
+	char tmpl[] = "/tmp/tn_mount_root_XXXXXX";
+	char *dir = NULL;
+	char *missing = NULL;
+	bool is_root = false;
+	int ret;
+	int saved_errno;
+
+	ret = tn_mount_path_is_root("/", &is_root);
+	torture_assert_int_equal(tctx, ret, 0, "root of the namespace");
+	torture_assert(tctx, is_root, "/ is the root of a mount");
+
+	dir = mkdtemp(tmpl);
+	torture_assert(tctx, dir != NULL, "mkdtemp");
+
+	is_root = true;
+	ret = tn_mount_path_is_root(dir, &is_root);
+	missing = talloc_asprintf(tctx, "%s/missing", dir);
+	rmdir(dir);
+	torture_assert_int_equal(tctx, ret, 0, "directory");
+	torture_assert(tctx, !is_root,
+		       "a directory is not the root of a mount");
+
+	torture_assert(tctx, missing != NULL, "talloc");
+	ret = tn_mount_path_is_root(missing, &is_root);
+	saved_errno = errno;
+	torture_assert_int_equal(tctx, ret, -1, "missing path fails");
+	torture_assert_int_equal(tctx, saved_errno, ENOENT,
+				 "missing path fails ENOENT");
 
 	return true;
 }
@@ -623,6 +661,8 @@ struct torture_suite *torture_local_truenas_mount(TALLOC_CTX *mem_ctx)
 				      test_lookup_equivalence);
 	torture_suite_add_simple_test(suite, "stale_mnt_id",
 				      test_stale_mnt_id);
+	torture_suite_add_simple_test(suite, "path_is_root",
+				      test_path_is_root);
 	torture_suite_add_simple_test(suite, "traverse", test_traverse);
 	torture_suite_add_simple_test(suite, "zfs_dataset",
 				      test_zfs_dataset);
@@ -1221,199 +1261,6 @@ static bool test_libzfs_create_refused(struct torture_context *tctx)
 }
 
 /*
- * No dataset is created in the pool of the root file system, even one the
- * caller asks for: on TrueNAS that is the boot pool. The root file system
- * of a test machine need not be ZFS, so a child process makes the
- * mountpoint of the test dataset its root.
- */
-static bool test_libzfs_create_root_pool(struct torture_context *tctx)
-{
-	const char *ds = tn_mount_setting(tctx, "tn_mount_ds");
-	const char *mp = tn_mount_setting(tctx, "tn_mount_mp");
-	char dir[PATH_MAX];
-	char name[ZFSDS_NAMELEN];
-	pid_t pid;
-	int status = 0;
-	int ret;
-
-	if ((ds == NULL) || (mp == NULL)) {
-		return tn_skip_or_fail(tctx,
-			"no tn_mount_ds/tn_mount_mp configured");
-	}
-	if (geteuid() != 0) {
-		return tn_skip_or_fail(tctx, "not root");
-	}
-
-	/* leftovers from a run in which the refusal failed */
-	snprintf(name, sizeof(name), "%s/tn_ac_rootdir", ds);
-	tn_zfs_destroy(name);
-
-	/*
-	 * The dataset is found from the nearest existing ancestor of the
-	 * path. The search does not go as far as /, so give it a directory.
-	 */
-	snprintf(dir, sizeof(dir), "%s/tn_ac_rootdir", mp);
-	ret = mkdir(dir, 0755);
-	torture_assert(tctx, (ret == 0) || (errno == EEXIST), "mkdir");
-
-	pid = fork();
-	if (pid == 0) {
-		const struct zfs_dataset **created = NULL;
-		size_t nentries = 0;
-		int err;
-
-		if ((chroot(mp) != 0) || (chdir("/") != 0)) {
-			fprintf(stderr, "chroot to %s: %s\n",
-				mp, strerror(errno));
-			_exit(10);
-		}
-
-		ret = smb_zfs_create_dataset(NULL, "/tn_ac_rootdir/user", ds,
-					     NULL, &created, &nentries, true);
-		err = errno;
-		if ((ret == -1) && (err == EPERM)) {
-			_exit(0);
-		}
-		fprintf(stderr, "smb_zfs_create_dataset: ret %d, errno %d "
-			"(%s)\n", ret, err, strerror(err));
-		_exit(11);
-	}
-	if (pid != -1) {
-		ret = waitpid(pid, &status, 0);
-	}
-
-	tn_zfs_destroy(name);
-	rmdir(dir);
-
-	torture_assert(tctx, pid != -1, "fork");
-	torture_assert_int_equal(tctx, ret, pid, "waitpid");
-	torture_assert(tctx, WIFEXITED(status), "child exited");
-	torture_assert_int_equal(tctx, WEXITSTATUS(status), 0,
-				 "refuses the pool of the root file system "
-				 "with EPERM");
-
-	return true;
-}
-
-/*
- * A dataset that is not mounted leaves its mountpoint behind as an empty
- * directory of the dataset above it. For a share with auto-creation that
- * directory is the connectpath of a user, or a directory on the way to it.
- */
-static bool test_libzfs_unmounted_dataset(struct torture_context *tctx)
-{
-	const char *ds = tn_mount_setting(tctx, "tn_mount_ds");
-	const char *mp = tn_mount_setting(tctx, "tn_mount_mp");
-	const struct zfs_dataset **created = NULL;
-	const struct zfs_dataset **again = NULL;
-	const struct zfs_dataset *zds = NULL;
-	const struct zfs_dataset *mid_ds = NULL;
-	char mid[PATH_MAX];
-	char leaf[PATH_MAX];
-	char other[PATH_MAX];
-	char plain[PATH_MAX];
-	char name[ZFSDS_NAMELEN];
-	size_t nentries = 0;
-	bool unmounted = true;
-	int ret;
-	int err;
-
-	if ((ds == NULL) || (mp == NULL)) {
-		return tn_skip_or_fail(tctx,
-			"no tn_mount_ds/tn_mount_mp configured");
-	}
-	if (geteuid() != 0) {
-		return tn_skip_or_fail(tctx, "not root");
-	}
-
-	/* leftovers from an interrupted run */
-	snprintf(name, sizeof(name), "%s/tn_um_mid", ds);
-	tn_zfs_destroy(name);
-
-	snprintf(mid, sizeof(mid), "%s/tn_um_mid", mp);
-	snprintf(leaf, sizeof(leaf), "%s/user", mid);
-	snprintf(other, sizeof(other), "%s/other", mid);
-	snprintf(plain, sizeof(plain), "%s/tn_um_plain", mp);
-
-	ret = conn_zfs_init(mp, &zds);
-	torture_assert_int_equal(tctx, ret, 0, "conn_zfs_init");
-	torture_assert(tctx, zds != NULL, "dataset resolved");
-
-	/* ds/tn_um_mid/user, as a %D/%U naming schema gives */
-	ret = smb_zfs_create_dataset(tctx, leaf, ds, NULL, &created,
-				     &nentries, true);
-	torture_assert_int_equal(tctx, ret, 0, "create with ancestors");
-	torture_assert_int_equal(tctx, nentries, 3, "two created plus anchor");
-	mid_ds = created[1];
-	torture_assert_str_equal(tctx, mid_ds->mountpoint, mid,
-				 "dataset in between");
-
-	/* the mountpoint of a mounted dataset: decided without libzfs */
-	ret = smb_zfs_path_unmounted(created[0], leaf, &unmounted);
-	torture_assert_int_equal(tctx, ret, 0, "mounted leaf");
-	torture_assert(tctx, !unmounted, "the leaf is mounted");
-
-	/* a directory that no dataset is named after */
-	ret = mkdir(plain, 0755);
-	torture_assert(tctx, (ret == 0) || (errno == EEXIST), "mkdir plain");
-	unmounted = true;
-	ret = smb_zfs_path_unmounted(zds, plain, &unmounted);
-	rmdir(plain);
-	torture_assert_int_equal(tctx, ret, 0, "plain directory");
-	torture_assert(tctx, !unmounted, "a plain directory has no dataset");
-
-	/*
-	 * The dataset of the user is not mounted. Its connectpath is now
-	 * an empty directory of ds/tn_um_mid.
-	 */
-	ret = umount2(leaf, 0);
-	torture_assert_int_equal(tctx, ret, 0, "unmount the leaf");
-	ret = smb_zfs_path_unmounted(mid_ds, leaf, &unmounted);
-	torture_assert_int_equal(tctx, ret, 0, "unmounted leaf");
-	torture_assert(tctx, unmounted, "the leaf is not mounted");
-
-	/* without that directory the dataset is not created a second time */
-	ret = rmdir(leaf);
-	torture_assert_int_equal(tctx, ret, 0, "rmdir the leaf mountpoint");
-	ret = smb_zfs_create_dataset(tctx, leaf, ds, NULL, &again,
-				     &nentries, true);
-	err = errno;
-	torture_assert_int_equal(tctx, ret, -1,
-				 "refuses a dataset that is not mounted");
-	torture_assert_int_equal(tctx, err, ENODEV, "ENODEV");
-
-	/*
-	 * The dataset in between is not mounted either. The nearest
-	 * existing ancestor of a path below it is its mountpoint, a
-	 * directory of ds: a new dataset would be mounted there and be
-	 * covered once ds/tn_um_mid is mounted again.
-	 */
-	ret = umount2(mid, 0);
-	torture_assert_int_equal(tctx, ret, 0, "unmount the dataset between");
-	unmounted = false;
-	ret = smb_zfs_path_unmounted(zds, mid, &unmounted);
-	torture_assert_int_equal(tctx, ret, 0, "unmounted dataset between");
-	torture_assert(tctx, unmounted, "the dataset between is not mounted");
-
-	ret = smb_zfs_create_dataset(tctx, other, ds, NULL, &again,
-				     &nentries, true);
-	err = errno;
-	torture_assert_int_equal(tctx, ret, -1,
-				 "refuses below a dataset that is not mounted");
-	torture_assert_int_equal(tctx, err, ENODEV, "ENODEV");
-	ret = access(other, F_OK);
-	torture_assert_int_equal(tctx, ret, -1, "nothing was mounted there");
-
-	snprintf(name, sizeof(name), "%s/tn_um_mid", ds);
-	tn_zfs_destroy(name);
-	ret = rmdir(mid);
-	torture_assert(tctx, (ret == 0) || (errno == ENOENT),
-		       "mountpoint gone after the dataset was destroyed");
-
-	return true;
-}
-
-/*
  * The dataset name statmount reports is exactly what smb_libzfs hands to
  * zfs_open(), so a name ZFS itself accepts has to survive the trip: the
  * lookup below succeeding at all is the proof, because mntid_get_entry()
@@ -1939,10 +1786,6 @@ struct torture_suite *torture_local_smb_libzfs(TALLOC_CTX *mem_ctx)
 				      test_libzfs_dataset_within);
 	torture_suite_add_simple_test(suite, "create_refused",
 				      test_libzfs_create_refused);
-	torture_suite_add_simple_test(suite, "create_root_pool",
-				      test_libzfs_create_root_pool);
-	torture_suite_add_simple_test(suite, "unmounted_dataset",
-				      test_libzfs_unmounted_dataset);
 	torture_suite_add_simple_test(suite, "space_in_name",
 				      test_libzfs_space_in_name);
 	torture_suite_add_simple_test(suite, "lookup_stability",

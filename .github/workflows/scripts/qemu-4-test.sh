@@ -791,6 +791,13 @@ fi
 zunmount guard/plain
 tcon_refused zguardplain "dataset of the share not mounted"
 zmount guard/tm guard/plain
+# zfs destroy left the mountpoint of guard/tm/smbtest behind: it is a
+# directory of guard/tm, which was not mounted then. The mount table does not
+# tell such a directory from the mountpoint of a dataset that is not mounted,
+# so a share with auto-creation does not serve it.
+mkdir -p "$GUARD/tm/smbtest"
+tcon_refused zguard "directory without a dataset"
+rmdir "$GUARD/tm/smbtest"
 tcon_ok zguard "dataset of the share mounted again, new user"
 ds_exists guard/tm/smbtest || { echo "ERROR: zfs_core did not create guard/tm/smbtest"; zfs list -r guard; exit 1; }
 tcon_ok zguardplain "dataset of the share mounted again"
@@ -799,11 +806,6 @@ echo "--- the dataset of the user is not mounted ---"
 zunmount guard/tm/smbtest
 [ -d "$GUARD/tm/smbtest" ] || { echo "ERROR: the mountpoint of guard/tm/smbtest is gone"; exit 1; }
 tcon_refused zguard "dataset of the user not mounted"
-# With canmount=off the directory is not the mountpoint of a dataset that
-# can be mounted. It is served like any directory without a dataset.
-zfs set canmount=off guard/tm/smbtest
-tcon_ok zguard "directory of a dataset with canmount=off"
-zfs set canmount=on guard/tm/smbtest
 zmount guard/tm/smbtest
 tcon_ok zguard "dataset of the user mounted again"
 echo "zfs_core refuses a share whose datasets are not mounted"

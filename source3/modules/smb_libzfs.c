@@ -840,224 +840,6 @@ bool smb_zfs_dataset_within(const char *name, const char *parent)
 	return (name[len] == '\0') || (name[len] == '/');
 }
 
-/*
- * Whether the dataset `name` is in the pool of the root file system. No
- * dataset is created there. On TrueNAS that is the boot pool: /mnt is a
- * dataset of the boot environment, and it is the nearest existing ancestor
- * of a share path while the pool of the share is not mounted.
- *
- * Returns 0 if the dataset is in another pool, -1 with errno set if it is
- * in that pool (EPERM) or if the root file system cannot be looked up.
- */
-static int refuse_root_pool(TALLOC_CTX *mem_ctx, const char *name)
-{
-	struct tn_mount_entry *root = NULL;
-	char *pool = NULL;
-	bool in_pool;
-	int ret;
-
-	ret = tn_mount_entry_get_path(mem_ctx, "/", &root);
-	if (ret != 0) {
-		DBG_ERR("failed to look up the mount entry of /: %s\n",
-			strerror(errno));
-		return -1;
-	}
-	if (!entry_is_zfs(root) || (root->sb_source == NULL)) {
-		TALLOC_FREE(root);
-		return 0;
-	}
-
-	pool = talloc_strndup(mem_ctx,
-			      root->sb_source,
-			      strcspn(root->sb_source, "/@"));
-	TALLOC_FREE(root);
-	if (pool == NULL) {
-		errno = ENOMEM;
-		return -1;
-	}
-
-	in_pool = smb_zfs_dataset_within(name, pool);
-	if (in_pool) {
-		DBG_ERR("%s: the dataset is in [%s], the pool of the root "
-			"file system. Not creating a dataset there.\n",
-			name, pool);
-	}
-	TALLOC_FREE(pool);
-	if (in_pool) {
-		errno = EPERM;
-		return -1;
-	}
-	return 0;
-}
-
-/*
- * Whether the dataset `name` exists, has `path` as its mountpoint and does
- * not have canmount=off. The caller knows that it is not mounted on `path`.
- * A dataset with canmount=off or with another mountpoint leaves `path` to
- * the dataset above it.
- */
-static bool dataset_belongs_at(libzfs_handle_t *lz,
-			       const char *name,
-			       const char *path)
-{
-	zfs_handle_t *zfsp = NULL;
-	char mountpoint[ZFS_MAXPROPLEN] = {0};
-	bool belongs = false;
-
-	/* quiet for a name that ZFS does not accept or does not know */
-	if (!zfs_dataset_exists(lz, name, ZFS_TYPE_FILESYSTEM)) {
-		return false;
-	}
-
-	zfsp = zfs_open(lz, name, ZFS_TYPE_FILESYSTEM);
-	if (zfsp == NULL) {
-		/* destroyed since */
-		return false;
-	}
-
-	if (zfs_prop_get_int(zfsp, ZFS_PROP_CANMOUNT) == ZFS_CANMOUNT_OFF) {
-		goto out;
-	}
-	if (zfs_prop_get(zfsp, ZFS_PROP_MOUNTPOINT,
-			 mountpoint, sizeof(mountpoint),
-			 NULL, NULL, 0, B_FALSE) != 0) {
-		goto out;
-	}
-	belongs = (strcmp(mountpoint, path) == 0);
-out:
-	zfs_close(zfsp);
-	return belongs;
-}
-
-/*
- * The part of `path` below `mountpoint`, without leading slashes: "" if
- * they are the same. NULL if `path` is not `mountpoint` or below it.
- */
-static const char *path_below_mountpoint(const char *path,
-					 const char *mountpoint)
-{
-	size_t mp_len = strlen(mountpoint);
-	const char *relative = NULL;
-
-	if (strncmp(path, mountpoint, mp_len) != 0) {
-		return NULL;
-	}
-	relative = path + mp_len;
-
-	/* /tank/share2 is not below /tank/share. A mountpoint of / ends in / */
-	if ((*relative != '\0') && (*relative != '/') &&
-	    ((mp_len == 0) || (mountpoint[mp_len - 1] != '/'))) {
-		return NULL;
-	}
-	while (*relative == '/') {
-		relative++;
-	}
-	return relative;
-}
-
-int smb_zfs_path_unmounted(const struct zfs_dataset *ds,
-			   const char *path,
-			   bool *_unmounted)
-{
-	const char *relative = NULL;
-	char name[ZFS_MAX_DATASET_NAME_LEN];
-	libzfs_handle_t *lz = NULL;
-	int len;
-
-	*_unmounted = false;
-
-	relative = path_below_mountpoint(path, ds->mountpoint);
-	if ((relative == NULL) || (*relative == '\0')) {
-		/*
-		 * The mountpoint of ds: a dataset is mounted here. Or a path
-		 * that does not name a location in ds, which gives no
-		 * dataset name to look for.
-		 */
-		return 0;
-	}
-
-	len = snprintf(name, sizeof(name), "%s/%s", ds->dataset_name, relative);
-	if ((len < 0) || ((size_t)len >= sizeof(name))) {
-		/* too long to be the name of a dataset */
-		return 0;
-	}
-
-	lz = get_global_smblibzfs_handle();
-	if (lz == NULL) {
-		return -1;
-	}
-	*_unmounted = dataset_belongs_at(lz, name, path);
-	global_handle_decref();
-
-	return 0;
-}
-
-/*
- * A dataset below the anchor that exists and belongs on the way to the new
- * dataset is not mounted: if it were, the nearest existing ancestor of the
- * path would be in it, and it would be the anchor. Creating below it now
- * would mount the new dataset on a directory of the anchor, where the
- * dataset that is not mounted covers it once it is mounted again.
- *
- * `relative` is the path of the new dataset below the mountpoint of the
- * anchor. Returns 0 if there is none, -1 with errno set otherwise.
- */
-static int refuse_unmounted_datasets(TALLOC_CTX *mem_ctx,
-				     libzfs_handle_t *lz,
-				     const struct tn_mount_entry *anchor,
-				     const char *relative)
-{
-	const char *mountpoint = anchor->mnt_point;
-	const char *p = relative;
-
-	/* the mountpoint of the root file system is /, which adds nothing */
-	if (strcmp(mountpoint, "/") == 0) {
-		mountpoint = "";
-	}
-
-	for (;;) {
-		const char *slash = strchr(p, '/');
-		char *name = NULL;
-		char *dir = NULL;
-		bool belongs;
-		int len;
-
-		len = (slash != NULL) ? (int)PTR_DIFF(slash, relative) :
-					(int)strlen(relative);
-
-		name = talloc_asprintf(mem_ctx, "%s/%.*s",
-				       anchor->sb_source, len, relative);
-		dir = talloc_asprintf(mem_ctx, "%s/%.*s",
-				      mountpoint, len, relative);
-		if ((name == NULL) || (dir == NULL)) {
-			TALLOC_FREE(name);
-			TALLOC_FREE(dir);
-			errno = ENOMEM;
-			return -1;
-		}
-
-		belongs = dataset_belongs_at(lz, name, dir);
-		if (belongs) {
-			DBG_ERR("%s: the dataset exists and is not mounted "
-				"on [%s]. Not creating a dataset below it.\n",
-				name, dir);
-		}
-		TALLOC_FREE(name);
-		TALLOC_FREE(dir);
-		if (belongs) {
-			errno = ENODEV;
-			return -1;
-		}
-
-		if (slash == NULL) {
-			break;
-		}
-		p = slash + 1;
-	}
-
-	return 0;
-}
-
 int
 smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 		       const char *path,
@@ -1071,6 +853,7 @@ smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 	int error;
 	int to_create;
 	int i;
+	size_t mp_len;
 	char parent[PATH_MAX] = {0};
 	const char *relative = NULL;
 	const char *p = NULL;
@@ -1145,17 +928,16 @@ smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 		goto fail;
 	}
 
-	error = refuse_root_pool(tmp_ctx, parent_entry->sb_source);
-	if (error != 0) {
-		goto fail;
-	}
-
-	relative = path_below_mountpoint(path, parent_entry->mnt_point);
-	if (relative == NULL) {
+	mp_len = strlen(parent_entry->mnt_point);
+	if (strncmp(path, parent_entry->mnt_point, mp_len) != 0) {
 		DBG_ERR("%s: path does not lie below mountpoint [%s]\n",
 			path, parent_entry->mnt_point);
 		errno = EINVAL;
 		goto fail;
+	}
+	relative = path + mp_len;
+	while (*relative == '/') {
+		relative++;
 	}
 
 	target_ds = talloc_asprintf(tmp_ctx, "%s/%s",
@@ -1179,30 +961,24 @@ smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 		}
 	}
 
-	if (!create_ancestors && (to_create > 1)) {
-		DBG_ERR("Unable to create dataset [%s] due to "
-			"missing ancestor datasets.", target_ds);
-		errno = ENOENT;
-		goto fail;
-	}
-
 	/* everything above needs the mount table only */
 	lz = get_global_smblibzfs_handle();
 	if (lz == NULL) {
 		goto fail;
 	}
 
-	error = refuse_unmounted_datasets(tmp_ctx, lz, parent_entry, relative);
-	if (error != 0) {
-		goto fail;
-	}
-
 	if (create_ancestors) {
 		/* a no-op when every ancestor dataset already exists */
-		error = zfs_create_ancestors(lz, target_ds);
-		if (error != 0) {
+		rv = zfs_create_ancestors(lz, target_ds);
+		if (rv != 0 ) {
 			goto fail;
 		}
+	}
+	else if (to_create > 1) {
+		DBG_ERR("Unable to create dataset [%s] due to "
+			"missing ancestor datasets.", target_ds);
+		errno = ENOENT;
+		goto fail;
 	}
 
 	error = create_dataset_internal(lz, target_ds, quota);
@@ -1272,7 +1048,7 @@ smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
 	*_nentries = (size_t)to_create + 1;
 	rv = 0;
 fail:
-	/* the caller tells the refusals apart by errno */
+	/* the caller gets the errno of the failure */
 	error = errno;
 	TALLOC_FREE(tmp_ctx);
 	/*

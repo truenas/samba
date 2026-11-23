@@ -189,16 +189,11 @@ uint64_t smb_zfs_disk_free(uint64_t mnt_id,
  * done silently.
  *
  * The dataset the path already lies in is found from the nearest ancestor
- * of the path that exists. If a dataset is not mounted, that ancestor is in
- * another dataset: the one mounted above it, or one in the pool of the root
- * file system if the whole pool is not mounted. Datasets are not created
- * there. These are refused, with errno:
- *
- * EXDEV	the nearest existing ancestor of the path is not in
- *		`root_dataset` or in a dataset below it
- * EPERM	it is in the pool of the root file system
- * ENODEV	a dataset on the way to the path exists, has its mountpoint
- *		there and is not mounted
+ * of the path that exists. If `root_dataset` is not mounted, that ancestor
+ * is in another dataset: the one mounted above it, or one in the pool of
+ * the root file system if the whole pool is not mounted. No dataset is
+ * created there: the call fails with errno EXDEV unless the ancestor is in
+ * `root_dataset` or in a dataset below it.
  *
  * @param[in]	mem_ctx			memory context for the returned
  *					array itself
@@ -231,23 +226,6 @@ int smb_zfs_create_dataset(TALLOC_CTX *mem_ctx,
  * the names are compared: neither dataset has to exist.
  */
 bool smb_zfs_dataset_within(const char *name, const char *parent);
-
-/*
- * Whether the directory `path` is the mountpoint of a dataset that is not
- * mounted. `path` is in the dataset `ds`. If it is the mountpoint of `ds`,
- * the answer is no and libzfs is not used. If it is a directory below the
- * mountpoint, the answer is yes if the dataset named after it exists, has
- * `path` as its mountpoint and does not have canmount=off.
- *
- * @param[in]	ds			dataset that `path` is in
- * @param[in]	path			directory to check
- * @param[out]	_unmounted		the answer
- *
- * @return	0 on success, -1 with errno set if libzfs is not available
- */
-int smb_zfs_path_unmounted(const struct zfs_dataset *ds,
-			   const char *path,
-			   bool *_unmounted);
 
 /*
  * List the snapshots of a dataset, newest first, from a read of the

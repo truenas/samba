@@ -23,6 +23,7 @@
 
 #include "lib/util/tevent_ntstatus.h"
 #include "source3/lib/substitute.h"
+#include "source3/lib/truenas_mount.h"
 #include "vfs_zfs_core.h"
 #include "zfs_core_file_id.h"
 
@@ -789,8 +790,8 @@ static bool zfs_core_ds_in_share(vfs_handle_struct *handle,
  * the empty directory it is mounted on, in the dataset above. It passes
  * zfs_core_ds_in_share(), and the client would see an empty share.
  *
- * A connectpath that is a directory with no dataset of its own is served
- * as before.
+ * The mount table does not tell that directory from one that never had a
+ * dataset, so a connectpath that is not the root of a mount is refused.
  *
  * Returns false with errno set if the connection has to be refused.
  */
@@ -798,25 +799,24 @@ static bool zfs_core_user_ds_mounted(vfs_handle_struct *handle,
 				     const struct zfs_core_config_data *config)
 {
 	const char *connectpath = handle->conn->connectpath;
-	bool unmounted = false;
+	bool is_root = false;
 	int ret;
 
-	if (!config->zfs_auto_create || (config->ds == NULL)) {
+	if (!config->zfs_auto_create) {
 		return true;
 	}
 
-	ret = smb_zfs_path_unmounted(config->ds, connectpath, &unmounted);
+	ret = tn_mount_path_is_root(connectpath, &is_root);
 	if (ret != 0) {
-		DBG_ERR("%s: failed to check for a dataset that is not "
-			"mounted: %s\n",
+		DBG_ERR("%s: failed to look up the path: %s\n",
 			connectpath, strerror(errno));
 		return false;
 	}
-	if (unmounted) {
-		DBG_ERR("%s: the dataset of this path is not mounted: the "
-			"path is a directory in the dataset [%s]. Refusing "
-			"the connection.\n",
-			connectpath, config->ds->dataset_name);
+	if (!is_root) {
+		DBG_ERR("%s: the path is not the mountpoint of a dataset: "
+			"its dataset is not mounted, or it is a directory "
+			"without a dataset. Refusing the connection.\n",
+			connectpath);
 		errno = ENODEV;
 		return false;
 	}
