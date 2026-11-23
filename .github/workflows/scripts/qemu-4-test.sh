@@ -17,6 +17,9 @@
 #     shadow_copy browse/readonly/listdir) against the share
 #   * verify per-user ZFS dataset auto-creation (zfs_core:zfs_auto_create),
 #     including on-disk ownership
+#   * verify that zfs_core creates no dataset and refuses the connection
+#     while the dataset of the share, its pool, or the dataset of the user
+#     is not mounted (zfs_core:share_dataset)
 #   * verify per-user auto-creation with vfs_fruit + ixnas in the stack
 #     inherits the parent dataset's NFSv4 ACL into the new dataset -- the
 #     regression where zfs_inherit_acls' connect-time stat routed through
@@ -117,6 +120,16 @@ chmod 0777 /tank/acl
 zfs create -o acltype=nfsv4 -o aclmode=passthrough -o aclinherit=passthrough \
            -o casesensitivity=insensitive -o atime=off tank/home
 chmod 0777 /tank/home
+# A pool of its own for the shares [zguard*], mounted on a directory of the
+# dataset tank/guardmnt -- as a TrueNAS pool is mounted on a directory of
+# /mnt, which is a dataset of the boot pool. While the pool guard is not
+# mounted, the share paths lead into tank/guardmnt.
+zfs create -o atime=off tank/guardmnt
+truncate -s 1G /var/tmp/zpool-guard.img
+zpool create -f -m /tank/guardmnt/guard guard /var/tmp/zpool-guard.img
+zfs create -o atime=off guard/tm
+zfs create -o atime=off guard/plain
+chmod 0777 /tank/guardmnt/guard/tm /tank/guardmnt/guard/plain
 # Case-SENSITIVE plain dataset for upstream smb2.* protocol regression, so the
 # generic suites aren't tripped by ZFS case-insensitivity.
 zfs create -o casesensitivity=sensitive -o atime=off tank/vanilla
@@ -248,11 +261,37 @@ cat > /etc/smb4.conf <<CONF
 
 [zauto]
     # zfs_core auto-creates the per-user %U dataset via libzfs on connect.
+    # It creates datasets only below zfs_core:share_dataset, the dataset of
+    # the share path without %U (middleware sets it from the share entry).
     path = $SHARE/%U
     read only = no
     vfs objects = zfs_core
     zfs_core:zfs_auto_create = yes
+    zfs_core:share_dataset = tank/share
     zfs_core:dataset_auto_quota = 1G
+
+[zguard]
+    # Auto-creation in the pool guard, for the tests with the pool, the
+    # dataset of the share or the dataset of the user not mounted.
+    path = /tank/guardmnt/guard/tm/%U
+    read only = no
+    vfs objects = zfs_core
+    zfs_core:zfs_auto_create = yes
+    zfs_core:share_dataset = guard/tm
+
+[zguardnods]
+    # The same share without zfs_core:share_dataset: no dataset is created.
+    path = /tank/guardmnt/guard/tm/%U
+    read only = no
+    vfs objects = zfs_core
+    zfs_core:zfs_auto_create = yes
+
+[zguardplain]
+    # A share without auto-creation whose dataset is named.
+    path = /tank/guardmnt/guard/plain
+    read only = no
+    vfs objects = zfs_core
+    zfs_core:share_dataset = guard/plain
 
 [zsc]
     # snapshot browsing via shadow_copy_zfs (@GMT- previous versions)
@@ -313,6 +352,7 @@ cat > /etc/smb4.conf <<CONF
     read only = no
     vfs objects = fruit truenas_streams_xattr ixnas zfs_core
     zfs_core:zfs_auto_create = yes
+    zfs_core:share_dataset = tank/home
     zfs_core:dataset_auto_quota = 1G
     fruit:nfs_aces = no
     nfs4:mode = simple
@@ -662,6 +702,113 @@ if [ "$auto_owner" = "smbtest" ]; then
 else
   echo "ERROR: tank/share/smbtest owner is [$auto_owner], expected smbtest"; exit 1
 fi
+
+echo "=========================================="
+echo "Auto-creation while a dataset of the share is not mounted"
+echo "=========================================="
+# zfs_core finds where to create the dataset of a user from the nearest
+# directory of the share path that exists. While the pool of the share is
+# not mounted, that directory is in the dataset the pool is mounted on:
+# tank/guardmnt here, /mnt of the boot pool on TrueNAS, where the datasets
+# of the share path were then created and mounted. zfs_core:share_dataset
+# names the dataset of the share. Nothing is created outside it, and a share
+# path that leads into another dataset is refused.
+GUARD=/tank/guardmnt/guard
+tcon_ok() {       # share, state
+  smbclient "//127.0.0.1/$1" -U 'smbtest%testpass123' -c 'ls' >/tmp/tcon.out 2>&1 \
+    || { echo "ERROR: connect to [$1] failed: $2"; cat /tmp/tcon.out; tail -40 /var/log/samba4/smbd.log; exit 1; }
+  echo "  [$1] connected: $2"
+}
+tcon_refused() {  # share, state
+  if smbclient "//127.0.0.1/$1" -U 'smbtest%testpass123' -c 'ls' >/tmp/tcon.out 2>&1; then
+    echo "ERROR: connect to [$1] was not refused: $2"; cat /tmp/tcon.out; tail -40 /var/log/samba4/smbd.log; exit 1
+  fi
+  echo "  [$1] refused: $2"
+}
+ds_exists() { zfs list -H -o name "$1" >/dev/null 2>&1; }
+ds_mounted() { [ "$(zfs get -H -o value mounted "$1")" = yes ]; }
+zmount() { local d; for d in "$@"; do ds_mounted "$d" || zfs mount "$d"; done; }
+# `zfs unmount` also unmounts the datasets below. The smbd of the previous
+# connection may still be exiting in one of them.
+zunmount() {
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    ds_mounted "$1" || return 0
+    zfs unmount "$1" 2>/dev/null && return 0
+    sleep 0.5
+  done
+  echo "ERROR: cannot unmount $1"; zfs unmount "$1"; exit 1
+}
+no_strays() {
+  if zfs list -H -o name -r tank/guardmnt | grep -qv '^tank/guardmnt$'; then
+    echo "ERROR: datasets were created in tank/guardmnt ($1):"; zfs list -r tank/guardmnt; exit 1
+  fi
+}
+
+echo "--- everything mounted ---"
+zfs destroy -r guard/tm/smbtest 2>/dev/null || true
+tcon_refused zguardnods "new user, zfs_core:share_dataset is not set"
+if ds_exists guard/tm/smbtest; then
+  echo "ERROR: guard/tm/smbtest was created without zfs_core:share_dataset"; exit 1
+fi
+tcon_ok zguard "new user"
+ds_exists guard/tm/smbtest || { echo "ERROR: zfs_core did not create guard/tm/smbtest"; zfs list -r guard; exit 1; }
+tcon_ok zguard "the dataset of the user exists"
+tcon_ok zguardnods "the dataset of the user exists"
+tcon_ok zguardplain "share without auto-creation"
+
+echo "--- the pool of the share is not mounted ---"
+zunmount guard
+[ -d "$GUARD" ] && [ ! -e "$GUARD/tm" ] || { echo "ERROR: $GUARD is not the empty mountpoint"; ls -la "$GUARD"; exit 1; }
+tcon_refused zguard "pool not mounted"
+no_strays "pool not mounted"
+tcon_refused zguardnods "pool not mounted, zfs_core:share_dataset is not set"
+no_strays "pool not mounted, zfs_core:share_dataset is not set"
+tcon_refused zguardplain "pool not mounted, share path does not exist"
+
+echo "--- datasets of another pool on the share path ---"
+# What was created there before zfs_core:share_dataset. These have the
+# mountpoint of tank/guardmnt, so they are mounted on the share path.
+zfs create -p tank/guardmnt/guard/tm/smbtest
+zfs create -p tank/guardmnt/guard/plain
+[ -d "$GUARD/tm/smbtest" ] && [ -d "$GUARD/plain" ] || { echo "ERROR: the datasets of tank are not on the share path"; exit 1; }
+tcon_refused zguard "share path in a dataset of another pool"
+tcon_refused zguardplain "share path in a dataset of another pool"
+zfs destroy -r tank/guardmnt/guard
+no_strays "after the cleanup"
+zmount guard guard/tm guard/tm/smbtest guard/plain
+tcon_ok zguard "pool mounted again"
+tcon_ok zguardplain "pool mounted again"
+
+echo "--- the dataset of the share is not mounted ---"
+zunmount guard/tm
+tcon_refused zguard "dataset of the share not mounted, the dataset of the user exists"
+zfs destroy guard/tm/smbtest
+tcon_refused zguard "dataset of the share not mounted, new user"
+if ds_exists guard/tm/smbtest; then
+  echo "ERROR: guard/tm/smbtest was created with guard/tm not mounted"; zfs list -r guard; exit 1
+fi
+zunmount guard/plain
+tcon_refused zguardplain "dataset of the share not mounted"
+zmount guard/tm guard/plain
+# zfs destroy left the mountpoint of guard/tm/smbtest behind: it is a
+# directory of guard/tm, which was not mounted then. The mount table does not
+# tell such a directory from the mountpoint of a dataset that is not mounted,
+# so a share with auto-creation does not serve it.
+mkdir -p "$GUARD/tm/smbtest"
+tcon_refused zguard "directory without a dataset"
+rmdir "$GUARD/tm/smbtest"
+tcon_ok zguard "dataset of the share mounted again, new user"
+ds_exists guard/tm/smbtest || { echo "ERROR: zfs_core did not create guard/tm/smbtest"; zfs list -r guard; exit 1; }
+tcon_ok zguardplain "dataset of the share mounted again"
+
+echo "--- the dataset of the user is not mounted ---"
+zunmount guard/tm/smbtest
+[ -d "$GUARD/tm/smbtest" ] || { echo "ERROR: the mountpoint of guard/tm/smbtest is gone"; exit 1; }
+tcon_refused zguard "dataset of the user not mounted"
+zmount guard/tm/smbtest
+tcon_ok zguard "dataset of the user mounted again"
+echo "zfs_core refuses a share whose datasets are not mounted"
 
 echo "=========================================="
 echo "Snapshot browsing via shadow_copy_zfs"

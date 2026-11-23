@@ -223,6 +223,27 @@ int tn_mount_path_get_mnt_id(const char *path, uint64_t *mnt_id_out)
 	return 0;
 }
 
+int tn_mount_path_is_root(const char *path, bool *is_root_out)
+{
+	struct statx stx = {};
+	int ret;
+
+	ret = statx(AT_FDCWD, path, 0, 0, &stx);
+	if (ret != 0) {
+		DBG_INFO("statx() failed for %s: %s\n", path,
+			 strerror(errno));
+		return -1;
+	}
+	if ((stx.stx_attributes_mask & STATX_ATTR_MOUNT_ROOT) == 0) {
+		DBG_ERR("kernel did not report whether a path is the root "
+			"of a mount\n");
+		errno = ENOSYS;
+		return -1;
+	}
+	*is_root_out = (stx.stx_attributes & STATX_ATTR_MOUNT_ROOT) != 0;
+	return 0;
+}
+
 int tn_mount_entry_get_path(TALLOC_CTX *mem_ctx,
 			    const char *path,
 			    struct tn_mount_entry **entry_out)

@@ -71,6 +71,11 @@ struct zfs_core_config_data {
 	bool zfs_integrity_streams_enabled;
 	bool zfs_auto_create;
 	bool checked;
+	/*
+	 * TrueNAS: zfs_core:share_dataset, the name of the dataset the path
+	 * of the share is in. NULL if it is not set.
+	 */
+	const char *share_dataset;
 	const char *dataset_auto_quota;
 	uint64_t base_user_quota;
 	const zc_offload_ops_t *offload_ops;
