@@ -37,13 +37,28 @@
 #      is done, smbd finds the session of a PDU in the global record. With
 #      the reactors on, smbd must accept the decryption of the reactor,
 #      which used the keys of the session of the connection.
+#   P7 A TREE_CONNECT that fails after vfs_io_uring set up its ring gets an
+#      error, with the reactors on and off, and smbd does not panic. Only
+#      the main thread runs a TREE_CONNECT. A reactor that ran one freed
+#      the fd event of the ring when the connect failed (NAS-145440). The
+#      path of [gone] does not exist, so smbd refuses it after the connect
+#      of the VFS modules. In [tnplain] the directory of the user is not a
+#      dataset, so zfs_core refuses it in its connect. [tnplain] runs only
+#      with zfs_core in ROS_TN_VFS.
+#   P8 With "truenas:ros test defer dispatch", inline runs also take the
+#      messages that only the main thread runs: SESSION_SETUP, LOGOFF,
+#      TREE_CONNECT and TREE_DISCONNECT. smbd must pass each one to the
+#      main thread when it dispatches it. The checks of P5, P6 and P7 pass,
+#      smbd does not panic, and its log shows that it passed messages to
+#      the main thread, at least one TREE_CONNECT among them. Without that
+#      the test of the deferral did not run.
 #
 # To run outside the VM, set ROS_POOL empty (no pool and no stop of other
 # daemons) and ROS_DIR to a directory on slow storage. Set ROS_TN_DIR to
 # a directory on ZFS with NFSv4 ACLs. ROS_TN_VFS can leave out the
 # modules that need libzfs. ROS_WORK, ROS_USER,
-# ROS_DELAY_MS (0: any delay), ROS_IO_SIZE, SMBD, SMBPASSWD, SMBSTATUS and
-# SMBTORTURE can also change.
+# ROS_DELAY_MS (0: any delay), ROS_IO_SIZE, SMBD, SMBCLIENT, SMBPASSWD,
+# SMBSTATUS and SMBTORTURE can also change.
 ######################################################################
 
 set -eu
@@ -56,6 +71,7 @@ IO_SIZE="${ROS_IO_SIZE:-1048576}"
 USER_NAME="${ROS_USER:-rosuser}"
 USER_PASS='Passw0rd.3'
 SMBD="${SMBD:-/usr/sbin/smbd}"
+SMBCLIENT="${SMBCLIENT:-/usr/bin/smbclient}"
 SMBPASSWD="${SMBPASSWD:-/usr/bin/smbpasswd}"
 SMBSTATUS="${SMBSTATUS:-/usr/bin/smbstatus}"
 SMBTORTURE="${SMBTORTURE:-/usr/bin/smbtorture}"
@@ -115,11 +131,13 @@ stop() {
 	rm -f "$WORK/rosz.img"
 }
 
-# (Re)start smbd with the reactors on or off
-start_smbd() { # $1: on or off
+# (Re)start smbd with the reactors on or off, or on with the test option
+# of P8
+start_smbd() { # $1: on, off or defer
 	stop_smbd
 	case "$1" in
 	off) echo "truenas:ros transport = no" > "$SWITCH" ;;
+	defer) echo "truenas:ros test defer dispatch = yes" > "$SWITCH" ;;
 	*) : > "$SWITCH" ;;
 	esac
 	"$SMBD" -D -s "$CONF"
@@ -216,6 +234,31 @@ grown() {
 	END { print v[ARGV[2]] - v[ARGV[1]] }' "$2" "$3"
 }
 
+# The number of lines of panics in the logs of smbd
+panics() {
+	cat "$WORK"/log/log.* 2> /dev/null | grep -c 'PANIC' || true
+}
+
+# The number of messages, of the opcode $1 if given, that smbd passed from
+# an inline run to the main thread (smbd_smb2_ros_inline_defer_dispatch())
+deferrals() { # [$1: opcode, such as SMB2_OP_TCON]
+	cat "$WORK"/log/log.* 2> /dev/null |
+		grep -c "${1:-SMB2_OP_[A-Z]*} reached an inline reactor run" ||
+		true
+}
+
+# smbclient as the test user, on the share $2. True if the tree connect
+# fails with the status $3 and smbd does not panic.
+tcon_fails() { # $1: name of the output, $2: share, $3: status
+	local out="$OUT/$1.txt" before
+	before=$(panics)
+	"$SMBCLIENT" "//127.0.0.1/$2" --configfile="$CONF" \
+		-U "$USER_NAME%$USER_PASS" -c ls > "$out" 2>&1 || true
+	cat "$out"
+	grep -q "tree connect failed: $3" "$out" &&
+		[ "$(panics)" -eq "$before" ]
+}
+
 mkdir -p "$WORK" "$OUT" "$DIR"
 for d in run log private lock state cache ncalrpc; do
 	mkdir -p "$WORK/$d"
@@ -262,6 +305,11 @@ fi
 mkdir -p "$TN_DIR"
 # P5 and P6 create files at the root of [tn].
 chown "$USER_NAME" "$TN_DIR"
+# P7: [gone] has no directory. [tnplain] has a plain directory for the
+# user, as a home directory that middleware creates.
+rm -rf "$WORK/gone"
+mkdir -p "$TN_DIR/plain/$USER_NAME"
+TN_DATASET=$(findmnt -n -o SOURCE --target "$TN_DIR" 2> /dev/null || true)
 
 cat > "$CONF" <<CONF
 [global]
@@ -318,6 +366,16 @@ cat > "$CONF" <<CONF
     mangled names = no
     ea support = no
     smb3 unix extensions = no
+[gone]
+    path = $WORK/gone
+    read only = no
+    vfs objects = io_uring
+[tnplain]
+    path = $TN_DIR/plain/%U
+    read only = no
+    vfs objects = $TN_VFS
+    zfs_core:zfs_auto_create = yes
+    zfs_core:share_dataset = $TN_DATASET
 CONF
 : > "$SWITCH"
 printf '%s\n%s\n' "$USER_PASS" "$USER_PASS" |
@@ -450,7 +508,65 @@ for transport in on off; do
 		smb2.session.bind_invalid_auth smb2.session.ntlmssp_bug14932 &&
 		ok P6 "$name: smbd answered each re-authentication" ||
 		bad P6 "$name: a re-authentication failed"
+
+	name="reactors $transport"
+	step "P7: $name, tree connects that fail"
+	tcon_fails "p7-$transport-gone" gone NT_STATUS_BAD_NETWORK_NAME &&
+		ok P7a "$name: [gone] refused, no panic" ||
+		bad P7a "$name: [gone] another status, or a panic"
+	case " $TN_VFS " in
+	*" zfs_core "*)
+		tcon_fails "p7-$transport-tnplain" tnplain \
+			NT_STATUS_UNSUCCESSFUL &&
+			ok P7b "$name: [tnplain] refused, no panic" ||
+			bad P7b "$name: [tnplain] another status, or a panic"
+		;;
+	esac
 done
+
+# P8: the messages of P5, P6 and P7 that only the main thread runs go
+# through inline runs, which pass them to the main thread.
+name="reactors on, test defer dispatch"
+start_smbd defer
+deferred=$(deferrals)
+deferred_tcon=$(deferrals SMB2_OP_TCON)
+before=$(panics)
+for seal in plain encrypted; do
+	step "P8: $name, $seal, a logoff and a tree disconnect"
+	case "$seal" in
+	encrypted) set -- --option=clientsmbencrypt=required ;;
+	*) set -- ;;
+	esac
+	SHARE=tn torture "p8-$seal" "$@" smb2.notify.logoff smb2.notify.tdis &&
+		ok P8a "$name, $seal: the waiting requests ended" ||
+		bad P8a "$name, $seal: a logoff or a tree disconnect failed"
+done
+step "P8: $name, a re-authentication"
+SHARE=tn torture p8-reauth --option=clientsmbencrypt=required \
+	smb2.session.reauth1 smb2.session.reauth6 \
+	smb2.session.bind_invalid_auth smb2.session.ntlmssp_bug14932 &&
+	ok P8b "$name: smbd answered each re-authentication" ||
+	bad P8b "$name: a re-authentication failed"
+step "P8: $name, tree connects that fail"
+tcon_fails p8-gone gone NT_STATUS_BAD_NETWORK_NAME &&
+	ok P8c "$name: [gone] refused, no panic" ||
+	bad P8c "$name: [gone] another status, or a panic"
+case " $TN_VFS " in
+*" zfs_core "*)
+	tcon_fails p8-tnplain tnplain NT_STATUS_UNSUCCESSFUL &&
+		ok P8d "$name: [tnplain] refused, no panic" ||
+		bad P8d "$name: [tnplain] another status, or a panic"
+	;;
+esac
+n=$(($(deferrals) - deferred))
+tcon=$(($(deferrals SMB2_OP_TCON) - deferred_tcon))
+if [ "$(panics)" -ne "$before" ]; then
+	bad P8e "$name: smbd panicked"
+elif [ "$tcon" -gt 0 ]; then
+	ok P8e "$name: $n messages passed to the main thread, $tcon TCONs"
+else
+	bad P8e "$name: no TREE_CONNECT reached an inline run, nothing tested"
+fi
 stop_smbd
 
 step "$PASS passed, $FAILED failed"

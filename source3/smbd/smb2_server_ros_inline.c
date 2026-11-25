@@ -275,6 +275,31 @@ static void smbd_smb2_ros_inline_trace_immediate(
 }
 
 /*
+ * True if only the main thread runs a message with this opcode. The main
+ * thread runs each NEGPROT, SESSION_SETUP, LOGOFF, TREE_CONNECT and
+ * TREE_DISCONNECT. LOGOFF and TREE_DISCONNECT block until the reactors end
+ * their file I/O. A CLOSE waits for that I/O asynchronously. A
+ * TREE_CONNECT runs the connect hooks of the VFS modules. vfs_io_uring
+ * adds a tevent fd event there, and a connect that fails frees it again.
+ * A reactor must not free an fd event. Messages after a TREE_CONNECT can
+ * also use the new tree, which smbd_smb2_ros_inline_main_only() cannot
+ * check.
+ */
+static bool smbd_smb2_ros_inline_main_opcode(uint16_t opcode)
+{
+	switch (opcode) {
+	case SMB2_OP_NEGPROT:
+	case SMB2_OP_SESSSETUP:
+	case SMB2_OP_LOGOFF:
+	case SMB2_OP_TCON:
+	case SMB2_OP_TDIS:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*
  * True if the inline run on this thread dispatches req next. Then the
  * caller must not schedule an immediate event for req.
  */
@@ -286,6 +311,42 @@ bool smbd_smb2_ros_inline_take_next(struct smbd_smb2_request *req)
 		return false;
 	}
 	smbd_smb2_ros_inline_next = req;
+	return true;
+}
+
+/*
+ * smbd_smb2_ros_inline_shape() keeps the messages that only the main
+ * thread runs out of inline runs, except with "truenas:ros test defer
+ * dispatch". If an inline run on this thread dispatches one anyway, this
+ * queues req for the main thread and returns true. Then the caller must
+ * not dispatch req.
+ */
+bool smbd_smb2_ros_inline_defer_dispatch(struct smbd_smb2_request *req,
+					 uint16_t opcode)
+{
+	struct tevent_immediate *im = NULL;
+
+	if (smbd_smb2_ros_inline_xconn == NULL ||
+	    !smbd_smb2_ros_inline_main_opcode(opcode))
+	{
+		return false;
+	}
+
+	DBG_ERR("%s reached an inline reactor run, the main thread runs it\n",
+		smb2_opcode_name(opcode));
+
+	im = tevent_create_immediate(req);
+	if (im == NULL) {
+		smb_panic("no memory to defer a request to the main thread");
+	}
+	/*
+	 * smbd_smb2_ros_inline_trace_immediate() counts the immediate. So the
+	 * reactor wakes the main thread after the run.
+	 */
+	tevent_schedule_immediate(im,
+				  req->xconn->client->raw_ev_ctx,
+				  smbd_smb2_request_dispatch_immediate,
+				  req);
 	return true;
 }
 
@@ -374,14 +435,12 @@ static const uint8_t *smbd_smb2_ros_inline_first(
 }
 
 /*
- * True if an inline run can run the PDU of e. The main thread runs each
- * NEGPROT, SESSION_SETUP, LOGOFF and TREE_DISCONNECT. LOGOFF and
- * TREE_DISCONNECT block until the reactors end their file I/O. A CLOSE
- * waits for that I/O asynchronously. The main thread also runs a
- * TREE_CONNECT with messages after it. smbd_smb2_ros_inline_main_only()
- * cannot check the new tree that those messages use.
+ * True if an inline run can run the PDU of e: no message of it is one that
+ * only the main thread runs. With main_ok, such messages are also allowed,
+ * for the tests of smbd_smb2_ros_inline_defer_dispatch().
  */
-static bool smbd_smb2_ros_inline_shape(const struct tn_smbros_event *e)
+static bool smbd_smb2_ros_inline_shape(const struct tn_smbros_event *e,
+				       bool main_ok)
 {
 	const uint8_t *p = NULL;
 	size_t len = 0;
@@ -393,6 +452,7 @@ static bool smbd_smb2_ros_inline_shape(const struct tn_smbros_event *e)
 	}
 
 	for (n = 0; n < SMBD_SMB2_ROS_INLINE_MAX_MSGS; n++) {
+		uint16_t opcode;
 		uint32_t next;
 
 		if (len < SMB2_HDR_BODY + 2 ||
@@ -400,23 +460,12 @@ static bool smbd_smb2_ros_inline_shape(const struct tn_smbros_event *e)
 		{
 			return false;
 		}
-		next = IVAL(p, SMB2_HDR_NEXT_COMMAND);
-
-		switch (SVAL(p, SMB2_HDR_OPCODE)) {
-		case SMB2_OP_NEGPROT:
-		case SMB2_OP_SESSSETUP:
-		case SMB2_OP_LOGOFF:
-		case SMB2_OP_TDIS:
+		opcode = SVAL(p, SMB2_HDR_OPCODE);
+		if (!main_ok && smbd_smb2_ros_inline_main_opcode(opcode)) {
 			return false;
-		case SMB2_OP_TCON:
-			if (next != 0) {
-				return false;
-			}
-			break;
-		default:
-			break;
 		}
 
+		next = IVAL(p, SMB2_HDR_NEXT_COMMAND);
 		if (next == 0) {
 			return true;
 		}
@@ -532,7 +581,7 @@ static bool smbd_smb2_ros_inline(void *private_data,
 	bool wake;
 	NTSTATUS status;
 
-	if (!smbd_smb2_ros_inline_shape(e)) {
+	if (!smbd_smb2_ros_inline_shape(e, o->test_defer_dispatch)) {
 		return false;
 	}
 	if (__atomic_load_n(&o->main_waits, __ATOMIC_ACQUIRE)) {
@@ -612,6 +661,11 @@ void smbd_smb2_ros_inline_setup(struct smbd_smb2_ros_owner *o)
 	/* The main thread has the lock except while it waits for events. */
 	pthread_mutex_lock(&o->lock);
 	o->inline_on = true;
+	/* Only the tests of CI set it. The reactors read it, so set it now. */
+	o->test_defer_dispatch = lp_parm_bool(GLOBAL_SECTION_SNUM,
+					      "truenas",
+					      "ros test defer dispatch",
+					      false);
 	tevent_set_trace_fd_callback(o->ev,
 				     smbd_smb2_ros_inline_trace_fd,
 				     NULL);
