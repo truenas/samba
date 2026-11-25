@@ -434,9 +434,14 @@ fn an_unclean_exit_drops_that_processes_handles_on_both_controllers() {
     let mut want: Vec<Record> =
         (11..=20).map(|i| record(i, two.owner, 10)).collect();
     want.insert(0, disconnected);
-    let (_, records) = a.smbd(Client::Parent, 1).rehydrate_all(1 << 20);
+    // The parent keeps its connection until the primary is killed. A parent
+    // that closes during a rehydration ends it, and the primary then fences
+    // the standby's replica.
+    let mut parent = a.smbd(Client::Parent, 1);
+    let (_, records) = parent.rehydrate_all(1 << 20);
     assert_eq!(sorted(records), want);
     a.kill();
+    drop(parent);
     promote(&mut b);
     let (_, records) = b.smbd(Client::Parent, 1).rehydrate_all(1 << 20);
     assert_eq!(sorted(records), want);
@@ -877,10 +882,14 @@ fn a_large_copy_resyncs_in_chunks_under_concurrent_writes() {
     // One more promise covers all changes.
     let s = smbd.submit(Vec::new(), SyncLevel::Remote).unwrap();
     assert_eq!(s.protection, Protection::Protected);
-    let (_, want) = a.smbd(Client::Parent, 1).rehydrate_all(1 << 20);
     // The rehydration freezes the primary's copy. Kill the primary, promote
-    // the standby and compare the replica with that copy.
+    // the standby and compare the replica with that copy. The parent keeps
+    // its connection until the kill. A parent that closes during a
+    // rehydration ends it, and the primary then fences the replica.
+    let mut parent = a.smbd(Client::Parent, 1);
+    let (_, want) = parent.rehydrate_all(1 << 20);
     a.kill();
+    drop(parent);
     promote(&mut b);
     let (page, records) = b.smbd(Client::Parent, 2).rehydrate_all(300 * 1024);
     assert_eq!(page.origin, Origin::Replica);
