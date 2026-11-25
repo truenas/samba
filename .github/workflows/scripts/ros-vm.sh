@@ -168,6 +168,11 @@ prepare() {
 	sync -f "$DIR/pending/read.dat"
 	# The pool frees the dirty data of read.dat only when its txg syncs.
 	[ -z "$POOL" ] || zpool sync "$POOL"
+	# primarycache=metadata does not keep every data buffer out of the ARC.
+	# ZFS keeps a prefetched buffer until its next periodic eviction. In one
+	# run the READ of P3 ended within 500 microseconds, without an interim
+	# response. zinject -a flushes the ARC, so the READ goes to the pool.
+	[ -z "$POOL" ] || zinject -a
 }
 
 # smbtorture as the test user, on the share SHARE (default slow). A skipped
