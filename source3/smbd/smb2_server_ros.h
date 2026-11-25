@@ -47,6 +47,13 @@ struct smbd_smb2_ros_owner {
 	 * lock runs a PDU through smbd on its own thread.
 	 */
 	bool inline_on;
+	/*
+	 * "truenas:ros test defer dispatch", for the tests of CI. Inline runs
+	 * then also take the messages that only the main thread runs, and
+	 * smbd_smb2_ros_inline_defer_dispatch() passes them to the main
+	 * thread.
+	 */
+	bool test_defer_dispatch;
 	pthread_mutex_t lock;
 	/*
 	 * True while the main thread sleeps without the lock. Only the main
@@ -134,6 +141,8 @@ NTSTATUS smbd_smb2_ros_adopt(struct smbXsrv_connection *xconn);
 int smbd_smb2_ros_owner_destructor(struct smbd_smb2_ros_owner *o);
 void smbd_smb2_ros_trash_empty(void);
 bool smbd_smb2_ros_inline_take_next(struct smbd_smb2_request *req);
+bool smbd_smb2_ros_inline_defer_dispatch(struct smbd_smb2_request *req,
+					 uint16_t opcode);
 bool smbd_smb2_ros_inline_defer_terminate(struct smbXsrv_connection *xconn,
 					  const char *reason,
 					  const char *location);
