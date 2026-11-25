@@ -3150,6 +3150,17 @@ NTSTATUS smbd_smb2_request_dispatch(struct smbd_smb2_request *req)
 	bool session_expired = false;
 
 	inhdr = SMBD_SMB2_IN_HDR_PTR(req);
+	opcode = SVAL(inhdr, SMB2_HDR_OPCODE);
+
+	/*
+	 * TrueNAS: only the main thread runs some messages, such as a
+	 * TREE_CONNECT. If an inline run of a truenas_ros reactor got here
+	 * with one, the main thread dispatches req instead. Nothing of req
+	 * is done yet.
+	 */
+	if (smbd_smb2_ros_inline_defer_dispatch(req, opcode)) {
+		return NT_STATUS_OK;
+	}
 
 	DO_PROFILE_INC(request);
 
@@ -3158,7 +3169,6 @@ NTSTATUS smbd_smb2_request_dispatch(struct smbd_smb2_request *req)
 	/* TODO: verify more things */
 
 	flags = IVAL(inhdr, SMB2_HDR_FLAGS);
-	opcode = SVAL(inhdr, SMB2_HDR_OPCODE);
 	mid = BVAL(inhdr, SMB2_HDR_MESSAGE_ID);
 	DBG_DEBUG("opcode[%s] mid = %"PRIu64"\n",
 		  smb2_opcode_name(opcode),
